@@ -39,6 +39,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let config = WKWebViewConfiguration()
         let controller = WKUserContentController()
 
+        // 允许 Cookie 和本地持久化
+        config.websiteDataStore = WKWebsiteDataStore.default()
+
         // 注册 JSBridge Handler
         controller.add(self, name: "bridge")
         controller.add(self, name: "cordovaExec")
@@ -46,6 +49,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 注入桥接适配脚本
         let bridgeJS = """
         window.isIOSNativeApp = true;
+        
+        // 保证 Capacitor.Plugins 和 Capacitor.CapacitorHttp 存在
+        window.Capacitor = window.Capacitor || {};
+        window.Capacitor.Plugins = window.Capacitor.Plugins || {};
         
         // Cordova 插件桥接
         if (!window.cordova) {
@@ -89,6 +96,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 SangTacVietApp/1.2.17"
         webView.isOpaque = false
         webView.backgroundColor = .black
         webView.scrollView.backgroundColor = .black
@@ -105,10 +113,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     }
 
     private func loadApp() {
-        // 直接加载官方完整的移动端应用入口，与 Android 行为 100% 一致
         let targetURL = URL(string: "https://sangtacviet.vip/app.v2.php") ?? URL(string: "https://sangtacviet.vip/")!
         var request = URLRequest(url: targetURL)
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", forHTTPHeaderField: "User-Agent")
         request.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
         webView.load(request)
     }
@@ -271,5 +277,20 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 webView.load(URLRequest(url: fallbackURL))
             }
         }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // 修复语言与翻译以及登录 Cookie 刷新
+        let fixScript = """
+        (function() {
+            // 确保 localStorage 中语言设置正确生效
+            var savedLang = localStorage.getItem('stv_lang') || localStorage.getItem('lang');
+            if (savedLang && window.setLang) {
+                try { window.setLang(savedLang);
+                } catch(e) {}
+            }
+        })();
+        """
+        webView.evaluateJavaScript(fixScript, completionHandler: nil)
     }
 }
