@@ -46,19 +46,117 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         controller.add(self, name: "bridge")
         controller.add(self, name: "cordovaExec")
 
-        // 注入桥接适配脚本
+        // 预设 Capacitor 原生环境和 Cordova TTS 原生插件
         let bridgeJS = """
-        window.isIOSNativeApp = true;
-        
-        // 保证 Capacitor.Plugins 和 Capacitor.CapacitorHttp 存在
+        // 1. 注入 iOS WebKit CSS 视口与安全区规则
+        (function() {
+            var css = document.createElement('style');
+            css.id = 'ios-viewport-fix';
+            css.innerHTML = `
+                :root {
+                    --vh: 1vh;
+                    --vh100: 100vh;
+                    --vh100subtop: 100vh;
+                    --status-bar-height: env(safe-area-inset-top, 20px);
+                    --screensafebottom: env(safe-area-inset-bottom, 20px);
+                }
+                html, body {
+                    width: 100% !important;
+                    height: 100% !important;
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    overflow: hidden !important;
+                    position: fixed !important;
+                    inset: 0 !important;
+                    background-color: #fff !important;
+                }
+                tab#mainview {
+                    display: flex !important;
+                    flex-direction: column !important;
+                    height: 100% !important;
+                    width: 100% !important;
+                    position: absolute !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    right: 0 !important;
+                    bottom: 0 !important;
+                }
+                tab#mainview > div:first-of-type {
+                    flex: 1 1 auto !important;
+                    height: 100% !important;
+                    overflow: hidden !important;
+                    position: relative !important;
+                }
+                #mainnavbar, tab#mainview > tabbar#mainnavbar {
+                    flex: 0 0 auto !important;
+                    position: relative !important;
+                    bottom: 0 !important;
+                    width: 100% !important;
+                    z-index: 9999 !important;
+                    padding-bottom: env(safe-area-inset-bottom, 20px) !important;
+                }
+            `;
+            if (document.head) {
+                document.head.appendChild(css);
+            } else {
+                document.addEventListener('DOMContentLoaded', function() {
+                    document.head.appendChild(css);
+                });
+            }
+
+            // 动态设置 --vh 变量
+            function updateVH() {
+                var vh = window.innerHeight * 0.01;
+                document.documentElement.style.setProperty('--vh', vh + 'px');
+                document.documentElement.style.setProperty('--vh100', (window.innerHeight) + 'px');
+                document.documentElement.style.setProperty('--vh100subtop', (window.innerHeight) + 'px');
+            }
+            updateVH();
+            window.addEventListener('resize', updateVH);
+            window.addEventListener('orientationchange', updateVH);
+        })();
+
+        // 2. 注入 Capacitor / Cordova Bridge
         window.Capacitor = window.Capacitor || {};
+        window.Capacitor.isNative = true;
+        window.Capacitor.isPluginAvailable = function(name) { return true; };
         window.Capacitor.Plugins = window.Capacitor.Plugins || {};
         
-        // Cordova 插件桥接
+        // 注册 Haptics / NativeClick
+        window.Capacitor.Plugins.Haptics = {
+            impact: function(options) {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                    window.webkit.messageHandlers.bridge.postMessage({
+                        pluginId: 'Haptics',
+                        methodName: 'impact',
+                        options: options || {}
+                    });
+                }
+            }
+        };
+
+        // 注册 StatusBar
+        window.Capacitor.Plugins.StatusBar = {
+            hide: function() {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                    window.webkit.messageHandlers.bridge.postMessage({ pluginId: 'StatusBar', methodName: 'hide' });
+                }
+            },
+            show: function() {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                    window.webkit.messageHandlers.bridge.postMessage({ pluginId: 'StatusBar', methodName: 'show' });
+                }
+            },
+            overlaysWebView: function() {
+                return Promise.resolve();
+            }
+        };
+
+        // 兼容 Cordova 经典 exec 桥接
         if (!window.cordova) {
             window.cordova = {
                 exec: function(success, fail, service, action, args) {
-                    var callbackId = 'cb_' + Date.now() + '_' + Math.floor(Math.random()*10000);
+                    var callbackId = 'cb_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
                     window._callbacks = window._callbacks || {};
                     window._callbacks[callbackId] = { success: success, fail: fail };
                     
@@ -270,9 +368,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // 修复语言与翻译以及登录 Cookie 刷新
+        // 修复语言与翻译以及登录 Cookie 刷新与布局重新测量
         let fixScript = """
         (function() {
+            // 触发一次 resize 计算
+            if (window.dispatchEvent) {
+                window.dispatchEvent(new Event('resize'));
+            }
+            
             // 确保 localStorage 中语言设置正确生效
             var savedLang = localStorage.getItem('stv_lang') || localStorage.getItem('lang');
             if (savedLang && window.setLang) {

@@ -8,3 +8,12 @@ xcuserdata/
 # Temp analysis
 apk_extracted/
 *.apk
+inspect_*.js
+find_*.js
+test_*.js
+run_tests.js
+script10.js
+app.v2*.js
+app_v2*.html
+stv.ui.js
+download_assets.js
