@@ -48,8 +48,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
         // 预设 Capacitor 原生环境和 Cordova TTS 原生插件
         let bridgeJS = """
-        // 1. 注入 iOS WebKit CSS 视口与安全区规则
         (function() {
+            // 1. 注入 iOS WebKit CSS 视口与安全区规则 (非侵入式)
             var css = document.createElement('style');
             css.id = 'ios-viewport-fix';
             css.innerHTML = `
@@ -57,43 +57,15 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     --vh: 1vh;
                     --vh100: 100vh;
                     --vh100subtop: 100vh;
-                    --status-bar-height: env(safe-area-inset-top, 20px);
-                    --screensafebottom: env(safe-area-inset-bottom, 20px);
-                }
-                html, body {
-                    width: 100% !important;
-                    height: 100% !important;
-                    margin: 0 !important;
-                    padding: 0 !important;
-                    overflow: hidden !important;
-                    position: fixed !important;
-                    inset: 0 !important;
-                    background-color: #fff !important;
+                    --status-bar-height: env(safe-area-inset-top, 0px);
+                    --screensafebottom: env(safe-area-inset-bottom, 0px);
                 }
                 tab#mainview {
-                    display: flex !important;
-                    flex-direction: column !important;
-                    height: 100% !important;
-                    width: 100% !important;
-                    position: absolute !important;
-                    top: 0 !important;
-                    left: 0 !important;
-                    right: 0 !important;
-                    bottom: 0 !important;
+                    height: 100vh !important;
+                    height: 100dvh !important;
                 }
-                tab#mainview > div:first-of-type {
-                    flex: 1 1 auto !important;
-                    height: 100% !important;
-                    overflow: hidden !important;
-                    position: relative !important;
-                }
-                #mainnavbar, tab#mainview > tabbar#mainnavbar {
-                    flex: 0 0 auto !important;
-                    position: relative !important;
-                    bottom: 0 !important;
-                    width: 100% !important;
-                    z-index: 9999 !important;
-                    padding-bottom: env(safe-area-inset-bottom, 20px) !important;
+                #mainnavbar {
+                    padding-bottom: env(safe-area-inset-bottom, 0px);
                 }
             `;
             if (document.head) {
@@ -106,83 +78,244 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
             // 动态设置 --vh 变量
             function updateVH() {
-                var vh = window.innerHeight * 0.01;
+                var vh = (window.innerHeight || document.documentElement.clientHeight) * 0.01;
                 document.documentElement.style.setProperty('--vh', vh + 'px');
-                document.documentElement.style.setProperty('--vh100', (window.innerHeight) + 'px');
-                document.documentElement.style.setProperty('--vh100subtop', (window.innerHeight) + 'px');
+                document.documentElement.style.setProperty('--vh100', (window.innerHeight || document.documentElement.clientHeight) + 'px');
+                document.documentElement.style.setProperty('--vh100subtop', (window.innerHeight || document.documentElement.clientHeight) + 'px');
             }
             updateVH();
             window.addEventListener('resize', updateVH);
             window.addEventListener('orientationchange', updateVH);
-        })();
 
-        // 2. 注入 Capacitor / Cordova Bridge
-        window.Capacitor = window.Capacitor || {};
-        window.Capacitor.isNative = true;
-        window.Capacitor.isPluginAvailable = function(name) { return true; };
-        window.Capacitor.Plugins = window.Capacitor.Plugins || {};
-        
-        // 注册 Haptics / NativeClick
-        window.Capacitor.Plugins.Haptics = {
-            impact: function(options) {
-                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
-                    window.webkit.messageHandlers.bridge.postMessage({
-                        pluginId: 'Haptics',
-                        methodName: 'impact',
-                        options: options || {}
+            // 2. 注入完整健壮的 Capacitor 桥接 (包含 fromNative 与各核心插件)
+            window.Capacitor = window.Capacitor || {};
+            window.Capacitor.isNative = true;
+            window.Capacitor.isPluginAvailable = function(name) {
+                // 不提供原生 Http 插件，让前端天然使用原生 XHR/fetch 请求真实的服务器网络与 Cookie
+                if (name === 'Http') return false;
+                return true;
+            };
+            window.Capacitor.fromNative = function(result) {
+                // 默认的 fromNative 回执处理
+            };
+            window.Capacitor.Plugins = window.Capacitor.Plugins || {};
+
+            // Capacitor App 插件 (支持 addListener, SyncCookie, getInfo, exitApp)
+            var appListeners = {};
+            window.Capacitor.Plugins.App = {
+                addListener: function(eventName, callback) {
+                    if (!appListeners[eventName]) appListeners[eventName] = [];
+                    appListeners[eventName].push(callback);
+                    return Promise.resolve({
+                        remove: function() {
+                            if (appListeners[eventName]) {
+                                appListeners[eventName] = appListeners[eventName].filter(function(cb) { return cb !== callback; });
+                            }
+                        }
                     });
+                },
+                removeAllListeners: function(eventName) {
+                    if (eventName) {
+                        delete appListeners[eventName];
+                    } else {
+                        appListeners = {};
+                    }
+                    return Promise.resolve();
+                },
+                SyncCookie: function() {
+                    // 同步 Cookie
+                    return Promise.resolve();
+                },
+                exitApp: function() {
+                    return Promise.resolve();
+                },
+                getInfo: function() {
+                    return Promise.resolve({
+                        name: "SangTacReader",
+                        id: "com.sangtacviet.mobilereader",
+                        build: "1",
+                        version: "1.2.17"
+                    });
+                },
+                getState: function() {
+                    return Promise.resolve({ isActive: true });
                 }
-            }
-        };
+            };
 
-        // 注册 StatusBar
-        window.Capacitor.Plugins.StatusBar = {
-            hide: function() {
-                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
-                    window.webkit.messageHandlers.bridge.postMessage({ pluginId: 'StatusBar', methodName: 'hide' });
-                }
-            },
-            show: function() {
-                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
-                    window.webkit.messageHandlers.bridge.postMessage({ pluginId: 'StatusBar', methodName: 'show' });
-                }
-            },
-            overlaysWebView: function() {
-                return Promise.resolve();
-            }
-        };
-
-        // 兼容 Cordova 经典 exec 桥接
-        if (!window.cordova) {
-            window.cordova = {
-                exec: function(success, fail, service, action, args) {
-                    var callbackId = 'cb_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-                    window._callbacks = window._callbacks || {};
-                    window._callbacks[callbackId] = { success: success, fail: fail };
-                    
-                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cordovaExec) {
-                        window.webkit.messageHandlers.cordovaExec.postMessage({
-                            service: service,
-                            action: action,
-                            args: args || [],
-                            callbackId: callbackId
-                        });
+            // 派发原生 BackButton 事件
+            window._fireBackButton = function(canGoBack) {
+                if (appListeners['backButton']) {
+                    appListeners['backButton'].forEach(function(cb) {
+                        try { cb({ canGoBack: !!canGoBack }); } catch(e) {}
+                    });
+                } else {
+                    if (window.history && window.history.length > 1) {
+                        window.history.back();
                     }
                 }
             };
-        }
 
-        // 快捷分发原生回执
-        window._nativeCallback = function(callbackId, isSuccess, data) {
-            if (window._callbacks && window._callbacks[callbackId]) {
-                if (isSuccess) {
-                    if (window._callbacks[callbackId].success) window._callbacks[callbackId].success(data);
-                } else {
-                    if (window._callbacks[callbackId].fail) window._callbacks[callbackId].fail(data);
+            // Capacitor Haptics 插件 (触觉反馈)
+            window.Capacitor.Plugins.Haptics = {
+                impact: function(options) {
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                        window.webkit.messageHandlers.bridge.postMessage({
+                            pluginId: 'Haptics',
+                            methodName: 'impact',
+                            options: options || {}
+                        });
+                    }
+                    return Promise.resolve();
+                },
+                vibrate: function() {
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                        window.webkit.messageHandlers.bridge.postMessage({
+                            pluginId: 'Haptics',
+                            methodName: 'vibrate',
+                            options: {}
+                        });
+                    }
+                    return Promise.resolve();
+                },
+                notification: function() { return Promise.resolve(); },
+                selectionStart: function() { return Promise.resolve(); },
+                selectionChanged: function() { return Promise.resolve(); },
+                selectionEnd: function() { return Promise.resolve(); }
+            };
+
+            // Capacitor StatusBar 插件
+            window.Capacitor.Plugins.StatusBar = {
+                hide: function() {
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                        window.webkit.messageHandlers.bridge.postMessage({ pluginId: 'StatusBar', methodName: 'hide' });
+                    }
+                    return Promise.resolve();
+                },
+                show: function() {
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {
+                        window.webkit.messageHandlers.bridge.postMessage({ pluginId: 'StatusBar', methodName: 'show' });
+                    }
+                    return Promise.resolve();
+                },
+                setStyle: function(options) {
+                    return Promise.resolve();
+                },
+                setBackgroundColor: function(options) {
+                    return Promise.resolve();
+                },
+                setOverlaysWebView: function(options) {
+                    return Promise.resolve();
+                },
+                getInfo: function() {
+                    return Promise.resolve({ visible: true, overlays: false });
                 }
-                delete window._callbacks[callbackId];
+            };
+
+            // Capacitor Device 插件
+            window.Capacitor.Plugins.Device = {
+                getInfo: function() {
+                    return Promise.resolve({
+                        model: "iPhone",
+                        platform: "ios",
+                        operatingSystem: "ios",
+                        osVersion: "17.0",
+                        manufacturer: "Apple",
+                        isVirtual: false,
+                        webViewVersion: "605.1.15"
+                    });
+                },
+                getId: function() {
+                    return Promise.resolve({ uuid: "ios-device-uuid" });
+                },
+                getBatteryInfo: function() {
+                    return Promise.resolve({ batteryLevel: 1.0, isCharging: false });
+                },
+                getLanguageCode: function() {
+                    return Promise.resolve({ value: "vi" });
+                },
+                getLanguageTag: function() {
+                    return Promise.resolve({ value: "vi-VN" });
+                }
+            };
+
+            // Capacitor Keyboard 插件
+            window.Capacitor.Plugins.Keyboard = {
+                show: function() { return Promise.resolve(); },
+                hide: function() { return Promise.resolve(); },
+                setAccessoryBarVisible: function() { return Promise.resolve(); },
+                setScroll: function() { return Promise.resolve(); }
+            };
+
+            // Capacitor SplashScreen 插件
+            window.Capacitor.Plugins.SplashScreen = {
+                hide: function() { return Promise.resolve(); },
+                show: function() { return Promise.resolve(); }
+            };
+
+            // Capacitor Toast 插件
+            window.Capacitor.Plugins.Toast = {
+                show: function(options) {
+                    if (window.M && window.M.toast && options && options.text) {
+                        try { window.M.toast({ html: options.text }); } catch(e) {}
+                    }
+                    return Promise.resolve();
+                }
+            };
+
+            // Capacitor Browser 插件
+            window.Capacitor.Plugins.Browser = {
+                open: function(options) {
+                    if (options && options.url) window.open(options.url, '_blank');
+                    return Promise.resolve();
+                },
+                close: function() { return Promise.resolve(); }
+            };
+
+            // 3. 兼容 Cordova 经典 exec 桥接
+            if (!window.cordova) {
+                window.cordova = {
+                    exec: function(success, fail, service, action, args) {
+                        var callbackId = 'cb_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                        window._callbacks = window._callbacks || {};
+                        window._callbacks[callbackId] = { success: success, fail: fail };
+                        
+                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cordovaExec) {
+                            window.webkit.messageHandlers.cordovaExec.postMessage({
+                                service: service,
+                                action: action,
+                                args: args || [],
+                                callbackId: callbackId
+                            });
+                        }
+                    },
+                    plugins: {
+                        tts: {
+                            speak: function(options, success, fail) {
+                                window.cordova.exec(success, fail, "TTS", "speak", [options]);
+                            },
+                            stop: function(success, fail) {
+                                window.cordova.exec(success, fail, "TTS", "stop", []);
+                            },
+                            getVoices: function(success, fail) {
+                                window.cordova.exec(success, fail, "TTS", "getVoices", []);
+                            }
+                        }
+                    }
+                };
             }
-        };
+
+            // 快捷分发原生回执
+            window._nativeCallback = function(callbackId, isSuccess, data) {
+                if (window._callbacks && window._callbacks[callbackId]) {
+                    if (isSuccess) {
+                        if (window._callbacks[callbackId].success) window._callbacks[callbackId].success(data);
+                    } else {
+                        if (window._callbacks[callbackId].fail) window._callbacks[callbackId].fail(data);
+                    }
+                    delete window._callbacks[callbackId];
+                }
+            };
+        })();
         """
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         controller.addUserScript(bridgeScript)
@@ -190,10 +323,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         config.userContentController = controller
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.allowsInlineMediaPlayback = true
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
 
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 SangTacVietApp/1.2.17"
         webView.isOpaque = true
         webView.backgroundColor = .systemBackground
@@ -257,10 +392,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         } else if pluginId == "StatusBar" {
             if methodName == "hide" {
                 isStatusBarHidden = true
-                setNeedsStatusBarAppearanceUpdate()
+                UIView.animate(withDuration: 0.25) {
+                    self.setNeedsStatusBarAppearanceUpdate()
+                }
             } else if methodName == "show" {
                 isStatusBarHidden = false
-                setNeedsStatusBarAppearanceUpdate()
+                UIView.animate(withDuration: 0.25) {
+                    self.setNeedsStatusBarAppearanceUpdate()
+                }
             }
             sendCapacitorResult(callbackId: callbackId, pluginId: pluginId, methodName: methodName, success: true, data: [:])
         } else {

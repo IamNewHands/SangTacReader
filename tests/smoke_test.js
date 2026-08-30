@@ -295,9 +295,11 @@ async function testCSSRules() {
   assert(swiftContent.includes('safe-area-inset-bottom'), 'D4. bridgeJS 包含安全区底部适配');
 
   // D5: 主视图布局规则
-  assert(swiftContent.includes('tab#mainview'), 'D5. bridgeJS 包含 #mainview flex 布局修复规则');
-  assert(swiftContent.includes('#mainnavbar'), 'D6. bridgeJS 包含 #mainnavbar 底栏固定规则');
-  assert(swiftContent.includes('flex: 1 1 auto'), 'D7. 内容区域 flex 弹性扩展规则存在');
+  assert(swiftContent.includes('tab#mainview'), 'D5. bridgeJS 包含 #mainview 高度视口适配');
+  assert(swiftContent.includes('#mainnavbar'), 'D6. bridgeJS 包含 #mainnavbar 底栏安全区规则');
+  assert(swiftContent.includes('SyncCookie'), 'D7. bridgeJS 包含 Capacitor App.SyncCookie 登录与会话同步支持');
+  assert(swiftContent.includes('addListener'), 'D7.1. bridgeJS 包含 Capacitor App.addListener 事件支持');
+  assert(swiftContent.includes('fromNative'), 'D7.2. bridgeJS 包含 Capacitor fromNative 回执支持');
 
   // D8: 动态视口更新
   assert(swiftContent.includes('window.innerHeight'), 'D8. 动态 vh 计算使用 window.innerHeight');
