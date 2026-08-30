@@ -381,24 +381,23 @@ async function testBridgeIntegrity() {
     'Entry URL must be sangtacviet.com to keep cookies same-origin'
   );
 
-  // E7-E8: 原生网络层兜底 —— WKURLSchemeHandler 接管 https，强制附加 Referer。
-  // 服务器对 GET 请求强制要求 Referer 头，否则返回空体(Content-Length: 0)，
-  // 前端会误判为 "Kết nối tới máy chủ thất bại"。iOS WKWebView 同源 XHR 不带
-  // Referer，而 JS 无法设置 Referer(forbidden header)。安卓用 CapacitorHttp 原生层
-  // 显式附加 "Referer": document.referrer || location.href，这里用 WKURLSchemeHandler
-  // 在原生层等价实现。
+  // E7-E8: 解决服务器对 GET 强制要求 Referer 的问题。
+  // 服务器要求 GET 必须带 Referer 头，否则返回空体(Content-Length: 0)，前端会误判为
+  // "Kết nối tới máy chủ thất bại"。安卓用 CapacitorHttp 原生层显式附加 Referer。
+  // iOS 不能再用 WKURLSchemeHandler 接管 https（https 是 WKWebView 原生 scheme，
+  // setURLSchemeHandler 会抛异常崩溃），而是注入脚本强制所有 STV 请求保持同源：
+  // WKWebView 对【同源】XHR 会自动携带完整 Referer，等价于安卓显式附加 Referer。
   assert(
-    swiftContent.includes('WKURLSchemeHandler') &&
-      swiftContent.includes('setURLSchemeHandler') &&
-      swiftContent.includes('forURLScheme: "https"'),
-    'E7. 注册 https scheme 处理器拦截 STV 请求 (WKURLSchemeHandler)',
-    'Missing WKURLSchemeHandler for https (required to attach Referer)'
+    !swiftContent.includes('setURLSchemeHandler'),
+    'E7. 不使用 WKURLSchemeHandler 接管 https（避免崩溃）',
+    'setURLSchemeHandler on https throws an exception in WKWebView'
   );
   assert(
-    swiftContent.includes('forHTTPHeaderField: "Referer"') &&
-      swiftContent.includes('netSession.dataTask'),
-    'E8. 原生层强制附加 Referer 后经 URLSession 转发',
-    'Missing Referer attachment in native network layer'
+    swiftContent.includes('isDomainAlive = function') &&
+      swiftContent.includes('bestDomain = function') &&
+      swiftContent.includes('XMLHttpRequest.prototype.open'),
+    'E8. 注入同域强制脚本 (覆盖 isDomainAlive/bestDomain + XHR 同域) 让浏览器自动带 Referer',
+    'Missing same-origin enforcement so WKWebView sends Referer automatically'
   );
 }
 
