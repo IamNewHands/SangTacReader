@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<head>
+	<meta
+      name="viewport"
+      content="viewport-fit=cover, width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+	<script src="https://sangtacviet.com/jqr.js"></script>
+  <meta charset="UTF-8" />
+  <title>STV MobileReader</title>
+  <script
+      type="module"
+      src="https://unpkg.com/@ionic/pwa-elements@latest/dist/ionicpwaelements/ionicpwaelements.esm.js"
+    ></script>
+    <script
+      nomodule
+      src="https://unpkg.com/@ionic/pwa-elements@latest/dist/ionicpwaelements/ionicpwaelements.js"
+    ></script>
+
+    <link rel="icon" type="image/x-icon" href="./assets/icon/favicon.ico" />
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="stylesheet" href="./css/style.css" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="msapplication-tap-highlight" content="no" />
+	<link rel="stylesheet" href="https://sangtacviet.com/bootstrap.min.css?origin=">
+	<link rel="stylesheet" href="https://sangtacviet.com/font/font.css?v=4">
+	<link rel="stylesheet" href="https://sangtacviet.com/asset/all.min.css">
+	<link rel="stylesheet" type="text/css" href="https://sangtacviet.com/main.css?v=44">
+	<link rel="stylesheet" type="text/css" href="https://sangtacviet.com/asset/theme.default.css?v=0">
+	<script src="https://sangtacviet.com/bootstrap.min.js"></script>
+	<script type="text/javascript" src="https://sangtacviet.com/stv.ui.js?v=1.262"></script>
+	<script type="text/javascript" src="https://sangtacviet.com/stv.host.js"></script>
+	<meta charset="utf-8">
+	<meta name="apple-mobile-web-app-status-bar-style" content="hidden">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="format-detection" content="telephone=no">
+	<link rel="apple-touch-icon" href="https://sangtacviet.com/favicon.png">
+	<link rel="apple-touch-startup-image" href="/splash.png">
+	<meta name="apple-mobile-web-app-title" content="Sáng Tác Việt">
+	<link rel="manifest" href="/manifest_app_v2.json">
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.11.0/gsap.min.js" integrity="sha512-GQ5/eIhs41UXpG6fGo4xQBpwSEj9RrBvMuKyE2h/2vw3a9x85T1Bt0JglOUVJJLeyIUl/S/kCdDXlE/n7zCjIg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+	<!-- Compiled and minified CSS -->
+	<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css">
+
+	<!-- Compiled and minified JavaScript -->
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/js/materialize.min.js"></script>
+
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/pulltorefreshjs/0.1.22/index.umd.min.js" integrity="sha512-djmgTiVR15A/7fON+ojDzFYrRsfVkzQZu07ZVb0zLC1OhA2iISP39Lzs05GqSKF0vPjkLzL5hBC+am6po7dKpA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+</head>
+
+<body>
+	<tab id="mainview" style="height: 100vh;">
+		<div>
+			<tabdiv id="maintabdiv">
+				<tabview>
+					<tab id="tabtusach">
+						<tabbar>
+							<tabitem class="active">Lịch sử</tabitem>
+							<tabitem>Theo dõi</tabitem>
+							<tabitem>Đánh dấu</tabitem>
+							<tabitem>Sở hữu</tabitem>
+						</tabbar>
+						<tabpointer>
+							<ntab>
+								<tabpointermark>
+									<span></span>
+								</tabpointermark>
+							</ntab>
+						</tabpointer>
+						<div>
+							<tabdiv>
+								<tabview view="bookhistory">
+									<div id="historyview"></div>
+								</tabview>
+								<tabview view="bookfollowing"></tabview>
+								<tabview view="bookmarked"></tabview>
+								<tabview view="bookowning"></tabview>
+							</tabdiv>
+						</div>
+					</tab>
+				</tabview>
+				<tabview style="position:relative;">
+
+					<tab id="tabtimkiem">
+						<tabbar>
+							<tabitem class="active">Xếp hạng</tabitem>
+							<tabitem>Đẩy sách</tabitem>
+							<tabitem onclick="app.fun.showSearch()">Tìm kiếm</tabitem>
+						</tabbar>
+						<tabpointer>
+							<tabpointermark>
+								<span></span>
+							</tabpointermark>
+						</tabpointer>
+						<div>
+							<tabdiv>
+								<tabview view="bookranking"></tabview>
+								<tabview view="bookpush"></tabview>
+								<tabview view="bookpromote"></tabview>
+							</tabdiv>
+						</div>
+					</tab>
+					<div class="tabcontext">
+						<button onclick="app.context.current(0)" class="context ctxbtn" style="color: white;">
+							<i class="far fa-ellipsis-v"></i>
+						</button>
+					</div>
+				</tabview>
+				<tabview id="tabcomm">
+					<div class="titlebar">
+						<div class="title">
+							Cộng đồng
+						</div>
+					</div>
+					<div class="flex p-4">
+						<button onclick="app.fun.showPage('pagecbox')" class="iconbtn col-3">
+							<i class="fas fa-comment-dots"></i>
+							Cbox web
+						</button>
+						<button class="iconbtn col-3">
+							<i class="fas fa-comment-dots"></i>
+							Chat
+						</button>
+						<button onclick="window.open('https://facebook.com/sangtacviet')" class="iconbtn col-3">
+							<i class="fab fa-facebook-square"></i>
+							Fanpage
+						</button>
+						<button onclick="window.open('https://www.facebook.com/groups/489420668744980')" class="iconbtn col-3">
+							<i class="fas fa-users"></i>
+							Group face
+						</button>
+					</div>
+					<div class="flex p-4">
+						<button class="iconbtn col-3">
+							<i class="fas fa-stars"></i>
+							Kênh truyện
+						</button>
+						<button class="iconbtn col-3">
+							<i class="fas fa-comment-alt-lines"></i>
+							Kênh linh tinh
+						</button>
+						<button onclick="window.open('https://forum.sangtacviet.com')" class="iconbtn col-3">
+							<i class="fas fa-comment-alt-plus"></i>
+							Diễn đàn
+						</button>
+						<button onclick="app.fun.showComment('broadcast',0)" class="iconbtn col-3">
+							<i class="fas fa-comment"></i>
+							Bình luận
+						</button>
+					</div>
+				</tabview>
+				<tabview id="tabuser" view="userme"></tabview>
+			</tabdiv>
+		</div>
+		<tabpointer>
+			<tabpointermark style="top:0">
+				<span style="background-color: var(--background);"></span>
+			</tabpointermark>
+		</tabpointer>
+		<tabbar>
+			<tabitem class="active w-25 ibtn">
+				<i class="fas fa-home"></i>
+				<text>home</text>
+			</tabitem>
+			<tabitem class="w-25 ibtn">
+				<i class="fas fa-search"></i>
+				<text>search</text>
+			</tabitem>
+			<tabitem class="w-25 ibtn">
+				<i class="fas fa-users"></i>
+				<text>community</text>
+			</tabitem>
+			<tabitem class="w-25 ibtn">
+				<i class="fas fa-user"></i>
+				<text>user</text>
+			</tabitem>
+		</tabbar>
+	</tab>
+	<div id="ptransit"></div>
+	<div id="overlay"></div>
+	<div id="ctxoverlay"></div>
+	<div id="pagestore" hidden>
+		<template id="page-bookinfo">
+			<div class="bookinfo">
+				<img class="thumb backdrop">
+				<div class="titlebar" style="background-color: transparent;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div style="flex:1"></div>
+					<div>
+						<button class="rbtn" onclick="app.context.bookinfo()">
+							<i class="fas fa-ellipsis-v"></i>
+						</button>
+					</div>
+				</div>
+				<div class="body">
+					<div class="flex">
+						<div class="thumbcontainer">
+							<img class="thumb">
+						</div>
+						<div class="desc">
+							<div class="tname"></div>
+							<div class="hname"></div>
+							<div class="name"></div>
+							<div class="hauthor"></div>
+						</div>
+					</div>
+					<div class="blk-body" style="border:none;padding:0">
+						<div class="row justify-content-md-left" style="margin: 0">
+							<div class="col-3 col-lg-2">
+								<span class="blk-item"><i class="far fa-eye"></i><br><span class="view"></span></span>
+							</div>
+							<div class="col-3 col-lg-2">
+								<span class="blk-item" onclick="promote();"><i class="fas fa-thumbs-up"></i><br><span class="liked"></span> Thích</span>
+							</div>
+							<div class="col-3 col-lg-2">
+								<span class="blk-item" onclick="updateTusach()"><i class="fas fa-bookmark"></i><br><span class="bookmark"></span> Tủ</span>
+							</div>
+							<div class="col-3 col-lg-2">
+								<span class="blk-item" onclick="followthisbook()"><i class="fas fa-rss"></i><br><span class="subscribe"></span> Ngóng</span>
+							</div>
+						</div>
+					</div>
+					<div class="info" style="max-height: 220px;overflow:hidden;"></div>
+
+					<div class="showchapterlist">
+						<b class="chaptercount"></b> Chương
+						<i class="fa fa-chevron-right" style="font-size:20px;"></i>
+						<span class="lastupdate" style="margin-right: 10px;"></span>
+					</div>
+				</div>
+				<div class="bottombar">
+					<button class="btnbookmark iconbtn f1" style="border-top: 1px solid #b0b0b185;color:black;background: #ffffffaa;">
+						<i class="fal fa-bookmark"></i>
+						Đánh dấu
+					</button>
+					<button class="btncomment iconbtn f1" style="border-top: 1px solid #b0b0b185;color:black;background: #ffffffaa;">
+						<i class="fal fa-comment"></i>
+						Bình luận
+					</button>
+					<button class="btnreadnow iconbtn f1" style="border-top: 1px solid #b0b0b185;color:black;background: #f7f3c8aa;">
+						<i class="fal fa-glasses-alt"></i>
+						<span class=".readnow">Đọc ngay</span>
+					</button>
+					<button class="btnshowchapter iconbtn f1" style="border-top: 1px solid #b0b0b185;color:black;background: #ffffffaa;">
+						<i class="fal fa-list-ul"></i>
+						Mục lục
+					</button>
+				</div>
+				<div style="height: 80px"></div>
+			</div>
+		</template>
+		<template id="page-chapterlist">
+			<div class="chapterlist">
+				<div class="titlebar" style="background-color: white;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div style="flex:1;">
+						<input class="search chaptersearch" placeholder="Tìm kiếm">
+					</div>
+					<button class="searchbtn" onclick="app.opensearch();">
+						<i class="fa fa-search"></i>
+					</button>
+					<button class="reloadbtn rbtn" onclick="app.context.reloadChapterlist();">
+						<i class="fa fa-sync"></i>
+					</button>
+				</div>
+				<div class="body">
+					<tab style="height:calc(100% - 40px)">
+						<tabbar></tabbar>
+						<tabpointer>
+							<ntab>
+								<tabpointermark><span></span></tabpointermark>
+							</ntab>
+						</tabpointer>
+						<div>
+							<tabdiv></tabdiv>
+						</div>
+					</tab>
+				</div>
+			</div>
+		</template>
+		<template id="page-searchfilter">
+			<div class="searchfilter" render>
+				<div class="titlebar" style="background-color: white;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div class="title commenttitle">Lọc truyện</div>
+					<div class="rctx">
+						<button class="rbtn" onclick="app.search.reset()">
+							<i class="fas fa-redo"></i>
+						</button>
+					</div>
+				</div>
+				<div class="body">
+					<div class="optionname">Tìm trong tóm tắt</div>
+					<div class="option">
+						<input class="shadowinset findincontent" placeholder="...">
+					</div>
+					<div class="optionname">Nguồn truyện</div>
+					<div class="option">
+						<selectable menu="app.context.hostlist()"></selectable>
+					</div>
+					<div class="optionname">Số chương tối thiểu</div>
+					<div class="option" onclick="app.search.select(event.target,'minc')">
+						<div class="minc" v="0">Không</div>
+						<div class="minc" v="50">50</div>
+						<div class="minc" v="100">100</div>
+						<div class="minc" v="150">150</div>
+						<div class="minc" v="200">200</div>
+						<div class="minc" v="300">300</div>
+						<div class="minc" v="500">500</div>
+						<div class="minc" v="1000">1000</div>
+						<div class="minc" v="1500">1500</div>
+						<div class="minc" v="2000">2000</div>
+					</div>
+					<div class="optionname">Sắp xếp</div>
+					<div class="option" onclick="app.search.select(event.target,'sort')">
+						<div class="sort" v="">Không</div>
+						<div class="sort" v="new">Mới nhập kho</div>
+						<div class="sort" v="update">Mới cập nhật</div>
+						<div class="sort" v="view">Lượt xem tổng</div>
+						<div class="sort" v="viewweek">Lượt xem tuần</div>
+						<div class="sort" v="viewday">Lượt xem ngày</div>
+						<div class="sort" v="like">Lượt thích</div>
+						<div class="sort" v="following">Lượt theo dõi</div>
+						<div class="sort" v="bookmarked">Lượt đánh dấu</div>
+						<div class="sort" v="auto">Đề cử ngẫu nhiên</div>
+					</div>
+					<div class="optionname">Thể loại</div>
+					<div class="option" onclick="app.search.select(event.target,'category')">
+						<div class="category" v="">Tất cả</div>
+						<div class="category" v="hh">Huyền huyễn</div>
+						<div class="category" v="dt">Đô thị</div>
+						<div class="category" v="nt">Ngôn tình</div>
+						<div class="category" v="vd">Võng du</div>
+						<div class="category" v="kh">Khoa học viễn tưởng</div>
+						<div class="category" v="ls">Lịch sử</div>
+						<div class="category" v="dn">Đồng nhân</div>
+						<div class="category" v="dna">Dị năng</div>
+						<div class="category" v="ld">Linh dị</div>
+						<div class="category" v="ln">Light Novel</div>
+					</div>
+					<div class="optionname">Nhãn dán</div>
+					<div class="option">
+
+					</div>
+
+					<br><br>
+					<div class="text-center">
+						<button class="btn btn-primary w-50" onclick="app.search.applyfilter()">Lọc</button>
+					</div>
+				</div>
+				<div class="bottombar">
+					<button class="btn btn-primary w-100" onclick="app.search.applyfilter()">Lọc</button>
+				</div>
+			</div>
+		</template>
+		<template id="page-readchapter">
+			<div id="chapterview">
+				<div class="titlebar chaptertopbar">
+					<button class="go-back" onclick="document.exitFullscreen();app.goback()">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div style="flex:1">
+						<input class="search w-100" placeholder="Tìm kiếm">
+					</div>
+					<div class="rctx">
+						<button class="rbtn" onclick="">
+							<i class="fas fa-ellipsis-v"></i>
+						</button>
+					</div>
+				</div>
+				<div class="chapterscroller"></div>
+				<div class="bottombar chapterbotbar">
+					<button class="btnprevchap iconbtn f1">
+						<i class="fas fa-chevron-left"></i>
+					</button>
+					<button class="btnnextchap iconbtn f1">
+						<i class="fas fa-chevron-right"></i>
+					</button>
+					<button class="btncomment iconbtn f1">
+						<i class="fas fa-comment"></i>
+					</button>
+					<button class="btnspeak iconbtn f1">
+						<i class="fas fa-headphones-alt"></i>
+					</button>
+					<button class="btnsetting iconbtn f1">
+						<i class="fas fa-cog"></i>
+					</button>
+				</div>
+				<div class="coption"></div>
+			</div>
+		</template>
+		<template id="page-booksearch">
+			<div class="booksearch">
+				<div class="titlebar" style="background-color: white;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div style="flex:1">
+						<input class="search booksearch w-100 d-block" placeholder="Tìm kiếm">
+					</div>
+					<div class="rctx">
+						<button class="rbtn" onclick="app.fun.showSearchFilter()">
+							<i class="fas fa-ellipsis-v"></i>
+						</button>
+					</div>
+				</div>
+				<div id="searchcontainer">
+				</div>
+			</div>
+		</template>
+		<template id="page-comment">
+			<div class="commentpage">
+				<div class="titlebar" style="background: white;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div class="title commenttitle">Bình luận</div>
+					<div class="rctx">
+						<button class="rbtn" onclick="app.context.comment()">
+							<i class="fas fa-ellipsis-v"></i>
+						</button>
+					</div>
+				</div>
+				<div class="commentview">
+
+				</div>
+			</div>
+		</template>
+		<template id="page-pagewithtitle">
+			<div class="">
+				<div class="titlebar">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div style="flex:1">
+						<input class="search w-100" placeholder="Tìm kiếm">
+					</div>
+					<div class="rctx">
+						<button class="rbtn" onclick="">
+							<i class="fas fa-ellipsis-v"></i>
+						</button>
+					</div>
+				</div>
+				<div id="">
+
+				</div>
+			</div>
+		</template>
+		<template id="page-writepreview">
+			<div>
+				<div class="titlebar">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div class="title">Viết preview</div>
+					<div class="rctx"></div>
+				</div>
+				<div>
+					<div class="optionname">Nội dung đánh giá</div>
+					<div class="option">
+						<textarea class="w-100 shadowinset previewcontent" style="min-height: 200px;"></textarea>
+					</div>
+					<div style="padding: 8px">
+						<button class="nbtn useinfobtn">Dùng tóm tắt</button>
+					</div>
+				</div>
+				<div class="bottombar">
+					<button class="btn btn-primary w-100" onclick="app.fun.postpreview()">Gửi</button>
+				</div>
+
+			</div>
+		</template>
+		<template id="page-pagecbox">
+			<div>
+				<div class="titlebar">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div class="title">
+						Cbox
+					</div>
+					<div class="rctx">
+					</div>
+				</div>
+				<div>
+					<iframe src="https://www6.cbox.ws/box/?boxid=828154&boxtag=DAdiQY" style="width: 100%;height:calc(100% - 40px);border:none;"></iframe>
+				</div>
+			</div>
+		</template>
+		<template id="page-pagenotify">
+			<div>
+				<div class="titlebar" style="background-color: white;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div class="title">
+						Thông báo
+					</div>
+					<div class="rctx">
+					</div>
+				</div>
+				<div class="notifybox">
+					
+				</div>
+			</div>
+		</template>
+		<template id="page-pagelogin">
+			<div>
+				<div class="titlebar" style="background-color: white;">
+					<button class="go-back" onclick="app.goback();">
+						<i class="fa fa-chevron-left"></i>
+					</button>
+					<div class="title">
+						Đăng nhập/Đăng ký
+					</div>
+					<div class="rctx">
+					</div>
+				</div>
+				<div class="loginpage">
+					<div class="center">
+						<div class="mb-4">
+							<img src="/favicon.png" class="w-100">
+						</div>
+						<div class="mt-3">
+							<input id="username" placeholder="Tài khoản">
+						</div>
+						<div class="mt-3">
+							<input type="password" id="password" placeholder="Mật khẩu">
+						</div>
+						<div class="login">
+							<div class="mt-3">
+								<button class="w-100 waves-effect waves-light ibtn p-3 loginbtn">Đăng nhập</button>
+							</div>
+							<div class="mt-5">
+								<button class="w-100 showregistbtn waves-effect waves-light ibtn p-3" class="waves-effect waves-light ibtn p-3">
+									Đăng ký
+								</button>
+							</div>
+						</div>
+						<div class="register" style="display:none">
+							<div class="mt-3">
+								<input type="password" id="repeatpassword" placeholder="Nhập lại mật khẩu">
+							</div>
+							<div class="mt-3">
+								<button class="w-100 waves-effect waves-light ibtn p-3 registerbtn">Đăng ký</button>
+							</div>
+							<div class="mt-5">
+								<button class="w-100 showloginbtn waves-effect waves-light ibtn p-3" class="waves-effect waves-light ibtn p-3">
+									Đăng nhập
+								</button>
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+		</template>
+	</div>
+	<div id="viewstore" hidden>
+		<template id="view-notify">
+			<div class="notify">
+				<div class="title">
+					<span class="from"></span>
+					<time class="time"><time>
+				</div>
+				<div class="content"></div>
+			</div>
+		</template>
+		<template id="view-booksquare">
+			<div class="booksquare col-3" style="padding: 6px;">
+				<div style="padding-top: 125%;position: relative;">
+					<img lazyload class="thumb" referrerpolicy="no-referrer" src="/default.png">
+				</div>
+				<div class="tname"></div>
+				<div class="hauthor"></div>
+			</div>
+		</template>
+		<template id="view-bookrow">
+			<div class="bookrow" style="padding: 6px;">
+				<div>
+					<img lazyload class="thumb" referrerpolicy="no-referrer" src="/default.png">
+				</div>
+				<div class="right">
+					<div class="tname"></div>
+					<div class="hauthor"></div>
+				</div>
+			</div>
+		</template>
+		<template id="view-bookgrid">
+			<div style="padding: 3px;">
+				<for data="root.data.list" style="display: flex;flex-wrap: wrap;">
+					<booksquare></booksquare>
+				</for>
+			</div>
+		</template>
+		<template id="view-booklist">
+			<div style="padding: 3px;">
+				<for data="root.data.list" style="display: flex;flex-wrap: wrap;">
+					<bookrow></bookrow>
+				</for>
+			</div>
+		</template>
+		<template id="view-for">
+			<for></for>
+		</template>
+		<template id="view-if">
+			<if></if>
+		</template>
+		<template id="view-bookfollowing">
+			<div>
+				<if showtype="grid" if="data.showtype == 'grid'">
+					<bookgrid from="/mobile/booklist.php?method=following&p=0"></bookgrid>
+					<booklist from="/mobile/booklist.php?method=following&p=0"></booklist>
+				</if>
+			</div>
+		</template>
+		<template id="view-bookhistory">
+			<div>
+				<bookhistory>
+				</bookhistory>
+			</div>
+		</template>
+		<template id="view-bookmarked">
+			<div>
+				<if showtype="list" if="false">
+					<bookgrid from="/mobile/booklist.php?method=bookmarked&p=0"></bookgrid>
+					<booklist from="/mobile/booklist.php?method=bookmarked&p=0"></booklist>
+				</if>
+			</div>
+		</template>
+		<template id="view-bookranking">
+			<div id="bookrankingview">
+				<booklist from="/mobile/booklist.php?method=ranking&ranktype={app.prop.viewranktype}&p=0"></booklist>
+			</div>
+		</template>
+		<template id="view-bookpromote">
+			<div>
+				<booklist from="/mobile/booklist.php?method=search&find=&minc=50&sort=auto&step=5&tag="></booklist>
+			</div>
+		</template>
+		<template id="view-bookpush">
+			<div id="bookdirview">
+				<booklist from="/mobile/booklist.php?method=bookpush&channel={app.prop.pushdir || ''}"></booklist>
+			</div>
+		</template>
+		<template id="view-bookowning">
+			<div>
+				<booklist from="/mobile/booklist.php?method=mybook"></booklist>
+			</div>
+		</template>
+		<template id="view-commentblock">
+			<div>
+				<span class="id" hidden></span>
+				<div class="cmtblock">
+					<img lazyload class="avatar" referrerpolicy="no-referrer" src="/default.png">
+					<div class="cmtbody">
+						<div class="cmtname">
+							<span class="name"></span> <time class="time" style="font-size:12px;color:gray;"></time>
+						</div>
+						<div class="cmtcontent content"></div>
+						<if if="app.user.isLogin">
+							<div class="cmtfooter">
+								<span class="cmtresp">
+									<i class="fas fa-reply"></i>
+									Trả lời
+								</span>
+								<if if="app.user.isAdmin || app.user.info.id == root.data.userid">
+									<span class="cmtdel" display="inline">
+										<i class="far fa-eraser"></i>
+											Xóa
+										</span>
+									<div></div>
+								</if>
+							</div>
+							<div></div>
+						</if>
+					</div>
+				</div>
+				<div class="cmtreplies"></div>
+			</div>
+		</template>
+		<template id="view-time">
+			<div class="time"></div>
+		</template>
+		<template id="view-selectable">
+			<div></div>
+		</template>
+		<template id="view-chaptercontainer">
+			<div>
+				<div class="chaptertopinfo">
+					<div class="chaptername"></div>
+					<div class="currenttime"></div>
+				</div>
+				<iframe class="content" style="border:none;flex:1" ;></iframe>
+			</div>
+		</template>
+		<template id="view-ttssetting">
+			<div class="ttssetting">
+				<div class="playpausenextprev">
+					<button class="playbtn">
+						<i class="fas fa-play"></i>
+						<i class="fas fa-pause"></i>
+					</button>
+				</div>
+				<div class="tslider">
+					<input id="ttsslider" type="range" min="0" max="100" step="1" value="0" oninput="app.tts.setsenid(this.value);">
+				</div>
+			</div>
+		</template>
+		<template id="view-stylesetting">
+			<div class="stylesetting">
+				<div class="settingrow">
+					<div class="flex">
+						<div class="colortheme" style="flex:1"></div>
+						<button class="setcustomcolor" style="margin-left:8px;padding:0;border-radius:20px;width:40px;">
+							<i class="fas fa-wrench"></i>
+						</button>
+					</div>
+				</div>
+				<div class="settingrow fontsizelineheight flex">
+					<div class="fontsize" style="flex:1">
+						<button class="decreasefontsize">
+							<i class="fas fa-text-size"></i>
+							<i class="fal fa-minus"></i>
+						</button>
+						<button class="increasefontsize">
+							<i class="fas fa-text-size"></i>
+							<i class="fal fa-plus"></i>
+						</button>
+					</div>
+					<div style="flex: 1"></div>
+					<div class="lineheight">
+						<button class="decreaselineheight">
+							<i class="fas fa-text-height"></i>
+							<i class="fal fa-minus"></i>
+						</button>
+						<button class="increaselineheight">
+							<i class="fas fa-text-height"></i>
+							<i class="fal fa-plus"></i>
+						</button>
+					</div>
+				</div>
+				<div class="settingrow alignpadding flex">
+					<div class="align" style="flex:1">
+						<button onclick="app.reader.style.set('textAlign','left')">
+							<i class="fas fa-align-left"></i>
+						</button>
+						<button onclick="app.reader.style.set('textAlign','center')">
+							<i class="fas fa-align-center"></i>
+						</button>
+						<button onclick="app.reader.style.set('textAlign','justify')">
+							<i class="fas fa-align-justify"></i>
+						</button>
+						<button onclick="app.reader.style.set('textAlign','right')">
+							<i class="fas fa-align-right"></i>
+						</button>
+					</div>
+					<div style="flex: 1"></div>
+					<div class="padding">
+						<button onclick="app.reader.style.decPadding()">
+							<i class="fas fa-arrow-from-right"></i>
+						</button>
+						<button onclick="app.reader.style.incPadding()">
+							<i class="fas fa-arrow-from-left"></i>
+						</button>
+					</div>
+				</div>
+			</div>
+		</template>
+		<template id="view-userme">
+			<div>
+				<if if="app.user.isLogin">
+					<usermeinfo></usermeinfo>
+
+					<usermenotlogin></usermenotlogin>
+				</if>
+			</div>
+		</template>
+		<template id="view-usermeinfo">
+			<div>
+				<div style="text-align: right;position:absolute;right:0;padding: 10px;">
+					<button onclick="app.fun.showNotify()" class="waves-effect waves-light ibtn p-3">
+						<i class="fas fa-bell"></i>
+					</button>
+					<button onclick="app.fun.showEditInfo()" class="waves-effect waves-light ibtn p-3">
+						<i class="fas fa-edit"></i>
+					</button>
+					<button onclick="app.fun.logout()" class="waves-effect waves-light ibtn p-3">
+						<i class="fas fa-sign-out"></i>
+					</button>
+				</div>
+				<div class="usertop" bg>
+
+					<div>
+						<div>
+							<img class="avatar" src="/default.png">
+						</div>
+						<div style="text-align: center;">
+							<div class="displayname"></div>
+							<div class="theluc"></div>
+						</div>
+
+					</div>
+					<pre class="userdesc"></pre>
+				</div>
+				<div class="userstat flex" style="box-shadow: 0 0 3px white;">
+					<div class="stat">
+						<div class="readed">0</div>
+						<div class="statname">ĐỌC</div>
+					</div>
+					<div class="stat">
+						<div class="online">0</div>
+						<div class="statname">ONLINE</div>
+					</div>
+					<div class="stat">
+						<div class="comment">0</div>
+						<div class="statname">BÌNH LUẬN</div>
+					</div>
+					<div class="stat">
+						<div class="birthday">20/8/2023</div>
+						<div class="statname">KHAI SINH</div>
+					</div>
+				</div>
+				<div class="sectionblock">
+					<div class="section">
+						<div class="icon">
+							<i class="fas fa-book"></i>
+						</div>
+						<div class="sectionname">Tu vi</div>
+						<div class="value danhhao"></div>
+					</div>
+					<div class="section" onclick="window.open('/user/0/')">
+						<div class="icon">
+							<i class="fas fa-sack"></i>
+						</div>
+						<div class="sectionname">Túi đồ</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+					<div class="section">
+						<div class="icon">
+							<i class="fas fa-badge-dollar"></i>
+						</div>
+						<div class="sectionname">Thần thạch</div>
+						<div class="value money">0</div>
+					</div>
+					<div class="section">
+						<div class="icon">
+							<i class="fas fa-badge-dollar"></i>
+						</div>
+						<div class="sectionname">Kim tệ</div>
+						<div class="value coin">0</div>
+					</div>
+					<div class="section">
+						<div class="icon">
+							<i class="fas fa-coins"></i>
+						</div>
+						<div class="sectionname">SFPoint</div>
+						<div class="value sfpoint">0</div>
+					</div>
+					<div class="section">
+						<div class="icon">
+							<i class="fas fa-coins"></i>
+						</div>
+						<div class="sectionname">CCoin</div>
+						<div class="value ccoin">0</div>
+					</div>
+					<div class="section">
+						<div class="icon">
+							<i class="fas fa-coins"></i>
+						</div>
+						<div class="sectionname">JJMoney</div>
+						<div class="value jjmoney">0</div>
+					</div>
+					<div class="section" onclick="app.fun.showBuyHistory()">
+						<div class="icon">
+							<i class="fas fa-history"></i>
+						</div>
+						<div class="sectionname">Lịch sử mua chương</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+					<div class="section" onclick="app.fun.showSetting()">
+						<div class="icon">
+							<i class="fas fa-cog"></i>
+						</div>
+						<div class="sectionname">Cài đặt</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+					<div class="section" onclick="app.fun.showNotifSetting()">
+						<div class="icon">
+							<i class="fas fa-cog"></i>
+						</div>
+						<div class="sectionname">Cài đặt thông báo</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+					<div class="section cmt">
+						<div class="icon">
+							<i class="fas fa-comment"></i>
+						</div>
+						<div class="sectionname">Bình luận</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+				</div>
+			</div>
+		</template>
+		<template id="view-usermenotlogin">
+			<div>
+				<div style="text-align: right;position:absolute;right:0;padding: 10px;">
+					
+				</div>
+				<div class="usertop d-block">
+					<div>
+						<div>
+							<img class="avatar" src="/default.png">
+						</div>
+						<div style="text-align: center;">
+							<button class="waves-effect waves-light ibtn p-3 mt-3" onclick="app.fun.showLogin()">Đăng nhập</button>
+						</div>
+					</div>
+				</div>
+				<div class="userstat flex" style="box-shadow: 0 0 3px white;">
+				</div>
+				<div class="sectionblock">
+					<div class="section" onclick="app.fun.showSetting()">
+						<div class="icon">
+							<i class="fas fa-cog"></i>
+						</div>
+						<div class="sectionname">Cài đặt</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+					<div class="section" onclick="app.fun.showLogin()">
+						<div class="icon">
+							<i class="fas fa-sign-in"></i>
+						</div>
+						<div class="sectionname">Đăng nhập</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+					<div class="section" onclick="app.fun.showRegister()">
+						<div class="icon">
+							<i class="fas fa-feather"></i>
+						</div>
+						<div class="sectionname">Đăng ký</div>
+						<div class="value">
+							<i class="fas fa-chevron-right"></i>
+						</div>
+					</div>
+				</div>
+			</div>
+		</template>
+	</div>
+  <script type="module">
+    import { App as CapacitorApp } from '@capacitor/app';
+    CapacitorApp.addListener('backButton', ({canGoBack}) => {
+      if(!canGoBack){
+        CapacitorApp.exitApp();
+      } else {
+        window.history.back();
+      }
+    });
+  </script>
+	<script>
+		HTMLElement.prototype.q = HTMLElement.prototype.querySelector;
+		var link = document.createElement('link');
+		link.setAttribute('rel', 'stylesheet')
+		link.setAttribute('href', "https://sangtacviet.com/asset/app.v2.css?r=" + Math.random());
+		document.head.appendChild(link);
+		var transistor = g("ptransit");
+    ui.scriptmanager.load("https://sangtacviet.com/asset/app.v2.main.js?" + Math.random(), function(){
+      ui.scriptmanager.load("https://sangtacviet.com/asset/app.v2.js?" + Math.random(), function() {
+        app.init();
+      });
+    })
+		
+	</script>
+</body>

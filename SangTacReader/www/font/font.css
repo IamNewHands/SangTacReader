@@ -1,0 +1,61 @@
+@font-face{
+	font-family: linotype;
+	src: url('/font/pala.ttf');
+}
+@font-face {
+  font-family: notosans;
+  src: url('/font/NotoSans-Regular.ttf');
+}
+@font-face {
+  font-family: nunitoblack;
+  src: url('/font/Nunito-Black.ttf');
+}
+@font-face {
+  font-family: nunito;
+  src: url(/font/Nunito-Regular.ttf);
+}
+@font-face {
+  font-family: worksans;
+  src: url('/font/WorkSans-VariableFont_wght.ttf');
+}
+@font-face {
+  font-family: quicksans;
+  src: url('/font/Quicksand-VariableFont_wght.ttf');
+}
+
+@font-face{
+  font-family: palatinolinotype;
+  src: url(/font/palatinolinotype.ttf);
+}
+@font-face {
+  font-family: stvarial;
+  src: url(/font/arial.ttf);
+}
+@font-face {
+  font-family: helvetica;
+  src: url(/font/helvetica.ttf);
+}
+@font-face {
+  font-family: roboto;
+  src: url(/font/roboto.ttf);
+}
+@font-face {
+  font-family: stvtahoma;
+  src: url(/font/tahoma.ttf);
+}
+@font-face {
+  font-family: stvverdana;
+  src: url(/font/verdana.ttf);
+}
+@font-face {
+  font-family: opensans;
+  src: url(/font/opensans.ttf);
+}
+@font-face {
+  font-family: robotoslab;
+  src: url(/font/robotoslab.ttf);
+}
+@font-face {
+  font-family: sourceserifpro;
+  src: url(/font/sourceserifpro.ttf);
+}

@@ -4,3 +4,7 @@ DerivedData/
 *.ipa
 *.xcuserstate
 xcuserdata/
+
+# Temp analysis
+apk_extracted/
+*.apk

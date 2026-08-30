@@ -1,0 +1,100 @@
+#full{
+	overflow:hidden;
+}
+#tm-top-nav{
+	color: grey;
+	background-color:#eeeeee;
+	line-height: 2;
+	font-size: 12px;
+}
+#tm-top-nav-home{
+	color: grey;
+}
+#mainbar{
+
+}
+#tm-nav-search-top{
+	display:block;
+	line-height: 50px;
+}
+#tm-nav-search-logo{
+	float:left;
+	cursor:pointer;
+	height:50px;
+	width:120px;
+	display:inline-block;
+	margin-right:12px;
+}
+#tm-nav-search-top-right{
+	float: right;
+}
+#notifmarker{
+
+}
+#tm-user-avatar{
+	border-radius: 50%;
+	height: 50px;
+	width: 50px;
+	margin: 6px;
+	margin-top:0;
+	background: #f0f0f0;
+	cursor: pointer;
+	box-shadow: 0 0 4px black;
+}
+#menunavigator2{
+
+}
+#id{
+
+}
+#tm-btn-goto{
+	padding: 5px;
+	width: 50px;
+	display:inline-block;
+	display: inline-block;
+	margin-left: -50px;
+	z-index: 3;
+	color: #a29f9f;
+	background: transparent;
+	border: none;
+	font-size: 24px;
+	font-weight: 700;
+}
+#tm-btn-rescan{
+	padding: 5px;
+	width: 50px;
+	display:inline-block;
+	display: inline-block;
+	margin-left:-100px;
+	z-index: 3;
+	color: #a29f9f;
+	background: transparent;
+	border: none;
+	font-size: 24px;
+	font-weight: 700;
+}
+#tm-nav-search-popup{
+	position: relative;
+	height: 0px;
+	display: block;
+	margin-top: -6px;
+	width: 100%;
+}
+#tm-bot-nav{
+	box-shadow: 0 16px 16px -16px black;
+	overflow: hidden;
+	overflow-x:auto;
+	height: 40px;
+	position: relative;
+}
+#naviga{
+	color: #eeeeee !important;
+	font-weight: 600;
+	white-space: nowrap;
+}
+#naviga a{
+	margin: 6px;
+	padding: 2px;
+	display: inline-block;
+	color: #eeeeee;
+}

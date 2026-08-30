@@ -1,32 +1,98 @@
 import UIKit
 import WebKit
+import AVFoundation
 
-class WebViewController: UIViewController, WKNavigationDelegate {
+class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, AVSpeechSynthesizerDelegate {
 
     var webView: WKWebView!
-    let bookURL = URL(string: "https://sangtacviet.vip/")!
+    let synthesizer = AVSpeechSynthesizer()
+    let impactGenerator = UIImpactFeedbackGenerator(style: .light)
+    var isStatusBarHidden = false
+
+    override var prefersStatusBarHidden: Bool {
+        return isStatusBarHidden
+    }
+
+    override var preferredStatusBarStyle: UIStatusBarStyle {
+        return .lightContent
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        view.backgroundColor = .black
+        synthesizer.delegate = self
+        setupAudioSession()
         setupWebView()
-        loadSite()
+        loadLocalApp()
+    }
+
+    private func setupAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers, .defaultToSpeaker])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("AudioSession setup failed: \(error)")
+        }
     }
 
     private func setupWebView() {
-        // 注入 "阅读模式" 脚本
-        let readerJS = loadScript("reader")
-        let userScript = WKUserScript(source: readerJS, injectionTime: .atDocumentEnd, forMainFrameOnly: false)
-
         let config = WKWebViewConfiguration()
         let controller = WKUserContentController()
-        controller.addUserScript(userScript)
-        config.userContentController = controller
 
-        // 允许无痕模式外链映射
+        // 注册 JSBridge Handler
+        controller.add(self, name: "bridge")
+        controller.add(self, name: "cordovaExec")
+
+        // 注入桥接适配脚本
+        let bridgeJS = """
+        window.isIOSNativeApp = true;
+        
+        // Cordova 插件桥接
+        if (!window.cordova) {
+            window.cordova = {
+                exec: function(success, fail, service, action, args) {
+                    var callbackId = 'cb_' + Date.now() + '_' + Math.floor(Math.random()*10000);
+                    window._callbacks = window._callbacks || {};
+                    window._callbacks[callbackId] = { success: success, fail: fail };
+                    
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cordovaExec) {
+                        window.webkit.messageHandlers.cordovaExec.postMessage({
+                            service: service,
+                            action: action,
+                            args: args || [],
+                            callbackId: callbackId
+                        });
+                    }
+                }
+            };
+        }
+
+        // 快捷分发原生回执
+        window._nativeCallback = function(callbackId, isSuccess, data) {
+            if (window._callbacks && window._callbacks[callbackId]) {
+                if (isSuccess) {
+                    if (window._callbacks[callbackId].success) window._callbacks[callbackId].success(data);
+                } else {
+                    if (window._callbacks[callbackId].fail) window._callbacks[callbackId].fail(data);
+                }
+                delete window._callbacks[callbackId];
+            }
+        };
+        """
+        let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        controller.addUserScript(bridgeScript)
+
+        config.userContentController = controller
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        config.allowsInlineMediaPlayback = true
 
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.isOpaque = false
+        webView.backgroundColor = .black
+        webView.scrollView.backgroundColor = .black
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
 
@@ -38,29 +104,161 @@ class WebViewController: UIViewController, WKNavigationDelegate {
         ])
     }
 
-    private func loadScript(_ name: String) -> String {
-        guard let url = Bundle.main.url(forResource: name, withExtension: "js") else {
-            print("⚠️ 未找到脚本 \(name).js")
-            return ""
+    private func loadLocalApp() {
+        if let wwwPath = Bundle.main.path(forResource: "www", ofType: nil),
+           let htmlURL = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "www") {
+            let readAccessURL = URL(fileURLWithPath: wwwPath)
+            webView.loadFileURL(htmlURL, allowingReadAccessTo: readAccessURL)
+        } else {
+            // 降级使用远程加载
+            let remoteURL = URL(string: "https://sangtacviet.com/app.v2.php") ?? URL(string: "https://sangtacviet.vip/")!
+            var req = URLRequest(url: remoteURL)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+            webView.load(req)
         }
-        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
-    private func loadSite() {
-        var req = URLRequest(url: bookURL)
-        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
-        webView.load(req)
+    // MARK: - WKScriptMessageHandler
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "cordovaExec", let body = message.body as? [String: Any] {
+            handleCordovaExec(body: body)
+        } else if message.name == "bridge", let body = message.body as? [String: Any] {
+            handleCapacitorBridge(body: body)
+        }
     }
 
-    // 让站内跳转都在 webView 内
+    private func handleCordovaExec(body: [String: Any]) {
+        guard let service = body["service"] as? String,
+              let action = body["action"] as? String,
+              let callbackId = body["callbackId"] as? String else { return }
+        let args = body["args"] as? [Any] ?? []
+
+        switch service {
+        case "TTS":
+            handleTTS(action: action, args: args, callbackId: callbackId)
+        case "NativeClick":
+            impactGenerator.impactOccurred()
+            sendCordovaResult(callbackId: callbackId, success: true, data: nil)
+        case "AndroidFullScreen":
+            handleFullScreen(action: action, callbackId: callbackId)
+        default:
+            sendCordovaResult(callbackId: callbackId, success: true, data: nil)
+        }
+    }
+
+    private func handleCapacitorBridge(body: [String: Any]) {
+        guard let pluginId = body["pluginId"] as? String,
+              let methodName = body["methodName"] as? String,
+              let callbackId = body["callbackId"] as? String else { return }
+        let options = body["options"] as? [String: Any] ?? [:]
+
+        if pluginId == "Haptics" || pluginId == "NativeClick" {
+            impactGenerator.impactOccurred()
+            sendCapacitorResult(callbackId: callbackId, pluginId: pluginId, methodName: methodName, success: true, data: [:])
+        } else if pluginId == "StatusBar" {
+            if methodName == "hide" {
+                isStatusBarHidden = true
+                setNeedsStatusBarAppearanceUpdate()
+            } else if methodName == "show" {
+                isStatusBarHidden = false
+                setNeedsStatusBarAppearanceUpdate()
+            }
+            sendCapacitorResult(callbackId: callbackId, pluginId: pluginId, methodName: methodName, success: true, data: [:])
+        } else {
+            sendCapacitorResult(callbackId: callbackId, pluginId: pluginId, methodName: methodName, success: true, data: [:])
+        }
+    }
+
+    // MARK: - TTS 处理 (原生 AVSpeechSynthesizer)
+    private func handleTTS(action: String, args: [Any], callbackId: String) {
+        if action == "speak" {
+            if synthesizer.isSpeaking {
+                synthesizer.stopSpeaking(at: .immediate)
+            }
+            var textToSpeak = ""
+            var rate: Float = AVSpeechUtteranceDefaultSpeechRate
+            var lang = "vi-VN"
+
+            if let firstArg = args.first as? [String: Any] {
+                textToSpeak = firstArg["text"] as? String ?? ""
+                if let rateVal = firstArg["rate"] as? Double {
+                    rate = Float(rateVal) * AVSpeechUtteranceDefaultSpeechRate
+                }
+                if let locale = firstArg["locale"] as? String {
+                    lang = locale
+                }
+            } else if let str = args.first as? String {
+                textToSpeak = str
+            }
+
+            let utterance = AVSpeechUtterance(string: textToSpeak)
+            utterance.voice = AVSpeechSynthesisVoice(language: lang) ?? AVSpeechSynthesisVoice(language: "vi-VN")
+            utterance.rate = max(AVSpeechUtteranceMinimumSpeechRate, min(rate, AVSpeechUtteranceMaximumSpeechRate))
+            utterance.pitchMultiplier = 1.0
+            utterance.volume = 1.0
+
+            synthesizer.speak(utterance)
+            sendCordovaResult(callbackId: callbackId, success: true, data: nil)
+        } else if action == "stop" {
+            if synthesizer.isSpeaking {
+                synthesizer.stopSpeaking(at: .immediate)
+            }
+            sendCordovaResult(callbackId: callbackId, success: true, data: nil)
+        } else if action == "getVoices" {
+            let voices = AVSpeechSynthesisVoice.speechVoices().map { ["name": $0.name, "language": $0.language, "identifier": $0.identifier] }
+            sendCordovaResult(callbackId: callbackId, success: true, data: voices)
+        } else {
+            sendCordovaResult(callbackId: callbackId, success: true, data: nil)
+        }
+    }
+
+    private func handleFullScreen(action: String, callbackId: String) {
+        if action == "immersiveMode" || action == "leanMode" {
+            isStatusBarHidden = true
+            UIView.animate(withDuration: 0.25) {
+                self.setNeedsStatusBarAppearanceUpdate()
+            }
+        } else if action == "showSystemUI" || action == "resetScreen" {
+            isStatusBarHidden = false
+            UIView.animate(withDuration: 0.25) {
+                self.setNeedsStatusBarAppearanceUpdate()
+            }
+        }
+        sendCordovaResult(callbackId: callbackId, success: true, data: nil)
+    }
+
+    private func sendCordovaResult(callbackId: String, success: Bool, data: Any?) {
+        let jsonStr: String
+        if let data = data, let jsonData = try? JSONSerialization.data(withJSONObject: data), let str = String(data: jsonData, encoding: .utf8) {
+            jsonStr = str
+        } else {
+            jsonStr = "null"
+        }
+        let js = "window._nativeCallback('\(callbackId)', \(success), \(jsonStr));"
+        DispatchQueue.main.async {
+            self.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private func sendCapacitorResult(callbackId: String, pluginId: String, methodName: String, success: Bool, data: [String: Any]) {
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: data),
+              let jsonStr = String(data: jsonData, encoding: .utf8) else { return }
+        let js = "if (window.Capacitor && window.Capacitor.fromNative) { window.Capacitor.fromNative({ callbackId: '\(callbackId)', pluginId: '\(pluginId)', methodName: '\(methodName)', success: \(success), data: \(jsonStr) }); }"
+        DispatchQueue.main.async {
+            self.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    // MARK: - WKNavigationDelegate
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url {
-            // 站内/同域 保留；外链(广告等)用系统浏览器
-            if url.host == "sangtacviet.vip" || url.host == "sangtacviet.app" || url.host == "sangtacviet.com" {
+            if url.isFileURL || url.host?.contains("sangtacviet") == true || url.host?.contains("unpkg.com") == true || url.host?.contains("cdnjs") == true {
                 decisionHandler(.allow)
-            } else {
+            } else if navigationAction.navigationType == .linkActivated {
                 decisionHandler(.cancel)
                 UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            } else {
+                decisionHandler(.allow)
             }
         } else {
             decisionHandler(.allow)
