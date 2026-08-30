@@ -93,6 +93,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.allowsInlineMediaPlayback = true
 
+        // 允许跨域和跨源安全请求
+        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        config.setValue(true, forKey: "allowUniversalAccessFromFileURLs")
+        
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -253,11 +257,17 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // MARK: - WKNavigationDelegate
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url {
-            if url.isFileURL || url.host?.contains("sangtacviet") == true || url.host?.contains("unpkg.com") == true || url.host?.contains("cdnjs") == true {
+            let host = url.host?.lowercased() ?? ""
+            if url.isFileURL || host.contains("sangtacviet") || host.contains("sangtacvietcdn") || host.contains("unpkg.com") || host.contains("cdnjs") || host.contains("cloudflare") {
                 decisionHandler(.allow)
             } else if navigationAction.navigationType == .linkActivated {
-                decisionHandler(.cancel)
-                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+                // 如果是阅读相关跳转或小说跳转，依然在应用内打开
+                if url.absoluteString.contains("sangtacviet") || url.absoluteString.contains("/truyen/") {
+                    decisionHandler(.allow)
+                } else {
+                    decisionHandler(.cancel)
+                    UIApplication.shared.open(url, options: [:], completionHandler: nil)
+                }
             } else {
                 decisionHandler(.allow)
             }
