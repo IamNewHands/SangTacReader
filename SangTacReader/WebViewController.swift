@@ -79,7 +79,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
                     var origOpen = XMLHttpRequest.prototype.open;
                     XMLHttpRequest.prototype.open = function(method, url) {
                         try {
-                            if (typeof url === 'string' && !/^[a-z]+:\/\//i.test(url)) {
+                            if (typeof url === 'string' && url.indexOf('://') === -1) {
                                 url = curOrigin + (url.charAt(0) === '/' ? url : '/' + url);
                             }
                             if (typeof url === 'string') {
