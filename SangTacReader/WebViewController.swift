@@ -5,6 +5,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     var webView: WKWebView!
 
+    // ===== 临时调试日志面板 (debug-point D) =====
+    // 无 Xcode 控制台访问时，把 [DBG:] 日志直接显示在 iOS 界面，供用户复制。
+    private var debugLogs: [String] = []
+    private var logTextView: UITextView!
+    private var logToggleButton: UIButton!
+    private var logPanelVisible = false
+    private let maxLogLines = 600
+
     // iOS 纯 Web 模式方案（参考安卓，但不用 WKURLSchemeHandler 接管 https——那会抛异常，
     // 因为 https 是 WKWebView 原生自带的 scheme）：
     // 服务器要求 GET 请求必须携带 Referer 头，否则返回空体(Content-Length: 0)，
@@ -18,6 +26,156 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         view.backgroundColor = .black
         setupWebView()
         loadApp()
+        setupDebugPanel()
+    }
+
+    // ===== 临时调试日志面板 UI (debug-point D) =====
+    private func setupDebugPanel() {
+        // 显示/隐藏日志的悬浮开关（右上角），避免遮挡正常 UI
+        logToggleButton = UIButton(type: .system)
+        logToggleButton.setTitle("LOG", for: .normal)
+        logToggleButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 13)
+        logToggleButton.setTitleColor(.white, for: .normal)
+        logToggleButton.backgroundColor = UIColor(white: 0, alpha: 0.55)
+        logToggleButton.layer.cornerRadius = 14
+        logToggleButton.layer.masksToBounds = true
+        logToggleButton.addTarget(self, action: #selector(toggleLogPanel), for: .touchUpInside)
+        logToggleButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(logToggleButton)
+
+        // 日志展示面板（半透明覆盖层）
+        logTextView = UITextView()
+        logTextView.isEditable = false
+        logTextView.isSelectable = true
+        logTextView.backgroundColor = UIColor(white: 0.08, alpha: 0.92)
+        logTextView.textColor = .white
+        logTextView.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        logTextView.text = "等待日志..."
+        logTextView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(logTextView)
+
+        let copyButton = UIButton(type: .system)
+        copyButton.setTitle("复制日志", for: .normal)
+        copyButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 14)
+        copyButton.setTitleColor(.white, for: .normal)
+        copyButton.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
+        copyButton.layer.cornerRadius = 12
+        copyButton.layer.masksToBounds = true
+        copyButton.addTarget(self, action: #selector(copyLogs), for: .touchUpInside)
+        copyButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(copyButton)
+
+        let closeButton = UIButton(type: .system)
+        closeButton.setTitle("隐藏", for: .normal)
+        closeButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 14)
+        closeButton.setTitleColor(.white, for: .normal)
+        closeButton.backgroundColor = UIColor(white: 0.25, alpha: 0.85)
+        closeButton.layer.cornerRadius = 12
+        closeButton.layer.masksToBounds = true
+        closeButton.addTarget(self, action: #selector(toggleLogPanel), for: .touchUpInside)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            logToggleButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
+            logToggleButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            logToggleButton.widthAnchor.constraint(equalToConstant: 52),
+            logToggleButton.heightAnchor.constraint(equalToConstant: 28),
+
+            logTextView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
+            logTextView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 6),
+            logTextView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -6),
+            logTextView.heightAnchor.constraint(equalTo: view.heightAnchor, multiplier: 0.6),
+
+            copyButton.topAnchor.constraint(equalTo: logTextView.bottomAnchor, constant: 6),
+            copyButton.trailingAnchor.constraint(equalTo: logTextView.trailingAnchor),
+            copyButton.widthAnchor.constraint(equalToConstant: 110),
+            copyButton.heightAnchor.constraint(equalToConstant: 36),
+
+            closeButton.topAnchor.constraint(equalTo: logTextView.bottomAnchor, constant: 6),
+            closeButton.leadingAnchor.constraint(equalTo: logTextView.leadingAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 90),
+            closeButton.heightAnchor.constraint(equalToConstant: 36)
+        ])
+
+        logTextView.isHidden = true
+        copyButton.isHidden = true
+        closeButton.isHidden = true
+    }
+
+    @objc private func toggleLogPanel() {
+        logPanelVisible.toggle()
+        logTextView.isHidden = !logPanelVisible
+        logToggleButton.superview?.subviews.forEach { v in
+            if v is UIButton && v !== logToggleButton {
+                v.isHidden = !logPanelVisible
+            }
+            if v is UITextView {
+                v.isHidden = !logPanelVisible
+            }
+        }
+        if logPanelVisible {
+            refreshLogView(forceScroll: true)
+        }
+    }
+
+    @objc private func copyLogs() {
+        let text = logTextView.text ?? ""
+        UIPasteboard.general.string = text
+        showToast("已复制 \(debugLogs.count) 条日志")
+    }
+
+    private func showToast(_ msg: String) {
+        let label = UILabel()
+        label.text = msg
+        label.textColor = .white
+        label.backgroundColor = UIColor(white: 0, alpha: 0.8)
+        label.font = UIFont.systemFont(ofSize: 13)
+        label.textAlignment = .center
+        label.layer.cornerRadius = 8
+        label.layer.masksToBounds = true
+        label.alpha = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            label.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            label.heightAnchor.constraint(equalToConstant: 40)
+        ])
+        UIView.animate(withDuration: 0.25, animations: { label.alpha = 1 }) { _ in
+            UIView.animate(withDuration: 0.5, delay: 1.2, options: [], animations: { label.alpha = 0 }) { _ in
+                label.removeFromSuperview()
+            }
+        }
+    }
+
+    private func appendDebugLog(_ line: String) {
+        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        debugLogs.append("[\(ts)] \(line)")
+        if debugLogs.count > maxLogLines {
+            debugLogs.removeFirst(debugLogs.count - maxLogLines)
+        }
+        // 同时打印到控制台（有 Xcode 时也能看）
+        print(line)
+        refreshLogView(forceScroll: false)
+    }
+
+    private func refreshLogView(forceScroll: Bool) {
+        guard logTextView != nil else { return }
+        if logPanelVisible {
+            let shouldScroll = forceScroll || isNearBottom(logTextView)
+            logTextView.text = debugLogs.joined(separator: "\n")
+            if shouldScroll {
+                let range = NSRange(location: (logTextView.text as NSString).length, length: 0)
+                logTextView.scrollRangeToVisible(range)
+            }
+        }
+    }
+
+    private func isNearBottom(_ tv: UITextView) -> Bool {
+        let offset = tv.contentOffset.y + tv.bounds.size.height
+        return tv.contentSize.height - offset < 120
     }
 
     private func setupWebView() {
@@ -268,7 +426,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         if message.name == "dbg", let body = message.body as? [String: Any] {
             let tag = body["tag"] as? String ?? "?"
             let msg = body["msg"] as? String ?? ""
-            print("[DBG:\(tag)] \(msg)")
+            // 主线程刷新 UI
+            DispatchQueue.main.async {
+                self.appendDebugLog("[DBG:\(tag)] \(msg)")
+            }
         }
     }
     // #endregion
