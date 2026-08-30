@@ -442,8 +442,20 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         dbg('init', 'origin=' + window.location.origin + ' href=' + window.location.href + ' winOriginType=' + (typeof window.origin) + ' winOriginVal=' + (window.origin === undefined ? 'UNDEF' : String(window.origin)));
         var _dbgXhrOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url) {
+            try { this._dbgUrl = url; } catch(e){}
             try { dbg('xhr-open', method + ' -> ' + url); } catch(e){}
             return _dbgXhrOpen.apply(this, arguments);
+        };
+        // 捕获 readchapter / chapterlist 请求实际设置的请求头，判断服务器判定依据
+        var _dbgSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+        XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+            try {
+                if (String(this._dbgUrl||'').indexOf('readchapter') > -1 || String(this._dbgUrl||'').indexOf('chapterlist') > -1) {
+                    var rec = this._dbgHeaders || (this._dbgHeaders = {});
+                    rec[name] = value;
+                }
+            } catch(e) {}
+            return _dbgSetHeader.apply(this, arguments);
         };
         var _dbgXhrSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.send = function(body) {
@@ -458,6 +470,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 var oldOnload = xhr.onload;
                 xhr.onload = function(e) {
                     try { dbg('xhr-load', 'status=' + xhr.status + ' size=' + (xhr.responseText ? xhr.responseText.length : 0) + ' url=' + xhr.responseURL); } catch(err){ dbg('xhr-load-err', String(err)); }
+                    try {
+                        if (String(xhr._dbgUrl||'').indexOf('readchapter') > -1) {
+                            dbg('xhr-hdrs', 'REQ-HDRS=' + JSON.stringify(xhr._dbgHeaders || {}) + ' | respHdr=' + (xhr.getAllResponseHeaders ? xhr.getAllResponseHeaders() : ''));
+                            dbg('xhr-cookie', document.cookie);
+                        }
+                    } catch(err) {}
                     if (oldOnload) oldOnload.apply(this, arguments);
                 };
             } catch(e) { dbg('xhr-send-wrap-err', String(e)); }
