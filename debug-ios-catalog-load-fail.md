@@ -46,34 +46,65 @@
 - **章节内容 readchapter 请求 `key=undefined` → 返回 `size=24`（即 `{"code":7}`）**。
 - 登录成功、语言切换成功。
 
-## 最终根因（已定位）
+## 最终根因（已通过真实登录会话 + Chrome 抓包精确定位）
 
-iOS 纯 Web 版 **没有 `window.Capacitor`**。线上 `app.v2.read.js` 的 `loadKeyFromServer`(535行) / `getContent2`(555行) 只在 `window.Capacitor.Plugins.Http` 存在时执行：
+### 决定性证据（真实登录会话，Chrome 抓包）
 
-- 安卓有原生 Capacitor，会先调 `/io/grantcontext/context` 接口 `eval` 出章节 `chapterkey`，再带 key 请求 readchapter。
-- iOS 无 Capacitor → `chapterkey` 保持 `undefined` → readchapter 返回 `{"code":7}` → 前端 throw "Device not supported" → 返回 "Kết nối tới máy chủ thất bại"。
-- 服务器 `/io/grantcontext/context` 强制要求 `x-stv-transport: app` + `x-requested-with: com.sangtacviet.mobilereader` 头才返回 key 数据（node 实测：仅 app 头即可，298KB）。
+成功读取章节的请求格式（**不需要 key、不需要 grantcontext/eval**）：
 
-## 修复方案 v2（已实施，待真机验证）
+```
+/index.php?bookid={bookid}&h={源名}&c={章节}&ngmar=readc&sajax=readchapter&sty=1&exts=
+```
+
+返回 `{"code":"0","bookname":...,"chaptername":...,"data":"<p>..."}`。
+
+**参数矩阵（真实会话实测）**：
+
+| URL 变体 | 结果 |
+|---|---|
+| `?bookid&h=源名&c&ngmar=readc&sajax=readchapter&sty=1&exts=` | **code:0 正文** |
+| 同上但 `h=数字`(hostid) | code:5 (4003) |
+| 缺 `ngmar/sty/exts` | **code:7** |
+| 带 `key=undefined` | **code:7** |
+
+### 真相
+
+1. **grantcontext 返回的 JSFuck 代码**（`(()=>{var 藡锔...})()`）**在任何环境 eval 均返回 undefined，且无任何副作用**（无全局变量、无 cookie、无网络请求）——已用 node、真实 Chrome file://、真实网站会话三重验证。`readcontextid` cookie 也不是 key。
+2. **key 参数根本不需要**。真实成功请求不带 key。
+3. **iOS 前端 `getContent`（online_app.v2.read.js 615行）构造的 `/?sajax=readchapter&h=&bookid=&c=&key=undefined` 缺 `ngmar=readc&sty=1&exts=` 且多带 `key=undefined` → 服务器返回 `{"code":7}` → 前端 throw "Device not supported" → 返回 "Kết nối tới máy chủ thất bại"**。
+4. `h` 参数必须用**源名**（ciweimao），`app.reader.host` 已是源名（download 代码 3534 行 `h=${this.host}` 佐证）。
+5. 安卓能工作是因为其 Capacitor.Http 走的 `x-stv-transport: app` 分支会**触发 key 相关循环**，而 web 分支的 code:7 处理（622行 `throw`）直接失败。**但真相是：即使没有 key，用正确的参数格式（ngmar/sty/exts/源名）也能成功读取。**
+
+## 修复方案 v3（已实施，待真机验证）
 
 ### v1 失败：注入 window.Capacitor（commit 1f4c279，已废弃）
 
-v1 注入最小 `window.Capacitor` 桥接（Plugins.Http + getPlatform + App/StatusBar 等 stub），让 `loadKeyFromServer` 执行。
+v1 注入最小 `window.Capacitor` 桥接，让 `loadKeyFromServer` 执行。**实测失败（用户反馈"点击点不动"）**：注入后 `app.v2.js` 4412行 `if(window.Capacitor)` 让前端走原生布局分支（跳过 isWeb 分支的 CSS 变量设置）→ 布局塌陷、点击无响应。
 
-**实测失败（用户反馈"点击小说页面点不动，点不进小说详情"）**：注入 Capacitor 后，`app.v2.js` 第4412行 `if(window.Capacitor)` 让 `app.platform.isIOS=true`，走原生布局分支（4559行设 mainview 高度、**跳过 4566-4605 行 isWeb 分支的 CSS 变量设置**）→ 布局塌陷、首页点击无响应。日志证实：首页 searchBooks 加载成功（43309/39459 字节）、登录/语言正常，但点击书卡后无任何 detail/readchapter 请求。
+### v2 失败：覆写 loadKeyFromServer（commit 5f14f71，已废弃）
 
-### v2 方案：不注入 Capacitor + 覆写 loadKeyFromServer（当前）
+假设 `eval(grantcontext JSFuck)` 能拿到 key。**已证伪**：eval 在任何环境返回 undefined，且 key 根本不需要。
 
-**核心：不注入 window.Capacitor**，保持纯 Web 布局（恢复点击），只覆写 `app.reader.loadKeyFromServer`，用 XHR + app 头从 `/io/grantcontext/context` 获取并 eval 章节 key：
+### v3 方案：覆写 `app.reader.getContent`（当前）
 
-1. `capHttpXhr`：同源 XHR 请求 grantcontext，设置非 forbidden 头 `x-stv-transport: app` + `x-requested-with: com.sangtacviet.mobilereader`（服务器强制要求）。同源 XHR 自动携带完整 Referer/Cookie（满足服务器要求）。
-2. 覆写 `app.reader.loadKeyFromServer(h,i)`：`ctx.chapterkey = eval(toEvaluate.data)`，与安卓原生第549行**逐字一致**。
-3. 完整闭环：`getContent`（602-631行）→ `getKey`（610）→ 我的 `loadKeyFromServer` 设好 chapterkey → `getContent2`（555，无 Capacitor 故不执行返回 undefined）→ fallback 到第615行 `/?sajax=readchapter&...&key=${this.chapterkey}` 普通 XHR（同源带 Referer）→ **key 正确则章节可读**。
-4. 时序：`setInterval` 轮询 `window.app.reader` 出现后覆写（app.v2.read.js 由 ui.scriptmanager 动态加载）。
-5. 调试：`tryDbg` 通过 `dbg` handler 上报 `[DBG:key] type=... len=... head=...`，用户应用内日志面板可直接看到 key 获取结果。
+**不注入 Capacitor，保持纯 Web 布局**，只覆写 `app.reader.getContent`，用验证过的成功格式请求：
 
-**key 获取的验证依据**：混淆代码是 JSFuck/Unicode 风格 IIFE（`(()=>{var 藡锔...`，无字面 return，依赖浏览器 btoa/atob 等 API）。node vm 沙箱无法完美模拟浏览器环境检测，返回 undefined，**不构成真实环境反证**。WKWebView 是完整浏览器环境，与安卓 V8 行为一致，`eval` 应返回 key。待真机 `[DBG:key]` 日志确认。
+```js
+/index.php?bookid={i}&h={h}&c={c}&ngmar=readc&sajax=readchapter&sty=1&exts=
+```
+
+- 强制用 `window.location.origin` 构造同源绝对 URL（避免 fullUrl 切镜像域触发跨域 preflight）
+- 复用 `app.net.get`（同源 XHR + `x-stv-transport: web` 头，已验证可成功返回正文）
+- 跳过 `getKey`（不需要 key）、跳过 `getContent2`（无 Capacitor 自动返回 undefined）
+- 保留 `offlineBook` 逻辑和 `setTransMode()`
+- 失败时回退原始逻辑
+- 调试日志：`[DBG:gc] h=... i=... c=...`、`[DBG:gc-url]`、`[DBG:gc-code]`（确认 h 是否为源名、请求是否成功）
+
+### 待真机验证
+
+1. 章节正文可读取（`[DBG:gc-ok]` 显示长度）。
+2. `[DBG:gc]` 中 `h=` 是否为源名（若为数字，需额外转换，返回会是 code:5）。
 
 ## 结论
 
-根因是 iOS 缺 Capacitor 原生网络层导致 key 无法获取。v2 方案移除 Capacitor 注入（恢复点击）并覆写 loadKeyFromServer（与安卓一致获取 key）。需真机验证：① 点击恢复正常；② 章节可读（`[DBG:key]` 显示有效 key）。
+根因不是"缺 Capacitor 拿不到 key"，而是**前端 readchapter 请求 URL 格式错误**（缺 `ngmar/sty/exts`、多带 `key=undefined`、路径/参数不符），服务器因此返回 code:7。v3 覆写 `getContent` 用真实会话验证过的成功格式请求，无需 key、无需 Capacitor。待真机确认。

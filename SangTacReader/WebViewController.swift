@@ -191,19 +191,20 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 因此此处只做 CSS 修复，让前端进入正常的 Web 分支 (localStorage + XHR)。)
         let bridgeJS = """
         (function() {
-            // ===== iOS 章节 key 修复：不注入 window.Capacitor =====
-            // 根因：线上 app.v2.read.js 的 loadKeyFromServer(535) 只在 window.Capacitor
-            // 存在时执行，通过 /io/grantcontext/context 接口 eval 出章节 key，再带 key 请求
-            // readchapter。iOS 纯 Web 无 Capacitor -> chapterkey=undefined -> readchapter
-            // 返回 {"code":7} -> "Kết nối tới máy chủ thất bại"。
+            // ===== iOS 章节读取修复：不注入 window.Capacitor =====
+            // 已通过真实登录会话 + Chrome 抓包确认真相：
+            //   1) 成功读取章节的请求格式为（不需要 key、不需要 grantcontext/eval）：
+            //        /index.php?bookid={bookid}&h={源名}&c={章节}&ngmar=readc&sajax=readchapter&sty=1&exts=
+            //      返回 {"code":"0", ...data}。
+            //   2) 前端 app.v2.read.js 的 getContent(615) 构造的
+            //        /?sajax=readchapter&h=&bookid=&c=&key=undefined
+            //      缺 ngmar/sty/exts 且多带 key=undefined -> 服务器返回 {"code":7}
+            //      (Device not supported) -> "Kết nối tới máy chủ thất bại"。
+            //   3) grantcontext 返回的 JSFuck 代码在任何环境 eval 均返回 undefined、
+            //      无副作用，且 key 参数根本不需要 -> 覆写 loadKeyFromServer 毫无意义。
             //
-            // 注意：不能注入 window.Capacitor 全局对象。前端 app.v2.js 第4412行 if(window.Capacitor)
-            // 会让 app.platform 走原生分支（isIOS/isWeb 都不设置 isWeb 分支的 CSS 变量，
-            // 见4566-4605行），导致布局塌陷、首页点击无响应（实测）。
-            // 因此这里【不注入 Capacitor】，保持纯 Web 布局，只覆写 app.reader.loadKeyFromServer，
-            // 用 XHR + app 头从 grantcontext 接口获取并 eval 章节 key。
-            // 服务器强制要求 x-stv-transport: app + x-requested-with 头才返回 key 数据，
-            // 这些是同源 XHR 可设置的非 forbidden 头。
+            // 因此本修复：保持纯 Web 布局（不注入 Capacitor，避免布局塌陷），
+            // 只覆写 app.reader.getContent，用上面验证过的成功格式请求章节正文。
             function tryDbg(tag, msg) {
                 try {
                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg) {
@@ -213,54 +214,50 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 } catch(e) {}
                 try { console.log('[key:' + tag + '] ' + msg); } catch(e) {}
             }
-            function capHttpXhr(opts) {
-                return new Promise(function(resolve, reject) {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', opts.url);
-                    var h = opts.headers || {};
-                    try {
-                        for (var k in h) {
-                            if (!h.hasOwnProperty(k)) continue;
-                            // 跳过浏览器 forbidden 头（Cookie/Referer/Origin/User-Agent 等），
-                            // 同源 XHR 会自动携带 Referer/Cookie/UA。
-                            if (/^(cookie|referer|origin|user-agent|accept-charset|accept-encoding|connection|host|content-length|transfer-encoding|upgrade|expect|te|range|if-)/i.test(k)) continue;
-                            xhr.setRequestHeader(k, h[k]);
-                        }
-                    } catch(e) {}
-                    // 服务器强制要求 app 头才能获取 key 数据
-                    try { xhr.setRequestHeader('x-stv-transport', 'app'); } catch(e) {}
-                    try { xhr.setRequestHeader('x-requested-with', 'com.sangtacviet.mobilereader'); } catch(e) {}
-                    xhr.timeout = opts.timeout || 15000;
-                    xhr.onload = function() {
-                        resolve({ status: xhr.status, data: xhr.responseText, headers: {} });
-                    };
-                    xhr.onerror = function() { reject(new Error("network error: " + opts.url)); };
-                    xhr.ontimeout = function() { reject(new Error("timeout: " + opts.url)); };
-                    try { xhr.send(); } catch(e) { reject(e); }
-                });
-            }
-            // 覆写 loadKeyFromServer：直接走 XHR + app 头获取章节 key（不依赖 Capacitor）
-            function patchReaderKey(app) {
+            // 用同源 XHR 请求章节正文（复用 app.net 走同源 + x-stv-transport:web 头，
+            // 已验证该头可成功返回正文；且现有代码已把网络层强制保持同源）。
+            function patchReaderGetContent(app) {
                 try {
                     if (!app || !app.reader) return false;
-                    if (app.reader.__keyPatched) return true;
-                    app.reader.__keyPatched = true;
-                    var net = app.net;
-                    app.reader.loadKeyFromServer = async function(h, i) {
-                        var ctx = this;
+                    if (app.reader.__getContentPatched) return true;
+                    app.reader.__getContentPatched = true;
+                    var origGetContent = app.reader.getContent;
+                    app.reader.getContent = async function(h, i, c, rl) {
+                        var self = this;
+                        // 保留离线书逻辑
+                        if (self.offlineBook && !rl) {
+                            try {
+                                var cdata = await self.offlineBook.getChapterOrNull(c);
+                                if (cdata) return JSON.parse(cdata);
+                            } catch(e) {}
+                        }
+                        try { self.setTransMode(); } catch(e) {}
+                        // 记录传入的真实参数，便于确认 h 是源名还是数字
+                        tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
+                        // 用验证过的成功格式请求（不需要 key）。
+                        // 强制用当前页同源 origin 构造绝对 URL，避免 fullUrl 切到镜像域触发跨域拦截。
+                        var base = window.location.origin;
+                        var url = base + "/index.php?bookid=" + encodeURIComponent(i)
+                                + "&h=" + encodeURIComponent(h)
+                                + "&c=" + encodeURIComponent(c)
+                                + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
+                        if (rl) url += "&rescan=true";
+                        tryDbg('gc-url', url);
                         try {
-                            var url = (net && net.networkManager && net.networkManager.bestDomain ? net.networkManager.bestDomain() : window.location.origin)
-                                        + "/io/grantcontext/context?hostid=" + h + "&bookid=" + i;
-                            var toEvaluate = await capHttpXhr({ url: url });
-                            if (toEvaluate && toEvaluate.data) {
-                                // 与安卓原生一致：eval 服务器下发的 JS 表达式作为 key
-                                var keyVal = eval(toEvaluate.data);
-                                ctx.chapterkey = keyVal;
-                                tryDbg('key', 'type=' + (typeof keyVal) + ' len=' + (keyVal ? String(keyVal).length : 0) + ' head=' + (keyVal ? JSON.stringify(String(keyVal)).slice(0, 30) : ''));
-                            } else {
-                                tryDbg('key', 'no data, status=' + (toEvaluate && toEvaluate.status));
+                            var cdata = await app.net.get(url);
+                            if (cdata) {
+                                if (cdata.code + "" == "0") {
+                                    tryDbg('gc-ok', 'len=' + (cdata.data ? cdata.data.length : 0));
+                                } else {
+                                    tryDbg('gc-code', 'code=' + cdata.code + ' err=' + (cdata.err || '') + ' info=' + (cdata.info || ''));
+                                }
+                                return cdata;
                             }
-                        } catch(e) { tryDbg('key', 'error: ' + e); }
+                        } catch(e) {
+                            tryDbg('gc-err', 'exception: ' + e);
+                        }
+                        // 回退到原始逻辑
+                        return origGetContent.apply(self, arguments);
                     };
                     return true;
                 } catch(e) { return false; }
@@ -270,7 +267,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 function apply() {
                     try {
                         if (typeof window.app !== 'undefined' && window.app && window.app.reader) {
-                            if (patchReaderKey(window.app)) {
+                            if (patchReaderGetContent(window.app)) {
                                 clearInterval(t);
                                 clearTimeout(stopper);
                             }
