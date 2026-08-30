@@ -321,12 +321,13 @@ async function testCSSRules() {
     'D12. didFinish 中触发 resize 事件重新计算视口'
   );
 
-  // D13: Web 模式 XHR 同域修复 —— 拦截发往镜像域名 (dns1/sangtacviet.com) 的请求，
-  // 改回当前同域以保持登录/语言/源目录的 Cookie 生效
+  // D13: Web 模式同域方案 —— 入口域名落在 defaultDomains 内，不注入有风险的
+  // XHR 同域拦截补丁。与安卓一致：页面加载在 sangtacviet.com（属于
+  // networkManagerXHR.defaultDomains），fullUrl() 保持同域，Cookie 自然携带。
   assert(
-    swiftContent.includes('XMLHttpRequest.prototype.open') && swiftContent.includes('dns1.stv-appdomain-00000001.org'),
-    'D13. 注入 XHR 同域拦截，修复跨域 Cookie 丢失',
-    'Missing XHR same-origin rewrite patch'
+    !swiftContent.includes('XMLHttpRequest.prototype.open'),
+    'D13. 不注入 XHR 同域拦截，采用同域入口方案',
+    'Found risky XHR same-origin rewrite patch'
   );
 }
 
@@ -370,10 +371,11 @@ async function testBridgeIntegrity() {
     'E5. 导航策略拦截器 (decidePolicyFor)'
   );
 
-  // E6: 入口 URL
+  // E6: 入口 URL —— 必须落在前端 defaultDomains 内 (sangtacviet.com)，与安卓一致
   assert(
-    swiftContent.includes('sangtacviet.vip/app.v2.php') || swiftContent.includes('sangtacviet.vip'),
-    'E6. 加载正确的移动端入口 URL'
+    swiftContent.includes('sangtacviet.com/app.v2.php'),
+    'E6. 加载正确的移动端入口 URL (sangtacviet.com)',
+    'Entry URL must be sangtacviet.com to keep cookies same-origin'
   );
 }
 

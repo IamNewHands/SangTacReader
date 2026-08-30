@@ -60,39 +60,6 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
             updateVH();
             window.addEventListener('resize', updateVH);
             window.addEventListener('orientationchange', updateVH);
-
-            // 修复 Web 模式下 XHR 跨域丢失 Cookie 的问题。
-            // 官方 app.v2.js 的 fullUrl() 会把相对路径请求的 baseDomain 切换到镜像域名
-            // (dns1.stv-appdomain-00000001.org / sangtacviet.com / sangtacviet.app)。
-            // 页面实际加载在 <当前同域> 上，登录/语言/源目录请求一旦发往跨域镜像，
-            // 浏览器跨域 XHR 默认不携带本域 Cookie，导致登录失效、语言切换不生效、
-            // 源目录加载失败。这里拦截 XHR，把发往这些镜像域名的请求改回当前同域。
-            (function() {
-                try {
-                    var curHost = window.location.hostname;
-                    var mirrorHosts = [
-                        'dns1.stv-appdomain-00000001.org',
-                        'sangtacviet.com',
-                        'sangtacviet.app'
-                    ];
-                    var origOpen = XMLHttpRequest.prototype.open;
-                    XMLHttpRequest.prototype.open = function(method, url) {
-                        try {
-                            if (typeof url === 'string' && !url.startsWith('http')) {
-                                url = window.location.origin + (url.charAt(0) === '/' ? url : '/' + url);
-                            }
-                            if (typeof url === 'string') {
-                                var u = new URL(url, window.location.href);
-                                if (mirrorHosts.indexOf(u.hostname) !== -1) {
-                                    // 改回当前同域，保持 Cookie 生效
-                                    url = window.location.origin + u.pathname + u.search;
-                                }
-                            }
-                        } catch (e) {}
-                        return origOpen.apply(this, arguments);
-                    };
-                } catch (e) {}
-            })();
         })();
         """
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
@@ -124,9 +91,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
     }
 
     private func loadApp() {
-        let targetURL = URL(string: "https://sangtacviet.vip/app.v2.php") ?? URL(string: "https://sangtacviet.vip/")!
+        // 入口域名必须落在前端 app.v2.js 的 networkManagerXHR.defaultDomains 内，
+        // 否则 fullUrl() 会把所有请求切换到镜像域名，跨域 XHR 不携带本域 Cookie，
+        // 导致登录/语言切换/源目录加载失败。
+        // 与安卓 APK (capacitor.config.json: server.url) 一致，使用 sangtacviet.com。
+        let targetURL = URL(string: "https://sangtacviet.com/app.v2.php") ?? URL(string: "https://sangtacviet.com/")!
         var request = URLRequest(url: targetURL)
-        request.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
+        request.setValue("https://sangtacviet.com", forHTTPHeaderField: "Referer")
         webView.load(request)
     }
 
@@ -142,8 +113,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
         print("Web load failed: \(error.localizedDescription)")
         
         // 自动重试或者备选域名
-        if let currentURL = webView.url?.absoluteString, currentURL.contains("sangtacviet.vip") {
-            if let fallbackURL = URL(string: "https://sangtacviet.com/app.v2.php") {
+        if let currentURL = webView.url?.absoluteString, currentURL.contains("sangtacviet.com") {
+            if let fallbackURL = URL(string: "https://sangtacviet.app/app.v2.php") {
                 webView.load(URLRequest(url: fallbackURL))
             }
         }
