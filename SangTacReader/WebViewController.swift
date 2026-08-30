@@ -452,6 +452,71 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     window.setTimeout(function() { window.clearInterval(t); }, 15000);
                 } catch (e) {}
             })();
+
+        // ===== 登录框闪退诊断 (debug-login) =====
+        (function(){
+            function dl(tag, msg){
+                try{
+                    if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg){
+                        window.webkit.messageHandlers.dbg.postMessage({tag:'lg:'+tag, msg:String(msg)});
+                    }
+                }catch(e){}
+            }
+            // 全局 JS 异常：登录框闪退常由脚本异常触发页面回退
+            window.addEventListener('error', function(e){
+                dl('jserr', (e.message||'') + ' @' + (e.filename||'') + ':' + (e.lineno||''));
+            });
+            window.addEventListener('unhandledrejection', function(e){
+                var r = e.reason; var m = (r && r.message) ? r.message : String(r);
+                dl('reject', m);
+            });
+            var curHash = location.hash;
+            window.addEventListener('hashchange', function(){
+                dl('hash', curHash + ' => ' + location.hash);
+                curHash = location.hash;
+            });
+            function patchNav(){
+                try{
+                    if(!window.app) return false;
+                    if(window.app.__navPatched) return true;
+                    window.app.__navPatched = true;
+                    var A = window.app;
+                    if(typeof A.pushPage === 'function'){
+                        var op = A.pushPage;
+                        A.pushPage = function(id, data, cb){
+                            var isLogin = (String(id).indexOf('login') > -1);
+                            dl('push', 'id=' + id + (isLogin ? ' <== LOGIN' : '') + ' hash=' + location.hash);
+                            var r = op.apply(this, arguments);
+                            if(isLogin){
+                                dl('login-PUSH', 'href=' + location.href);
+                                setTimeout(function(){
+                                    var tp = (A.topPage ? A.topPage() : null);
+                                    dl('login+300ms', 'top=' + (tp ? (tp.view || tp.id || tp.tagName || '?') : 'null') + ' hash=' + location.hash);
+                                }, 300);
+                                setTimeout(function(){
+                                    var tp = (A.topPage ? A.topPage() : null);
+                                    dl('login+1500ms', 'top=' + (tp ? (tp.view || tp.id || tp.tagName || '?') : 'null') + ' hash=' + location.hash);
+                                }, 1500);
+                            }
+                            return r;
+                        };
+                    }
+                    if(typeof A.popPage === 'function'){
+                        var oq = A.popPage;
+                        A.popPage = function(){
+                            dl('pop', 'hash=' + location.hash + '\n' + (new Error().stack||'').split('\n').slice(1,5).join('\n'));
+                            return oq.apply(this, arguments);
+                        };
+                    }
+                    return true;
+                }catch(e){ dl('patchNav-err', String(e)); return false; }
+            }
+            (function(){
+                var t = setInterval(function(){
+                    try{ if(patchNav()){ clearInterval(t); } }catch(e){}
+                }, 300);
+                setTimeout(function(){ clearInterval(t); }, 20000);
+            })();
         })();
         """
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
