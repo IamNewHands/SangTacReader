@@ -1,7 +1,7 @@
 import UIKit
 import WebKit
 
-class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
 
     var webView: WKWebView!
 
@@ -146,6 +146,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         controller.addUserScript(bridgeScript)
 
+        // ===== 临时调试插桩 (debug-point) =====
+        // #region debug-point D:ios-evidence
+        let debugScript = WKUserScript(source: debugJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        controller.addUserScript(debugScript)
+        controller.add(self, name: "dbg")
+        // #endregion
+
         config.userContentController = controller
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.allowsInlineMediaPlayback = true
@@ -170,6 +177,55 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
             webView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
     }
+
+    // ===== 临时调试插桩注入脚本 (debug-point D) =====
+    private let debugJS = """
+    (function(){
+        function dbg(tag, msg) {
+            try {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg) {
+                    window.webkit.messageHandlers.dbg.postMessage({tag:tag, msg:String(msg)});
+                }
+            } catch(e) {}
+        }
+        dbg('init', 'origin=' + window.location.origin + ' href=' + window.location.href + ' winOriginType=' + (typeof window.origin) + ' winOriginVal=' + (window.origin === undefined ? 'UNDEF' : String(window.origin)));
+        var _dbgXhrOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            try { dbg('xhr-open', method + ' -> ' + url); } catch(e){}
+            return _dbgXhrOpen.apply(this, arguments);
+        };
+        var _dbgXhrSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function(body) {
+            var xhr = this;
+            try {
+                dbg('xhr-send', 'url=' + xhr.responseURL);
+                var oldOnerror = xhr.onerror;
+                xhr.onerror = function(e) {
+                    dbg('xhr-error', 'status=' + xhr.status + ' url=' + xhr.responseURL);
+                    if (oldOnerror) oldOnerror.apply(this, arguments);
+                };
+                var oldOnload = xhr.onload;
+                xhr.onload = function(e) {
+                    try { dbg('xhr-load', 'status=' + xhr.status + ' size=' + (xhr.responseText ? xhr.responseText.length : 0) + ' url=' + xhr.responseURL); } catch(err){ dbg('xhr-load-err', String(err)); }
+                    if (oldOnload) oldOnload.apply(this, arguments);
+                };
+            } catch(e) { dbg('xhr-send-wrap-err', String(e)); }
+            return _dbgXhrSend.apply(this, arguments);
+        };
+        (function(){
+            var t = setInterval(function(){
+                try {
+                    if (window.app && window.app.net && window.app.net.networkManagerXHR) {
+                        dbg('patch', 'nm-exists; isDomainAlivePatched=' + (window.app.net.networkManagerXHR.isDomainAlive.toString().indexOf('curOrigin') > -1));
+                        clearInterval(t);
+                    }
+                } catch(e) {}
+            }, 500);
+            setTimeout(function(){ clearInterval(t); }, 8000);
+        })();
+        dbg('ready', 'instrumentation installed');
+    })();
+    """
 
     private func loadApp() {
         // 入口域名必须落在前端 app.v2.js 的 networkManagerXHR.defaultDomains 内，
@@ -205,4 +261,15 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
         // 触发一次 resize，让前端重新测量 --vh 等视口变量
         webView.evaluateJavaScript("window.dispatchEvent(new Event('resize'));", completionHandler: nil)
     }
+
+    // ===== 临时调试插桩 handler (debug-point D) =====
+    // #region debug-point D:handle
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "dbg", let body = message.body as? [String: Any] {
+            let tag = body["tag"] as? String ?? "?"
+            let msg = body["msg"] as? String ?? ""
+            print("[DBG:\(tag)] \(msg)")
+        }
+    }
+    // #endregion
 }
