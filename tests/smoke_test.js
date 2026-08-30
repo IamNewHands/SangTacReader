@@ -321,13 +321,16 @@ async function testCSSRules() {
     'D12. didFinish 中触发 resize 事件重新计算视口'
   );
 
-  // D13: Web 模式同域方案 —— 入口域名落在 defaultDomains 内，不注入有风险的
-  // XHR 同域拦截补丁。与安卓一致：页面加载在 sangtacviet.com（属于
-  // networkManagerXHR.defaultDomains），fullUrl() 保持同域，Cookie 自然携带。
+  // D13: Web 模式强制同域 —— 注入 XHR 拦截，把前端 fullUrl()/bestDomain() 切到镜像
+  // 域名的请求改回当前页面域。原因：GET 请求带自定义头 x-stv-transport: web，
+  // 服务器 CORS 白名单不含该头，跨域 preflight 被拦截 -> onerror -> 目录加载失败。
+  // 改回同域后无 preflight，x-stv-transport 头正常发送（去掉会返回 502）。
   assert(
-    !swiftContent.includes('XMLHttpRequest.prototype.open'),
-    'D13. 不注入 XHR 同域拦截，采用同域入口方案',
-    'Found risky XHR same-origin rewrite patch'
+    swiftContent.includes('XMLHttpRequest.prototype.open') &&
+      swiftContent.includes('x-stv-transport') &&
+      swiftContent.includes('stvHosts'),
+    'D13. 注入 XHR 同域拦截，保持同域绕开 CORS preflight 拦截',
+    'Missing XHR same-origin rewrite patch for x-stv-transport header'
   );
 }
 

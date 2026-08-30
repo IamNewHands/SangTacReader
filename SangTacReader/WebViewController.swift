@@ -60,6 +60,39 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
             updateVH();
             window.addEventListener('resize', updateVH);
             window.addEventListener('orientationchange', updateVH);
+
+            // iOS 纯 Web 模式：强制 STV 请求保持同域，绕开跨域 CORS preflight 拦截。
+            // 原因：前端 fullUrl()/bestDomain() 会把登录/源目录请求切到镜像域名
+            // (sangtacviet.com / dns1.stv-appdomain-00000001.org / sangtacviet.app)。
+            // 这些 GET 请求都带自定义头 x-stv-transport: web（服务器要求，去掉会返回 502），
+            // 而服务器 CORS 白名单 (Access-Control-Allow-Headers) 不包含 x-stv-transport，
+            // 导致跨域 preflight 被拦截 -> XHR onerror -> "Kết nối tới máy chủ thất bại"。
+            // 把请求改回当前页面域后变成同域请求，无 preflight，x-stv-transport 头正常发送。
+            (function() {
+                try {
+                    var curOrigin = window.location.origin;
+                    var stvHosts = [
+                        'sangtacviet.com',
+                        'sangtacviet.app',
+                        'dns1.stv-appdomain-00000001.org'
+                    ];
+                    var origOpen = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        try {
+                            if (typeof url === 'string' && !/^[a-z]+:\/\//i.test(url)) {
+                                url = curOrigin + (url.charAt(0) === '/' ? url : '/' + url);
+                            }
+                            if (typeof url === 'string') {
+                                var u = new URL(url, window.location.href);
+                                if (stvHosts.indexOf(u.hostname) !== -1 && u.origin !== curOrigin) {
+                                    url = curOrigin + u.pathname + u.search;
+                                }
+                            }
+                        } catch (e) {}
+                        return origOpen.apply(this, arguments);
+                    };
+                } catch (e) {}
+            })();
         })();
         """
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
