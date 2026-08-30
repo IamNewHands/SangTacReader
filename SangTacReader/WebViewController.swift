@@ -37,6 +37,18 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     //      导致 readchapter 服务器返回 code:7 "设备不支持/版本过旧"。=====
     private static let cookieDefaultsKey = "stv.persistedCookies.v1"
 
+    // 用 Codable 结构体序列化 cookie，避免 NSKeyedArchiver 对 HTTPCookie
+    // 数组的归档在部分 SDK 上的编译/运行时兼容问题。
+    private struct PersistedCookie: Codable {
+        var name: String
+        var value: String
+        var domain: String
+        var path: String
+        var secure: Bool
+        var httpOnly: Bool
+        var expires: Date?
+    }
+
     private func setupCookiePersistence() {
         guard let store = webView?.configuration.websiteDataStore.httpCookieStore else { return }
         cookieObserver = CookieObserver(owner: self)
@@ -46,21 +58,37 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private func restorePersistedCookies() {
         let defaults = UserDefaults.standard
         guard let data = defaults.data(forKey: WebViewController.cookieDefaultsKey),
-              let cookies = try? NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(data) as? [HTTPCookie] else { return }
+              let items = try? JSONDecoder().decode([PersistedCookie].self, from: data) else { return }
         let store = webView.configuration.websiteDataStore.httpCookieStore
-        for c in cookies {
-            store.setCookie(c, completionHandler: nil)
+        for item in items {
+            var props: [HTTPCookiePropertyKey: Any] = [
+                .name: item.name,
+                .value: item.value,
+                .domain: item.domain,
+                .path: item.path,
+            ]
+            if item.secure { props[.secure] = "TRUE" }
+            if item.httpOnly { props[HTTPCookiePropertyKey(rawValue: "HttpOnly")] = "TRUE" }
+            if let e = item.expires { props[.expires] = e }
+            if let c = HTTPCookie(properties: props) {
+                store.setCookie(c, completionHandler: nil)
+            }
         }
-        appendDebugLog("[cookie] restored \(cookies.count) cookies")
+        appendDebugLog("[cookie] restored \(items.count) cookies")
     }
 
-    private func saveCookies() {
+    // fileprivate：被同文件的 CookieObserver 回调调用
+    fileprivate func saveCookies() {
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { [weak self] cookies in
             guard let self = self else { return }
-            if let data = try? NSKeyedArchiver.archivedData(withRootObject: cookies, requiringSecureCoding: true) {
-                UserDefaults.standard.set(data, forKey: WebViewController.cookieDefaultsKey)
+            let items = cookies.map { c -> PersistedCookie in
+                PersistedCookie(name: c.name, value: c.value, domain: c.domain,
+                                path: c.path, secure: c.isSecure,
+                                httpOnly: c.isHTTPOnly, expires: c.expiresDate)
             }
+            guard let data = try? JSONEncoder().encode(items) else { return }
+            UserDefaults.standard.set(data, forKey: WebViewController.cookieDefaultsKey)
         }
     }
 
