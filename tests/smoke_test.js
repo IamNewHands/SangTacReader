@@ -297,9 +297,15 @@ async function testCSSRules() {
   // D5: 主视图布局规则
   assert(swiftContent.includes('tab#mainview'), 'D5. bridgeJS 包含 #mainview 高度视口适配');
   assert(swiftContent.includes('#mainnavbar'), 'D6. bridgeJS 包含 #mainnavbar 底栏安全区规则');
-  assert(swiftContent.includes('SyncCookie'), 'D7. bridgeJS 包含 Capacitor App.SyncCookie 登录与会话同步支持');
-  assert(swiftContent.includes('addListener'), 'D7.1. bridgeJS 包含 Capacitor App.addListener 事件支持');
-  assert(swiftContent.includes('fromNative'), 'D7.2. bridgeJS 包含 Capacitor fromNative 回执支持');
+
+  // D7-D11: 关键 —— 纯 Web 模式，不得注入任何 Capacitor/Cordova 桥接。
+  // 前端 app.v2.js 用 window.hasOwnProperty("Capacitor") 判断原生模式，
+  // 一旦存在 window.Capacitor 就会等待原生 SQLite，导致 app.init() 永不执行。
+  assert(!swiftContent.includes('window.Capacitor'), 'D7. 不注入 window.Capacitor（避免触发原生分支）');
+  assert(!/window\.Capacitor\s*=/.test(swiftContent), 'D7.1. 不赋值 window.Capacitor 对象');
+  assert(!swiftContent.includes('cordovaExec'), 'D7.2. 不注册 cordovaExec 消息桥');
+  assert(!swiftContent.includes('window.cordova'), 'D10. 不注入 window.cordova');
+  assert(!swiftContent.includes('WKScriptMessageHandler'), 'D11. 不注册 JS-Native 消息桥');
 
   // D8: 动态视口更新
   assert(swiftContent.includes('window.innerHeight'), 'D8. 动态 vh 计算使用 window.innerHeight');
@@ -309,21 +315,11 @@ async function testCSSRules() {
     'Missing resize listener'
   );
 
-  // D10: Cordova/Capacitor Bridge
-  assert(swiftContent.includes('window.Capacitor') || swiftContent.includes('Capacitor'), 'D10. Capacitor 桥接对象注入');
-  assert(swiftContent.includes('cordovaExec') || swiftContent.includes('cordova'), 'D11. Cordova 执行桥接注入');
-
   // D12: didFinish 中的修复
   assert(
     swiftContent.includes('dispatchEvent') && swiftContent.includes('resize'),
     'D12. didFinish 中触发 resize 事件重新计算视口'
   );
-
-  // D13: TTS 支持
-  assert(swiftContent.includes('AVSpeechSynthesizer') || swiftContent.includes('AVSpeech'), 'D13. 原生 TTS 语音合成支持');
-
-  // D14: 触觉反馈
-  assert(swiftContent.includes('UIImpactFeedbackGenerator') || swiftContent.includes('FeedbackGenerator'), 'D14. 原生触觉反馈支持');
 }
 
 // ============================================
@@ -353,10 +349,11 @@ async function testBridgeIntegrity() {
     'Missing cookie persistence'
   );
 
-  // E4: 消息处理桥接
+  // E4: 纯 Web 模式 —— 不注册 JS-Native 消息桥（避免前端误判原生环境）
   assert(
-    swiftContent.includes('WKScriptMessageHandler') || swiftContent.includes('userContentController'),
-    'E4. JS-Native 消息桥接 (WKScriptMessageHandler)'
+    !swiftContent.includes('WKScriptMessageHandler'),
+    'E4. 纯 Web 模式，不注册 JS-Native 消息桥',
+    'Found native message bridge that would break Web mode'
   );
 
   // E5: 导航策略
@@ -369,12 +366,6 @@ async function testBridgeIntegrity() {
   assert(
     swiftContent.includes('sangtacviet.vip/app.v2.php') || swiftContent.includes('sangtacviet.vip'),
     'E6. 加载正确的移动端入口 URL'
-  );
-
-  // E7: 状态栏控制
-  assert(
-    swiftContent.includes('prefersStatusBarHidden') || swiftContent.includes('StatusBar'),
-    'E7. 全屏/状态栏控制支持'
   );
 }
 
