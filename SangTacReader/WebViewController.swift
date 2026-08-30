@@ -5,6 +5,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     var webView: WKWebView!
 
+    private var cookieObserver: CookieObserver?
     // ===== 临时调试日志面板 (debug-point D) =====
     // 无 Xcode 控制台访问时，把 [DBG:] 日志直接显示在 iOS 界面，供用户复制。
     private var debugLogs: [String] = []
@@ -25,8 +26,42 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         super.viewDidLoad()
         view.backgroundColor = .black
         setupWebView()
+        setupCookiePersistence()
+        restorePersistedCookies()
         loadApp()
         setupDebugPanel()
+    }
+
+    // ===== Cookie 手动持久化 (LiveContainer 下 WKWebsiteDataStore.default()
+    //      持久化不可靠，登录后的 access/useri2 等关键 cookie 冷启动即丢失，
+    //      导致 readchapter 服务器返回 code:7 "设备不支持/版本过旧"。=====
+    private static let cookieDefaultsKey = "stv.persistedCookies.v1"
+
+    private func setupCookiePersistence() {
+        guard let store = webView?.configuration.websiteDataStore.httpCookieStore else { return }
+        cookieObserver = CookieObserver(owner: self)
+        store.add(cookieObserver)
+    }
+
+    private func restorePersistedCookies() {
+        let defaults = UserDefaults.standard
+        guard let data = defaults.data(forKey: WebViewController.cookieDefaultsKey),
+              let cookies = try? NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(data) as? [HTTPCookie] else { return }
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        for c in cookies {
+            store.setCookie(c, completionHandler: nil)
+        }
+        appendDebugLog("[cookie] restored \(cookies.count) cookies")
+    }
+
+    private func saveCookies() {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { [weak self] cookies in
+            guard let self = self else { return }
+            if let data = try? NSKeyedArchiver.archivedData(withRootObject: cookies, requiringSecureCoding: true) {
+                UserDefaults.standard.set(data, forKey: WebViewController.cookieDefaultsKey)
+            }
+        }
     }
 
     // ===== 临时调试日志面板 UI (debug-point D) =====
@@ -544,4 +579,15 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         }
     }
     // #endregion
+}
+
+/// 监听 WKWebView cookie 变化，回调宿主保存到 UserDefaults，
+/// 规避 LiveContainer 下 WKWebsiteDataStore 持久化失效导致的登录态丢失。
+private class CookieObserver: NSObject, WKHTTPCookieStoreObserver {
+    private weak var owner: WebViewController?
+    init(owner: WebViewController) { self.owner = owner }
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        owner?.saveCookies()
+    }
 }
