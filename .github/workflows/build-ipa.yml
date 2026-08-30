@@ -1,0 +1,56 @@
+name: Build unsigned IPA
+
+# 云端编译出未签名 .ipa，下载后用 AltStore / Sideloadly 本地签名安装。
+# 说明：不在此处签名（免费 Apple ID 云端签名易风控/禁号），
+#       改为本地 AltStore/Sideloadly 用你的 Apple ID 签名，安全且免费。
+
+on:
+  workflow_dispatch:      # 手动触发（GitHub 仓库页面 Actions → Build unsigned IPA → Run workflow）
+  push:
+    branches: [ main ]    # push 到 main 也触发
+
+jobs:
+  build:
+    name: Compile
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app || echo "Xcode_15.4 不存在，使用默认 Xcode"
+          xcodebuild -version
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project SangTacReader/SangTacReader.xcodeproj \
+            -scheme SangTacReader \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package .ipa
+        run: |
+          APP_FILE=$(find build/Build/Products -name "*.app" -type d | head -1)
+          echo "找到应用包: $APP_FILE"
+          mkdir -p Payload
+          cp -r "${APP_FILE}" Payload/
+          echo "--- 确认 reader.js 已打进包 ---"
+          ls Payload/SangTacReader.app/ | grep -i reader || echo "(说明在 subdir)"
+          # 打 zip 并改名 .ipa（未签名，AltStore 可接受）
+          zip -qr SangTacReader-unsigned.ipa Payload
+          ls -lh SangTacReader-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SangTacReader-unsigned
+          path: SangTacReader-unsigned.ipa
+          if-no-files-found: error
