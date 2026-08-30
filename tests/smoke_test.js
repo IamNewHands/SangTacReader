@@ -320,6 +320,14 @@ async function testCSSRules() {
     swiftContent.includes('dispatchEvent') && swiftContent.includes('resize'),
     'D12. didFinish 中触发 resize 事件重新计算视口'
   );
+
+  // D13: Web 模式 XHR 同域修复 —— 拦截发往镜像域名 (dns1/sangtacviet.com) 的请求，
+  // 改回当前同域以保持登录/语言/源目录的 Cookie 生效
+  assert(
+    swiftContent.includes('XMLHttpRequest.prototype.open') && swiftContent.includes('dns1.stv-appdomain-00000001.org'),
+    'D13. 注入 XHR 同域拦截，修复跨域 Cookie 丢失',
+    'Missing XHR same-origin rewrite patch'
+  );
 }
 
 // ============================================
