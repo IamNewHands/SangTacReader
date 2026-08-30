@@ -18,7 +18,7 @@
 		A1A2C3B01BAD4E1A9C1D2E3F /* SangTacReader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SangTacReader.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		A1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewController.swift; sourceTree = "<group>"; };
-		A1A2C3B61BAD4E1A9C1D2E3F /* reader.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = reader.js; path = Resources/InjectScripts/reader.js; sourceTree = "<group>"; };
+		A1A2C3B61BAD4E1A9C1D2E3F /* reader.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = reader.js; path = reader.js; sourceTree = "<group>"; };
 		A1A2C3B71BAD4E1A9C1D2E3F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1A2C3B81BAD4E1A9C1D2E3F /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		A1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
