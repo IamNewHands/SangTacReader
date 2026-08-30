@@ -380,6 +380,26 @@ async function testBridgeIntegrity() {
     'E6. 加载正确的移动端入口 URL (sangtacviet.com)',
     'Entry URL must be sangtacviet.com to keep cookies same-origin'
   );
+
+  // E7-E8: 原生网络层兜底 —— WKURLSchemeHandler 接管 https，强制附加 Referer。
+  // 服务器对 GET 请求强制要求 Referer 头，否则返回空体(Content-Length: 0)，
+  // 前端会误判为 "Kết nối tới máy chủ thất bại"。iOS WKWebView 同源 XHR 不带
+  // Referer，而 JS 无法设置 Referer(forbidden header)。安卓用 CapacitorHttp 原生层
+  // 显式附加 "Referer": document.referrer || location.href，这里用 WKURLSchemeHandler
+  // 在原生层等价实现。
+  assert(
+    swiftContent.includes('WKURLSchemeHandler') &&
+      swiftContent.includes('setURLSchemeHandler') &&
+      swiftContent.includes('forURLScheme: "https"'),
+    'E7. 注册 https scheme 处理器拦截 STV 请求 (WKURLSchemeHandler)',
+    'Missing WKURLSchemeHandler for https (required to attach Referer)'
+  );
+  assert(
+    swiftContent.includes('forHTTPHeaderField: "Referer"') &&
+      swiftContent.includes('netSession.dataTask'),
+    'E8. 原生层强制附加 Referer 后经 URLSession 转发',
+    'Missing Referer attachment in native network layer'
+  );
 }
 
 // ============================================
