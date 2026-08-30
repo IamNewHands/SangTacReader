@@ -93,17 +93,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.allowsInlineMediaPlayback = true
 
-        // 允许跨域和跨源安全请求
-        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
-        config.setValue(true, forKey: "allowUniversalAccessFromFileURLs")
-        
         webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 SangTacVietApp/1.2.17"
-        webView.isOpaque = false
-        webView.backgroundColor = .black
-        webView.scrollView.backgroundColor = .black
+        webView.isOpaque = true
+        webView.backgroundColor = .systemBackground
+        webView.scrollView.backgroundColor = .systemBackground
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
@@ -256,24 +252,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     // MARK: - WKNavigationDelegate
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        if let url = navigationAction.request.url {
-            let host = url.host?.lowercased() ?? ""
-            if url.isFileURL || host.contains("sangtacviet") || host.contains("sangtacvietcdn") || host.contains("unpkg.com") || host.contains("cdnjs") || host.contains("cloudflare") {
-                decisionHandler(.allow)
-            } else if navigationAction.navigationType == .linkActivated {
-                // 如果是阅读相关跳转或小说跳转，依然在应用内打开
-                if url.absoluteString.contains("sangtacviet") || url.absoluteString.contains("/truyen/") {
-                    decisionHandler(.allow)
-                } else {
-                    decisionHandler(.cancel)
-                    UIApplication.shared.open(url, options: [:], completionHandler: nil)
-                }
-            } else {
-                decisionHandler(.allow)
-            }
-        } else {
-            decisionHandler(.allow)
-        }
+        // 全面放行应用内部请求与导航
+        decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
