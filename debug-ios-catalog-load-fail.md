@@ -67,44 +67,36 @@
 | 缺 `ngmar/sty/exts` | **code:7** |
 | 带 `key=undefined` | **code:7** |
 
+### 最终根因（v4，决定性）：User-Agent 判定设备
+
+同一本 `100490360` 同一章 `114882456` 的**完全相同 URL**，Chrome 返回 code:0（59668 字节正文），iOS WKWebView 返回 code:7（24 字节）——二者**唯一差异是 User-Agent**。
+
+**Chrome 覆盖 UA 实测（决定性）**：DevTools Network conditions 把 UA 覆盖为 iOS 的
+`Mozilla/5.0 (iPhone...) Mobile/15E148 SangTacVietApp/1.2.17` 后，同一个成功 URL **立即返回 code:7**；换回 Chrome 自带 UA 则 code:0。
+
+**结论**：服务器通过 User-Agent 判定设备，带 `SangTacVietApp` 后缀的自定义 UA 被判为不受支持的设备 → readchapter 返回 code:7（Device not supported）。chapterlist 接口不校验设备所以此前能成功。
+
 ### 真相
 
-1. **grantcontext 返回的 JSFuck 代码**（`(()=>{var 藡锔...})()`）**在任何环境 eval 均返回 undefined，且无任何副作用**（无全局变量、无 cookie、无网络请求）——已用 node、真实 Chrome file://、真实网站会话三重验证。`readcontextid` cookie 也不是 key。
+1. **grantcontext 返回的 JSFuck 代码**（`(()=>{var 藡锔...})()`）**在任何环境 eval 均返回 undefined，且无任何副作用**——已用 node、真实 Chrome file://、真实网站会话三重验证。`readcontextid` cookie 也不是 key。
 2. **key 参数根本不需要**。真实成功请求不带 key。
-3. **iOS 前端 `getContent`（online_app.v2.read.js 615行）构造的 `/?sajax=readchapter&h=&bookid=&c=&key=undefined` 缺 `ngmar=readc&sty=1&exts=` 且多带 `key=undefined` → 服务器返回 `{"code":7}` → 前端 throw "Device not supported" → 返回 "Kết nối tới máy chủ thất bại"**。
-4. `h` 参数必须用**源名**（ciweimao），`app.reader.host` 已是源名（download 代码 3534 行 `h=${this.host}` 佐证）。
-5. 安卓能工作是因为其 Capacitor.Http 走的 `x-stv-transport: app` 分支会**触发 key 相关循环**，而 web 分支的 code:7 处理（622行 `throw`）直接失败。**但真相是：即使没有 key，用正确的参数格式（ngmar/sty/exts/源名）也能成功读取。**
+3. iOS 前端 getContent 构造的 URL 格式缺 `ngmar/sty/exts` 且带 `key=undefined` → code:7（已由覆写 getContent 修复为正确格式）。
+4. **即使 URL 格式完全正确，iOS 仍因自定义 UA `SangTacVietApp` 被判为不受支持设备 → code:7**（这是 v3 修复后仍失败的真正原因）。
+5. `h` 参数必须用**源名**（ciweimao），`app.reader.host` 已是源名。
 
-## 修复方案 v3（已实施，待真机验证）
+## 修复方案 v4（已实施，待真机验证）
 
 ### v1 失败：注入 window.Capacitor（commit 1f4c279，已废弃）
-
-v1 注入最小 `window.Capacitor` 桥接，让 `loadKeyFromServer` 执行。**实测失败（用户反馈"点击点不动"）**：注入后 `app.v2.js` 4412行 `if(window.Capacitor)` 让前端走原生布局分支（跳过 isWeb 分支的 CSS 变量设置）→ 布局塌陷、点击无响应。
-
 ### v2 失败：覆写 loadKeyFromServer（commit 5f14f71，已废弃）
+### v3 部分成功：覆写 getContent（commit d3c4989）
 
-假设 `eval(grantcontext JSFuck)` 能拿到 key。**已证伪**：eval 在任何环境返回 undefined，且 key 根本不需要。
+覆写 `app.reader.getContent` 用正确格式 `?bookid&h=源名&c&ngmar=readc&sajax=readchapter&sty=1&exts=`（不带 key），同源请求。真机验证：**URL 已正确（h=ciweimao 源名），但 readchapter 仍返回 code:7** → 定位到 UA 是第二层根因。
 
-### v3 方案：覆写 `app.reader.getContent`（当前）
+### v4 修复：改回标准 iPhone Safari UA（当前）
 
-**不注入 Capacitor，保持纯 Web 布局**，只覆写 `app.reader.getContent`，用验证过的成功格式请求：
-
-```js
-/index.php?bookid={i}&h={h}&c={c}&ngmar=readc&sajax=readchapter&sty=1&exts=
-```
-
-- 强制用 `window.location.origin` 构造同源绝对 URL（避免 fullUrl 切镜像域触发跨域 preflight）
-- 复用 `app.net.get`（同源 XHR + `x-stv-transport: web` 头，已验证可成功返回正文）
-- 跳过 `getKey`（不需要 key）、跳过 `getContent2`（无 Capacitor 自动返回 undefined）
-- 保留 `offlineBook` 逻辑和 `setTransMode()`
-- 失败时回退原始逻辑
-- 调试日志：`[DBG:gc] h=... i=... c=...`、`[DBG:gc-url]`、`[DBG:gc-code]`（确认 h 是否为源名、请求是否成功）
+`customUserAgent` 从 `...Mobile/15E148 SangTacVietApp/1.2.17` 改为 `...Mobile/15E148 Safari/604.1`（标准 iPhone Safari），去掉 app 后缀，服务器视其为 Safari 浏览器放行。
 
 ### 待真机验证
 
 1. 章节正文可读取（`[DBG:gc-ok]` 显示长度）。
-2. `[DBG:gc]` 中 `h=` 是否为源名（若为数字，需额外转换，返回会是 code:5）。
-
-## 结论
-
-根因不是"缺 Capacitor 拿不到 key"，而是**前端 readchapter 请求 URL 格式错误**（缺 `ngmar/sty/exts`、多带 `key=undefined`、路径/参数不符），服务器因此返回 code:7。v3 覆写 `getContent` 用真实会话验证过的成功格式请求，无需 key、无需 Capacitor。待真机确认。
+2. 登录、语言切换、目录仍正常（用 Safari UA 走纯 web 分支）。

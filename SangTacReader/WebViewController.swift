@@ -409,7 +409,11 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
-        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 SangTacVietApp/1.2.17"
+        // 使用标准 iPhone Safari UA，去掉 SangTacVietApp 后缀。
+        // 已用 Chrome 覆盖 UA 实测：readchapter 接口按 UA 判定设备，
+        // 带 "SangTacVietApp/1.2.17" 的自定义 UA 会被服务器判为不受支持的设备
+        // 返回 {"code":7}（Device not supported）；标准 Safari UA 则返回 code:0 正常正文。
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         webView.isOpaque = true
         webView.backgroundColor = .systemBackground
         webView.scrollView.backgroundColor = .systemBackground
