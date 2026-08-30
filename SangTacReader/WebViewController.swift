@@ -90,6 +90,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             // 2. 注入完整健壮的 Capacitor 桥接 (包含 fromNative 与各核心插件)
             window.Capacitor = window.Capacitor || {};
             window.Capacitor.isNative = true;
+            // 关键：必须提供 platform / getPlatform，否则官方 app.v2.js 在
+            // Capacitor.platform.toLowerCase() 处抛异常，导致整个应用初始化中断。
+            window.Capacitor.platform = "ios";
+            window.Capacitor.getPlatform = function() { return "ios"; };
             window.Capacitor.isPluginAvailable = function(name) {
                 // 不提供原生 Http 插件，让前端天然使用原生 XHR/fetch 请求真实的服务器网络与 Cookie
                 if (name === 'Http') return false;
@@ -139,6 +143,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 },
                 getState: function() {
                     return Promise.resolve({ isActive: true });
+                },
+                getLaunchUrl: function() {
+                    // 无启动深链时返回 null（app.v2.js 的 handlerAppUrlStart 依赖此方法）
+                    return Promise.resolve(null);
                 }
             };
 
@@ -243,7 +251,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 show: function() { return Promise.resolve(); },
                 hide: function() { return Promise.resolve(); },
                 setAccessoryBarVisible: function() { return Promise.resolve(); },
-                setScroll: function() { return Promise.resolve(); }
+                setScroll: function() { return Promise.resolve(); },
+                addListener: function(eventName, callback) {
+                    // app.v2.js 注册 keyboardWillShow/keyboardWillHide，安全空实现
+                    return Promise.resolve({
+                        remove: function() {}
+                    });
+                }
             };
 
             // Capacitor SplashScreen 插件
@@ -269,6 +283,23 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     return Promise.resolve();
                 },
                 close: function() { return Promise.resolve(); }
+            };
+
+            // 为官方脚本会调用、但 iOS 端未实现的原生插件提供安全兜底，
+            // 避免用户触发（如分享、OCR、原生 WebView）时抛出未定义错误。
+            window.Capacitor.Plugins.Share = {
+                canShare: function() { return Promise.resolve(false); },
+                share: function() { return Promise.resolve(); }
+            };
+            window.Capacitor.Plugins.MainClass = {
+                mlKitOcrScreen: function() { return Promise.resolve(null); }
+            };
+            window.Capacitor.Plugins.WebNativeView = {
+                createView: function() { return Promise.resolve({}); },
+                invoke: function() { return Promise.resolve({}); },
+                invokeObject: function() { return Promise.resolve({}); },
+                createObject: function() { return Promise.resolve({}); },
+                createHandler: function() { return Promise.resolve({}); }
             };
 
             // 3. 兼容 Cordova 经典 exec 桥接
