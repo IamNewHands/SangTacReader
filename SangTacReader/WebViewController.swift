@@ -51,8 +51,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     private func setupCookiePersistence() {
         guard let store = webView?.configuration.websiteDataStore.httpCookieStore else { return }
-        cookieObserver = CookieObserver(owner: self)
-        store.add(cookieObserver)
+        // 先创建 observer 再 add，避免把 Optional 传给 add(_:)
+        let observer = CookieObserver(owner: self)
+        cookieObserver = observer
+        store.add(observer)
     }
 
     private func restorePersistedCookies() {
@@ -80,8 +82,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // fileprivate：被同文件的 CookieObserver 回调调用
     fileprivate func saveCookies() {
         let store = webView.configuration.websiteDataStore.httpCookieStore
-        store.getAllCookies { [weak self] cookies in
-            guard let self = self else { return }
+        store.getAllCookies { cookies in
             let items = cookies.map { c -> PersistedCookie in
                 PersistedCookie(name: c.name, value: c.value, domain: c.domain,
                                 path: c.path, secure: c.isSecure,
