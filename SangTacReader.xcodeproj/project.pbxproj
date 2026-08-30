@@ -10,6 +10,7 @@
 		B1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift */; };
 		B1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift */; };
 		B1A2C3B61BAD4E1A9C1D2E3F /* reader.js in Resources */ = {isa = PBXBuildFile; fileRef = A1A2C3B61BAD4E1A9C1D2E3F /* reader.js */; };
+		B1A2C3B81BAD4E1A9C1D2E3F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A1A2C3B81BAD4E1A9C1D2E3F /* LaunchScreen.storyboard */; };
 		B1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -123,7 +124,7 @@
 			files = (
 				B1A2C3B61BAD4E1A9C1D2E3F /* reader.js in Resources */,
 				B1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets in Resources */,
-				A1A2C3B81BAD4E1A9C1D2E3F /* LaunchScreen.storyboard in Resources */,
+				B1A2C3B81BAD4E1A9C1D2E3F /* LaunchScreen.storyboard in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
