@@ -26,7 +26,7 @@ jobs:
       - name: Build (unsigned)
         run: |
           xcodebuild \
-            -project SangTacReader/SangTacReader.xcodeproj \
+            -project SangTacReader.xcodeproj \
             -scheme SangTacReader \
             -configuration Release \
             -sdk iphoneos \
