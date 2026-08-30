@@ -399,17 +399,35 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     var origOpen = XMLHttpRequest.prototype.open;
                     XMLHttpRequest.prototype.open = function(method, url) {
                         try {
-                            if (typeof url === 'string' && url.indexOf('://') === -1) {
-                                url = curOrigin + (url.charAt(0) === '/' ? url : '/' + url);
-                            }
+                            var args = Array.prototype.slice.call(arguments);
                             if (typeof url === 'string') {
+                                var curOrigin = window.location.origin;
+                                // 相对路径补全为绝对同源 URL
+                                if (url.indexOf('://') === -1) {
+                                    url = curOrigin + (url.charAt(0) === '/' ? url : '/' + url);
+                                }
                                 var u = new URL(url, window.location.href);
+                                // 强制 STV 域名请求回到当前同源，让 WKWebView 自动携带 Referer
                                 if (stvHosts.indexOf(u.hostname) !== -1 && u.origin !== curOrigin) {
                                     url = curOrigin + u.pathname + u.search;
+                                    u = new URL(url, window.location.href);
                                 }
+                                // readchapter 请求规范化：原版 getContent 会带上 key=undefined 且缺
+                                // ngmar/sty/exts，服务器对这两种情况均返回 code:7。key 参数经多重验证
+                                // 根本不需要。这里统一修正为已验证成功的格式。
+                                if (url.indexOf('readchapter') > -1) {
+                                    var sp = u.searchParams;
+                                    if (sp.get('key') === 'undefined') sp.delete('key');
+                                    if (!sp.has('ngmar')) sp.set('ngmar', 'readc');
+                                    if (!sp.has('sty')) sp.set('sty', '1');
+                                    if (!sp.has('exts')) sp.set('exts', '');
+                                    u.search = sp.toString();
+                                    url = u.toString();
+                                }
+                                args[1] = url;
                             }
                         } catch (e) {}
-                        return origOpen.apply(this, arguments);
+                        return origOpen.apply(this, args);
                     };
                 } catch (e) {}
             })();
