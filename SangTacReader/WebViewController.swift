@@ -191,6 +191,94 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 因此此处只做 CSS 修复，让前端进入正常的 Web 分支 (localStorage + XHR)。)
         let bridgeJS = """
         (function() {
+            // ===== iOS 最小 Capacitor.Http 桥接（仅 Http，不用 SQLite）=====
+            // 根因：线上 app.v2.read.js 的 loadKeyFromServer/getContent2 只在
+            // window.Capacitor.Plugins.Http 存在时才执行。安卓有 Capacitor 原生网络层，
+            // 会先调 /io/grantcontext/context 获取章节 key，再带 key 请求 readchapter。
+            // iOS 纯 Web 版没有 Capacitor，chapterkey 保持 undefined -> readchapter 返回
+            // {"code":7} -> "Kết nối tới máy chủ thất bại"。
+            // 服务器强制要求 x-stv-transport: app + x-requested-with 头才返回 key 数据。
+            // 这些是同源 XHR 可设置的非 forbidden 头，因此用 XHR 模拟 Capacitor.Http 即可。
+            // 注意：不注入 CapacitorSQLite，避免前端进入 SQLite 等待分支（app.init 卡死）。
+            if (typeof window.Capacitor === 'undefined') {
+                // ---------- Capacitor.Http：用 XHR 模拟，带服务器强制要求的 app 头 ----------
+                function capHttpXhr(opts, method, body) {
+                    return new Promise(function(resolve, reject) {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open(method, opts.url);
+                        var h = opts.headers || {};
+                        try {
+                            for (var k in h) {
+                                if (!h.hasOwnProperty(k)) continue;
+                                // 跳过浏览器 forbidden 头（Cookie/Referer/Origin/User-Agent 等），
+                                // 同源 XHR 会自动携带 Referer/Cookie/UA。
+                                if (/^(cookie|referer|origin|user-agent|accept-charset|accept-encoding|connection|host|content-length|transfer-encoding|upgrade|expect|te|range|if-)/i.test(k)) continue;
+                                xhr.setRequestHeader(k, h[k]);
+                            }
+                        } catch(e) {}
+                        // 服务器强制要求 app 头才能获取 key 数据
+                        try { xhr.setRequestHeader('x-stv-transport', 'app'); } catch(e) {}
+                        try { xhr.setRequestHeader('x-requested-with', 'com.sangtacviet.mobilereader'); } catch(e) {}
+                        xhr.timeout = opts.timeout || 15000;
+                        xhr.onload = function() {
+                            resolve({ status: xhr.status, data: xhr.responseText, headers: {} });
+                        };
+                        xhr.onerror = function() { reject(new Error("network error: " + opts.url)); };
+                        xhr.ontimeout = function() { reject(new Error("timeout: " + opts.url)); };
+                        try {
+                            if (typeof body === 'string') xhr.send(body);
+                            else if (body) xhr.send(JSON.stringify(body));
+                            else xhr.send();
+                        } catch(e) { reject(e); }
+                    });
+                }
+                // 空操作 stub（Promise），保证前端的裸调用不崩溃。
+                // 被调用返回非 Promise 会触发 .then 崩溃，因此都返回已 resolve 的 Promise。
+                function noopResolved() { return Promise.resolve(); }
+                function noopResolvedNull() { return Promise.resolve(null); }
+                function noopResolvedFalse() { return Promise.resolve(false); }
+                function addListenerStub() { return { remove: function(){} }; }
+
+                // 必须提供 getPlatform()：app.v2.js 第4413-4417行在 window.Capacitor 存在时
+                // 会用 Capacitor.getPlatform() 赋给 Capacitor.platform，若缺该方法则
+                // Capacitor.platform 为 undefined，随后 .toLowerCase() 抛 TypeError，导致
+                // app.platform 初始化 IIFE 中止。返回真实平台 "ios"，让前端走 iOS 分支。
+                window.Capacitor = {
+                    getPlatform: function() { return "ios"; },
+                    platform: "ios",
+                    isNativePlatform: true,
+                    Plugins: {
+                        Http: {
+                            get: function(opts) { return capHttpXhr(opts, 'GET'); },
+                            post: function(opts, data) { return capHttpXhr(opts, 'POST', data); },
+                            request: function(opts) { return capHttpXhr(opts, opts.method || 'GET', opts.data); }
+                        },
+                        // App：handlerAppUrlStart 只检查 window.Capacitor 就调用
+                        // Capacitor.Plugins.App.getLaunchUrl()，无 Plugins.App 会崩溃；
+                        // backButton/appStateChange addListener 也是裸调用。
+                        App: {
+                            getLaunchUrl: function() { return noopResolvedNull(); },
+                            addListener: addListenerStub,
+                            exitApp: function() {},
+                            SyncCookie: noopResolved
+                        },
+                        // 状态栏/分享/浏览器/键盘/OCR 等 stub，避免其它平台分支裸调用崩溃
+                        StatusBar: {
+                            hide: function() {}, show: function() {},
+                            setStyle: function() {}, setOverlaysWebView: function() {},
+                            setBackgroundColor: function() {}
+                        },
+                        Share: {
+                            canShare: function() { return noopResolvedFalse(); },
+                            share: noopResolved
+                        },
+                        Browser: { open: function() {} },
+                        Keyboard: { addListener: addListenerStub },
+                        MainClass: { mlKitOcrScreen: function() { return noopResolved(); } }
+                    }
+                };
+            }
+
             var css = document.createElement('style');
             css.id = 'ios-viewport-fix';
             css.innerHTML = `
@@ -262,32 +350,33 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 } catch (e) {}
             })();
 
-            // 从源头强制保持同源：覆盖 networkManagerXHR 的域存活判断与 bestDomain，
-            // 让 fullUrl() 不再把请求切到镜像域名，从而请求从一开始就是同源的完整 URL，
-            // WKWebView 会自动携带完整 Referer。等 app.v2.js 初始化 networkManagerXHR 后覆盖。
+            // 从源头强制保持同源：覆盖 networkManager 与 networkManagerXHR 的域存活判断与
+            // bestDomain，让 fullUrl()/getCapacitor 不再把请求切到镜像域名，从而请求从一开始
+            // 就是同源的完整 URL，WKWebView 会自动携带完整 Referer。
+            // 注入 Capacitor.Http 后 getCapacitor 使用 networkManager（不是 networkManagerXHR），
+            // 因此两个对象都要覆盖，避免切到镜像域触发跨域 CORS preflight 拦截。
             (function() {
                 try {
                     var applied = false;
+                    function patchNet(nm) {
+                        if (!nm) return;
+                        var curOrigin = window.location.origin;
+                        nm.isDomainAlive = function(domain) {
+                            try {
+                                if (domain === curOrigin) return true;
+                            } catch (e) {}
+                            return false;
+                        };
+                        nm.bestDomain = function() {
+                            return curOrigin;
+                        };
+                    }
                     function applyPatch() {
-                        if (applied) return;
                         try {
                             if (typeof window.app !== 'undefined' &&
-                                window.app && window.app.net &&
-                                window.app.net.networkManagerXHR) {
-                                var nm = window.app.net.networkManagerXHR;
-                                var curOrigin = window.location.origin;
-                                // isDomainAlive 只信任当前 origin，其余镜像域名一律视为不可用，
-                                // 使 fullUrl() 的 baseDomain 保持为 window.location.origin。
-                                nm.isDomainAlive = function(domain) {
-                                    try {
-                                        if (domain === curOrigin) return true;
-                                    } catch (e) {}
-                                    return false;
-                                };
-                                // bestDomain 直接返回当前 origin，绝不切镜像域名。
-                                nm.bestDomain = function() {
-                                    return curOrigin;
-                                };
+                                window.app && window.app.net) {
+                                patchNet(window.app.net.networkManager);
+                                patchNet(window.app.net.networkManagerXHR);
                                 applied = true;
                             }
                         } catch (e) {}
