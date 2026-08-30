@@ -23,7 +23,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         synthesizer.delegate = self
         setupAudioSession()
         setupWebView()
-        loadLocalApp()
+        loadApp()
     }
 
     private func setupAudioSession() {
@@ -104,18 +104,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         ])
     }
 
-    private func loadLocalApp() {
-        if let wwwPath = Bundle.main.path(forResource: "www", ofType: nil),
-           let htmlURL = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "www") {
-            let readAccessURL = URL(fileURLWithPath: wwwPath)
-            webView.loadFileURL(htmlURL, allowingReadAccessTo: readAccessURL)
-        } else {
-            // 降级使用远程加载
-            let remoteURL = URL(string: "https://sangtacviet.com/app.v2.php") ?? URL(string: "https://sangtacviet.vip/")!
-            var req = URLRequest(url: remoteURL)
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
-            webView.load(req)
-        }
+    private func loadApp() {
+        // 直接加载官方完整的移动端应用入口，与 Android 行为 100% 一致
+        let targetURL = URL(string: "https://sangtacviet.vip/app.v2.php") ?? URL(string: "https://sangtacviet.vip/")!
+        var request = URLRequest(url: targetURL)
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", forHTTPHeaderField: "User-Agent")
+        request.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
+        webView.load(request)
     }
 
     // MARK: - WKScriptMessageHandler
@@ -262,6 +257,19 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             }
         } else {
             decisionHandler(.allow)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        let err = error as NSError
+        if err.code == NSURLErrorCancelled { return }
+        print("Web load failed: \(error.localizedDescription)")
+        
+        // 自动重试或者备选域名
+        if let currentURL = webView.url?.absoluteString, currentURL.contains("sangtacviet.vip") {
+            if let fallbackURL = URL(string: "https://sangtacviet.com/app.v2.php") {
+                webView.load(URLRequest(url: fallbackURL))
+            }
         }
     }
 }
