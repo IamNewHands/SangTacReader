@@ -54,12 +54,26 @@ iOS 纯 Web 版 **没有 `window.Capacitor`**。线上 `app.v2.read.js` 的 `loa
 - iOS 无 Capacitor → `chapterkey` 保持 `undefined` → readchapter 返回 `{"code":7}` → 前端 throw "Device not supported" → 返回 "Kết nối tới máy chủ thất bại"。
 - 服务器 `/io/grantcontext/context` 强制要求 `x-stv-transport: app` + `x-requested-with: com.sangtacviet.mobilereader` 头才返回 key 数据（node 实测：仅 app 头即可，298KB）。
 
-## 修复方案（已实施，待真机验证）
+## 修复方案 v2（已实施，待真机验证）
 
-注入最小 `window.Capacitor` 桥接（仅 `Plugins.Http`，用 XHR 模拟并带 app 头），并补齐 `getPlatform()` + App/StatusBar/Share/Browser/Keyboard/MainClass 的安全 stub，避免 `app.v2.js` 初始化裸调用崩溃（第4413-4417行 `Capacitor.platform.toLowerCase()`、第4401行 `Capacitor.Plugins.App.getLaunchUrl()` 等）。同时保留 applyPatch 强制 networkManager/networkManagerXHR 同源。
+### v1 失败：注入 window.Capacitor（commit 1f4c279，已废弃）
 
-效果：`loadKeyFromServer` 会执行 → `eval` grantcontext 得到 key → `getContent2` 带 key 请求 readchapter → 章节内容可读。
+v1 注入最小 `window.Capacitor` 桥接（Plugins.Http + getPlatform + App/StatusBar 等 stub），让 `loadKeyFromServer` 执行。
+
+**实测失败（用户反馈"点击小说页面点不动，点不进小说详情"）**：注入 Capacitor 后，`app.v2.js` 第4412行 `if(window.Capacitor)` 让 `app.platform.isIOS=true`，走原生布局分支（4559行设 mainview 高度、**跳过 4566-4605 行 isWeb 分支的 CSS 变量设置**）→ 布局塌陷、首页点击无响应。日志证实：首页 searchBooks 加载成功（43309/39459 字节）、登录/语言正常，但点击书卡后无任何 detail/readchapter 请求。
+
+### v2 方案：不注入 Capacitor + 覆写 loadKeyFromServer（当前）
+
+**核心：不注入 window.Capacitor**，保持纯 Web 布局（恢复点击），只覆写 `app.reader.loadKeyFromServer`，用 XHR + app 头从 `/io/grantcontext/context` 获取并 eval 章节 key：
+
+1. `capHttpXhr`：同源 XHR 请求 grantcontext，设置非 forbidden 头 `x-stv-transport: app` + `x-requested-with: com.sangtacviet.mobilereader`（服务器强制要求）。同源 XHR 自动携带完整 Referer/Cookie（满足服务器要求）。
+2. 覆写 `app.reader.loadKeyFromServer(h,i)`：`ctx.chapterkey = eval(toEvaluate.data)`，与安卓原生第549行**逐字一致**。
+3. 完整闭环：`getContent`（602-631行）→ `getKey`（610）→ 我的 `loadKeyFromServer` 设好 chapterkey → `getContent2`（555，无 Capacitor 故不执行返回 undefined）→ fallback 到第615行 `/?sajax=readchapter&...&key=${this.chapterkey}` 普通 XHR（同源带 Referer）→ **key 正确则章节可读**。
+4. 时序：`setInterval` 轮询 `window.app.reader` 出现后覆写（app.v2.read.js 由 ui.scriptmanager 动态加载）。
+5. 调试：`tryDbg` 通过 `dbg` handler 上报 `[DBG:key] type=... len=... head=...`，用户应用内日志面板可直接看到 key 获取结果。
+
+**key 获取的验证依据**：混淆代码是 JSFuck/Unicode 风格 IIFE（`(()=>{var 藡锔...`，无字面 return，依赖浏览器 btoa/atob 等 API）。node vm 沙箱无法完美模拟浏览器环境检测，返回 undefined，**不构成真实环境反证**。WKWebView 是完整浏览器环境，与安卓 V8 行为一致，`eval` 应返回 key。待真机 `[DBG:key]` 日志确认。
 
 ## 结论
 
-根因是 iOS 缺 Capacitor 原生网络层导致 key 无法获取。方案是注入最小 Capacitor.Http 桥接（参考安卓原生行为），需真机验证章节阅读。
+根因是 iOS 缺 Capacitor 原生网络层导致 key 无法获取。v2 方案移除 Capacitor 注入（恢复点击）并覆写 loadKeyFromServer（与安卓一致获取 key）。需真机验证：① 点击恢复正常；② 章节可读（`[DBG:key]` 显示有效 key）。
