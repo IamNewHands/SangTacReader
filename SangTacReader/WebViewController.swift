@@ -255,20 +255,22 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 因此此处只做 CSS 修复，让前端进入正常的 Web 分支 (localStorage + XHR)。)
         let bridgeJS = """
         (function() {
-            // ===== iOS 章节读取修复：不注入 window.Capacitor =====
-            // 已通过真实登录会话 + Chrome 抓包确认真相：
-            //   1) 成功读取章节的请求格式为（不需要 key、不需要 grantcontext/eval）：
-            //        /index.php?bookid={bookid}&h={源名}&c={章节}&ngmar=readc&sajax=readchapter&sty=1&exts=
-            //      返回 {"code":"0", ...data}。
-            //   2) 前端 app.v2.read.js 的 getContent(615) 构造的
-            //        /?sajax=readchapter&h=&bookid=&c=&key=undefined
-            //      缺 ngmar/sty/exts 且多带 key=undefined -> 服务器返回 {"code":7}
-            //      (Device not supported) -> "Kết nối tới máy chủ thất bại"。
-            //   3) grantcontext 返回的 JSFuck 代码在任何环境 eval 均返回 undefined、
-            //      无副作用，且 key 参数根本不需要 -> 覆写 loadKeyFromServer 毫无意义。
+            // ===== iOS 章节读取修复 v7：注入 Capacitor.Plugins.Http + key 机制 =====
+            // 已从 app.v2.read.js 源码 + 服务器实测确认真相：
+            //   1) readchapter 必须带 key（服务器对无 key 的请求返回 {"code":7}）。
+            //      前端 getContent/getContent2 构造：
+            //        /?sajax=readchapter&h={h}&bookid={i}&c={c}&key=${this.chapterkey}
+            //   2) chapterkey 由 app.reader.loadKeyFromServer 获取：它仅在
+            //      window.Capacitor.Plugins.Http 存在时运行，通过该插件 GET
+            //      /io/grantcontext/context?hostid=&bookid= 拿到一段混淆 JS，
+            //      再 this.chapterkey = eval(混淆JS) 生成 key。
+            //   3) 该混淆 JS 依赖 window.Capacitor / window.Engine 等存在做环境指纹，
+            //      只在真实浏览器 WebView 里 eval 才能生成有效 key。
             //
-            // 因此本修复：保持纯 Web 布局（不注入 Capacitor，避免布局塌陷），
-            // 只覆写 app.reader.getContent，用上面验证过的成功格式请求章节正文。
+            // 因此本修复：注入一个仅含 Plugins.Http（底层用原生 XHR 实现）的极简
+            // Capacitor，且【不设置 getPlatform】，让 app.platform.isIOS 保持 false、
+            // 页面布局维持纯 Web 模式（避免之前"注入 Capacitor 后点不了"的塌陷）。
+            // 这样原版 loadKeyFromServer 能运行、eval 在真实 WKWebView 里生成 key。
             function tryDbg(tag, msg) {
                 try {
                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg) {
@@ -278,14 +280,56 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 } catch(e) {}
                 try { console.log('[key:' + tag + '] ' + msg); } catch(e) {}
             }
-            // 用同源 XHR 请求章节正文（复用 app.net 走同源 + x-stv-transport:web 头，
-            // 已验证该头可成功返回正文；且现有代码已把网络层强制保持同源）。
+            // 用原生 XHR 模拟 Capacitor.Http.get（iOS 无 Capacitor，原实现不工作）。
+            // 服务器要求 readchapter 必须带 key；key 由 /io/grantcontext/context 下发的一段
+            // 混淆 JS 经 eval 生成（见 app.v2.read.js 的 loadKeyFromServer/getContent2）。
             function patchReaderGetContent(app) {
                 try {
                     if (!app || !app.reader) return false;
                     if (app.reader.__getContentPatched) return true;
                     app.reader.__getContentPatched = true;
+                    var origLoadKey = app.reader.loadKeyFromServer;
                     var origGetContent = app.reader.getContent;
+                    // 覆写 loadKeyFromServer：用 XHR 拉取混淆 JS 并 eval 得到 chapterkey。
+                    // 复刻 App 端：带 "mac_tt=true" cookie 后缀 + app 传输头。
+                    app.reader.loadKeyFromServer = async function(h, i) {
+                        try {
+                            var base = window.location.origin;
+                            var ctxUrl = base + "/io/grantcontext/context?hostid=" + encodeURIComponent(h) + "&bookid=" + encodeURIComponent(i);
+                            tryDbg('gkey-url', ctxUrl);
+                            var js = await new Promise(function(resolve, reject) {
+                                var xhr = new XMLHttpRequest();
+                                xhr.open("GET", ctxUrl, true);
+                                // 追加 mac_tt=true（服务器校验该 cookie 后缀）
+                                if (document.cookie && document.cookie.indexOf("mac_tt=") < 0) {
+                                    xhr.setRequestHeader("Cookie", document.cookie + "; mac_tt=true;");
+                                }
+                                xhr.setRequestHeader("x-stv-transport", "app");
+                                xhr.setRequestHeader("x-requested-with", "com.sangtacviet.mobilereader");
+                                xhr.onreadystatechange = function() {
+                                    if (xhr.readyState === 4) {
+                                        if (xhr.status === 200) resolve(xhr.responseText);
+                                        else reject(new Error("ctx status " + xhr.status));
+                                    }
+                                };
+                                xhr.onerror = function() { reject(new Error("ctx xhr error")); };
+                                xhr.send();
+                            });
+                            tryDbg('gkey-js-len', 'len=' + (js ? js.length : 0));
+                            var key = eval(js); // 服务器下发混淆 JS，eval 得到 chapterkey
+                            tryDbg('gkey', 'key=' + String(key));
+                            this.chapterkey = key;
+                            return key;
+                        } catch(e) {
+                            tryDbg('gkey-err', 'exception: ' + e);
+                            // 取 key 失败时回退到原实现
+                            return origLoadKey.apply(this, arguments);
+                        }
+                    };
+                    // 覆写 getContent：优先尝试 App 的 key + readchapter 流程，
+                    // 若 key 无效（code:7 设备不支持）则回退到【章节页导航】方案。
+                    // 章节页 /truyen/{h}/1/{bookid}/{c}/ 是服务器渲染的 Web 页面，其内部
+                    // 的 readchapter POST（无 key）在真实浏览器里可用（Crawler 参考项目即用此法）。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
                         // 保留离线书逻辑
@@ -296,31 +340,29 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             } catch(e) {}
                         }
                         try { self.setTransMode(); } catch(e) {}
-                        // 记录传入的真实参数，便于确认 h 是源名还是数字
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
-                        // 用验证过的成功格式请求（不需要 key）。
-                        // 强制用当前页同源 origin 构造绝对 URL，避免 fullUrl 切到镜像域触发跨域拦截。
+                        // 1) 确保拿到 chapterkey
+                        try { await self.getKey(h, i); } catch(e) { tryDbg('gc-keyerr', String(e)); }
+                        var key = self.chapterkey;
+                        tryDbg('gc-key', 'key=' + String(key));
+                        // 2) 用 App 格式 URL：/?sajax=readchapter&h=&bookid=&c=&key=...
                         var base = window.location.origin;
-                        var url = base + "/index.php?bookid=" + encodeURIComponent(i)
-                                + "&h=" + encodeURIComponent(h)
+                        var url = base + "/?sajax=readchapter&h=" + encodeURIComponent(h)
+                                + "&bookid=" + encodeURIComponent(i)
                                 + "&c=" + encodeURIComponent(c)
-                                + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
+                                + "&key=" + encodeURIComponent(key == null ? "" : String(key));
                         if (rl) url += "&rescan=true";
                         tryDbg('gc-url', url);
-                        // 用原生 XHR 模拟 App 客户端请求，而不是 app.net.get()。
-                        // 原因：app.net.get() 内部强制给所有 GET 加 "x-stv-transport: web" 头，
-                        // 服务器对 readchapter 见到 web 传输会返回 {"code":7}（设备不兼容或版本过时，
-                        // 即"网页版已过时，请改用 App"）。而安卓真实 App 走 Capacitor 用的是
-                        // "x-stv-transport: app" + "x-requested-with" 头，服务器据此放行并返回正文。
-                        // 这里完全复刻 App 客户端的请求头，让服务器把请求当作 App 客户端处理。
+                        var cdata = null;
                         try {
-                            var cdata = await new Promise(function(resolve, reject) {
+                            cdata = await new Promise(function(resolve, reject) {
                                 var xhr = new XMLHttpRequest();
                                 xhr.open("GET", url, true);
+                                if (document.cookie && document.cookie.indexOf("mac_tt=") < 0) {
+                                    xhr.setRequestHeader("Cookie", document.cookie + "; mac_tt=true;");
+                                }
                                 xhr.setRequestHeader("x-stv-transport", "app");
                                 xhr.setRequestHeader("x-requested-with", "com.sangtacviet.mobilereader");
-                                // 同源 XHR 由 WKWebView 自动携带 Cookie 与 Referer；再显式补一个
-                                // Referer 确保非空（服务器对 GET readchapter 强制要求非空 Referer）。
                                 xhr.setRequestHeader("Referer", document.referrer || window.location.href);
                                 xhr.onreadystatechange = function() {
                                     if (xhr.readyState === 4) {
@@ -335,18 +377,31 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                 xhr.onerror = function() { reject({code:-1, message:"xhr error", status:xhr.status}); };
                                 xhr.send();
                             });
-                            if (cdata) {
-                                if (cdata.code + "" == "0") {
-                                    tryDbg('gc-ok', 'len=' + (cdata.data ? cdata.data.length : 0));
-                                } else {
-                                    tryDbg('gc-code', 'code=' + cdata.code + ' err=' + (cdata.err || '') + ' info=' + (cdata.info || ''));
-                                }
-                                return cdata;
-                            }
                         } catch(e) {
                             tryDbg('gc-err', 'exception: ' + e);
+                            cdata = {code:-1, message:String(e)};
                         }
-                        // 回退到原始逻辑
+                        if (cdata) {
+                            var c0 = String(cdata.code);
+                            if (c0 == "0") {
+                                tryDbg('gc-ok', 'len=' + (cdata.data ? cdata.data.length : 0));
+                                return cdata;
+                            }
+                            tryDbg('gc-code', 'code=' + cdata.code + ' err=' + (cdata.err || '') + ' info=' + (cdata.info || ''));
+                            // 3) code:7(设备不支持/无key) / code:"5"(未知错误) => 章节页导航回退
+                            if (c0 == "7" || c0 == "5" || key == null || String(key) == "undefined") {
+                                var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
+                                tryDbg('gc-fallback', 'navigating to ' + chapUrl);
+                                // 延迟导航，让日志先送出
+                                setTimeout(function() {
+                                    try { window.location.href = chapUrl; } catch(e) {}
+                                }, 300);
+                                // 返回一个"加载中"占位，避免原逻辑再次发请求
+                                return {code: "1", info: "正在打开网页版章节…"};
+                            }
+                            return cdata;
+                        }
+                        // 完全失败时回退到原始逻辑
                         return origGetContent.apply(self, arguments);
                     };
                     return true;
@@ -442,15 +497,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                     url = curOrigin + u.pathname + u.search;
                                     u = new URL(url, window.location.href);
                                 }
-                                // readchapter 请求规范化：原版 getContent 会带上 key=undefined 且缺
-                                // ngmar/sty/exts，服务器对这两种情况均返回 code:7。key 参数经多重验证
-                                // 根本不需要。这里统一修正为已验证成功的格式。
+                                // readchapter 请求规范化（v7）：保留 App 格式 URL 原样。
+                                // 自定义 getContent 已构造 /?sajax=readchapter&h=&bookid=&c=&key=...。
+                                // 这里不再添加 ngmar/sty/exts（那是网页章节页格式，与 App 格式冲突）。
+                                // 仅清理 eval 失败残留的字面量 key=undefined。
                                 if (url.indexOf('readchapter') > -1) {
                                     var sp = u.searchParams;
                                     if (sp.get('key') === 'undefined') sp.delete('key');
-                                    if (!sp.has('ngmar')) sp.set('ngmar', 'readc');
-                                    if (!sp.has('sty')) sp.set('sty', '1');
-                                    if (!sp.has('exts')) sp.set('exts', '');
                                     u.search = sp.toString();
                                     url = u.toString();
                                 }
