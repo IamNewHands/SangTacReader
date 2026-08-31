@@ -19,3 +19,17 @@ app.v2*.js
 app_v2*.html
 stv.ui.js
 download_assets.js
+
+# 反编译/调试临时产物（不提交，体积大）
+_*/
+_*.py
+_*.txt
+_*.js
+_*.html
+_*.css
+_*.zip
+_*.json
+log.txt
+jdk17.zip
+jdk17_dir/
+*脚本.js

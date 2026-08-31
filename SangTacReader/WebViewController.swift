@@ -1,7 +1,7 @@
 import UIKit
 import WebKit
 
-class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIPageViewControllerDataSource {
+class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIPageViewControllerDataSource, UITableViewDataSource, UITableViewDelegate {
 
     var webView: WKWebView!
 
@@ -28,6 +28,17 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private var readerPrevC = ""                 // 上一章 ID（readchapter 提供）
     private var readerNextC = ""                 // 下一章 ID
     private let readerTopBarHeight: CGFloat = 52
+
+    // ===== 安卓阅读器复刻 (v22)：主题 / 排版 / 底栏 =====
+    private var readerThemeIndex = 0             // 当前主题索引（ReaderThemes.all）
+    private var readerTopBar: UIView!            // 顶栏：返回 + 标题 + ⋮
+    private var readerBottomBar: UIView!         // 底栏：进度条 + 章节名 + 功能按钮
+    private var readerProgressSlider: UISlider!  // 章节进度条 (0-1000)
+    private var readerChapterNameLabel: UILabel! // 章节名
+    private var readerSettingsView: UIView!      // 设置面板（主题/字号/行高/对齐/字体）
+    private var readerMenusVisible = true        // 顶/底栏显隐
+    private var readerChapterTitles: [String] = [] // 章节标题列表（目录抽屉）
+    private var readerDrawerView: UIView!        // 目录抽屉（安卓 view-chapterlist）
 
     private var cookieObserver: CookieObserver?
     // ===== 临时调试日志面板 (debug-point D) =====
@@ -854,25 +865,38 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                 }
                             } catch(err) {}
                         } else if (String(xhr._dbgUrl||'').indexOf('getchapterlist') > -1) {
-                            // 拦截章节列表，提取真实章节 ID 数组供上一章/下一章
+                            // 拦截章节列表：data 字符串以 -//- 分章、-/- 分字段（cid=字段1, title=字段2）
                             try {
                                 var clTxt = xhr.responseText || '';
                                 var clObj = JSON.parse(clTxt);
                                 var ids = [];
-                                (function collect(o) {
-                                    if (!o || typeof o !== 'object') return;
-                                    if (Array.isArray(o)) { for (var a=0;a<o.length;a++) collect(o[a]); return; }
-                                    for (var key in o) {
-                                        if (!o.hasOwnProperty(key)) continue;
-                                        var v = o[key];
-                                        if ((key === 'cid' || key === 'id' || key === 'chapter_id' || key === 'chapterid') && (typeof v === 'string' || typeof v === 'number')) {
-                                            ids.push(String(v));
-                                        }
-                                        collect(v);
+                                var titles = [];
+                                var dataStr = (typeof clObj.data === 'string') ? clObj.data : '';
+                                if (dataStr) {
+                                    var parts = dataStr.split('-//-');
+                                    for (var ci = 0; ci < parts.length; ci++) {
+                                        var f = parts[ci].split('-/-');
+                                        var cid = f[1];
+                                        if (cid) { ids.push(String(cid)); titles.push(f[2] || ''); }
                                     }
-                                })(clObj);
+                                }
+                                if (ids.length === 0) {
+                                    // 兜底：递归扫描 JSON 找 cid 类字段
+                                    (function collect(o) {
+                                        if (!o || typeof o !== 'object') return;
+                                        if (Array.isArray(o)) { for (var a=0;a<o.length;a++) collect(o[a]); return; }
+                                        for (var key in o) {
+                                            if (!o.hasOwnProperty(key)) continue;
+                                            var v = o[key];
+                                            if ((key === 'cid' || key === 'id' || key === 'chapter_id' || key === 'chapterid') && (typeof v === 'string' || typeof v === 'number')) {
+                                                ids.push(String(v));
+                                            }
+                                            collect(v);
+                                        }
+                                    })(clObj);
+                                }
                                 if (ids.length > 0 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.chapter) {
-                                    window.webkit.messageHandlers.chapter.postMessage({ tag: 'chapters', payload: JSON.stringify({ ids: ids }) });
+                                    window.webkit.messageHandlers.chapter.postMessage({ tag: 'chapters', payload: JSON.stringify({ ids: ids, titles: titles }) });
                                 }
                             } catch(err) {}
                         }
@@ -1002,7 +1026,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let ids = obj["ids"] as? [String] {
                 readerChapterIds = ids
-                appendDebugLog("[reader] chapter ids stored: \(ids.count)")
+                readerChapterTitles = obj["titles"] as? [String] ?? []
+                appendDebugLog("[reader] chapter ids stored: \(ids.count) titles: \(readerChapterTitles.count)")
             }
             return
         }
@@ -1037,8 +1062,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     }
 
     private func presentReader(html: String, title: String) {
-        if readerContainer == nil { buildReaderUI() }
+        if readerContainer == nil {
+            ReaderFontLoader.registerAll()   // 首次进入阅读器注册安卓正文字体
+            buildReaderUI()
+        }
         readerTitleLabel.text = title.isEmpty ? "阅读器" : title
+        readerChapterNameLabel?.text = title.isEmpty ? "" : title
         // v15：HTML 正文 -> 原生富文本 -> 分页/滚动原生渲染
         readerRawHTML = html
         readerContainer.isHidden = false
@@ -1054,8 +1083,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     // ===== v15 原生阅读器：HTML -> 富文本 / 分页 / 渲染 =====
     private func htmlToAttributed(_ html: String) -> NSAttributedString {
-        // 加基础样式：字号、行高、段落间距、中文字体
-        let styled = "<span style=\"font-size:\(Int(readerFontSize))pt;line-height:1.7;\">\(html)</span>"
+        // 安卓排版：字号、行高1.8、两端对齐、首行缩进、段间距
+        let lh = ReaderDefaultStyle.lineHeight
+        let styled = "<span style=\"font-size:\(Int(readerFontSize))pt;line-height:\(lh);text-align:justify;text-indent:\(Int(ReaderDefaultStyle.textIndent))px;\">\(html)</span>"
         guard let data = styled.data(using: .utf8),
               let attr = try? NSAttributedString(data: data,
                                                  options: [.documentType: NSAttributedString.DocumentType.html,
@@ -1063,26 +1093,52 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                                  documentAttributes: nil) else {
             return NSAttributedString(string: html, attributes: baseTextAttrs())
         }
-        return attr
+        let mutable = NSMutableAttributedString(attributedString: attr)
+        // 全文统一字体（含富文本可能带来的系统字体差异）
+        mutable.addAttribute(.font, value: ReaderFontLoader.font(family: ReaderDefaultStyle.fontFamily, size: readerFontSize), range: NSRange(location: 0, length: mutable.length))
+        mutable.addAttribute(.foregroundColor, value: currentReaderTheme().textColor, range: NSRange(location: 0, length: mutable.length))
+        // 段间距：基于段落文本应用 paragraph spacing
+        mutable.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: mutable.length)) { value, range, _ in
+            let ps = ((value as? NSParagraphStyle) ?? NSParagraphStyle.default).mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+            ps.alignment = .justified
+            ps.lineSpacing = (lh - 1.0) * readerFontSize
+            ps.paragraphSpacing = ReaderDefaultStyle.paragraphSpacing
+            ps.firstLineHeadIndent = ReaderDefaultStyle.textIndent
+            mutable.addAttribute(.paragraphStyle, value: ps, range: range)
+        }
+        return mutable
     }
 
     private func baseTextAttrs() -> [NSAttributedString.Key: Any] {
-        let fg = readerIsNight ? UIColor(white: 0.85, alpha: 1) : UIColor(white: 0.15, alpha: 1)
+        let theme = currentReaderTheme()
         return [
-            .font: UIFont.systemFont(ofSize: readerFontSize),
-            .foregroundColor: fg
+            .font: ReaderFontLoader.font(family: ReaderDefaultStyle.fontFamily, size: readerFontSize),
+            .foregroundColor: theme.textColor,
+            .paragraphStyle: {
+                let ps = NSMutableParagraphStyle()
+                ps.alignment = .justified
+                ps.lineSpacing = (ReaderDefaultStyle.lineHeight - 1.0) * readerFontSize
+                ps.paragraphSpacing = ReaderDefaultStyle.paragraphSpacing
+                ps.firstLineHeadIndent = ReaderDefaultStyle.textIndent
+                return ps
+            }()
         ]
     }
 
     // 把富文本渲染进当前模式（分页/滚动），并应用主题
     private func renderReaderContent(_ attr: NSAttributedString) {
-        let bg = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
-        readerContainer.backgroundColor = bg
+        let theme = currentReaderTheme()
+        readerContainer.backgroundColor = theme.backgroundColor
         if readerModeIsPaged {
             buildPagedContent(attr)
         } else {
             buildScrollContent(attr)
         }
+    }
+
+    private func currentReaderTheme() -> ReaderTheme {
+        let i = min(max(readerThemeIndex, 0), ReaderThemes.all.count - 1)
+        return ReaderThemes.all[i]
     }
 
     // 滚动模式：原生 UITextView
@@ -1091,14 +1147,15 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerPageVC = nil
         readerContentHolder.isHidden = false
         guard let tv = readerTextView else { return }
+        let theme = currentReaderTheme()
         tv.attributedText = attr
         tv.isEditable = false
         tv.isSelectable = true
         tv.isScrollEnabled = true
-        tv.backgroundColor = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
-        tv.textColor = readerIsNight ? UIColor(white: 0.85, alpha: 1) : UIColor(white: 0.15, alpha: 1)
-        tv.font = UIFont.systemFont(ofSize: readerFontSize)
-        tv.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 44, right: 16)
+        tv.backgroundColor = theme.backgroundColor
+        tv.textColor = theme.textColor
+        tv.font = ReaderFontLoader.font(family: ReaderDefaultStyle.fontFamily, size: readerFontSize)
+        tv.textContainerInset = UIEdgeInsets(top: ReaderDefaultStyle.padding, left: ReaderDefaultStyle.padding, bottom: 44, right: ReaderDefaultStyle.padding)
     }
 
     // 分页模式：UIPageViewController，每页一个 UITextView 显示一个分页切片
@@ -1106,7 +1163,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerContentHolder.isHidden = true
         let vc = UIPageViewController(transitionStyle: .pageCurl, navigationOrientation: .horizontal, options: nil)
         vc.dataSource = self
-        vc.view.backgroundColor = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        vc.view.backgroundColor = currentReaderTheme().backgroundColor
         vc.view.translatesAutoresizingMaskIntoConstraints = false
         if let old = readerPageVC {
             old.view.removeFromSuperview()
@@ -1116,7 +1173,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             vc.view.topAnchor.constraint(equalTo: readerContainer.topAnchor, constant: readerTopBarHeight + view.safeAreaInsets.top),
             vc.view.leadingAnchor.constraint(equalTo: readerContainer.leadingAnchor),
             vc.view.trailingAnchor.constraint(equalTo: readerContainer.trailingAnchor),
-            vc.view.bottomAnchor.constraint(equalTo: readerContainer.bottomAnchor, constant: -(44 + view.safeAreaInsets.bottom))
+            vc.view.bottomAnchor.constraint(equalTo: readerContainer.bottomAnchor, constant: -(96 + view.safeAreaInsets.bottom))
         ])
         readerPageVC = vc
         paginateText(attr)
@@ -1130,7 +1187,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerPages.removeAll()
         readerPageOffset = 0
         let pageWidth = max(readerContainer.bounds.width - 32, 50)
-        let pageHeight = max(readerContainer.bounds.height - readerTopBarHeight - 44 - view.safeAreaInsets.top - view.safeAreaInsets.bottom, 50)
+        let pageHeight = max(readerContainer.bounds.height - readerTopBarHeight - 96 - view.safeAreaInsets.top - view.safeAreaInsets.bottom, 50)
 
         let storage = NSTextStorage(attributedString: attr)
         let layout = NSLayoutManager()
@@ -1163,10 +1220,11 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         guard index >= 0 && index < readerPages.count else { return nil }
         let pvc = ReaderPageViewController()
         pvc.pageIndex = index
-        let bg = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        let theme = currentReaderTheme()
         pvc.attributedText = readerPages[index]
-        pvc.pageBackground = bg
+        pvc.pageBackground = theme.backgroundColor
         pvc.fontSize = readerFontSize
+        pvc.textColor = theme.textColor
         return pvc
     }
 
@@ -1236,7 +1294,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     private func buildReaderUI() {
         let container = UIView()
-        container.backgroundColor = .black
+        container.backgroundColor = currentReaderTheme().backgroundColor
         container.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(container)
         NSLayoutConstraint.activate([
@@ -1247,15 +1305,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         ])
         container.isHidden = true
 
-        // 顶栏：关闭 | 标题 | 上一章/下一章
+        // ===== 顶栏（安卓 page-readchapter.titlebar）：返回 | 标题 | ⋮ =====
         let topBar = UIView()
-        topBar.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        topBar.backgroundColor = UIColor.black.withAlphaComponent(0.22)
         topBar.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(topBar)
+        readerTopBar = topBar
 
         let closeBtn = UIButton(type: .system)
-        closeBtn.setTitle("✕ 返回", for: .normal)
-        closeBtn.setTitleColor(.white, for: .normal)
+        closeBtn.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        closeBtn.tintColor = .white
         closeBtn.addTarget(self, action: #selector(readerCloseTapped), for: .touchUpInside)
         closeBtn.translatesAutoresizingMaskIntoConstraints = false
         topBar.addSubview(closeBtn)
@@ -1270,19 +1329,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         topBar.addSubview(titleLbl)
         readerTitleLabel = titleLbl
 
-        let prevBtn = UIButton(type: .system)
-        prevBtn.setTitle("←上", for: .normal)
-        prevBtn.setTitleColor(.white, for: .normal)
-        prevBtn.addTarget(self, action: #selector(readerPrevTapped), for: .touchUpInside)
-        prevBtn.translatesAutoresizingMaskIntoConstraints = false
-        topBar.addSubview(prevBtn)
-
-        let nextBtn = UIButton(type: .system)
-        nextBtn.setTitle("下→", for: .normal)
-        nextBtn.setTitleColor(.white, for: .normal)
-        nextBtn.addTarget(self, action: #selector(readerNextTapped), for: .touchUpInside)
-        nextBtn.translatesAutoresizingMaskIntoConstraints = false
-        topBar.addSubview(nextBtn)
+        let menuBtn = UIButton(type: .system)
+        menuBtn.setImage(UIImage(systemName: "ellipsis"), for: .normal)
+        menuBtn.tintColor = .white
+        menuBtn.addTarget(self, action: #selector(readerShowDrawer), for: .touchUpInside)
+        menuBtn.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(menuBtn)
 
         NSLayoutConstraint.activate([
             topBar.topAnchor.constraint(equalTo: container.topAnchor),
@@ -1292,25 +1344,23 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
             closeBtn.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 8),
             closeBtn.centerYAnchor.constraint(equalTo: topBar.bottomAnchor, constant: -(readerTopBarHeight / 2)),
-            closeBtn.widthAnchor.constraint(equalToConstant: 70),
+            closeBtn.widthAnchor.constraint(equalToConstant: 44),
+            closeBtn.heightAnchor.constraint(equalToConstant: 44),
 
-            prevBtn.leadingAnchor.constraint(equalTo: closeBtn.trailingAnchor, constant: 4),
-            prevBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor),
-            prevBtn.widthAnchor.constraint(equalToConstant: 52),
+            menuBtn.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -8),
+            menuBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor),
+            menuBtn.widthAnchor.constraint(equalToConstant: 44),
+            menuBtn.heightAnchor.constraint(equalToConstant: 44),
 
-            nextBtn.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -8),
-            nextBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor),
-            nextBtn.widthAnchor.constraint(equalToConstant: 52),
-
-            titleLbl.leadingAnchor.constraint(equalTo: prevBtn.trailingAnchor, constant: 4),
-            titleLbl.trailingAnchor.constraint(equalTo: nextBtn.leadingAnchor, constant: -4),
+            titleLbl.leadingAnchor.constraint(equalTo: closeBtn.trailingAnchor, constant: 4),
+            titleLbl.trailingAnchor.constraint(equalTo: menuBtn.leadingAnchor, constant: -4),
             titleLbl.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor)
         ])
 
-        // 正文原生容器（v15）：滚动模式 UITextView；分页模式由 UIPageViewController 承载
+        // ===== 正文容器（滚动模式 UITextView；分页模式 UIPageViewController）=====
         let holder = UIView()
         holder.translatesAutoresizingMaskIntoConstraints = false
-        holder.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        holder.backgroundColor = currentReaderTheme().backgroundColor
         container.addSubview(holder)
         NSLayoutConstraint.activate([
             holder.topAnchor.constraint(equalTo: topBar.bottomAnchor),
@@ -1325,10 +1375,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         tv.isSelectable = true
         tv.isScrollEnabled = true
         tv.showsVerticalScrollIndicator = false
-        tv.font = UIFont.systemFont(ofSize: readerFontSize)
-        tv.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
-        tv.textColor = UIColor(white: 0.15, alpha: 1)
-        tv.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 44, right: 16)
+        tv.font = ReaderFontLoader.font(family: ReaderDefaultStyle.fontFamily, size: readerFontSize)
+        tv.backgroundColor = currentReaderTheme().backgroundColor
+        tv.textColor = currentReaderTheme().textColor
+        tv.textContainerInset = UIEdgeInsets(top: ReaderDefaultStyle.padding, left: ReaderDefaultStyle.padding, bottom: 44, right: ReaderDefaultStyle.padding)
         holder.addSubview(tv)
         NSLayoutConstraint.activate([
             tv.topAnchor.constraint(equalTo: holder.topAnchor),
@@ -1338,79 +1388,301 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         ])
         readerTextView = tv
 
-        // 阅读设置条（底部）：字号-/A /A+ /夜间 /白天
-        let settingsBar = UIView()
-        settingsBar.backgroundColor = UIColor(white: 0.12, alpha: 1)
-        settingsBar.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(settingsBar)
-        let fontDown = UIButton(type: .system)
-        fontDown.setTitle("A-", for: .normal)
-        fontDown.setTitleColor(.white, for: .normal)
-        fontDown.addTarget(self, action: #selector(readerFontDown), for: .touchUpInside)
-        fontDown.translatesAutoresizingMaskIntoConstraints = false
-        settingsBar.addSubview(fontDown)
+        // 点击正文中部切换菜单显隐（安卓 menuTapMode centerlr）
+        let tap = UITapGestureRecognizer(target: self, action: #selector(readerToggleMenus))
+        holder.addGestureRecognizer(tap)
 
-        let fontUp = UIButton(type: .system)
-        fontUp.setTitle("A+", for: .normal)
-        fontUp.setTitleColor(.white, for: .normal)
-        fontUp.addTarget(self, action: #selector(readerFontUp), for: .touchUpInside)
-        fontUp.translatesAutoresizingMaskIntoConstraints = false
-        settingsBar.addSubview(fontUp)
+        // ===== 底栏（安卓 page-readchapter.bottombar）：进度条 + 章节名 + 功能按钮 =====
+        buildReaderBottomBar(in: container)
 
-        let nightBtn = UIButton(type: .system)
-        nightBtn.setTitle("🌙夜间", for: .normal)
-        nightBtn.setTitleColor(.white, for: .normal)
-        nightBtn.addTarget(self, action: #selector(readerNightToggle), for: .touchUpInside)
-        nightBtn.translatesAutoresizingMaskIntoConstraints = false
-        settingsBar.addSubview(nightBtn)
-
-        let dayBtn = UIButton(type: .system)
-        dayBtn.setTitle("☀白天", for: .normal)
-        dayBtn.setTitleColor(.white, for: .normal)
-        dayBtn.addTarget(self, action: #selector(readerDayMode), for: .touchUpInside)
-        dayBtn.translatesAutoresizingMaskIntoConstraints = false
-        settingsBar.addSubview(dayBtn)
-
-        let modeBtn = UIButton(type: .system)
-        modeBtn.setTitle("翻页", for: .normal)
-        modeBtn.setTitleColor(.white, for: .normal)
-        modeBtn.addTarget(self, action: #selector(readerToggleMode), for: .touchUpInside)
-        modeBtn.translatesAutoresizingMaskIntoConstraints = false
-        settingsBar.addSubview(modeBtn)
-
-        NSLayoutConstraint.activate([
-            settingsBar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            settingsBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            settingsBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            settingsBar.heightAnchor.constraint(equalToConstant: 44 + view.safeAreaInsets.bottom),
-
-            fontDown.leadingAnchor.constraint(equalTo: settingsBar.leadingAnchor, constant: 16),
-            fontDown.topAnchor.constraint(equalTo: settingsBar.topAnchor, constant: 8),
-            fontDown.widthAnchor.constraint(equalToConstant: 56),
-            fontDown.heightAnchor.constraint(equalToConstant: 30),
-
-            fontUp.leadingAnchor.constraint(equalTo: fontDown.trailingAnchor, constant: 8),
-            fontUp.topAnchor.constraint(equalTo: fontDown.topAnchor),
-            fontUp.widthAnchor.constraint(equalToConstant: 56),
-            fontUp.heightAnchor.constraint(equalToConstant: 30),
-
-            nightBtn.trailingAnchor.constraint(equalTo: modeBtn.leadingAnchor, constant: -8),
-            nightBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
-            nightBtn.widthAnchor.constraint(equalToConstant: 72),
-
-            modeBtn.trailingAnchor.constraint(equalTo: dayBtn.leadingAnchor, constant: -8),
-            modeBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
-            modeBtn.widthAnchor.constraint(equalToConstant: 60),
-
-            dayBtn.trailingAnchor.constraint(equalTo: settingsBar.trailingAnchor, constant: -16),
-            dayBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
-            dayBtn.widthAnchor.constraint(equalToConstant: 72)
-        ])
-
-        // holder 底部接到 settingsBar.top，避免被设置条遮挡
-        holder.bottomAnchor.constraint(equalTo: settingsBar.topAnchor).isActive = true
+        // holder 底部接到底栏 top
+        holder.bottomAnchor.constraint(equalTo: readerBottomBar.topAnchor).isActive = true
 
         readerContainer = container
+    }
+
+    // 底栏：进度条 + 章节名 + 上章/下章/评论/朗读/设置 五按钮
+    private func buildReaderBottomBar(in container: UIView) {
+        let bar = UIView()
+        bar.backgroundColor = UIColor.black.withAlphaComponent(0.22)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            bar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 96 + view.safeAreaInsets.bottom)
+        ])
+        readerBottomBar = bar
+
+        // 进度条（安卓 chapterprogress，0-1000）
+        let slider = UISlider()
+        slider.minimumValue = 0
+        slider.maximumValue = 1000
+        slider.value = 0
+        slider.tintColor = .systemBlue
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.addTarget(self, action: #selector(readerProgressChanged(_:)), for: .valueChanged)
+        bar.addSubview(slider)
+        readerProgressSlider = slider
+
+        // 章节名
+        let nameLbl = UILabel()
+        nameLbl.textColor = .white
+        nameLbl.font = .systemFont(ofSize: 13)
+        nameLbl.numberOfLines = 1
+        nameLbl.lineBreakMode = .byTruncatingTail
+        nameLbl.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(nameLbl)
+        readerChapterNameLabel = nameLbl
+
+        // 功能按钮行：上章 | 下章 | 评论 | 朗读 | 设置
+        let buttons: [(String, Selector)] = [
+            ("chevron.left", #selector(readerPrevTapped)),
+            ("chevron.right", #selector(readerNextTapped)),
+            ("bubble.left", #selector(readerCommentTapped)),
+            ("speaker.wave.2", #selector(readerSpeakTapped)),
+            ("gearshape", #selector(readerMenuTapped)),
+        ]
+        var prevBtn: UIButton?
+        for (icon, sel) in buttons {
+            let b = UIButton(type: .system)
+            b.setImage(UIImage(systemName: icon), for: .normal)
+            b.tintColor = .white
+            b.addTarget(self, action: sel, for: .touchUpInside)
+            b.translatesAutoresizingMaskIntoConstraints = false
+            bar.addSubview(b)
+            NSLayoutConstraint.activate([
+                b.topAnchor.constraint(equalTo: nameLbl.bottomAnchor, constant: 6),
+                b.widthAnchor.constraint(equalToConstant: 52),
+                b.heightAnchor.constraint(equalToConstant: 40)
+            ])
+            if let prev = prevBtn {
+                b.leadingAnchor.constraint(equalTo: prev.trailingAnchor).isActive = true
+            } else {
+                b.leadingAnchor.constraint(equalTo: bar.leadingAnchor).isActive = true
+            }
+            prevBtn = b
+        }
+
+        NSLayoutConstraint.activate([
+            slider.topAnchor.constraint(equalTo: bar.topAnchor, constant: 6),
+            slider.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
+            slider.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
+
+            nameLbl.topAnchor.constraint(equalTo: slider.bottomAnchor, constant: 4),
+            nameLbl.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
+            nameLbl.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -16),
+        ])
+    }
+
+    // 设置面板（安卓 view-stylesetting）：12 主题色块 + 字号 / 行高 / 对齐 / 字体
+    private func buildReaderSettingsView() {
+        let panel = UIView()
+        panel.backgroundColor = UIColor.black.withAlphaComponent(0.85)
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.isHidden = true
+        view.addSubview(panel)
+        NSLayoutConstraint.activate([
+            panel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            panel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            panel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            panel.heightAnchor.constraint(equalToConstant: 300 + view.safeAreaInsets.bottom)
+        ])
+        readerSettingsView = panel
+
+        let title = UILabel()
+        title.text = "样式设置"
+        title.textColor = .white
+        title.font = .boldSystemFont(ofSize: 15)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(title)
+
+        // 12 主题色块横向可滚
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(scroll)
+
+        var prevSwatch: UIView?
+        for (i, t) in ReaderThemes.all.enumerated() {
+            let sw = UIView()
+            sw.backgroundColor = t.backgroundColor
+            sw.layer.borderWidth = (i == readerThemeIndex) ? 3 : 1
+            sw.layer.borderColor = (i == readerThemeIndex) ? UIColor.systemBlue.cgColor : UIColor.white.cgColor
+            sw.layer.cornerRadius = 6
+            sw.tag = i
+            sw.translatesAutoresizingMaskIntoConstraints = false
+            let tap = UITapGestureRecognizer(target: self, action: #selector(readerThemeTapped(_:)))
+            sw.addGestureRecognizer(tap)
+            scroll.addSubview(sw)
+            NSLayoutConstraint.activate([
+                sw.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 4),
+                sw.widthAnchor.constraint(equalToConstant: 44),
+                sw.heightAnchor.constraint(equalToConstant: 44)
+            ])
+            if let p = prevSwatch {
+                sw.leadingAnchor.constraint(equalTo: p.trailingAnchor, constant: 10).isActive = true
+            } else {
+                sw.leadingAnchor.constraint(equalTo: scroll.leadingAnchor, constant: 4).isActive = true
+            }
+            prevSwatch = sw
+        }
+        if let last = prevSwatch {
+            last.trailingAnchor.constraint(equalTo: scroll.trailingAnchor, constant: -4).isActive = true
+        }
+
+        // 字号行
+        let fontRow = UIStackView()
+        fontRow.axis = .horizontal
+        fontRow.spacing = 12
+        fontRow.alignment = .center
+        fontRow.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(fontRow)
+
+        let minusBtn = makeSettingsButton(title: "A-", action: #selector(readerFontDown))
+        let sizeLbl = UILabel()
+        sizeLbl.text = "\(Int(readerFontSize))"
+        sizeLbl.textColor = .white
+        sizeLbl.font = .systemFont(ofSize: 14)
+        sizeLbl.tag = 9001
+        sizeLbl.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        sizeLbl.textAlignment = .center
+        let plusBtn = makeSettingsButton(title: "A+", action: #selector(readerFontUp))
+        fontRow.addArrangedSubview(minusBtn)
+        fontRow.addArrangedSubview(sizeLbl)
+        fontRow.addArrangedSubview(plusBtn)
+
+        NSLayoutConstraint.activate([
+            title.topAnchor.constraint(equalTo: panel.topAnchor, constant: 16),
+            title.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+
+            scroll.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 8),
+            scroll.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -8),
+            scroll.heightAnchor.constraint(equalToConstant: 56),
+
+            fontRow.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 16),
+            fontRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+        ])
+
+        // 主题切换：更新选中框 + 重渲染
+    }
+
+    private func makeSettingsButton(title: String, action: Selector) -> UIButton {
+        let b = UIButton(type: .system)
+        b.setTitle(title, for: .normal)
+        b.setTitleColor(.white, for: .normal)
+        b.titleLabel?.font = .boldSystemFont(ofSize: 15)
+        b.backgroundColor = UIColor.white.withAlphaComponent(0.15)
+        b.layer.cornerRadius = 6
+        b.addTarget(self, action: action, for: .touchUpInside)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        return b
+    }
+
+    // 点击主题色块
+    @objc private func readerThemeTapped(_ tap: UITapGestureRecognizer) {
+        guard let sw = tap.view else { return }
+        readerThemeIndex = sw.tag
+        // 刷新色块选中框
+        if let scroll = readerSettingsView?.subviews.compactMap({ $0 as? UIScrollView }).first {
+            for v in scroll.subviews {
+                if let s = v as? UIView, s.tag < ReaderThemes.all.count {
+                    s.layer.borderWidth = (s.tag == readerThemeIndex) ? 3 : 1
+                    s.layer.borderColor = (s.tag == readerThemeIndex) ? UIColor.systemBlue.cgColor : UIColor.white.cgColor
+                }
+            }
+        }
+        applyReaderThemeChange()
+    }
+
+    // 主题/字号变化后统一重渲染
+    private func applyReaderThemeChange() {
+        // 更新容器/正文背景
+        renderReaderContent(readerAttributed ?? NSAttributedString(string: ""))
+    }
+
+    // 顶栏 ⋮ -> 打开/关闭目录抽屉
+    @objc private func readerShowDrawer() {
+        if readerDrawerView == nil {
+            buildReaderDrawerView()
+        }
+        let d = readerDrawerView!
+        let showing = d.isHidden
+        d.isHidden = !showing
+        if showing { view.bringSubviewToFront(d) }
+    }
+
+    // 目录抽屉：侧滑面板，列出全部章节，点击跳转
+    private func buildReaderDrawerView() {
+        let drawer = UIView()
+        drawer.backgroundColor = currentReaderTheme().backgroundColor
+        drawer.translatesAutoresizingMaskIntoConstraints = false
+        drawer.isHidden = true
+        view.addSubview(drawer)
+        NSLayoutConstraint.activate([
+            drawer.topAnchor.constraint(equalTo: view.topAnchor),
+            drawer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            drawer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            drawer.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.85)
+        ])
+        readerDrawerView = drawer
+
+        let header = UILabel()
+        header.text = "目录"
+        header.font = .boldSystemFont(ofSize: 16)
+        header.textColor = currentReaderTheme().textColor
+        header.translatesAutoresizingMaskIntoConstraints = false
+        drawer.addSubview(header)
+
+        let closeBtn = UIButton(type: .system)
+        closeBtn.setImage(UIImage(systemName: "xmark"), for: .normal)
+        closeBtn.tintColor = currentReaderTheme().textColor
+        closeBtn.addTarget(self, action: #selector(readerShowDrawer), for: .touchUpInside)
+        closeBtn.translatesAutoresizingMaskIntoConstraints = false
+        drawer.addSubview(closeBtn)
+
+        let tableView = UITableView()
+        tableView.backgroundColor = currentReaderTheme().backgroundColor
+        tableView.translatesAutoresizingMaskIntoConstraints = false
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.tag = 7001
+        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "chap")
+        drawer.addSubview(tableView)
+
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: drawer.topAnchor, constant: 16 + view.safeAreaInsets.top),
+            header.leadingAnchor.constraint(equalTo: drawer.leadingAnchor, constant: 16),
+
+            closeBtn.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            closeBtn.trailingAnchor.constraint(equalTo: drawer.trailingAnchor, constant: -16),
+            closeBtn.widthAnchor.constraint(equalToConstant: 40),
+            closeBtn.heightAnchor.constraint(equalToConstant: 40),
+
+            tableView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            tableView.leadingAnchor.constraint(equalTo: drawer.leadingAnchor),
+            tableView.trailingAnchor.constraint(equalTo: drawer.trailingAnchor),
+            tableView.bottomAnchor.constraint(equalTo: drawer.bottomAnchor)
+        ])
+    }
+
+    // 点击目录某章 -> 导航到该章
+    private func readerJumpToChapter(index: Int) {
+        guard index >= 0 && index < readerChapterIds.count else { return }
+        let target = readerChapterIds[index]
+        guard let info = readerLastData else { return }
+        readerExpectedC = target
+        readerLoadedC = nil
+        let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(target)/"
+        appendDebugLog("[reader] jump to \(chapUrl)")
+        readerDrawerView?.isHidden = true
+        if let url = URL(string: chapUrl) {
+            webView.load(URLRequest(url: url))
+        }
     }
 
     // 翻页模式切换：分页 <-> 滚动
@@ -1419,6 +1691,53 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         appendDebugLog("[reader] mode -> \(readerModeIsPaged ? "paged" : "scroll")")
         if let attr = readerAttributed {
             renderReaderContent(attr)
+        }
+    }
+
+    // 顶栏 ⋮ 或底栏"设置"按钮 -> 显示设置面板
+    @objc private func readerMenuTapped() {
+        if readerSettingsView == nil {
+            buildReaderSettingsView()
+        }
+        let s = readerSettingsView!
+        let showing = s.isHidden
+        s.isHidden = !showing
+        if showing { view.bringSubviewToFront(s) }
+    }
+
+    // 点击正文中部切换顶/底栏显隐（安卓 menuTapMode）
+    @objc private func readerToggleMenus() {
+        readerMenusVisible.toggle()
+        let target: CGFloat = readerMenusVisible ? 0 : -80
+        UIView.animate(withDuration: 0.25) {
+            if let tb = self.readerTopBar { tb.alpha = self.readerMenusVisible ? 1 : 0 }
+            if let bb = self.readerBottomBar { bb.transform = CGAffineTransform(translationX: 0, y: self.readerMenusVisible ? 0 : 96) }
+            _ = target
+        }
+        // 隐藏设置面板
+        if let s = readerSettingsView, !s.isHidden { s.isHidden = true }
+    }
+
+    // 评论占位（安卓 btncomment）
+    @objc private func readerCommentTapped() {
+        appendDebugLog("[reader] comment tapped")
+    }
+
+    // 朗读占位（安卓 btnspeak）
+    @objc private func readerSpeakTapped() {
+        appendDebugLog("[reader] speak tapped")
+    }
+
+    // 进度条拖动 -> 跳到章节对应位置（安卓 gotoProgress）
+    @objc private func readerProgressChanged(_ slider: UISlider) {
+        let p = CGFloat(slider.value) / 1000.0
+        appendDebugLog("[reader] progress \(Int(slider.value))")
+        // 滚动模式：滚动到正文对应位置
+        guard let tv = readerTextView, tv.isScrollEnabled else { return }
+        let h = tv.contentSize.height - tv.bounds.height
+        if h > 0 {
+            let offset = CGPoint(x: 0, y: h * p)
+            tv.setContentOffset(offset, animated: false)
         }
     }
 
@@ -1434,25 +1753,31 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerGo(delta: 1)
     }
 
-    // 上一章/下一章：优先用 readchapter 提供的 prev/next，其次用章节列表，最后 c±1
+    // 上一章/下一章：优先用章节列表(readerChapterIds)定位，其次 readchapter 的 prev/next，最后 c±1
     private func readerGo(delta: Int) {
         guard let info = readerLastData else {
             appendDebugLog("[reader] no last data for nav")
             return
         }
+        appendDebugLog("[reader] nav(+\(delta)) c=\(info.c) chapterIds=\(readerChapterIds.count) prev=\(readerPrevC) next=\(readerNextC)")
         var newC: String?
-        // 1) readchapter 提供的 prev/next
-        let direct = delta < 0 ? readerPrevC : readerNextC
-        if !direct.isEmpty {
-            newC = direct
-        } else if !readerChapterIds.isEmpty {
-            // 2) 章节列表顺序导航
+        // 1) 章节列表顺序导航（最可靠：getchapterlist 提供的真实有序章节）
+        if !readerChapterIds.isEmpty {
             if let idx = readerChapterIds.firstIndex(of: info.c) {
                 let ni = idx + delta
                 if ni >= 0 && ni < readerChapterIds.count {
                     newC = readerChapterIds[ni]
+                } else {
+                    appendDebugLog("[reader] nav out of range idx=\(idx) ni=\(ni)")
                 }
+            } else {
+                appendDebugLog("[reader] c=\(info.c) not in chapterIds, try fallback")
             }
+        }
+        // 2) readchapter 提供的 prev/next（仅当列表未命中时）
+        if newC == nil {
+            let direct = delta < 0 ? readerPrevC : readerNextC
+            if !direct.isEmpty { newC = direct }
         }
         if newC == nil {
             // 3) 兜底 c±1
@@ -1487,6 +1812,11 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private func adjustReaderFont(delta: CGFloat) {
         readerFontSize = max(12, min(32, readerFontSize + delta))
         appendDebugLog("[reader] font=\(readerFontSize)")
+        // 同步设置面板字号数字
+        if let panel = readerSettingsView,
+           let lbl = panel.subviews.flatMap({ $0.subviews }).compactMap({ $0 as? UILabel }).first(where: { $0.tag == 9001 }) {
+            lbl.text = "\(Int(readerFontSize))"
+        }
         if !readerRawHTML.isEmpty {
             let newAttr = htmlToAttributed(readerRawHTML)
             readerAttributed = newAttr
@@ -1495,14 +1825,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     }
 
     @objc private func readerNightToggle() {
-        readerIsNight = true
-        appendDebugLog("[reader] night")
+        // 夜间 = 深色主题（index 10, 11 为深底）
+        readerThemeIndex = 10
+        appendDebugLog("[reader] night theme idx=\(readerThemeIndex)")
         if let attr = readerAttributed { renderReaderContent(attr) }
     }
 
     @objc private func readerDayMode() {
-        readerIsNight = false
-        appendDebugLog("[reader] day")
+        // 白天 = 浅米色主题（index 0）
+        readerThemeIndex = 0
+        appendDebugLog("[reader] day theme idx=\(readerThemeIndex)")
         if let attr = readerAttributed { renderReaderContent(attr) }
     }
 
@@ -1527,6 +1859,40 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         return makePageVC(index: pvc.pageIndex + 1)
     }
 
+    // ===== UITableViewDataSource / Delegate（目录抽屉）=====
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        return readerChapterTitles.isEmpty ? readerChapterIds.count : readerChapterTitles.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "chap", for: indexPath)
+        let i = indexPath.row
+        let title: String
+        if !readerChapterTitles.isEmpty && i < readerChapterTitles.count {
+            title = readerChapterTitles[i].isEmpty ? "Chương \(readerChapterIds[i])" : readerChapterTitles[i]
+        } else if i < readerChapterIds.count {
+            title = "Chương \(readerChapterIds[i])"
+        } else {
+            title = "Chương \(i + 1)"
+        }
+        cell.textLabel?.text = title
+        cell.textLabel?.font = .systemFont(ofSize: 14)
+        cell.textLabel?.numberOfLines = 1
+        cell.backgroundColor = currentReaderTheme().backgroundColor
+        cell.textLabel?.textColor = currentReaderTheme().textColor
+        // 高亮当前章节
+        if let info = readerLastData, i < readerChapterIds.count, readerChapterIds[i] == info.c {
+            cell.textLabel?.textColor = .systemBlue
+            cell.textLabel?.font = .boldSystemFont(ofSize: 14)
+        }
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        readerJumpToChapter(index: indexPath.row)
+    }
+
 }
 
 // 分页阅读的一页：原生 UITextView 显示一段富文本
@@ -1535,6 +1901,7 @@ private class ReaderPageViewController: UIViewController {
     var attributedText: NSAttributedString? = nil
     var pageBackground: UIColor = UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
     var fontSize: CGFloat = 18
+    var textColor: UIColor = .black
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -1545,6 +1912,7 @@ private class ReaderPageViewController: UIViewController {
         tv.isSelectable = true
         tv.isScrollEnabled = false
         tv.backgroundColor = pageBackground
+        tv.textColor = textColor
         tv.attributedText = attributedText
         tv.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         tv.textContainer.lineFragmentPadding = 0
