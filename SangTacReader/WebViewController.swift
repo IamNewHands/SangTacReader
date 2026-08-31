@@ -11,6 +11,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private var readerContainer: UIView!
     private var readerTitleLabel: UILabel!
     private var readerLastData: (h: String, bookid: String, c: String)? = nil
+    private var readerExpectedC: String? = nil   // 用户期望的当前章节 ID，过滤章节页迟到/重复上报
+    private var readerLoadedC: String? = nil     // 阅读页已显示的章节 ID
     private let readerTopBarHeight: CGFloat = 52
 
     private var cookieObserver: CookieObserver?
@@ -589,10 +591,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         controller.addUserScript(bridgeScript)
 
-        // ===== 章节页(/truyen/)正文提取脚本 (v13) =====
+        // ===== 章节页(/truyen/)正文提取脚本 (v13.1) =====
         // 整页导航到章节页建立 time:30 会话后，正文由章节页自带逻辑异步加载(readchapter code:0)
         // 渲染进 DOM。本脚本【只读】轮询正文容器，提取 HTML+标题+章节信息，postMessage 给 Swift，
         // 供全屏沉浸阅读页渲染。关键：绝不覆写 XHR.open/send（章节页反爬会检测外部覆写导致 code:7）。
+        // v13.1 修复：v13 提取到的是"点击加载/正在加载"占位 HTML（readchapter code:0 之前），
+        // 不是真正正文。改进：① 正文容器优先；② 就绪判定排除占位符、要求含正文段落 <p>；
+        //   ③ 持续轮询直到正文真正就绪（不因容器非空就停）。
         let chapterExtractJS = """
         (function() {
             if (String(window.location.pathname).indexOf('/truyen/') !== 0) { return; }
@@ -603,12 +608,36 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 try { console.log('[chapter:' + tag + '] ' + String(payload)); } catch(e) {}
             }
             send('onpage', window.location.href);
+            // 正文容器优先；外层容器(#content-container)会包含占位/脚本，放后面作兜底
             var CANDIDATES = [
-                '#content-container', '.contentbox', '#maincontent',
-                '.chapter-content', '#chapter-content', '.chaptertext',
-                '#vcontent', '#reader', '#content', '.content',
-                '#chcontent', '#chapterbody', '.chapter_body', '.chapter__content'
+                '#maincontent', '.contentbox', '#chapter-content', '.chapter-content',
+                '.chaptertext', '#vcontent', '.chapter_body', '.chapter__content',
+                '#chcontent', '#chapterbody', '#content', '#reader',
+                '#content-container', '.content'
             ];
+            var PLACEHOLDER = /Nh\\u1ea5p v\\u00e0o|\\u0110ang t\\u1ea3i|spinner-border|\\u0110ang t\\u1ea3i n\\u1ed9i dung|vui l\\u00f2ng|click.*t\\u1ea3i/i;
+            function textLen(el) {
+                try { return el.innerText.replace(/\\s+/g, ' ').trim().length; } catch(e) { return 0; }
+            }
+            // 就绪判定：排除占位符，要求含正文段落 <p> 或有效文字足够长
+            function isReady(el) {
+                try {
+                    var h = el.innerHTML || '';
+                    if (PLACEHOLDER.test(h)) return false;
+                    var pCount = (h.match(/<p[ >]/g) || []).length;
+                    if (pCount >= 1) return true;
+                    if (textLen(el) > 300) return true;
+                    return false;
+                } catch(e) { return false; }
+            }
+            // 提取真正正文 HTML：若选中容器内含正文段落节点，取其段落；否则用容器自身
+            function extractHTML(el) {
+                try {
+                    var p = el.querySelector('p');
+                    if (p && p.parentElement === el) { return el.innerHTML; }
+                    return el.innerHTML;
+                } catch(e) { return el.innerHTML; }
+            }
             var selState = {};
             var t = setInterval(function() {
                 try {
@@ -618,21 +647,20 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         var sel = CANDIDATES[i];
                         var el;
                         try { el = document.querySelector(sel); } catch(e) { el = null; }
-                        if (!el) { selState[sel] = 'absent'; continue; }
-                        var txt = '';
-                        try { txt = el.innerHTML.replace(/<[^>]+>/g, '').replace(/\\s+/g, ' ').trim(); } catch(e) {}
-                        if (selState[sel] !== 'present') {
-                            selState[sel] = (txt.length > 0 ? 'present:' + txt.length : 'empty');
+                        if (!el) { if (selState[sel] !== 'absent') { selState[sel] = 'absent'; report.push(sel + '=absent'); } continue; }
+                        var ready = isReady(el);
+                        if (!selState[sel] || selState[sel].indexOf('ready') < 0) {
+                            selState[sel] = 'present len=' + textLen(el) + ' p=' + ((el.innerHTML.match(/<p[ >]/g) || []).length) + ' ready=' + ready;
                         }
                         report.push(sel + '=' + selState[sel]);
-                        if (!foundEl && txt.length > 20) { foundEl = el; foundSel = sel; }
+                        if (!foundEl && ready) { foundEl = el; foundSel = sel; }
                     }
                     if (!foundEl) {
                         send('probe', report.join(' | ') + ' | href=' + location.href);
                         return;
                     }
                     clearInterval(t);
-                    var html = foundEl.innerHTML;
+                    var html = extractHTML(foundEl);
                     // 标题
                     var title = '';
                     var tEl = document.querySelector('.chaptername') || document.querySelector('h1') || document.querySelector('#chaptername') || document.querySelector('.chapter-title');
@@ -649,7 +677,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     }));
                 } catch(e) { send('extract-err', String(e)); }
             }, 500);
-            // 验证/加载可能较久，延长等待；即使超时也保留 interval 引用可被 GC
+            // 验证/加载可能较久，延长等待
             setTimeout(function() { clearInterval(t); }, 180000);
         })();
         """
@@ -839,6 +867,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             let c = obj["c"] as? String ?? ""
             let title = obj["title"] as? String ?? ""
             appendDebugLog("[chapter:content-ok] sel=\(obj["sel"] as? String ?? "?") title=\(title) h=\(h) bookid=\(bookid) c=\(c) htmlLen=\(html.count)")
+            // 若用户已翻到其它章节，忽略旧章节的迟到上报，避免阅读页被错误覆盖
+            if let expected = readerExpectedC, !c.isEmpty, c != expected {
+                appendDebugLog("[reader] ignore stale content c=\(c) expected=\(expected)")
+                return
+            }
+            // 同一章节已显示则跳过，避免章节页 reload 导致的重复刷新
+            if readerLoadedC == c && readerContainer != nil && !readerContainer.isHidden {
+                appendDebugLog("[reader] already loaded c=\(c), skip")
+                return
+            }
             readerLastData = (h, bookid, c)
             presentReader(html: html, title: title)
         }
@@ -851,6 +889,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerView.loadHTMLString(page, baseURL: URL(string: "https://sangtacviet.vip"))
         readerContainer.isHidden = false
         view.bringSubviewToFront(readerContainer)
+        if let c = readerLastData?.c { readerLoadedC = c; readerExpectedC = c }
         appendDebugLog("[reader] presented, htmlLen=\(html.count)")
     }
 
@@ -1042,6 +1081,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         var cVal = Int64(info.c) ?? 0
         cVal += Int64(delta)
         let newC = String(cVal)
+        // 更新期望章节，忽略旧章节迟到上报；清空已加载标记以便新章节可 present
+        readerExpectedC = newC
+        readerLoadedC = nil
         let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(newC)/"
         appendDebugLog("[reader] nav to \(chapUrl)")
         // 让底层 webView 导航到章节页

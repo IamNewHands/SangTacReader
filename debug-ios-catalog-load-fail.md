@@ -425,3 +425,36 @@ cookie 相同但结果不同 → 差异在**请求发起的页面环境**（完�
 
 **代码改动**：`SangTacReader/WebViewController.swift`（getContent 导航 + chapterExtractJS + 全屏阅读页）。
 
+---
+
+## v13 结果（log10）：提取到占位 HTML，流程混乱，用户反馈"用不了"
+
+**2026-08-31 log10 分析**：
+- 导航到章节页成功（`[chapter:onpage]`），readchapter 走 code:7(time:30) → code:21 → verifyca → code:0（正文 L278 已拿到）。
+- **但提取脚本在正文就绪前就提取了占位 HTML**：
+  - `[chapter:content]` html 开头是 `#content-container` 内含 `#maincontent`（class=contentbox），内容是 `<center><span class="spinner-border">Nhấp vào để tải chương...</center>`（占位"点击加载/正在加载"）。
+  - 原因：v13 只检测容器非空（`txt.length > 20`），占位文字已有长度 → 立即 clearInterval 提取，永不等到 readchapter code:0 真正正文。
+  - `sel=#content-container`（外层容器）命中，正文其实在 `#maincontent` 内。
+- **阅读页 repeated present**：每次章节页 reload 都触发 presentReader（L104/138/170/184/220/254），覆盖层被反复刷新。
+- **用户反馈**："用不了，而且这样的方式还不如用浏览器"——阅读页显示占位符而非正文。
+
+## v13.1（修复）：就绪判定 + 状态管理
+
+**提取脚本改进**（chapterExtractJS）：
+1. 候选列表**正文容器优先**（`#maincontent`、`.contentbox` 在前，`#content-container` 作兜底）。
+2. **就绪判定 `isReady`**：排除占位符（Nhấp vào/Đang tải/spinner/vui lòng），要求含正文段落 `<p>` 或文字长度 > 300。只有真正正文才上报。
+3. **持续轮询**：不因容器非空就停，直到正文真正就绪。
+
+**Swift 状态管理改进**：
+- 新增 `readerExpectedC`（用户期望章节 ID）：过滤旧章节迟到上报，避免翻页后旧正文覆盖新页。
+- 新增 `readerLoadedC`：同一章已显示则跳过，避免章节页 reload 导致的重复刷新。
+- `readerGo` 翻页时更新 `readerExpectedC`、清空 `readerLoadedC`。
+
+**代码改动**：`SangTacReader/WebViewController.swift`（chapterExtractJS 就绪判定 + reader 状态管理）。
+
+### 待真机验证（v13.1）
+1. 进章节 → 正文应正确提取（`[chapter:content]` html 以 `<p>` 开头，非占位）。
+2. 阅读页只 present 一次（无 repeated）。
+3. 上一章/下一章正常（章节 ID ±1，若书 ID 不连续需从章节页 DOM 提取真实链接）。
+
+
