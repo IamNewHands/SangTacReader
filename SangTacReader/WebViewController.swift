@@ -4,6 +4,10 @@ import WebKit
 class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIPageViewControllerDataSource {
 
     var webView: WKWebView!
+    // v18：隐藏预加载 WKWebView。点章时后台加载章节页建立真实会话，
+    // 拦截其 readchapter 响应上报 Swift 原生渲染，主 webview 不跳转。
+    private var hiddenWebView: WKWebView?
+    private var hiddenLoading: (h: String, bookid: String, c: String)?
 
     // ===== 全屏沉浸阅读页 (v13 -> v15 原生渲染) =====
     // 章节页正文提取后，用原生 UITextView/UIPageViewController 渲染正文，
@@ -1143,103 +1147,99 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         appendDebugLog("[reader] dismissed")
     }
 
-    // ===== 原生直读正文 (v17.1)：点章 -> JS 传 h/bookid/c -> URLSession 直读 =====
-    // log5：从目录页直接 POST 返回 code:7（非浏览器会话）。v16.3 能 code:0 是因为
-    // 那时 WebView 已整页导航章节页建立了 time:30 会话。故这里先用 URLSession
-    // 后台 GET 章节页建立会话/种 cookie，再用同一会话 POST readchapter。
+    // ===== 隐藏预加载章节页 (v18)：点章 -> JS 传 h/bookid/c -> 隐藏 WKWebView 后台加载章节页 =====
+    // log5/log6：纯 URLSession 直读 readchapter 失败（code:7 / code:5-4002），因为该接口被
+    // Cloudflare Turnstile + 页面级会话保护，只有真实页面完整加载才能建立有效会话。
+    // 故这里用隐藏 WKWebView 后台加载章节页（用户无感知，主 webview 不跳转），其页面 JS
+    // 发出 readchapter 被 XHR 拦截捕获 code:0 -> 上报 Swift -> 原生渲染。
     private func nativeReadChapter(h: String, bookid: String, c: String) {
-        appendDebugLog("[nativeRead] h=\(h) bookid=\(bookid) c=\(c)")
+        appendDebugLog("[hiddenLoad] start h=\(h) bookid=\(bookid) c=\(c)")
         guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
-            appendDebugLog("[nativeRead] missing params, abort")
+            appendDebugLog("[hiddenLoad] missing params, abort")
             return
         }
-        let store = webView.configuration.websiteDataStore.httpCookieStore
-        store.getAllCookies { cookies in
-            var cookieDict: [String: String] = [:]
-            for ck in cookies { cookieDict[ck.name] = ck.value }
-            self.fetchChapterBySession(h: h, bookid: bookid, c: c, baseCookie: cookieDict)
-        }
+        hiddenLoading = (h, bookid, c)
+        // 预置期望章节与已读章节，使正文上报能通过 handleChapterMessage 的过滤
+        readerExpectedC = c
+        readerLoadedC = nil
+        ensureHiddenWebView()
+        let chapUrl = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
+        guard let u = URL(string: chapUrl) else { return }
+        var req = URLRequest(url: u)
+        req.setValue(iosUA, forHTTPHeaderField: "User-Agent")
+        // 用目录页作 referer，模拟从书内进入章节
+        req.setValue(webView.url?.absoluteString ?? "https://sangtacviet.vip/", forHTTPHeaderField: "Referer")
+        hiddenWebView?.load(req)
+        appendDebugLog("[hiddenLoad] loading \(chapUrl)")
     }
 
-    private func fetchChapterBySession(h: String, bookid: String, c: String, baseCookie: [String: String]) {
-        var cookieDict = baseCookie
-        func cookieHeader() -> String {
-            cookieDict.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
-        }
-        // 步骤1：后台 GET 章节页建立 time:30 会话
-        let chapUrl = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
-        guard let chapU = URL(string: chapUrl) else { return }
-        var chapReq = URLRequest(url: chapU)
-        chapReq.httpMethod = "GET"
-        chapReq.setValue(self.iosUA, forHTTPHeaderField: "User-Agent")
-        chapReq.setValue(cookieHeader(), forHTTPHeaderField: "Cookie")
-        chapReq.setValue("https://sangtacviet.vip/", forHTTPHeaderField: "Referer")
-        URLSession.shared.dataTask(with: chapReq) { [weak self] data, resp, err in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                if let e = err { self.appendDebugLog("[nativeRead] get-chap err=\(e.localizedDescription)"); return }
-                if let r = resp as? HTTPURLResponse {
-                    // 合并响应种下的 cookie（Set-Cookie）
-                    let headers = r.allHeaderFields as? [String: String] ?? [:]
-                    for (k, v) in headers {
-                        if k.lowercased() == "set-cookie" {
-                            if let eq = v.firstIndex(of: "=") {
-                                let name = String(v[..<eq])
-                                let value = v[v.index(after: eq)...].split(separator: ";").first.map(String.init) ?? ""
-                                cookieDict[name] = value
+    private func ensureHiddenWebView() {
+        if hiddenWebView != nil { return }
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = WKWebsiteDataStore.default()   // 与主 webview 共享 cookie/会话
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        let controller = WKUserContentController()
+        controller.add(self, name: "chapter")   // 复用 chapter handler 上报正文
+        // 精简拦截：捕获章节页 readchapter 响应的 code:0 正文，上报 Swift
+        let trapJS = """
+        (function() {
+            function cn(html) {
+                if (!html) return html;
+                try {
+                    html = html.replace(/<p><span style='color:gray.*?<\\/span><\\/p>/g, '');
+                    html = html.replace(/<i\\b[^>]*\\bt='([^']*)'[^>]*>(.*?)<\\/i>/g, function(m, t){ return t ? '<span>'+t+'</span>' : m; });
+                    html = html.replace(/(?:Vì vấn đề nội dung|không hỗ trợ xem văn bản gốc|由于版权问题)[^<\\n]*/g, '');
+                    return html;
+                } catch(e) { return html; }
+            }
+            var _origOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url, async) {
+                try { this._stvUrl = String(url || ''); } catch(e) {}
+                return _origOpen.apply(this, arguments);
+            };
+            var _origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function(body) {
+                var xhr = this;
+                var url = '';
+                try { url = xhr._stvUrl || xhr._dbgUrl || xhr.responseURL || ''; } catch(e) {}
+                var oldOnload = xhr.onload;
+                xhr.onload = function(e) {
+                    try {
+                        if (url.indexOf('readchapter') > -1) {
+                            var t = xhr.responseText || '';
+                            var o = JSON.parse(t);
+                            if (o && (o.code === '0' || o.code == 0) && typeof o.data === 'string' && o.data.length > 0) {
+                                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.chapter) {
+                                    window.webkit.messageHandlers.chapter.postMessage({
+                                        tag: 'content',
+                                        payload: JSON.stringify({
+                                            h: o.h || '', bookid: o.bookid || '', c: o.c || '',
+                                            title: (o.chaptername || '').trim(), html: cn(o.data),
+                                            prev: o.prev || o.prev_c || '', next: o.next || o.next_c || ''
+                                        })
+                                    });
+                                }
                             }
                         }
-                    }
-                    self.appendDebugLog("[nativeRead] get-chap status=\(r.statusCode) cookies=\(cookieDict.count)")
-                }
-                // 步骤2：POST readchapter 用会话 cookie
-                let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
-                let chapRef = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
-                self.fetchChapterPost(url: base, cookie: cookieHeader(), referer: chapRef, h: h, bookid: bookid, c: c)
-            }
-        }.resume()
-    }
-
-    private func fetchChapterPost(url: String, cookie: String, referer: String, h: String, bookid: String, c: String) {
-        guard let u = URL(string: url) else { return }
-        var req = URLRequest(url: u)
-        req.httpMethod = "POST"
-        req.setValue(self.iosUA, forHTTPHeaderField: "User-Agent")
-        if !cookie.isEmpty { req.setValue(cookie, forHTTPHeaderField: "Cookie") }
-        req.setValue(referer, forHTTPHeaderField: "Referer")
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.httpBody = Data()
-        let start = Date()
-        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                if let e = err {
-                    self.appendDebugLog("[nativeRead] err=\(e.localizedDescription)")
-                    return
-                }
-                guard let d = data, let s = String(data: d, encoding: .utf8) else {
-                    self.appendDebugLog("[nativeRead] no body")
-                    return
-                }
-                let el = String(format: "%.1fs", Date().timeIntervalSince(start))
-                self.appendDebugLog("[nativeRead] \(String(s.prefix(80))) (\(el))")
-                // 解析 code:0 响应
-                guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                      let code = obj["code"] as? String, code == "0",
-                      let raw = obj["data"] as? String, !raw.isEmpty else {
-                    self.appendDebugLog("[nativeRead] not code:0")
-                    return
-                }
-                let title = (obj["chaptername"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let cnHtml = self.toChineseContent(raw)
-                self.readerLastData = (h, bookid, c)
-                self.readerLoadedC = c
-                self.readerExpectedC = c
-                self.appendDebugLog("[nativeRead] code:0 htmlLen=\(cnHtml.count)")
-                self.presentReader(html: cnHtml, title: title)
-            }
-        }
-        task.resume()
+                    } catch(err) {}
+                    if (oldOnload) { try { oldOnload.apply(this, arguments); } catch(e){} }
+                };
+                return _origSend.apply(this, arguments);
+            };
+        })();
+        """
+        let trapScript = WKUserScript(source: trapJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        controller.addUserScript(trapScript)
+        config.userContentController = controller
+        let hw = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: config)
+        hw.navigationDelegate = self
+        hw.isHidden = true
+        hw.alpha = 0
+        hw.customUserAgent = iosUA
+        view.addSubview(hw)   // 需在视图层级内以保持活跃
+        hiddenWebView = hw
+        appendDebugLog("[hiddenLoad] hidden webview created")
     }
 
     // v17：Swift 版中文化（搬移 JS toChineseContent）——移除顶部灰色提示、<i>注释->中文t值、移除版权提示
@@ -1517,10 +1517,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerLoadedC = nil
         let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(target)/"
         appendDebugLog("[reader] nav to \(chapUrl)")
-        // 让底层 webView 导航到章节页
+        // v18：用隐藏 webview 后台加载新章节（保持原生阅读器覆盖，用户无感知跳转）
+        hiddenLoading = (info.h, info.bookid, target)
+        ensureHiddenWebView()
         if let url = URL(string: chapUrl) {
-            webView.load(URLRequest(url: url))
-            // 等章节页提取后 presentReader 会再次调用
+            var req = URLRequest(url: url)
+            req.setValue(iosUA, forHTTPHeaderField: "User-Agent")
+            req.setValue(webView.url?.absoluteString ?? "https://sangtacviet.vip/", forHTTPHeaderField: "Referer")
+            hiddenWebView?.load(req)
         }
     }
 
