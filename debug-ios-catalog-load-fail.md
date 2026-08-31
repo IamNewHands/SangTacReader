@@ -485,6 +485,33 @@ cookie 相同但结果不同 → 差异在**请求发起的页面环境**（完�
 
 **代码改动**：`SangTacReader/WebViewController.swift`（nativePost + testNativeReadChapter + presentReader 触发）。
 
+## v14.1 成功：从 readchapter 响应直接提取正文
+
+**突破**：正文已在 readchapter `code:0` 响应里（log2 line 510，71KB data）。不再依赖 DOM 提取，直接在 XHR onload 里拦截 code:0，提取 data 上报 Swift → 阅读页成功显示正文（htmlLen=101KB）。
+
+**签名实验结论**（log2）：
+- `no-sign-iosUA` → code:5 (4003)
+- `fakesign-iosUA` / `fakesign-androidUA` → code:1 "Không thể xác thực kết nối"
+- 结论：服务器确实验证 X-STV-Sign 签名，假签名通不过（code:1）。但**章节页 XHR 已能拿到正文（code:0），签名不是 iOS 阅读器的必需路径**。
+
+## v15 原生阅读器（用户核心诉求：真正的原生 APP 效果）
+
+**用户诉求**：拒绝"浏览器+脚本"壳，要原生 APP 阅读体验；正文语言切换中文；分页/滚动双模式。
+
+**实现**：
+1. **JS 中文化**：`toChineseContent()` 把正文 `<i>` 逐词注释替换为中文 `t` 值，移除顶部灰色提示/版权提示 → 输出纯中文正文 HTML。
+2. **Swift 原生渲染**：HTML → `NSAttributedString`（`htmlToAttributed`），用原生控件渲染：
+   - **分页模式**（默认）：`UIPageViewController` + 每页 UITextView，`paginateText` 用 NSLayoutManager 逐 glyph 分页。
+   - **滚动模式**：`UITextView` 连续滚动。
+   - **字号/夜间/白天**：原生属性调整后重建富文本重新渲染。
+   - **模式切换**：底栏"翻页"按钮 toggle。
+3. **上一章/下一章**：优先用 readchapter 提供的 prev/next，其次章节列表 ID，兜底 c±1。
+
+**代码改动**：`SangTacReader/WebViewController.swift`（toChineseContent + 原生阅读器 UIPageViewController/UITextView + chapters 拦截 + readerGo 改进）。
+
+**待验证**：原生阅读器正文显示、分页翻页、滚动、字号/夜间、中文显示、章节导航。
+
+
 ### 若实验确认签名必需（code:7），下一步完整复刻签名算法
 - 需要精确反汇编 MD5 变体（sin K 表、轮函数、密钥拼接、消息填充）。
 - 签名 + URLSession 原生网络 + cookie → 预期 code:0。
