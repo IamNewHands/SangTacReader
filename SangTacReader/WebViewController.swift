@@ -1141,12 +1141,22 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { cookies in
             let cookieStr = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-            // 附带章节页会话关键 cookie（若在）
+            // v16：URLSession TLS 指纹验证。code:1 = 连接/TLS 指纹认证，与签名值无关。
+            // 用 GET + x-stv-transport:app + 假签名，测试 iOS 原生 URLSession 指纹是否被接受。
             let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
             self.appendDebugLog("[native] cookies=\(cookieStr.prefix(200))")
-            self.nativePost(url: base, cookie: cookieStr, sign: nil, ua: self.iosUA, label: "no-sign-iosUA")
-            self.nativePost(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000", ua: self.iosUA, label: "fakesign-iosUA")
-            self.nativePost(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000", ua: self.androidUA, label: "fakesign-androidUA")
+            // GET + fakesign + x-stv-transport:app（最接近真实 app）
+            self.nativeReq(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000",
+                           ua: self.iosUA, method: "GET", transport: "app", label: "GET-fakesign-app-iosUA")
+            // POST 对照
+            self.nativeReq(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000",
+                           ua: self.iosUA, method: "POST", transport: "app", label: "POST-fakesign-app-iosUA")
+            // GET + android UA 对照
+            self.nativeReq(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000",
+                           ua: self.androidUA, method: "GET", transport: "app", label: "GET-fakesign-app-androidUA")
+            // GET + 无签名 + x-stv-transport:web（模拟 WebView 请求）
+            self.nativeReq(url: base, cookie: cookieStr, sign: nil,
+                           ua: self.iosUA, method: "GET", transport: "web", label: "GET-nosign-web-iosUA")
         }
     }
 
@@ -1157,14 +1167,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     }
 
-    private func nativePost(url: String, cookie: String, sign: String?, ua: String, label: String) {
+    private func nativeReq(url: String, cookie: String, sign: String?, ua: String, method: String, transport: String, label: String) {
         guard let u = URL(string: url) else { return }
         var req = URLRequest(url: u)
-        req.httpMethod = "POST"
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpMethod = method
         req.setValue(ua, forHTTPHeaderField: "User-Agent")
-        req.setValue("XmlHttpRequest", forHTTPHeaderField: "X-Requested-With")
-        req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        req.setValue(transport, forHTTPHeaderField: "x-stv-transport")
+        req.setValue("com.sangtacviet.mobilereader", forHTTPHeaderField: "x-requested-with")
+        if !cookie.isEmpty { req.setValue(cookie, forHTTPHeaderField: "Cookie") }
         req.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
         if let sign = sign {
             req.setValue(sign, forHTTPHeaderField: "X-STV-Sign")
@@ -1175,8 +1185,6 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             if let e = err { out += "err=\(e.localizedDescription)"; self?.appendDebugLog(out); return }
             if let r = resp as? HTTPURLResponse {
                 out += "status=\(r.statusCode) "
-                let hdrs = r.allHeaderFields
-                if let sig = hdrs["X-STV-Sign"] ?? hdrs["x-stv-sign"] { out += "respSign=\(sig) " }
             }
             if let d = data, let s = String(data: d, encoding: .utf8) {
                 out += "body=\(s.prefix(160))"
