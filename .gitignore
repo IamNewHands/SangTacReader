@@ -7,6 +7,7 @@ xcuserdata/
 
 # Temp analysis
 apk_extracted/
+error.txt
 *.apk
 inspect_*.js
 find_*.js
