@@ -934,6 +934,36 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         // 触发一次 resize，让前端重新测量 --vh 等视口变量
         webView.evaluateJavaScript("window.dispatchEvent(new Event('resize'));", completionHandler: nil)
+        // v19.1：章节页加载完成后主动重发正确格式 readchapter，避免章节页自身 JS 时序/会话
+        // 导致 readchapter 失败（log8：qidian 章一直"加载中"）。bridgeJS 的 XHR 拦截会自动捕获
+        // code:0 上报 Swift，这里只在请求层面主动重发一次。
+        if let url = webView.url, url.path.contains("/truyen/"), let d = readerLastData,
+           let exp = readerExpectedC, readerLoadedC != exp {
+            let h = d.h, bi = d.bookid, c = d.c
+            let js = """
+            (function(){
+                try {
+                    var h='\(h)', i='\(bi)', c='\(c)';
+                    var u='/index.php?bookid='+encodeURIComponent(i)+'&h='+encodeURIComponent(h)+'&c='+encodeURIComponent(c)+'&ngmar=readc&sajax=readchapter&sty=1&exts=';
+                    var x=new XMLHttpRequest();
+                    x._dbgUrl=u;
+                    x.open('POST', u);
+                    x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+                    x.onload=function(){
+                        try{
+                            var o=JSON.parse(x.responseText);
+                            var dbgM='req-readc code='+(o&&o.code)+' len='+(x.responseText||'').length;
+                            if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.dbg){
+                                window.webkit.messageHandlers.dbg.postMessage({tag:'req-readc',msg:dbgM});
+                            }
+                        }catch(e){}
+                    };
+                    x.send('');
+                }catch(e){}
+            })();
+            """
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
     }
 
     // ===== 临时调试插桩 handler (debug-point D) =====
