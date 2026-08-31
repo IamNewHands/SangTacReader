@@ -356,3 +356,33 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 1. 点进章节 → 跳转章节页（浏览器视图）。
 2. 首次可能弹 Turnstile/verifyca，验证后正文显示。
 3. 登录（ajax=login size=7/502）为独立问题，待单独处理。
+
+---
+
+## v12（破解证明算法受阻 → 真机实验验证 proof gate）
+
+**背景**：用户要求原生阅读体验，拒绝网页形态，选择"破解 readchapter 证明算法"。
+
+**深入分析结论**：
+1. **章节页脚本不是 proof 直接来源**：`stv.readinit.js`（99KB 混淆）实为反调试/错误上报/MD5 指纹脚本，其
+   `_0x7aa3c3`/`_0x23a768`（`MD5(_0x10380b)`，`_0x10380b`=MD5(time)+&time=+MD5(time)+&h=+MD5(bookhost)+
+   &bookid=+MD5(bookid)+&c=+MD5(currentid)）只在错误上报 `_0x2f3784` 中被调用。章节页 line 271 混淆脚本解码后
+   是 webdriver 反调试（构造 `window['slic']('...')`，最终 `_0x1d170c='sliceQW5kcm9pZA=='`，`QW5kcm9pZA==`=base64"Android"），
+   同样与 proof 无关。
+2. **node 实测（决定性）**：7 次 readchapter 请求（不同 cookie/空 body/真实 proof/伪 proof/不同 Referer/.vip 域）
+   全部返回 `{"code":7,"time":1000}`。`.vip` 域被 CF 挑战(403 code1005)，node TLS 无法通过。
+   → **code:7 是服务器端深度设备/环境指纹检测**（TLS ClientHello/UA/行为），node 无法复现真机，也无法用来验证 proof 算法。
+3. **log7 关键对比**：SPA 空 body 恒 `code:7 time:1000`，且 SPA 的 cookie 与章节页**完全相同**
+   （`readcontextid=89552109...`、`_acx=ckuVVTehrE7hnrJQzchLZg==`、`arouting=e` 都在）。
+   log8 章节页空 body 是 `code:21`（verifyca 后 code:0）。cookie 相同但结果不同 → 差异几乎肯定在
+   **首次请求是否带 proof body**（章节页首次带 proof `63b2e877...`，SPA 从不带）。
+4. **假设**：带 proof 的首请求让服务器进入"浏览器页面"会话分支 → 后续空 body 走 code:21 验证；
+   不带 proof → 判定非浏览器 → code:7。proof 的**存在**（而非内容）可能是 gate。
+
+**实验（v12，待真机验证）**：修改 bridgeJS 的 getContent——SPA 内先发一次带 log8 真实 proof
+`63b2e877ff9a5e8368d9eedae655e5cd` 的 readchapter（`gc-p1`），紧接着发空 body（`gc-p2`）。
+- 若 `gc-p2` 返回 code:21 → **proof 是 gate**，可复刻算法实现原生阅读。
+- 若 `gc-p2` 仍 code:7 → proof 无关，差异在别处（需另寻路径，如章节页抓取回填原生渲染器）。
+- `gc-p1` 的 `time` 值（30 vs 1000）也是线索：30=浏览器页面快速重试，1000=非浏览器。
+
+**代码改动**：`SangTacReader/WebViewController.swift` getContent 覆写（未提交）。
