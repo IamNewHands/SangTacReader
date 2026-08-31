@@ -1141,19 +1141,20 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { cookies in
             let cookieStr = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-            // v16.1：URLSession 已过 TLS 指纹（返回应用层 code:10002 而非 Python 的 code:1）。
-            // 现精确复刻 WebView 成功请求：POST + Content-Type:form + 空body + 完整cookie + 页面Referer。
-            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
+            // v16.2：URLSession 已过 TLS 指纹。关键修复——h 必须用源名(qidian/fanqie)，
+            // 而不是响应里的 rObj.h(为空)。从 WebView 章节页 URL /truyen/{host}/1/... 提取。
+            var host = h
+            if host.isEmpty, let wu = self.webView.url {
+                let segs = wu.path.split(separator: "/").map(String.init)
+                if segs.count > 2 && segs[0] == "truyen" { host = segs[1] }
+            }
+            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(host)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
             let pageRef = self.webView.url?.absoluteString ?? "https://sangtacviet.vip/"
-            self.appendDebugLog("[native] cookies_len=\(cookieStr.count) referer=\(pageRef)")
-            // 复刻 WebView：POST + form + 空body + 页面Referer（无 app 头）
+            self.appendDebugLog("[native] h=\(host) bookid=\(bookid) c=\(c) cookies_len=\(cookieStr.count) referer=\(pageRef)")
+            // 复刻 WebView：POST + form + 空body + 页面Referer（无 app 头、无签名）
             self.nativeReq(url: base, cookie: cookieStr, sign: nil,
                            ua: self.iosUA, method: "POST", body: "",
                            referer: pageRef, transport: nil, label: "web-POST-ref")
-            // POST + form + 空body + 页面Referer + 假签名
-            self.nativeReq(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000",
-                           ua: self.iosUA, method: "POST", body: "",
-                           referer: pageRef, transport: nil, label: "web-POST-ref-sign")
         }
     }
 
