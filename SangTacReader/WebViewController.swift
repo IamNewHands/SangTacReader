@@ -371,12 +371,17 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         }
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
+                        // v17：优先原生直读。URLSession 已实测可 code:0 直读正文，
+                        // 直接把 h/bookid/c 交给原生层，不再整页导航章节页。
+                        try { window.__stvPendingRead = {h:h, bookid:i, c:c}; } catch(e) {}
+                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nativeRead) {
+                            try { window.webkit.messageHandlers.nativeRead.postMessage({h: String(h), bookid: String(i), c: String(c)}); } catch(e) {}
+                            return {code: "1", info: "加载中…"};
+                        }
+                        // 兜底：无原生直读通道时退回整页导航章节页
                         var base = window.location.origin;
-                        // 整页导航到章节页（建立会话 + 触发 verifyca 验证）
                         var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
                         tryDbg('gc-nav', 'navigating to ' + chapUrl);
-                        // 记录待读章节，供章节页提取脚本 + 原生阅读器回退使用
-                        try { window.__stvPendingRead = {h:h, bookid:i, c:c}; } catch(e) {}
                         setTimeout(function() { try { window.location.href = chapUrl; } catch(e) {} }, 150);
                         return {code: "1", info: "正在进入阅读器…"};
                     };
@@ -703,6 +708,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         controller.addUserScript(debugScript)
         controller.add(self, name: "dbg")
         controller.add(self, name: "chapter")
+        controller.add(self, name: "nativeRead")   // v17 原生直读正文
         // #endregion
 
         config.userContentController = controller
@@ -945,6 +951,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             DispatchQueue.main.async {
                 self.handleChapterMessage(tag: tag, payload: payload)
             }
+        } else if message.name == "nativeRead", let body = message.body as? [String: Any] {
+            // v17：点章 -> JS 直接传 h/bookid/c，原生 URLSession 直读正文
+            let h = body["h"] as? String ?? ""
+            let bookid = body["bookid"] as? String ?? ""
+            let c = body["c"] as? String ?? ""
+            DispatchQueue.main.async {
+                self.nativeReadChapter(h: h, bookid: bookid, c: c)
+            }
         }
     }
     // #endregion
@@ -1004,10 +1018,6 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         renderReaderContent(attr)
         if let c = readerLastData?.c { readerLoadedC = c; readerExpectedC = c }
         appendDebugLog("[reader] presented(\(readerModeIsPaged ? "paged" : "scroll")) attrLen=\(attr.length) charLen=\(attr.string.count)")
-        // v14 实验：章节页会话已建立，用原生 URLSession 验证签名必要性
-        if let d = readerLastData {
-            testNativeReadChapter(h: d.h, bookid: d.bookid, c: d.c)
-        }
     }
 
     // ===== v15 原生阅读器：HTML -> 富文本 / 分页 / 渲染 =====
@@ -1133,75 +1143,105 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         appendDebugLog("[reader] dismissed")
     }
 
-    // ===== 原生网络实验 (v14)：验证 X-STV-Sign 签名是否必需 (com.sangtacviet) =====
-    // 安卓 app 用原生网络栈(Capacitor Http/OkHttp)发 readchapter，带 X-STV-Sign 签名头。
-    // 本实验用 iOS 原生 URLSession 复刻同样请求，对比有无签名/不同 UA，看服务器是否 code:0，
-    // 从而判定：①是否只需原生网络栈+cookie；②签名是否必需；③假签名是否够用。
-    private func testNativeReadChapter(h: String, bookid: String, c: String) {
+    // ===== 原生直读正文 (v17)：点章 -> JS 传 h/bookid/c -> URLSession 直读 code:0 =====
+    // 已实测(v16.3)：URLSession 带完整cookie + 页面Referer + POST/form/空body 即可 code:0，
+    // 无需签名头、无需整页导航章节页。这里从 JS 直接拿参数，构造章节页 referer。
+    private func nativeReadChapter(h: String, bookid: String, c: String) {
+        appendDebugLog("[nativeRead] h=\(h) bookid=\(bookid) c=\(c)")
+        guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
+            appendDebugLog("[nativeRead] missing params, abort")
+            return
+        }
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { cookies in
             let cookieStr = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-            // v16.3：URLSession 已过 TLS 指纹，h 已正确(源名)。还差 c 章节ID——
-            // readchapter 响应里的 rObj.c 为空(服务器不回显)，所以 readerLastData.c 为空。
-            // 从 WebView 章节页 URL /truyen/{h}/1/{bookid}/{c}/ 提取真实 c=最后一段。
-            var host = h
-            var chapter = c
-            if let wu = self.webView.url {
-                let segs = wu.path.split(separator: "/").map(String.init)
-                if segs.count > 2 && segs[0] == "truyen" {
-                    if host.isEmpty { host = segs[1] }
-                    if let last = segs.last, !last.isEmpty { chapter = last }
-                }
-            }
-            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(host)&c=\(chapter)&ngmar=readc&sajax=readchapter&sty=1&exts="
-            let pageRef = self.webView.url?.absoluteString ?? "https://sangtacviet.vip/"
-            self.appendDebugLog("[native] h=\(host) bookid=\(bookid) c=\(chapter) cookies_len=\(cookieStr.count) referer=\(pageRef)")
-            // 复刻 WebView：POST + form + 空body + 页面Referer（无 app 头、无签名）
-            self.nativeReq(url: base, cookie: cookieStr, sign: nil,
-                           ua: self.iosUA, method: "POST", body: "",
-                           referer: pageRef, transport: nil, label: "web-POST-ref")
+            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
+            // referer 用构造的章节页 URL（与 v16.3 成功时一致），即使未真正导航
+            let chapRef = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
+            self.fetchChapter(url: base, cookie: cookieStr, referer: chapRef, h: h, bookid: bookid, c: c)
         }
+    }
+
+    private func fetchChapter(url: String, cookie: String, referer: String, h: String, bookid: String, c: String) {
+        guard let u = URL(string: url) else { return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.setValue(self.iosUA, forHTTPHeaderField: "User-Agent")
+        if !cookie.isEmpty { req.setValue(cookie, forHTTPHeaderField: "Cookie") }
+        req.setValue(referer, forHTTPHeaderField: "Referer")
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data()
+        let start = Date()
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if let e = err {
+                    self.appendDebugLog("[nativeRead] err=\(e.localizedDescription)")
+                    return
+                }
+                guard let d = data, let s = String(data: d, encoding: .utf8) else {
+                    self.appendDebugLog("[nativeRead] no body")
+                    return
+                }
+                let el = String(format: "%.1fs", Date().timeIntervalSince(start))
+                self.appendDebugLog("[nativeRead] \(String(s.prefix(80))) (\(el))")
+                // 解析 code:0 响应
+                guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let code = obj["code"] as? String, code == "0",
+                      let raw = obj["data"] as? String, !raw.isEmpty else {
+                    self.appendDebugLog("[nativeRead] not code:0")
+                    return
+                }
+                let title = (obj["chaptername"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let cnHtml = self.toChineseContent(raw)
+                self.readerLastData = (h, bookid, c)
+                self.readerLoadedC = c
+                self.readerExpectedC = c
+                self.appendDebugLog("[nativeRead] code:0 htmlLen=\(cnHtml.count)")
+                self.presentReader(html: cnHtml, title: title)
+            }
+        }
+        task.resume()
+    }
+
+    // v17：Swift 版中文化（搬移 JS toChineseContent）——移除顶部灰色提示、<i>注释->中文t值、移除版权提示
+    private func toChineseContent(_ raw: String) -> String {
+        guard !raw.isEmpty else { return raw }
+        var html = raw
+        func regexReplace(_ pattern: String, _ out: (String, [String]) -> String) {
+            guard let rx = try? NSRegularExpression(pattern: pattern, options: []) else { return }
+            let ns = html as NSString
+            let matches = rx.matches(in: html, options: [], range: NSRange(location: 0, length: ns.length))
+            var parts = ""
+            var last = 0
+            for m in matches {
+                parts += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+                var groups: [String] = []
+                for gi in 0..<m.numberOfRanges {
+                    let gr = m.range(at: gi)
+                    groups.append(gr.location == NSNotFound ? "" : ns.substring(with: gr))
+                }
+                let full = ns.substring(with: m.range)
+                parts += out(full, groups)
+                last = m.range.location + m.range.length
+            }
+            parts += ns.substring(from: last)
+            html = parts
+        }
+        // 1) 移除顶部灰色提示 "@Bạn đang đọc bản lưu ..."
+        regexReplace(#"<p><span style='color:gray.*?</span></p>"#) { _, _ in "" }
+        // 2) <i ...t='中文'>原文</i> -> <span>中文</span>
+        regexReplace(#"<i\b[^>]*\bt='([^']*)'[^>]*>(.*?)</i>"#) { _, groups in
+            let cn = groups.count > 1 ? groups[1] : ""
+            return cn.isEmpty ? "" : "<span>" + cn + "</span>"
+        }
+        // 3) 移除版权提示（含越南语/中文关键词）
+        regexReplace(#"(?:Vì vấn đề nội dung|không hỗ trợ xem văn bản gốc|由于版权问题)[^<\n]*"#) { _, _ in "" }
+        return html
     }
 
     private var iosUA: String {
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    }
-    private var androidUA: String {
-        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    }
-
-    private func nativeReq(url: String, cookie: String, sign: String?, ua: String, method: String, body: String?, referer: String?, transport: String?, label: String) {
-        guard let u = URL(string: url) else { return }
-        var req = URLRequest(url: u)
-        req.httpMethod = method
-        req.setValue(ua, forHTTPHeaderField: "User-Agent")
-        if let transport = transport {
-            req.setValue(transport, forHTTPHeaderField: "x-stv-transport")
-            req.setValue("com.sangtacviet.mobilereader", forHTTPHeaderField: "x-requested-with")
-        }
-        if !cookie.isEmpty { req.setValue(cookie, forHTTPHeaderField: "Cookie") }
-        if let referer = referer { req.setValue(referer, forHTTPHeaderField: "Referer") }
-        if let body = body {
-            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            req.httpBody = body.data(using: .utf8)
-        }
-        if let sign = sign {
-            req.setValue(sign, forHTTPHeaderField: "X-STV-Sign")
-        }
-        let start = Date()
-        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-            var out = "[native:\(label)] "
-            if let e = err { out += "err=\(e.localizedDescription)"; self?.appendDebugLog(out); return }
-            if let r = resp as? HTTPURLResponse {
-                out += "status=\(r.statusCode) "
-            }
-            if let d = data, let s = String(data: d, encoding: .utf8) {
-                out += "body=\(s.prefix(160))"
-            } else { out += "no-body" }
-            out += String(format: " (%.1fs)", Date().timeIntervalSince(start))
-            self?.appendDebugLog(out)
-        }
-        task.resume()
     }
 
     private func buildReaderUI() {
