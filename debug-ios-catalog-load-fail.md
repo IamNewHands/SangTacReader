@@ -260,3 +260,25 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 ### 待真机验证（v8.1）
 1. 章节页不再无限 reload，正文能渲染（页面自身反爬证明正常工作）。
 2. 若仍 code:7，则证明 WKWebView/LiveContainer 环境本身被服务器判定为异常（非我们插桩导致），需评估是否替换浏览器内核。
+
+## v8.2（v8.1 验证结果 + 重新诊断）
+
+**2026-08-31 log3.txt 分析**：
+- v8.1 守卫生效：`/truyen/` 章节页无 `[DBG:init]/[DBG:ready]` 日志（bridgeJS/debugJS 空转）。
+- 但用户反馈 **仍无限刷新** → 章节页在**完全无插桩**下仍返回 code:7 循环。
+- **关键结论**：问题不在我们的插桩（插桩开/关都是 code:7），而是 **WKWebView/LiveContainer 环境下 web readchapter 的 `_gac`/`state` 反爬证明无法通过**。
+
+### node 决定性测试
+1. **grantcontext 混淆 JS 新增全局函数**（`_0x54a6`、`_0x498f`）：`_0x498f()` 返回字符串解码表，`_0x54a6()` 返回 undefined —— **key 在 IIFE 闭包内，全局不可达**，eval 返回 undefined，App key 机制为硬死路。
+2. **章节页脚本运行**：设置 `_gac` cookie，但**不包裹 XHR.send**（mock 中 send 源未变）→ 反爬证明纯靠 `_gac` cookie，无 XHR 覆写依赖。
+3. **全新会话**：GET 章节页返回 `state:0`（无有效 state），POST readchapter 返回**空 body**——与有会话的 code:"5"/code:7 不同。
+
+### 修复 v8.2（诊断构建，已提交）
+- **bridgeJS**：保留 `/truyen/` 守卫（空转），避免 open 覆写干扰章节页。
+- **debugJS**：重新在章节页注入（行为保持，仅日志），并新增 `[DBG:xhr-body]` 打印 readchapter **响应体前 300 字符**，确认章节页实际收到的 code/err。
+- 目标：拿到章节页 readchapter 的精确响应与 `_gac`/`state` 状态，判断是 stale session 还是 env 检测。
+
+### 待真机验证（v8.2）
+1. 日志应重新出现章节页的 `[DBG:xhr-load]` + `[DBG:xhr-body] resp={...}`，确认响应 code。
+2. 若 `state` 相关/`_gac` 过期 → 尝试登出重登、清 cookie 重开会话。
+3. 若环境被检测 → 评估更换浏览器内核/换源站直连。
