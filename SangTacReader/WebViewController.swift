@@ -342,6 +342,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 var stopper = setTimeout(function() { clearInterval(t); }, 20000);
                 apply();
             })();
+            // 闭合最外层 (function() {（第 257 行）。此前该外层 IIFE 缺少闭合括号，
+            // 导致整个 bridgeJS 的 JS 语法错误、一行都不执行。这是此前所有注入
+            // 补丁从未生效的直接原因之一（另一处是字符串里的反斜杠 n 被 Swift 转义）。
+            })();
 
             var css = document.createElement('style');
             css.id = 'ios-viewport-fix';
@@ -522,11 +526,6 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     if(typeof A.popPage === 'function'){
                         var oq = A.popPage;
                         A.popPage = function(){
-                            // 注意：bridgeJS 是 Swift 普通 """ 多行字符串，源码里必须写 '\\n'
-                            // 才能在注入后的 JS 中得到字面的 \n（否则 Swift 会把 \n 转义成
-                            // 真实换行符，导致 JS 单引号字符串跨行 -> 整个 bridgeJS 语法错误、
-                            // 一行都不执行。这是此前所有注入补丁(同源/readchapter 规范化)
-                            // 从未生效的根本原因）。
                             dl('pop', 'hash=' + location.hash + '\\n' + (new Error().stack||'').split('\\n').slice(1,5).join('\\n'));
                             return oq.apply(this, arguments);
                         };

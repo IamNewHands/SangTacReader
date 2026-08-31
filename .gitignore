@@ -9,6 +9,7 @@ xcuserdata/
 apk_extracted/
 error.txt
 *.apk
+*_Build*.txt
 inspect_*.js
 find_*.js
 test_*.js
