@@ -138,3 +138,35 @@ node 验证修复后注入 JS 语法 OK。
 
 1. 章节正文可读取（readchapter 应返回 `code:0`，URL 不再带 `key=undefined`）。
 2. 登录、语言切换、目录仍正常。
+
+## v6 根因（决定性）：readchapter 带 `x-stv-transport: web` 头 → 服务器返回 code:7
+
+**2026-08-31 v5 修复后真机新日志（error.txt）分析**：
+- bridgeJS 首次真正执行：`[DBG:gc]` / `[DBG:gc-url]` / `[DBG:gc-code]` 全部出现。
+- getContent 覆写生效，URL 已正确：`?bookid=1045345742&h=qidian&c=847372113&ngmar=readc&sajax=readchapter&sty=1&exts=`。
+- 但 readchapter 仍返回 **code:7**，且 `REQ-HDRS={"x-stv-transport":"web"}`。
+- 关键：**chapterlist（同走 app.net，同带 web 头）却成功**（200 size=122338）→ 说明 code:7 不是 UA 或网络层问题，而是 readchapter 独有的传输判定。
+
+**根因（分析 app.v2.js 源码确认）**：
+```js
+// app.net.get() 内部强制给所有 GET 加 web 传输头
+http.setRequestHeader("x-stv-transport", "web");
+// 而安卓真实 App 走 Capacitor，用的是：
+headers = {
+    "x-stv-transport": "app",
+    "x-requested-with": "com.sangtacviet.mobilereader",
+    ...
+}
+```
+readchapter 服务器按 `x-stv-transport` 区分传输方式：`app` → 正常返回正文；`web` → 判定"网页版已过时/设备不兼容"返回 code:7。UA 已改标准 Safari（v4），URL 已正确（v3+v5），剩余唯一差异就是**传输头**。
+
+**v6 修复（当前）**：覆写 getContent 时不再用 `app.net.get()`（会强制 web 头），改用**原生 XHR 手动设置 App 客户端头**：
+- `x-stv-transport: app`
+- `x-requested-with: com.sangtacviet.mobilereader`
+- `Referer: document.referrer || window.location.href`（显式补非空 Referer）
+
+同源请求无 preflight，自定义头可正常发送。
+
+### 待真机验证（v6）
+1. readchapter 应返回 `code:0`（正文），REQ-HDRS 应显示 `x-stv-transport: app`。
+2. 目录、登录、语言切换仍正常。
