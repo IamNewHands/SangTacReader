@@ -335,10 +335,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             return origLoadKey.apply(this, arguments);
                         }
                     };
-                    // 覆写 getContent：优先尝试 App 的 key + readchapter 流程，
-                    // 若 key 无效（code:7 设备不支持）则回退到【章节页导航】方案。
-                    // 章节页 /truyen/{h}/1/{bookid}/{c}/ 是服务器渲染的 Web 页面，其内部
-                    // 的 readchapter POST（无 key）在真实浏览器里可用（Crawler 参考项目即用此法）。
+                    // 覆写 getContent：改用【网页版】readchapter（POST /index.php?...&ngmar=readc&sty=1&exts=）。
+                    // 根因（log6 实测）：App 格式（/?sajax=readchapter&...&key=）必须带由 grantcontext
+                    // eval 生成的 key，但该混淆 JS 无 return、eval 恒 undefined -> 恒 code:7（设备不支持）。
+                    // 网页版 readchapter 不需要 key：首次可能 code:7（等待证明就绪，time=重试延时），
+                    // 随后返回 code:21（"Vui lòng xác nhận để tiếp tục"，需人机验证），用户通过 app 内置的
+                    // runCaptcha（Cloudflare Turnstile）验证后，再请求返回 code:0 与正文。
+                    // 这样正文直接在 app 原生阅读器渲染，不再跳浏览器页。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
                         // 保留离线书逻辑
@@ -350,34 +353,25 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         }
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
-                        // 1) 确保拿到 chapterkey
-                        try { await self.getKey(h, i); } catch(e) { tryDbg('gc-keyerr', String(e)); }
-                        var key = self.chapterkey;
-                        tryDbg('gc-key', 'key=' + String(key));
-                        // 2) 用 App 格式 URL：/?sajax=readchapter&h=&bookid=&c=&key=...
-                        var base = window.location.origin;
-                        var url = base + "/?sajax=readchapter&h=" + encodeURIComponent(h)
-                                + "&bookid=" + encodeURIComponent(i)
-                                + "&c=" + encodeURIComponent(c)
-                                + "&key=" + encodeURIComponent(key == null ? "" : String(key));
-                        if (rl) url += "&rescan=true";
-                        tryDbg('gc-url', url);
-                        var cdata = null;
-                        try {
-                            cdata = await new Promise(function(resolve, reject) {
+                        // 网页版 readchapter：POST /index.php?bookid=&h=&c=&ngmar=readc&sajax=readchapter&sty=1&exts=
+                        function webRead() {
+                            var base = window.location.origin;
+                            var url = base + "/index.php?bookid=" + encodeURIComponent(i)
+                                    + "&h=" + encodeURIComponent(h)
+                                    + "&c=" + encodeURIComponent(c)
+                                    + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
+                            if (rl) url += "&rescan=true";
+                            return new Promise(function(resolve, reject) {
                                 var xhr = new XMLHttpRequest();
-                                xhr.open("GET", url, true);
-                                if (document.cookie && document.cookie.indexOf("mac_tt=") < 0) {
-                                    xhr.setRequestHeader("Cookie", document.cookie + "; mac_tt=true;");
-                                }
-                                xhr.setRequestHeader("x-stv-transport", "app");
-                                xhr.setRequestHeader("x-requested-with", "com.sangtacviet.mobilereader");
-                                xhr.setRequestHeader("Referer", document.referrer || window.location.href);
+                                xhr.open("POST", url, true);
+                                xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+                                xhr.setRequestHeader("X-Requested-With", "XmlHttpRequest");
                                 xhr.onreadystatechange = function() {
                                     if (xhr.readyState === 4) {
                                         if (xhr.status === 200) {
-                                            try { resolve(JSON.parse(xhr.responseText)); }
-                                            catch(e) { resolve(xhr.responseText); }
+                                            var t = xhr.responseText;
+                                            try { resolve(JSON.parse(t)); }
+                                            catch(e) { resolve({code:-1, raw:t}); }
                                         } else {
                                             reject({code:-1, status:xhr.status, text:xhr.responseText});
                                         }
@@ -386,32 +380,33 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                 xhr.onerror = function() { reject({code:-1, message:"xhr error", status:xhr.status}); };
                                 xhr.send();
                             });
-                        } catch(e) {
-                            tryDbg('gc-err', 'exception: ' + e);
-                            cdata = {code:-1, message:String(e)};
                         }
-                        if (cdata) {
-                            var c0 = String(cdata.code);
+                        var last = null;
+                        // 重试：网页版首次可能返回 code:7（time=重试延时），等待证明就绪后变 code:21/code:0
+                        for (var attempt = 0; attempt < 6; attempt++) {
+                            try { last = await webRead(); } catch(e) { last = {code:-1, message:String(e)}; }
+                            var c0 = String(last.code);
+                            tryDbg('gc-resp', 'attempt=' + attempt + ' code=' + last.code + ' err=' + (last.err||'') + ' len=' + ((last.data&&last.data.length)||0));
                             if (c0 == "0") {
-                                tryDbg('gc-ok', 'len=' + (cdata.data ? cdata.data.length : 0));
-                                return cdata;
+                                tryDbg('gc-ok', 'len=' + (last.data ? last.data.length : 0));
+                                return last; // 正文，交给原生阅读器渲染
                             }
-                            tryDbg('gc-code', 'code=' + cdata.code + ' err=' + (cdata.err || '') + ' info=' + (cdata.info || ''));
-                            // 3) code:7(设备不支持/无key) / code:"5"(未知错误) => 章节页导航回退
-                            if (c0 == "7" || c0 == "5" || key == null || String(key) == "undefined") {
-                                var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
-                                tryDbg('gc-fallback', 'navigating to ' + chapUrl);
-                                // 延迟导航，让日志先送出
-                                setTimeout(function() {
-                                    try { window.location.href = chapUrl; } catch(e) {}
-                                }, 300);
-                                // 返回一个"加载中"占位，避免原逻辑再次发请求
-                                return {code: "1", info: "正在打开网页版章节…"};
+                            if (c0 == "21") {
+                                tryDbg('gc-verify', 'need manual verify');
+                                return last; // 交给 app.handlingException -> runCaptcha
                             }
-                            return cdata;
+                            if (c0 == "7") {
+                                // 等待证明就绪后重试；time 字段若存在则按其延时（截断到 <=1s）
+                                var dly = (last.time && +last.time > 0) ? Math.min(+last.time, 1000) : 800;
+                                tryDbg('gc-retry', 'wait ' + dly + 'ms');
+                                await new Promise(function(r){ setTimeout(r, dly); });
+                                continue;
+                            }
+                            // 其它 code：直接返回，交给 app 的 handlingException（登录等）
+                            return last;
                         }
-                        // 完全失败时回退到原始逻辑
-                        return origGetContent.apply(self, arguments);
+                        tryDbg('gc-giveup', 'retries exhausted');
+                        return {code: "1", info: "Không thể tải nội dung, vui lòng thử lại."};
                     };
                     return true;
                 } catch(e) { return false; }

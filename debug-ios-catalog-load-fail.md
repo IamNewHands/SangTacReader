@@ -308,3 +308,31 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 1. 应用入口是否成功加载 sangtacviet.vip（`[DBG:init] origin=https://sangtacviet.vip`）。
 2. Cloudflare 挑战是否自动完成并签发 cf_clearance。
 3. 章节正文是否正常显示（不再无限 reload）。
+
+## v10（突破）：网页版 readchapter + 内置 verifyca 成功加载正文
+
+**2026-08-31 log6 分析（决定性）**：
+- `[DBG:init] origin=https://sangtacviet.vip`：v9 域名切换生效，CF 挑战自动完成进入首页。
+- App 格式 readchapter（`/?sajax=readchapter&...&key=`）仍 code:7；grantcontext eval 仍 undefined。
+- 但**网页版 readchapter**（`POST /index.php?...&ngmar=readc&sajax=readchapter&sty=1&exts=`）完整走通：
+  1. 首次 code:7 `time:30`/`time:1000`（等待证明就绪/重试）
+  2. 随后 code:21 `err:"Vui lòng xác nhận để tiếp tục."`（需人机验证）
+  3. 用户完成 `POST /index.php?ngmar=verifyca` 后
+  4. 再次请求 → `{"code":"0","bookname":...,"chaptername":...,"data":"<p>正文...</p>"}` **正文加载成功**
+
+**关键源码确认（app.v2.read.js + app.v2.js）**：
+- `app.reader.getContent2`（line 555）被 `if(window.Capacitor && window.Capacitor.Plugins.Http)` 守卫，无 Capacitor 返回 undefined。
+- `app.reader.handlingException`（line 729）对 `code:"21"` 调 `runCaptcha("read", cb)`——app 内置 Cloudflare Turnstile（sitekey `0x4AAAAAABbXTEjsj3isHkfm`），验证成功后 `reloadCurrentChapter(true)` 重新加载。
+- 即 app **原生就有验证流**，只是 getContent2 用的 App 格式（需 key）先命中 code:7，到不了 code:21。
+
+**修复 v10（已提交）**：覆写 `app.reader.getContent` 改用**网页版 readchapter**（POST，无需 key）：
+1. code:7 → 按 `time` 延时重试（最多 6 次）。
+2. code:21 → 直接返回给 app，触发内置 runCaptcha（Turnstile）→ 用户验证 → reloadCurrentChapter。
+3. code:0 → 返回正文，**在 app 原生阅读器渲染**（不再跳浏览器页）。
+- 移除章节页导航回退（不再需要）。
+- JS 语法 node vm 验证通过，Swift 无诊断错误。
+
+### 待真机验证（v10）
+1. 进章节 → 应弹出 app 内置的 Turnstile 人机验证框（若会话已通过 CF，可能直接 code:0）。
+2. 验证后正文在原生阅读器显示（`[DBG:gc-ok]`）。
+3. 登录仍失败（ajax=login size=7）单独处理。
