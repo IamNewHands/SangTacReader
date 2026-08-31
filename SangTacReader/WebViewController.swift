@@ -5,6 +5,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     var webView: WKWebView!
 
+    // ===== 全屏沉浸阅读页 (v13) =====
+    // 章节页正文提取后，用独立 WKWebView 渲染正文 HTML，提供 App 级阅读体验。
+    private var readerView: WKWebView!
+    private var readerContainer: UIView!
+    private var readerTitleLabel: UILabel!
+    private var readerLastData: (h: String, bookid: String, c: String)? = nil
+    private let readerTopBarHeight: CGFloat = 52
+
     private var cookieObserver: CookieObserver?
     // ===== 临时调试日志面板 (debug-point D) =====
     // 无 Xcode 控制台访问时，把 [DBG:] 日志直接显示在 iOS 界面，供用户复制。
@@ -335,12 +343,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             return origLoadKey.apply(this, arguments);
                         }
                     };
-                    // 覆写 getContent：SPA 内网页版 readchapter + 真机实验验证 proof gate。
-                    // 实验假设（基于 log7/log8 + node 实测）：
-                    //   · SPA 空 body 恒 code:7(time:1000)，章节页空 body 是 code:21——cookie 相同，
-                    //     差异极可能是【首次请求是否带 32-hex proof body】建立的会话状态。
-                    //   · 本实验：首次发带 proof 的请求，紧接着发空 body，观察是否从 code:7 变 code:21。
-                    //     若 r2 变 code:21 -> proof 是 gate，可复刻算法；若仍 code:7 -> proof 无关。
+                    // 覆写 getContent（v13）：整页导航到章节页建立 time:30 会话。
+                    // 根因（v12 实验证实）：SPA 内同源 XHR 发 readchapter 恒返回
+                    // {"code":7,"time":1000}（非浏览器环境），无论 body/cookie/proof 怎么变；
+                    // 只有整页导航加载章节页(/truyen/)才能建立 time:30 的"浏览器页面"会话，
+                    // 从而让空 body readchapter 走 code:21 -> verifyca -> code:0（见 log8）。
+                    // 因此原生阅读的正确路径 = 先整页导航章节页拿正文，再由原生阅读页渲染。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
                         if (self.offlineBook && !rl) {
@@ -349,53 +357,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
                         var base = window.location.origin;
-                        var url = base + "/index.php?bookid=" + encodeURIComponent(i) + "&h=" + encodeURIComponent(h) + "&c=" + encodeURIComponent(c) + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
-                        // log8 真机章节页采集的真实 proof（32-hex），用于验证 proof 是否 gate
-                        var PROOF = "63b2e877ff9a5e8368d9eedae655e5cd";
-                        function sendReq(body) {
-                            return new Promise(function(resolve) {
-                                try {
-                                    var xhr = new XMLHttpRequest();
-                                    xhr.open("POST", url, true);
-                                    xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-                                    xhr.setRequestHeader("X-Requested-With", "XmlHttpRequest");
-                                    xhr.onreadystatechange = function() {
-                                        if (xhr.readyState === 4) {
-                                            try { resolve({status: xhr.status, text: xhr.responseText}); }
-                                            catch(e) { resolve({status: 0, text: "xhr read err"}); }
-                                        }
-                                    };
-                                    xhr.onerror = function() { resolve({status: 0, text: "xhr error"}); };
-                                    if (body) xhr.send(body); else xhr.send();
-                                } catch(e) { resolve({status: 0, text: "exc:" + e}); }
-                            });
-                        }
-                        // 1) proof 首请求
-                        tryDbg('gc-p1', 'proof-request start');
-                        var r1 = await sendReq(PROOF);
-                        tryDbg('gc-p1-resp', 'status=' + r1.status + ' body=' + String(r1.text));
-                        // 2) 空 body 请求（若 proof 建立会话，这里应 code:21）
-                        tryDbg('gc-p2', 'empty-request start');
-                        var r2 = await sendReq("");
-                        tryDbg('gc-p2-resp', 'status=' + r2.status + ' body=' + String(r2.text));
-                        try {
-                            var obj = JSON.parse(r2.text);
-                            if (obj && (obj.code === "0" || obj.code == 0)) {
-                                tryDbg('gc-p2-code0', 'content ok');
-                                return obj;
-                            }
-                            if (obj && (obj.code === "21" || obj.code == 21)) {
-                                tryDbg('gc-p2-code21', 'need verifyca, trigger captcha');
-                                try { if (window.ui && ui.captcha) ui.captcha.open("read", "sangtacviet", null, ["google"]); } catch(e) {}
-                                return {code: "21", info: "需要验证"};
-                            }
-                            if (obj) return {code: String(obj.code), info: (obj.err || obj.info || "")};
-                        } catch(e) {}
-                        // 兜底：跳转章节页保证可读
+                        // 整页导航到章节页（建立会话 + 触发 verifyca 验证）
                         var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
-                        tryDbg('gc-fallback', 'navigating to ' + chapUrl);
-                        setTimeout(function() { try { window.location.href = chapUrl; } catch(e) {} }, 300);
-                        return {code: "1", info: "正在打开网页版章节…"};
+                        tryDbg('gc-nav', 'navigating to ' + chapUrl);
+                        // 记录待读章节，供章节页提取脚本 + 原生阅读器回退使用
+                        try { window.__stvPendingRead = {h:h, bookid:i, c:c}; } catch(e) {}
+                        setTimeout(function() { try { window.location.href = chapUrl; } catch(e) {} }, 150);
+                        return {code: "1", info: "正在进入阅读器…"};
                     };
                     return true;
                 } catch(e) { return false; }
@@ -621,11 +589,79 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         controller.addUserScript(bridgeScript)
 
+        // ===== 章节页(/truyen/)正文提取脚本 (v13) =====
+        // 整页导航到章节页建立 time:30 会话后，正文由章节页自带逻辑异步加载(readchapter code:0)
+        // 渲染进 DOM。本脚本【只读】轮询正文容器，提取 HTML+标题+章节信息，postMessage 给 Swift，
+        // 供全屏沉浸阅读页渲染。关键：绝不覆写 XHR.open/send（章节页反爬会检测外部覆写导致 code:7）。
+        let chapterExtractJS = """
+        (function() {
+            if (String(window.location.pathname).indexOf('/truyen/') !== 0) { return; }
+            function send(tag, payload) {
+                try {
+                    window.webkit.messageHandlers.chapter.postMessage({tag: tag, payload: String(payload)});
+                } catch(e) {}
+                try { console.log('[chapter:' + tag + '] ' + String(payload)); } catch(e) {}
+            }
+            send('onpage', window.location.href);
+            var CANDIDATES = [
+                '#content-container', '.contentbox', '#maincontent',
+                '.chapter-content', '#chapter-content', '.chaptertext',
+                '#vcontent', '#reader', '#content', '.content',
+                '#chcontent', '#chapterbody', '.chapter_body', '.chapter__content'
+            ];
+            var selState = {};
+            var t = setInterval(function() {
+                try {
+                    var report = [];
+                    var foundEl = null, foundSel = null;
+                    for (var i = 0; i < CANDIDATES.length; i++) {
+                        var sel = CANDIDATES[i];
+                        var el;
+                        try { el = document.querySelector(sel); } catch(e) { el = null; }
+                        if (!el) { selState[sel] = 'absent'; continue; }
+                        var txt = '';
+                        try { txt = el.innerHTML.replace(/<[^>]+>/g, '').replace(/\\s+/g, ' ').trim(); } catch(e) {}
+                        if (selState[sel] !== 'present') {
+                            selState[sel] = (txt.length > 0 ? 'present:' + txt.length : 'empty');
+                        }
+                        report.push(sel + '=' + selState[sel]);
+                        if (!foundEl && txt.length > 20) { foundEl = el; foundSel = sel; }
+                    }
+                    if (!foundEl) {
+                        send('probe', report.join(' | ') + ' | href=' + location.href);
+                        return;
+                    }
+                    clearInterval(t);
+                    var html = foundEl.innerHTML;
+                    // 标题
+                    var title = '';
+                    var tEl = document.querySelector('.chaptername') || document.querySelector('h1') || document.querySelector('#chaptername') || document.querySelector('.chapter-title');
+                    if (tEl) { try { title = tEl.textContent.trim(); } catch(e) {} }
+                    // 从 URL 解析 h / bookid / c  (pathname=/truyen/{h}/{type}/{bookid}/{c}/)
+                    var h = '', bookid = '', c = '';
+                    try {
+                        var m = location.pathname.match(/\\/truyen\\/([^\\/]+)\\/\\d+\\/([^\\/]+)\\/([^\\/]+)\\/?/);
+                        if (m) { h = m[1]; bookid = m[2]; c = m[3]; }
+                    } catch(e) {}
+                    send('content', JSON.stringify({
+                        html: html, title: title,
+                        h: h, bookid: bookid, c: c, sel: foundSel, href: location.href
+                    }));
+                } catch(e) { send('extract-err', String(e)); }
+            }, 500);
+            // 验证/加载可能较久，延长等待；即使超时也保留 interval 引用可被 GC
+            setTimeout(function() { clearInterval(t); }, 180000);
+        })();
+        """
+        let chapterExtractScript = WKUserScript(source: chapterExtractJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        controller.addUserScript(chapterExtractScript)
+
         // ===== 临时调试插桩 (debug-point) =====
         // #region debug-point D:ios-evidence
         let debugScript = WKUserScript(source: debugJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         controller.addUserScript(debugScript)
         controller.add(self, name: "dbg")
+        controller.add(self, name: "chapter")
         // #endregion
 
         config.userContentController = controller
@@ -778,9 +814,320 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             DispatchQueue.main.async {
                 self.appendDebugLog("[DBG:\(tag)] \(msg)")
             }
+        } else if message.name == "chapter", let body = message.body as? [String: Any] {
+            let tag = body["tag"] as? String ?? "?"
+            let payload = body["payload"] as? String ?? ""
+            DispatchQueue.main.async {
+                self.handleChapterMessage(tag: tag, payload: payload)
+            }
         }
     }
     // #endregion
+
+    // ===== 章节页正文提取 -> 全屏沉浸阅读页 (v13) =====
+    private func handleChapterMessage(tag: String, payload: String) {
+        appendDebugLog("[chapter:\(tag)] \(String(payload.prefix(300)))")
+        if tag == "content" {
+            guard let data = payload.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let html = obj["html"] as? String else {
+                appendDebugLog("[chapter:content-parse-err] payload=\(payload.prefix(200))")
+                return
+            }
+            let h = obj["h"] as? String ?? ""
+            let bookid = obj["bookid"] as? String ?? ""
+            let c = obj["c"] as? String ?? ""
+            let title = obj["title"] as? String ?? ""
+            appendDebugLog("[chapter:content-ok] sel=\(obj["sel"] as? String ?? "?") title=\(title) h=\(h) bookid=\(bookid) c=\(c) htmlLen=\(html.count)")
+            readerLastData = (h, bookid, c)
+            presentReader(html: html, title: title)
+        }
+    }
+
+    private func presentReader(html: String, title: String) {
+        if readerContainer == nil { buildReaderUI() }
+        readerTitleLabel.text = title.isEmpty ? "阅读器" : title
+        let page = readerHTML(title: title, body: html)
+        readerView.loadHTMLString(page, baseURL: URL(string: "https://sangtacviet.vip"))
+        readerContainer.isHidden = false
+        view.bringSubviewToFront(readerContainer)
+        appendDebugLog("[reader] presented, htmlLen=\(html.count)")
+    }
+
+    private func dismissReader() {
+        readerContainer.isHidden = true
+        appendDebugLog("[reader] dismissed")
+    }
+
+    private func buildReaderUI() {
+        let container = UIView()
+        container.backgroundColor = .black
+        container.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(container)
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: view.topAnchor),
+            container.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            container.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        container.isHidden = true
+
+        // 顶栏：关闭 | 标题 | 上一章/下一章
+        let topBar = UIView()
+        topBar.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        topBar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(topBar)
+
+        let closeBtn = UIButton(type: .system)
+        closeBtn.setTitle("✕ 返回", for: .normal)
+        closeBtn.setTitleColor(.white, for: .normal)
+        closeBtn.addTarget(self, action: #selector(readerCloseTapped), for: .touchUpInside)
+        closeBtn.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(closeBtn)
+
+        let titleLbl = UILabel()
+        titleLbl.textColor = .white
+        titleLbl.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLbl.textAlignment = .center
+        titleLbl.numberOfLines = 1
+        titleLbl.lineBreakMode = .byTruncatingTail
+        titleLbl.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(titleLbl)
+        readerTitleLabel = titleLbl
+
+        let prevBtn = UIButton(type: .system)
+        prevBtn.setTitle("←上", for: .normal)
+        prevBtn.setTitleColor(.white, for: .normal)
+        prevBtn.addTarget(self, action: #selector(readerPrevTapped), for: .touchUpInside)
+        prevBtn.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(prevBtn)
+
+        let nextBtn = UIButton(type: .system)
+        nextBtn.setTitle("下→", for: .normal)
+        nextBtn.setTitleColor(.white, for: .normal)
+        nextBtn.addTarget(self, action: #selector(readerNextTapped), for: .touchUpInside)
+        nextBtn.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(nextBtn)
+
+        NSLayoutConstraint.activate([
+            topBar.topAnchor.constraint(equalTo: container.topAnchor),
+            topBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            topBar.heightAnchor.constraint(equalToConstant: readerTopBarHeight + view.safeAreaInsets.top),
+
+            closeBtn.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 8),
+            closeBtn.centerYAnchor.constraint(equalTo: topBar.bottomAnchor, constant: -(readerTopBarHeight / 2)),
+            closeBtn.widthAnchor.constraint(equalToConstant: 70),
+
+            prevBtn.leadingAnchor.constraint(equalTo: closeBtn.trailingAnchor, constant: 4),
+            prevBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor),
+            prevBtn.widthAnchor.constraint(equalToConstant: 52),
+
+            nextBtn.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -8),
+            nextBtn.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor),
+            nextBtn.widthAnchor.constraint(equalToConstant: 52),
+
+            titleLbl.leadingAnchor.constraint(equalTo: prevBtn.trailingAnchor, constant: 4),
+            titleLbl.trailingAnchor.constraint(equalTo: nextBtn.leadingAnchor, constant: -4),
+            titleLbl.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor)
+        ])
+
+        // 正文 WKWebView
+        let wvConfig = WKWebViewConfiguration()
+        wvConfig.websiteDataStore = WKWebsiteDataStore.default()
+        let readerWv = WKWebView(frame: .zero, configuration: wvConfig)
+        readerWv.backgroundColor = .systemBackground
+        readerWv.isOpaque = false
+        readerWv.scrollView.contentInsetAdjustmentBehavior = .never
+        readerWv.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(readerWv)
+        NSLayoutConstraint.activate([
+            readerWv.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            readerWv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            readerWv.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+            // 底部约束在 settingsBar 创建后统一添加，避免与 container.bottom 冲突
+        ])
+        readerView = readerWv
+
+        // 阅读设置条（底部）：字号-/A /A+ /夜间 /白天
+        let settingsBar = UIView()
+        settingsBar.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        settingsBar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(settingsBar)
+        let fontDown = UIButton(type: .system)
+        fontDown.setTitle("A-", for: .normal)
+        fontDown.setTitleColor(.white, for: .normal)
+        fontDown.addTarget(self, action: #selector(readerFontDown), for: .touchUpInside)
+        fontDown.translatesAutoresizingMaskIntoConstraints = false
+        settingsBar.addSubview(fontDown)
+
+        let fontUp = UIButton(type: .system)
+        fontUp.setTitle("A+", for: .normal)
+        fontUp.setTitleColor(.white, for: .normal)
+        fontUp.addTarget(self, action: #selector(readerFontUp), for: .touchUpInside)
+        fontUp.translatesAutoresizingMaskIntoConstraints = false
+        settingsBar.addSubview(fontUp)
+
+        let nightBtn = UIButton(type: .system)
+        nightBtn.setTitle("🌙夜间", for: .normal)
+        nightBtn.setTitleColor(.white, for: .normal)
+        nightBtn.addTarget(self, action: #selector(readerNightToggle), for: .touchUpInside)
+        nightBtn.translatesAutoresizingMaskIntoConstraints = false
+        settingsBar.addSubview(nightBtn)
+
+        let dayBtn = UIButton(type: .system)
+        dayBtn.setTitle("☀白天", for: .normal)
+        dayBtn.setTitleColor(.white, for: .normal)
+        dayBtn.addTarget(self, action: #selector(readerDayMode), for: .touchUpInside)
+        dayBtn.translatesAutoresizingMaskIntoConstraints = false
+        settingsBar.addSubview(dayBtn)
+
+        NSLayoutConstraint.activate([
+            settingsBar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            settingsBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            settingsBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            settingsBar.heightAnchor.constraint(equalToConstant: 44 + view.safeAreaInsets.bottom),
+
+            fontDown.leadingAnchor.constraint(equalTo: settingsBar.leadingAnchor, constant: 16),
+            fontDown.topAnchor.constraint(equalTo: settingsBar.topAnchor, constant: 8),
+            fontDown.widthAnchor.constraint(equalToConstant: 56),
+            fontDown.heightAnchor.constraint(equalToConstant: 30),
+
+            fontUp.leadingAnchor.constraint(equalTo: fontDown.trailingAnchor, constant: 8),
+            fontUp.topAnchor.constraint(equalTo: fontDown.topAnchor),
+            fontUp.widthAnchor.constraint(equalToConstant: 56),
+            fontUp.heightAnchor.constraint(equalToConstant: 30),
+
+            nightBtn.trailingAnchor.constraint(equalTo: dayBtn.leadingAnchor, constant: -12),
+            nightBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
+            nightBtn.widthAnchor.constraint(equalToConstant: 72),
+
+            dayBtn.trailingAnchor.constraint(equalTo: settingsBar.trailingAnchor, constant: -16),
+            dayBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
+            dayBtn.widthAnchor.constraint(equalToConstant: 72)
+        ])
+
+        // 把 readerWv 底部从 container.bottom 改接到 settingsBar.top，避免被设置条遮挡
+        readerWv.bottomAnchor.constraint(equalTo: settingsBar.topAnchor).isActive = true
+
+        // 让 readerWv 底部不被设置条遮挡
+        readerWvBottomInset()
+
+        readerContainer = container
+    }
+
+    private func readerWvBottomInset() {
+        // 正文底部留出设置条高度
+        readerView.scrollView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 44, right: 0)
+    }
+
+    @objc private func readerCloseTapped() {
+        dismissReader()
+    }
+
+    @objc private func readerPrevTapped() {
+        readerGo(delta: -1)
+    }
+
+    @objc private func readerNextTapped() {
+        readerGo(delta: 1)
+    }
+
+    // 上一章/下一章：导航到章节页，等待提取脚本重新上报正文
+    private func readerGo(delta: Int) {
+        guard let info = readerLastData else {
+            appendDebugLog("[reader] no last data for nav")
+            return
+        }
+        var cVal = Int64(info.c) ?? 0
+        cVal += Int64(delta)
+        let newC = String(cVal)
+        let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(newC)/"
+        appendDebugLog("[reader] nav to \(chapUrl)")
+        // 让底层 webView 导航到章节页
+        if let url = URL(string: chapUrl) {
+            webView.load(URLRequest(url: url))
+            // 等章节页提取后 presentReader 会再次调用
+        }
+    }
+
+    @objc private func readerFontDown() {
+        adjustReaderFont(delta: -2)
+    }
+
+    @objc private func readerFontUp() {
+        adjustReaderFont(delta: 2)
+    }
+
+    private func adjustReaderFont(delta: CGFloat) {
+        readerView.evaluateJavaScript("readerAdjustFont(\(delta))", completionHandler: nil)
+    }
+
+    @objc private func readerNightToggle() {
+        readerView.evaluateJavaScript("readerNightMode(true)", completionHandler: nil)
+    }
+
+    @objc private func readerDayMode() {
+        readerView.evaluateJavaScript("readerNightMode(false)", completionHandler: nil)
+    }
+
+    // 自包含阅读页 HTML：正文 + 沉浸式排版 + 字号/夜间模式 JS
+    private func readerHTML(title: String, body: String) -> String {
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+        <style>
+            :root { --bg:#f5f0e6; --fg:#2b2b2b; --title:#7a6a4a; }
+            @media (prefers-color-scheme: dark) {
+                :root { --bg:#1a1a1a; --fg:#c8c8c8; --title:#9a8a6a; }
+            }
+            body { background: var(--bg); color: var(--fg); margin:0; padding: 20px 20px 80px; }
+            .stv-chapter-title { text-align:center; font-size:22px; font-weight:bold; color:var(--title); margin: 8px 0 20px; line-height:1.4; }
+            .stv-body { font-size: 19px; line-height: 1.9; letter-spacing:0.2px; word-break: break-word; }
+            .stv-body p { margin: 0.6em 0; text-indent: 2em; }
+            .stv-body img { max-width: 100% !important; height: auto !important; }
+            .stv-body i[data-stv-ruby] { color: var(--title); }
+        </style>
+        </head>
+        <body>
+            <div class="stv-chapter-title">\(htmlEscape(title))</div>
+            <div class="stv-body" id="stvBody">\(body)</div>
+            <script>
+            var stvFont = 19;
+            function readerAdjustFont(d) {
+                stvFont = Math.max(14, Math.min(32, stvFont + d));
+                var b = document.getElementById('stvBody');
+                if (b) b.style.fontSize = stvFont + 'px';
+            }
+            function readerNightMode(night) {
+                var r = document.documentElement;
+                if (night) {
+                    r.style.setProperty('--bg', '#1a1a1a');
+                    r.style.setProperty('--fg', '#c8c8c8');
+                    r.style.setProperty('--title', '#9a8a6a');
+                } else {
+                    r.style.setProperty('--bg', '#f5f0e6');
+                    r.style.setProperty('--fg', '#2b2b2b');
+                    r.style.setProperty('--title', '#7a6a4a');
+                }
+            }
+            </script>
+        </body>
+        </html>
+        """
+    }
+
+    private func htmlEscape(_ s: String) -> String {
+        var out = s
+        out = out.replacingOccurrences(of: "&", with: "&amp;")
+        out = out.replacingOccurrences(of: "<", with: "&lt;")
+        out = out.replacingOccurrences(of: ">", with: "&gt;")
+        return out
+    }
+
 }
 
 /// 监听 WKWebView cookie 变化，回调宿主保存到 UserDefaults，

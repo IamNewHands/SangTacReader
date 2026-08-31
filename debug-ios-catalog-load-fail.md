@@ -386,3 +386,42 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 - `gc-p1` 的 `time` 值（30 vs 1000）也是线索：30=浏览器页面快速重试，1000=非浏览器。
 
 **代码改动**：`SangTacReader/WebViewController.swift` getContent 覆写（未提交）。
+
+---
+
+## v12 结果（log9）：proof 无关，SPA 内 XHR 恒 code:7（决定性）
+
+**2026-08-31 log9 分析**：
+- qimao 章：带 proof `63b2e877...` 首请求 → `{"code":"5","err":"...4003."}`（**旧 proof 无效/过期**）；空 body 后续 → `code:7,time:1000`。
+- qidian 章：带 proof 首请求 → **直接 `code:7,time:1000`**（连会话都建立不了）；空 body 后续 → `code:7,time:1000`。
+- **结论**：proof 的**存在与否与 code:7 完全无关**。带 proof 首请求在 SPA 内仍 time:1000，无法像章节页那样建立 time:30 会话。
+
+**决定性对比（log8 vs log9）**：
+
+| | log9 SPA | log8 章节页 |
+|---|---|---|
+| 首次 readchapter | `code:7,time:1000` | `code:7,time:30` |
+| 空 body 后续 | `code:7,time:1000` | `code:21` → verifyca → `code:0` |
+| cookie | 与章节页相同 | — |
+
+cookie 相同但结果不同 → 差异在**请求发起的页面环境**（完整 document 加载 vs 同源 XHR 注入）。服务器检测"完整页面加载"（time:30）与"SPA 内 XHR"（time:1000）。**SPA 内无论如何改 readchapter 参数都拿不到 code:0。**
+
+**用户决策（AskUserQuestion）**：选择"章节页会话+原生渲染"——整页导航章节页建立会话拿正文，再由原生阅读器渲染。
+
+---
+
+## v13：章节页会话 + 全屏沉浸阅读页（原生体验）
+
+**设计**：
+1. `getContent` 覆写 → 整页导航章节页 `/truyen/{h}/1/{bookid}/{c}/`（建立 time:30 会话，触发 verifyca）。
+2. 章节页正文由页面自带逻辑加载（readchapter code:0）渲染进 DOM。
+3. 新增 `chapterExtractJS`（独立 WKUserScript）：`/truyen/` 下**只读轮询**正文容器（自适应候选选择器），提取 HTML+标题+章节信息，`postMessage` 给 Swift `chapter` handler。**绝不覆写 XHR.open/send**（章节页反爬检测外部覆写 → code:7）。
+4. Swift `handleChapterMessage`：收到 `content` → 新增全屏沉浸阅读页（覆盖层 WKWebView `readerView`），渲染正文 HTML，提供关闭/上一章/下一章/字号 A-/A+/夜间/白天。
+
+**关键未知（待真机验证）**：
+- 章节页正文容器选择器（自适应候选 + probe 日志上报命中情况）。
+- 上一章/下一章：当前用章节 ID ±1（可能不连续），后续可从章节页 DOM 提取真实下一章链接改进。
+- 登录（ajax=login size=7/502）仍为独立问题。
+
+**代码改动**：`SangTacReader/WebViewController.swift`（getContent 导航 + chapterExtractJS + 全屏阅读页）。
+
