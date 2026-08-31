@@ -170,3 +170,52 @@ readchapter 服务器按 `x-stv-transport` 区分传输方式：`app` → 正常
 ### 待真机验证（v6）
 1. readchapter 应返回 `code:0`（正文），REQ-HDRS 应显示 `x-stv-transport: app`。
 2. 目录、登录、语言切换仍正常。
+
+## v7 根因（决定性）：readchapter 必须带有效 `key`，且 key 由 grantcontext 下发混淆 JS 生成（无法在 Web 环境复现）
+
+**2026-08-31 v6 修复后仍失败（error.txt）**：
+- `x-stv-transport: app` 头已正确发送，URL 已正确，但仍返回 code:7。
+
+**通过抓取 app.v2.read.js 源码 + 服务器多重实测，推翻 v5 的"key 不需要"结论**：
+
+### 源码真相（app.v2.read.js 决定性）
+```js
+// 真实 App 流程（App 端才有 Capacitor.Plugins.Http）：
+app.reader.loadKeyFromServer = async function(h,i){
+    if(window.Capacitor && window.Capacitor.Plugins.Http){   // ← 仅 App 存在 Capacitor 才运行
+        var toEvaluate = await context.get({
+            url: fullUrl(bestDomain() + "/io/grantcontext/context?hostid="+h+"&bookid="+i),
+            headers: { Cookie: document.cookie + "; mac_tt=true;", "x-stv-transport":"app", ... }
+        });
+        app.net.evalCookie(toEvaluate.headers);
+        this.chapterkey = eval(toEvaluate.data);   // ← key = eval 服务器下发混淆 JS 的结果
+    }
+}
+app.reader.getContent2 = async function(h,i,c,rl){
+    if(window.Capacitor && window.Capacitor.Plugins.Http){
+        var url = `/?sajax=readchapter&h=${h}&bookid=${i}&c=${c}&key=${this.chapterkey}`;  // ← 必须带 key
+        ...
+    }
+}
+```
+- **纯 Web WKWebView 无 Capacitor → loadKeyFromServer 永不运行 → chapterkey 永远 undefined → key=undefined → code:7**。
+- **服务器实测**：App 格式 `/?sajax=readchapter&h&bookid&c&key=`（key 空/缺）均返回 `{"code":7}`；`key` 确实必须。
+
+### 服务器 grantcontext 混淆 JS 分析（node 三重验证）
+- grantcontext 返回**超大混淆 JS**（因 session/cookie 变化：plain 321KB、带 `_ac`/`_gac` 297KB、两者都带 274KB）。
+- 脚本为 **javascript-obfuscator 风格 IIFE**：`(()=>{var ...})()`，**无 `return` 关键字、无 window/Capacitor/document 引用**。
+- node 精确复现（btoa/atob/RegExp/Date 全补）eval **返回 undefined**，仅设置两个全局 `_0x4d38`/`_0x8c0e`（字符串解码缓存）。
+- 结论：**eval 返回 undefined** → 要么真实 App 设备/登录会话拿到的脚本不同（设备指纹绑定），要么该机制本身就不可在纯 Web 复现。**从抓包环境无法确定 key 是否能在真机 WKWebView 里生成**。
+
+### 网页章节页（Crawler 参考项目，可工作）
+Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `/truyen/{ori}/1/{bookid}/{c}/` 抓 `contentbox` DOM，完全绕开 readchapter API 的 key。章节页内部用 `POST /index.php?bookid&h&c&ngmar=readc&sajax=readchapter&sty=1&exts=`（无 key），但其授权依赖**执行页面内联 JS 设置的 `_gac` cookie**（node 无法执行 JS，故 node 测试返回 code:"5"/7，真机浏览器可行）。
+
+### 修复方案 v7（当前，已实施）
+1. **保留自定义 loadKeyFromServer**：XHR 拉 grantcontext + eval，真机验证 `[DBG:gkey]` 能否拿到 key（若能则走原生 key 流程）。
+2. **getContent 覆写改造**：先尝试 App 格式 `/?sajax=readchapter&...&key=`；若 `key` 无效 / code:7 / code:"5" → **导航到章节页** `/truyen/{h}/1/{bookid}/{c}/`（网页版可读，Crawler 同法）。
+3. **移除全局 XHR.readchapter 的 ngmar/sty/exts 强制补全**（那是网页章节页格式，与 App 格式 key 冲突），仅清理字面 `key=undefined`。
+
+### 待真机验证（v7）
+1. `[DBG:gkey] key=...` 看 eval 是否真能返回有效 key（大概率 undefined）。
+2. 若 key 无效 → 应自动导航到章节页并渲染正文。
+3. 目录、登录、语言切换仍正常。
