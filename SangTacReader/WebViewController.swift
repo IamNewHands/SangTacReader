@@ -675,8 +675,6 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // ===== 临时调试插桩注入脚本 (debug-point D) =====
     private let debugJS = """
     (function(){
-        // 章节页(/truyen/)不加任何插桩，保持与真实浏览器一致，避免破坏页面自身反爬
-        try { if (String(window.location.pathname).indexOf('/truyen/') === 0) { return; } } catch(e) {}
         function dbg(tag, msg) {
             try {
                 if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg) {
@@ -719,6 +717,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         if (String(xhr._dbgUrl||'').indexOf('readchapter') > -1) {
                             dbg('xhr-hdrs', 'REQ-HDRS=' + JSON.stringify(xhr._dbgHeaders || {}) + ' | respHdr=' + (xhr.getAllResponseHeaders ? xhr.getAllResponseHeaders() : ''));
                             dbg('xhr-cookie', document.cookie);
+                            try { dbg('xhr-body', 'resp=' + String(xhr.responseText).slice(0, 300)); } catch(err){}
                         }
                     } catch(err) {}
                     if (oldOnload) oldOnload.apply(this, arguments);
