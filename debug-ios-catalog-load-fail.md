@@ -7,7 +7,9 @@
 ## 症状
 
 - 应用打开正常（不再崩溃）。
-- 小说目录/内容加载提示 "Kết nối tới máy chủ thất bại"（连接服务器失败）。
+- 小说目录/内容加载提示 "Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời
+Tải lại"（设备不兼容或应用版本已过时
+重新下载）。
 - 登录正常（POST 不需要 Referer）。
 
 ## 环境
@@ -96,7 +98,43 @@
 
 `customUserAgent` 从 `...Mobile/15E148 SangTacVietApp/1.2.17` 改为 `...Mobile/15E148 Safari/604.1`（标准 iPhone Safari），去掉 app 后缀，服务器视其为 Safari 浏览器放行。
 
-### 待真机验证
+### v5 根因（决定性）：bridgeJS 整段因 Swift 字符串转义而 JS 语法错误，从未执行
 
-1. 章节正文可读取（`[DBG:gc-ok]` 显示长度）。
-2. 登录、语言切换、目录仍正常（用 Safari UA 走纯 web 分支）。
+**2026-08-31 新日志（error.txt）分析**：
+- 应用不崩、登录/目录正常（chapterlist 200 size=122338）。
+- readchapter 仍返回 size=24（code:7），且请求 URL 仍是
+  `/?sajax=readchapter&...&key=undefined`——**未**被注入的
+  XHR.readchapter 规范化补丁修正。
+- `[DBG:patch] nm-exists; isDomainAlivePatched=false`：bridgeJS 的 patchNet 未生效。
+- getContent 覆写未生效（日志无任何 `gc-` 输出）。
+
+**根因**：`WebViewController.swift` 的 `bridgeJS` 是 Swift 普通 `"""` 多行字符串，
+其中第 525 行写了 `'\n'`。Swift 会把 `\n` 编译成**真实换行符**，导致注入 WKWebView 的
+JS 变成：
+
+```js
+dl('pop', 'hash=' + location.hash + '
+' + (new Error().stack||'').split('
+').slice(1,5).join('
+'));
+```
+
+单引号字符串跨行 → **整个 bridgeJS 脚本 JS 语法错误，一行都不执行**（node 验证
+`SYNTAX ERROR: Invalid or unexpected token`）。只有独立注入的 debugJS 正常打印日志。
+
+**因此此前所有基于 bridgeJS 的修复（getContent 覆写 / XHR.readchapter 规范化 /
+强制同源 patchNet / CSS 视口修复）从未真正执行过**——这就是反复失败、每次看起来
+"没生效"的真正原因。readchapter 一直发 `key=undefined` 坏 URL → code:7。
+
+**v5 修复（当前）**：把第 525 行改为 `'\\n'`（Swift 生成字面 `\n`），
+node 验证修复后注入 JS 语法 OK。
+
+修复后 bridgeJS 首次真正执行，以下机制将同时生效（双保险）：
+1. `app.reader.getContent` 覆写：用正确格式 `?bookid&h&c&ngmar=readc&sajax=readchapter&sty=1&exts=`。
+2. **XHR.open 兜底**：任何含 `readchapter` 的 URL 删 `key=undefined`、补 `ngmar/sty/exts`。
+   （即使 getContent 覆写被前端动态加载的 app.v2.read.js 覆盖，兜底仍生效。）
+
+### 待真机验证（重新编译含 v5 修复的包）
+
+1. 章节正文可读取（readchapter 应返回 `code:0`，URL 不再带 `key=undefined`）。
+2. 登录、语言切换、目录仍正常。

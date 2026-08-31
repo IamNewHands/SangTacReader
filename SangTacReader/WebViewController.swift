@@ -522,7 +522,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     if(typeof A.popPage === 'function'){
                         var oq = A.popPage;
                         A.popPage = function(){
-                            dl('pop', 'hash=' + location.hash + '\n' + (new Error().stack||'').split('\n').slice(1,5).join('\n'));
+                            // 注意：bridgeJS 是 Swift 普通 """ 多行字符串，源码里必须写 '\\n'
+                            // 才能在注入后的 JS 中得到字面的 \n（否则 Swift 会把 \n 转义成
+                            // 真实换行符，导致 JS 单引号字符串跨行 -> 整个 bridgeJS 语法错误、
+                            // 一行都不执行。这是此前所有注入补丁(同源/readchapter 规范化)
+                            // 从未生效的根本原因）。
+                            dl('pop', 'hash=' + location.hash + '\\n' + (new Error().stack||'').split('\\n').slice(1,5).join('\\n'));
                             return oq.apply(this, arguments);
                         };
                     }
