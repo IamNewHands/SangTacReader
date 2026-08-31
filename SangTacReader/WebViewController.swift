@@ -388,7 +388,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         // Swift，在完整的原生阅读器界面渲染正文。不跳浏览器。
                         try { window.__stvPendingRead = {h:h, bookid:i, c:c}; } catch(e) {}
                         if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nativeRead) {
-                            try { window.webkit.messageHandlers.nativeRead.postMessage({h: String(h), bookid: String(i), c: String(c)}); } catch(e) {}
+                            try { window.webkit.messageHandlers.nativeRead.postMessage({h: String(h), bookid: String(i), c: String(c), key: String(window.__lastChapterKey || '')}); } catch(e) {}
                         }
                         var base = window.location.origin;
                         var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
@@ -836,6 +836,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     try { dbg('xhr-load', 'status=' + xhr.status + ' size=' + (xhr.responseText ? xhr.responseText.length : 0) + ' url=' + xhr.responseURL); } catch(err){ dbg('xhr-load-err', String(err)); }
                     try {
                         if (String(xhr._dbgUrl||'').indexOf('readchapter') > -1) {
+                            // Task0：提取 chapterkey 供原生 URLSession 直读验证
+                            try {
+                                var rcUrl = String(xhr._dbgUrl || xhr.responseURL || '');
+                                var km = rcUrl.match(/[?&]key=([^&]+)/);
+                                if (km && km[1]) { window.__lastChapterKey = decodeURIComponent(km[1]); }
+                            } catch(e) {}
                             dbg('xhr-hdrs', 'REQ-HDRS=' + JSON.stringify(xhr._dbgHeaders || {}) + ' | respHdr=' + (xhr.getAllResponseHeaders ? xhr.getAllResponseHeaders() : ''));
                             dbg('xhr-cookie', document.cookie);
                             try { dbg('xhr-body', 'resp=' + String(xhr.responseText).slice(0, 300)); } catch(err){}
@@ -1006,12 +1012,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 self.handleChapterMessage(tag: tag, payload: payload)
             }
         } else if message.name == "nativeRead", let body = message.body as? [String: Any] {
-            // v17：点章 -> JS 直接传 h/bookid/c，原生 URLSession 直读正文
+            // v17：点章 -> JS 直接传 h/bookid/c(+key)，原生 URLSession 直读正文
             let h = body["h"] as? String ?? ""
             let bookid = body["bookid"] as? String ?? ""
             let c = body["c"] as? String ?? ""
+            let key = body["key"] as? String ?? ""
             DispatchQueue.main.async {
-                self.nativeReadChapter(h: h, bookid: bookid, c: c)
+                self.nativeReadChapter(h: h, bookid: bookid, c: c, key: key)
             }
         }
     }
@@ -1286,12 +1293,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // ===== v21 原生阅读器：主 webview 后台取正文 + 原生覆盖渲染 =====
     // 点章 -> getContent 发 nativeRead -> 这里先显示原生"加载中"占位（覆盖即将导航的章节页，
     // 用户无感知），章节页 readchapter 被拦截 -> 上报 -> 在完整原生阅读器渲染正文。
-    private func nativeReadChapter(h: String, bookid: String, c: String) {
-        appendDebugLog("[nativeRead] show placeholder h=\(h) bookid=\(bookid) c=\(c)")
+    private func nativeReadChapter(h: String, bookid: String, c: String, key: String = "") {
+        appendDebugLog("[nativeRead] show placeholder h=\(h) bookid=\(bookid) c=\(c) keyLen=\(key.count)")
         guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
             appendDebugLog("[nativeRead] missing params, abort")
             return
         }
+        // Task0：用原生 URLSession 带 app 头直读 readchapter，验证能否拿到 code:0（方案B基石）
+        probeNativeRead(h: h, bookid: bookid, c: c, key: key)
         // 预置期望章节，使正文上报能通过 handleChapterMessage 过滤
         readerExpectedC = c
         readerLoadedC = nil
@@ -1299,6 +1308,52 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 立即显示原生全屏"加载中"占位（覆盖即将导航的章节页）
         presentReader(html: "<p>加载中…</p>", title: "")
         appendDebugLog("[nativeRead] placeholder shown")
+    }
+
+    // Task0 临时验证：iOS 原生 URLSession 带 app 头 + 会话 cookie 直发 readchapter，
+    // 检查返回 code 是否 0（复刻安卓 Capacitor Http 的关键假设）。
+    private func probeNativeRead(h: String, bookid: String, c: String, key: String) {
+        if key.isEmpty {
+            appendDebugLog("[probe] SKIP: key empty (尚未缓存 chapterkey), 无法验证。需先完成一章读取后再切章才能拿到 key")
+            return
+        }
+        appendDebugLog("[probe] start h=\(h) bookid=\(bookid) c=\(c) key=\(key)")
+        // 收集 webview 会话 cookie
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { [weak self] cookies in
+            var cookieStr = ""
+            for ck in cookies {
+                if let d = ck.domain, d.contains("sangtacviet") {
+                    cookieStr += "\(ck.name)=\(ck.value); "
+                }
+            }
+            let urlStr = "https://sangtacviet.vip/?sajax=readchapter&h=\(h)&bookid=\(bookid)&c=\(c)&key=\(key)"
+            guard let url = URL(string: urlStr) else {
+                self?.appendDebugLog("[probe] bad url"); return
+            }
+            var req = URLRequest(url: url)
+            req.setValue("app", forHTTPHeaderField: "x-stv-transport")
+            req.setValue("com.sangtacviet.mobilereader", forHTTPHeaderField: "x-requested-with")
+            req.setValue(cookieStr + "mac_tt=true;", forHTTPHeaderField: "Cookie")
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", forHTTPHeaderField: "User-Agent")
+            let task = URLSession.shared.dataTask(with: req) { data, resp, err in
+                guard let data = data, let s = String(data: data, encoding: .utf8) else {
+                    self?.appendDebugLog("[probe] err=\(String(describing: err))"); return
+                }
+                var j = s
+                if j.hasPrefix("\u{FEFF}") { j.removeFirst() }
+                if j.first != "{" { if let idx = j.firstIndex(of: "{") { j = String(j[idx...]) } }
+                if let d = j.data(using: .utf8), let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                    let code = o["code"] as? String ?? "?"
+                    let dataLen = (o["data"] as? String)?.count ?? -1
+                    let time = o["time"] as? String ?? "?"
+                    self?.appendDebugLog("[probe] RESULT code=\(code) dataLen=\(dataLen) time=\(time) c=\(o["c"] ?? "?")")
+                } else {
+                    self?.appendDebugLog("[probe] non-json resp=\(s.prefix(200))")
+                }
+            }
+            task.resume()
+        }
     }
 
     // v17：Swift 版中文化（搬移 JS toChineseContent）——移除顶部灰色提示、<i>注释->中文t值、移除版权提示
