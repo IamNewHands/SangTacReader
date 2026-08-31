@@ -307,8 +307,34 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                 + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
                         if (rl) url += "&rescan=true";
                         tryDbg('gc-url', url);
+                        // 用原生 XHR 模拟 App 客户端请求，而不是 app.net.get()。
+                        // 原因：app.net.get() 内部强制给所有 GET 加 "x-stv-transport: web" 头，
+                        // 服务器对 readchapter 见到 web 传输会返回 {"code":7}（设备不兼容或版本过时，
+                        // 即"网页版已过时，请改用 App"）。而安卓真实 App 走 Capacitor 用的是
+                        // "x-stv-transport: app" + "x-requested-with" 头，服务器据此放行并返回正文。
+                        // 这里完全复刻 App 客户端的请求头，让服务器把请求当作 App 客户端处理。
                         try {
-                            var cdata = await app.net.get(url);
+                            var cdata = await new Promise(function(resolve, reject) {
+                                var xhr = new XMLHttpRequest();
+                                xhr.open("GET", url, true);
+                                xhr.setRequestHeader("x-stv-transport", "app");
+                                xhr.setRequestHeader("x-requested-with", "com.sangtacviet.mobilereader");
+                                // 同源 XHR 由 WKWebView 自动携带 Cookie 与 Referer；再显式补一个
+                                // Referer 确保非空（服务器对 GET readchapter 强制要求非空 Referer）。
+                                xhr.setRequestHeader("Referer", document.referrer || window.location.href);
+                                xhr.onreadystatechange = function() {
+                                    if (xhr.readyState === 4) {
+                                        if (xhr.status === 200) {
+                                            try { resolve(JSON.parse(xhr.responseText)); }
+                                            catch(e) { resolve(xhr.responseText); }
+                                        } else {
+                                            reject({code:-1, status:xhr.status, text:xhr.responseText});
+                                        }
+                                    }
+                                };
+                                xhr.onerror = function() { reject({code:-1, message:"xhr error", status:xhr.status}); };
+                                xhr.send();
+                            });
                             if (cdata) {
                                 if (cdata.code + "" == "0") {
                                     tryDbg('gc-ok', 'len=' + (cdata.data ? cdata.data.length : 0));
