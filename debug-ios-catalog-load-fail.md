@@ -336,3 +336,23 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 1. 进章节 → 应弹出 app 内置的 Turnstile 人机验证框（若会话已通过 CF，可能直接 code:0）。
 2. 验证后正文在原生阅读器显示（`[DBG:gc-ok]`）。
 3. 登录仍失败（ajax=login size=7）单独处理。
+
+## v10 结果（log7）：SPA 内网页版 readchapter 恒 code:7，恢复章节页导航
+
+**2026-08-31 log7 分析**：
+- 我的 v10 覆写在 SPA 里用网页版 readchapter（POST /index.php?...&ngmar=readc&sty=1&exts=）发起，
+  **6 次重试全部 `{"code":7,"time":1000}`**，永不进入 code:21，最终 `gc-giveup`。
+- **根因**：章节页在每次加载时会重置 `_gac`（`document.cookie="_gac=7aa2198e...";`）并运行自身的
+  反爬 JS 计算 **readchapter 请求体里的 32-hex 证明 token**（log6 里 `body=1986a9aff2909850...`，
+  且随请求/书变化）。SPA 里没有这段 JS 运行 → 无证明 body → 恒 code:7。
+- 尝试反向推算证明 token：`MD5(_gac_32hex)` 及多种组合均不匹配 → 算法在混淆 JS 内，无法复刻。
+- 结论：**web-format readchapter 只在章节页自身 JS 已运行的页面里可用**（log6 走通），SPA 内不可用。
+
+**修复 v11（已提交）**：恢复 getContent 覆写为【直接跳转章节页】
+`/truyen/{h}/1/{bookid}/{c}/`，不再在 SPA 里空转请求。章节页自身生成证明 +
+`ui.captcha.open`（code:21）引导验证，验证后正文可读（浏览器视图，可接受现状）。
+
+### 待真机验证（v11）
+1. 点进章节 → 跳转章节页（浏览器视图）。
+2. 首次可能弹 Turnstile/verifyca，验证后正文显示。
+3. 登录（ajax=login size=7/502）为独立问题，待单独处理。
