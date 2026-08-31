@@ -1143,9 +1143,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         appendDebugLog("[reader] dismissed")
     }
 
-    // ===== 原生直读正文 (v17)：点章 -> JS 传 h/bookid/c -> URLSession 直读 code:0 =====
-    // 已实测(v16.3)：URLSession 带完整cookie + 页面Referer + POST/form/空body 即可 code:0，
-    // 无需签名头、无需整页导航章节页。这里从 JS 直接拿参数，构造章节页 referer。
+    // ===== 原生直读正文 (v17.1)：点章 -> JS 传 h/bookid/c -> URLSession 直读 =====
+    // log5：从目录页直接 POST 返回 code:7（非浏览器会话）。v16.3 能 code:0 是因为
+    // 那时 WebView 已整页导航章节页建立了 time:30 会话。故这里先用 URLSession
+    // 后台 GET 章节页建立会话/种 cookie，再用同一会话 POST readchapter。
     private func nativeReadChapter(h: String, bookid: String, c: String) {
         appendDebugLog("[nativeRead] h=\(h) bookid=\(bookid) c=\(c)")
         guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
@@ -1154,15 +1155,52 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         }
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { cookies in
-            let cookieStr = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
-            // referer 用构造的章节页 URL（与 v16.3 成功时一致），即使未真正导航
-            let chapRef = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
-            self.fetchChapter(url: base, cookie: cookieStr, referer: chapRef, h: h, bookid: bookid, c: c)
+            var cookieDict: [String: String] = [:]
+            for ck in cookies { cookieDict[ck.name] = ck.value }
+            self.fetchChapterBySession(h: h, bookid: bookid, c: c, baseCookie: cookieDict)
         }
     }
 
-    private func fetchChapter(url: String, cookie: String, referer: String, h: String, bookid: String, c: String) {
+    private func fetchChapterBySession(h: String, bookid: String, c: String, baseCookie: [String: String]) {
+        var cookieDict = baseCookie
+        func cookieHeader() -> String {
+            cookieDict.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
+        }
+        // 步骤1：后台 GET 章节页建立 time:30 会话
+        let chapUrl = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
+        guard let chapU = URL(string: chapUrl) else { return }
+        var chapReq = URLRequest(url: chapU)
+        chapReq.httpMethod = "GET"
+        chapReq.setValue(self.iosUA, forHTTPHeaderField: "User-Agent")
+        chapReq.setValue(cookieHeader(), forHTTPHeaderField: "Cookie")
+        chapReq.setValue("https://sangtacviet.vip/", forHTTPHeaderField: "Referer")
+        URLSession.shared.dataTask(with: chapReq) { [weak self] data, resp, err in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if let e = err { self.appendDebugLog("[nativeRead] get-chap err=\(e.localizedDescription)"); return }
+                if let r = resp as? HTTPURLResponse {
+                    // 合并响应种下的 cookie（Set-Cookie）
+                    let headers = r.allHeaderFields as? [String: String] ?? [:]
+                    for (k, v) in headers {
+                        if k.lowercased() == "set-cookie" {
+                            if let eq = v.firstIndex(of: "=") {
+                                let name = String(v[..<eq])
+                                let value = v[v.index(after: eq)...].split(separator: ";").first.map(String.init) ?? ""
+                                cookieDict[name] = value
+                            }
+                        }
+                    }
+                    self.appendDebugLog("[nativeRead] get-chap status=\(r.statusCode) cookies=\(cookieDict.count)")
+                }
+                // 步骤2：POST readchapter 用会话 cookie
+                let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
+                let chapRef = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
+                self.fetchChapterPost(url: base, cookie: cookieHeader(), referer: chapRef, h: h, bookid: bookid, c: c)
+            }
+        }.resume()
+    }
+
+    private func fetchChapterPost(url: String, cookie: String, referer: String, h: String, bookid: String, c: String) {
         guard let u = URL(string: url) else { return }
         var req = URLRequest(url: u)
         req.httpMethod = "POST"
