@@ -372,14 +372,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         }
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
-                        // v19：整页导航章节页建立 time:30 会话（页面 JS 必执行 readchapter code:0），
-                        // 但导航前先通知原生层显示全屏"加载中"占位覆盖，用户无感知网页跳转。
-                        // 章节页 readchapter 被 XHR 拦截 -> 上报 Swift -> 原生渲染正文。
+                        // v20：直接导航章节页，让 app 自带网页阅读器显示正文（用户选择"用app自带网页阅读器"）。
+                        // 不经过原生覆盖层。章节页在 app 内 WKWebView 加载，即"应用内阅读"体验。
                         try { window.__stvPendingRead = {h:h, bookid:i, c:c}; } catch(e) {}
-                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nativeRead) {
-                            try { window.webkit.messageHandlers.nativeRead.postMessage({h: String(h), bookid: String(i), c: String(c)}); } catch(e) {}
-                        }
-                        // 整页导航章节页（可见加载，页面 JS 发 readchapter 建立真实会话）
                         var base = window.location.origin;
                         var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
                         tryDbg('gc-nav', 'navigating to ' + chapUrl);
@@ -934,36 +929,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         // 触发一次 resize，让前端重新测量 --vh 等视口变量
         webView.evaluateJavaScript("window.dispatchEvent(new Event('resize'));", completionHandler: nil)
-        // v19.1：章节页加载完成后主动重发正确格式 readchapter，避免章节页自身 JS 时序/会话
-        // 导致 readchapter 失败（log8：qidian 章一直"加载中"）。bridgeJS 的 XHR 拦截会自动捕获
-        // code:0 上报 Swift，这里只在请求层面主动重发一次。
-        if let url = webView.url, url.path.contains("/truyen/"), let d = readerLastData,
-           let exp = readerExpectedC, readerLoadedC != exp {
-            let h = d.h, bi = d.bookid, c = d.c
-            let js = """
-            (function(){
-                try {
-                    var h='\(h)', i='\(bi)', c='\(c)';
-                    var u='/index.php?bookid='+encodeURIComponent(i)+'&h='+encodeURIComponent(h)+'&c='+encodeURIComponent(c)+'&ngmar=readc&sajax=readchapter&sty=1&exts=';
-                    var x=new XMLHttpRequest();
-                    x._dbgUrl=u;
-                    x.open('POST', u);
-                    x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
-                    x.onload=function(){
-                        try{
-                            var o=JSON.parse(x.responseText);
-                            var dbgM='req-readc code='+(o&&o.code)+' len='+(x.responseText||'').length;
-                            if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.dbg){
-                                window.webkit.messageHandlers.dbg.postMessage({tag:'req-readc',msg:dbgM});
-                            }
-                        }catch(e){}
-                    };
-                    x.send('');
-                }catch(e){}
-            })();
-            """
-            webView.evaluateJavaScript(js, completionHandler: nil)
-        }
+        // v20：不再注入/重发 readchapter，也不再触发原生覆盖。
+        // 用户选择"用 app 自带网页阅读器"，章节页在 app 内直接显示正文。
     }
 
     // ===== 临时调试插桩 handler (debug-point D) =====
@@ -1032,7 +999,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 return
             }
             readerLastData = (h, bookid, c)
-            presentReader(html: html, title: title)
+            // v20：用户选择"用 app 自带网页阅读器"。正文由章节页网页阅读器在 app 内直接显示，
+            // 原生覆盖层不参与渲染。这里确保原生覆盖层隐藏，不遮挡章节页。
+            if readerContainer != nil && !readerContainer.isHidden {
+                appendDebugLog("[reader] v20 hide native overlay (use web reader)")
+                readerContainer.isHidden = true
+            }
         }
     }
 
@@ -1175,24 +1147,17 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         appendDebugLog("[reader] dismissed")
     }
 
-    // ===== 原生全屏占位 + 主 webview 章节页会话 (v19) =====
-    // log7：隐藏 webview 不可见导致章节页 JS 不执行，readchapter 不发出。
-    // 改为：点章时主 webview 整页导航章节页建立真实会话（页面 JS 必发 readchapter code:0），
-    // 但在导航前立即显示原生全屏"加载中"占位覆盖，用户无感知网页跳转。
-    // 章节页 readchapter 被主 webview 的 XHR 拦截 -> 上报 -> presentReader 更新正文。
+    // ===== v20 兜底：直接导航章节页（用 app 自带网页阅读器）=====
     private func nativeReadChapter(h: String, bookid: String, c: String) {
-        appendDebugLog("[nativeRead] show placeholder h=\(h) bookid=\(bookid) c=\(c)")
+        appendDebugLog("[nativeRead] fallback nav h=\(h) bookid=\(bookid) c=\(c)")
         guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
             appendDebugLog("[nativeRead] missing params, abort")
             return
         }
-        // 预置期望章节，使正文上报能通过 handleChapterMessage 过滤
-        readerExpectedC = c
-        readerLoadedC = nil
-        readerLastData = (h, bookid, c)
-        // 立即显示原生全屏"加载中"占位（覆盖即将导航的章节页）
-        presentReader(html: "<p>加载中…</p>", title: "")
-        appendDebugLog("[nativeRead] placeholder shown")
+        let chapUrl = "https://sangtacviet.vip/truyen/\(h)/1/\(bookid)/\(c)/"
+        if let url = URL(string: chapUrl) {
+            webView.load(URLRequest(url: url))
+        }
     }
 
     // v17：Swift 版中文化（搬移 JS toChineseContent）——移除顶部灰色提示、<i>注释->中文t值、移除版权提示
