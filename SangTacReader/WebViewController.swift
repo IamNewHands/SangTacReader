@@ -1048,7 +1048,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerPageVC?.view.removeFromSuperview()
         readerPageVC = nil
         readerContentHolder.isHidden = false
-        let tv = readerTextView
+        guard let tv = readerTextView else { return }
         tv.attributedText = attr
         tv.isEditable = false
         tv.isSelectable = true
