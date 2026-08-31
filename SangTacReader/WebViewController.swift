@@ -772,6 +772,26 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             dbg('xhr-hdrs', 'REQ-HDRS=' + JSON.stringify(xhr._dbgHeaders || {}) + ' | respHdr=' + (xhr.getAllResponseHeaders ? xhr.getAllResponseHeaders() : ''));
                             dbg('xhr-cookie', document.cookie);
                             try { dbg('xhr-body', 'resp=' + String(xhr.responseText).slice(0, 300)); } catch(err){}
+                            // v14.1：readchapter code:0 时正文已在响应里，直接提取 data 上报 Swift
+                            try {
+                                var rTxt = xhr.responseText || '';
+                                var rObj = JSON.parse(rTxt);
+                                if (rObj && (rObj.code === "0" || rObj.code == 0) && typeof rObj.data === 'string' && rObj.data.length > 0) {
+                                    dbg('readc-code0', 'c=' + (rObj.c || '') + ' dataLen=' + rObj.data.length);
+                                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.chapter) {
+                                        window.webkit.messageHandlers.chapter.postMessage({
+                                            tag: 'content',
+                                            payload: JSON.stringify({
+                                                h: rObj.h || '',
+                                                bookid: rObj.bookid || '',
+                                                c: rObj.c || '',
+                                                title: (rObj.chaptername || '').trim(),
+                                                html: rObj.data
+                                            })
+                                        });
+                                    }
+                                }
+                            } catch(err) {}
                         }
                     } catch(err) {}
                     if (oldOnload) oldOnload.apply(this, arguments);
