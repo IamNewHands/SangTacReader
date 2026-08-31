@@ -523,3 +523,39 @@ cookie 相同但结果不同 → 差异在**请求发起的页面环境**（完�
 3. 上一章/下一章正常（章节 ID ±1，若书 ID 不连续需从章节页 DOM 提取真实链接）。
 
 
+## 阶段 v16：逆向 libssign.so 签名 + 连接认证（2026-08-31）
+
+**目标**：用户拒绝 v11/v13（浏览器套壳），选择"逆向安卓签名，实现点章直接原生正文"。
+
+### 已确认的签名算法（逆向成果）
+1. **Java 层**（jadx 反编译 `Http.java`）：
+   - `X-STV-Sign = signParams(getQueryFromURLAndSort(url))`（`signRequest`，Http.java:579-590）
+   - `getQueryFromURLAndSort`：URL query 去 `?` → split `&` → 字母排序 → `&` join + 尾部 `&`（Http.java:564-577）
+   - Capacitor Http 插件对所有请求自动加该头（HttpRequestHandler.java:477/501）
+2. **libssign.so**（capstone 反汇编，arm64/x86/x86_64 均含）：
+   - 导出 `signParams`(0xe50，1 jstring) + `signParamsK`(0x1550，2 jstring)
+   - 内部标准 MD5（用 `sin` 生成 K 表、0x67452301 等 init 常量、4轮×16步）
+   - 盐字符串：`erogh982^%*%^*`（0x1da0，signParams）、`475yvjt837y9%$^#`（0x1db0，signParamsK）
+   - **MD5 消息 = input（即 sorted_query 带尾部 &），未发现盐进入消息**（关键反汇编：0xfd8 调用 MD5 核心时 x0=sp+0x30=input，x1=sp+0x18=盐，但 0x1080 只用 x0 构造消息；0x1da0 盐加载于 0xfa4 仅用于某 std::string 构造，未进消息缓冲）
+
+### 决定性实机测试结论（_decisive.py / _ua_test.py / _hf_test.py）
+1. **签名值不重要**：三种候选（MD5(input) / MD5(salt+input) / MD5(input+salt)）均能过 Cloudflare（HTTP 200 返回 PHP JSON），偶尔 403 是 Cloudflare 随机反爬（重复请求即可区分，非签名错误）。
+2. **code:1 与 签名/UA/请求头全部无关**：标准 Chrome UA、完整 Sec-Fetch/Origin/Accept-Language 浏览器头、app 专用 UA（STVMobileReader/SangTacVietApp）——**全部返回 code:1**（"Không thể xác thực kết nối" 无法验证连接）。
+3. **code:10002**（`MD5(input+salt)` 偶发）="Khởi động l..." 启动中，服务器状态消息。
+4. **app.v2.php 不种任何 cookie**（curl -c jar 为空）→ 非 cookie 会话机制。
+
+### 核心结论（v16）
+- **code:1 是服务器对"连接/TLS 指纹"的认证，与 HTTP 层（签名/UA/头）完全无关**。Python/curl 的 TLS(J)A3 指纹不在服务器白名单内 → 一律 code:1。
+- **真实 Chrome 浏览器**（v4 已证实）能拿到 code:0 → 服务器接受"真实浏览器"TLS 指纹。
+- **真实 app 用 OkHttp**（TLS 指纹也被接受）→ 服务器接受 OkHttp 指纹。
+- 因此纯 Python/curl 无法复现，**必须在 iOS 真机验证 URLSession 与 WKWebView 的 TLS 指纹是否被接受**：
+  - WKWebView 发请求（系统网络栈 ≈ Safari 指纹）→ 预期可过（v13 已用 WebView 导航拿到 code:0）
+  - 纯原生 URLSession 指纹 → **待 iOS 真机实测**（决定原生直连是否可行）
+
+### 待办（用户已选"抓真机包定位第二层"）
+1. iOS 真机：用 URLSession 带签名直接发 readchapter，看是否 code:0（验证 URLSession 指纹是否被接受）。
+2. 抓真实安卓 app 包（mitmproxy/Frida）确认其完整请求与握手序列。
+3. 若 URLSession 指纹不被接受 → 用 WKWebView 内 fetch/XHR 发请求拿正文 + 原生渲染（结合合法指纹与原生体验）。
+4. 清理临时逆向文件（`_apk_extract/`、`_jadx_out/`、`_*.py`、`jdk17.zip` 等）。
+
+
