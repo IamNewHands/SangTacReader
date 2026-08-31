@@ -558,4 +558,147 @@ cookie 相同但结果不同 → 差异在**请求发起的页面环境**（完�
 3. 若 URLSession 指纹不被接受 → 用 WKWebView 内 fetch/XHR 发请求拿正文 + 原生渲染（结合合法指纹与原生体验）。
 4. 清理临时逆向文件（`_apk_extract/`、`_jadx_out/`、`_*.py`、`jdk17.zip` 等）。
 
+---
+
+# 阶段 v17 - v21：原生阅读体验探索（2026-08-31 当日）
+
+> 本阶段主线：用户要"点一章直接应用原生界面显示正文"。已突破 TLS 指纹认证，探明 readchapter 受
+> "完整页面会话 + Cloudflare Turnstile" 保护，纯 URLSession 不可直读；最终 v21 定案为
+> **后台取正文 + 完整原生阅读器**。以下按版本记录每轮真机结论与代码改动。
+
+## v16 关键定论（上一阶段承接）
+- 纯 Python/curl 因 TLS 指纹不在服务器白名单 → 一律 `code:1`。**签名值其实不重要**。
+- 真实 iOS 真机测试成为唯一判定手段。
+
+---
+
+## v17 / v17.1：URLSession 原生直读正文（实验阶段）
+
+**目标**：用 iOS 原生 URLSession 直读 readchapter，绕过 WebView。
+
+**真机结论（log4，决定性）**：
+- URLSession 的 **TLS 指纹被服务器接受**（返回非 code:1，说明过了连接认证层）！
+- 但需满足：`POST + form + 空body + 完整cookie + 页面Referer + h/bookid/c` 正确 → **code:0 正文**。
+- 日志 `[nativeRead] code:0 htmlLen=...` → 连续 4 本不同源的书全部成功。
+
+**关键参数修正（log3）**：
+- `h` 为空 → `code:5(4003)`；从章节页 URL `/truyen/{源}/1/{bookid}/{c}/` 提取真实源名。
+- `c` 为空 → `code:1 你打开了一个不存在的章节`；`rObj.c` 服务器不回显，需从章节页 URL 最后一段提取。
+
+**但 v17（从目录页直接发）真机结论（log5）**：返回 `code:7`。
+- 原因：v16.3/v17 测试时 WebView **已整页导航过章节页**，建立了 `time:30` 会话；从目录页直接发无此会话。
+
+**v17.1（后台 GET 章节页建会话再 POST）log6**：返回 `code:5(4002)`。
+- 后台 GET 章节页（URLSession，无 JS 执行）建立的会话**不完整**（无 Turnstile 证明）→ POST 失败。
+
+**决定性结论**：`readchapter` 被 Cloudflare Turnstile + 页面级会话保护，**只有"真实浏览器完整页面加载"才能建立有效会话**，纯 URLSession 无法复现 → 原生直读正文**不可行**。
+
+---
+
+## v18：隐藏 WKWebView 预加载章节页（失败）
+
+**方案**：隐藏不可见的 WKWebView 后台加载章节页建立会话，拦截其 readchapter 上报 Swift 原生渲染，主 webview 不跳转。
+
+**真机结论（log7）**：`[hiddenLoad] loading ...` 后**从未触发 readchapter**（无正文上报）。
+- **根因**：不可见/1×1 的 WKWebView **不执行章节页 JS** → readchapter 不发出 → 正文永远拿不到。
+- 结论：**WKWebView 必须可见、正常尺寸，页面 JS 才执行**。
+
+---
+
+## v19 / v19.1：主 webview 导航章节页 + 原生占位覆盖（正文打通）
+
+**方案**：主 webview 整页导航章节页（可见，页面 JS 必执行 readchapter code:0），导航前先显示原生全屏"加载中"占位覆盖（用户无感知跳转），章节页 readchapter 拦截 → 上报 Swift → 原生渲染。
+
+**关键修复（v19）**：原生占位（空正文）**不更新 readerLoadedC**，否则真实正文上报被去重逻辑跳过 → 正文永不显示。
+
+**真机结论（log9）**：
+- 正文成功原生渲染（`[reader] presented(scroll) attrLen=4653`），readchapter code:0。
+- 但**章节页自身的 readchapter 早期请求可能带过期校验值而失败**（log8 一直"加载中"），qidian/trxs 时序不稳定。
+
+**v19.1 修复**：`didFinish`（章节页完全加载后）由 Swift **主动注入 XHR 重发**正确格式 readchapter → bridgeJS 拦截 code:0 自动上报 → 原生渲染。`req-readc code=?` 诊断日志。
+
+**真机结论（log9/log10）**：`didFinish` 重发生效，正文稳定拿到。log10 显示章节页 readchapter 首请求 `status=200 size=22`（带 `body=e8f6c4...` 校验值，22 字节失败），第二次 code:0 成功——**证实早期 readchapter 带过期 token 失败、需重发**。
+
+**用户反馈（v19.1 时）**："正文显示在你单独写的那个阅读器上面，不是在APP原生的阅读界面"。
+- 澄清后：用户要**所有 UI 元素都是 APP 原生**（翻页、标题栏、顶部、底部设置），不要浏览器页，也不要简陋的黑底白字 UITextView。
+
+---
+
+## v20：用 app 自带网页阅读器（方向调整，用户中途改变）
+
+**方案**：getContent 直接导航章节页，让 app 自带网页阅读器（`#content-container`）在 app 内显示正文，去掉原生覆盖。
+
+**真机结论（log10）**：正文能显示（readc-code0），但用户反馈"原生APP出现加载中，然后跳到网页界面"。
+- 用户澄清（AskUserQuestion）：**要保留 APP 界面框架**，所有东西都是 APP 的（翻页/标题栏/顶部全都要），"现在相当于 APP 里面套了浏览器，APP 的翻页 标题栏 顶部全部没有"。
+
+---
+
+## v21：后台取正文 + 完整原生阅读器（当前方案，最新 commit e8947c1）
+
+**最终定案**（用户确认"后台取正文+完整原生阅读器 (推荐)"）：正文只能通过"加载章节页"可靠拿到，但要**完整原生阅读界面**。
+
+**实现**（`SangTacReader/WebViewController.swift`）：
+1. **getContent** → 发 `nativeRead`（Swift 显示原生全屏"加载中"占位，覆盖章节页加载，用户无感知）→ 整页导航章节页 `/truyen/{h}/1/{bookid}/{c}/` 建立会话。
+2. **readchapter 拦截**（bridgeJS XHR onload，章节页页面上下文）→ `code:0` → `toChineseContent` 中文化 → `chapter:content` postMessage 上报 Swift。
+3. **didFinish** 章节页完全加载后主动重发 readchapter（章节页早期 readchapter 带过期 token 失败，需重发）。
+4. **完整原生阅读器**（`readerContainer`，v15 构建）：
+   - **顶部栏**：关闭按钮、章节标题、上一章/下一章（`readerTopBarHeight`）。
+   - **底部设置栏**：字号 A-/A+、夜间/白天、分页/滚动模式切换（44+safeArea）。
+   - **正文**：HTML → `NSAttributedString`（`htmlToAttributed`，字号/行高 1.7/段落）。
+   - **分页模式**（默认）：`UIPageViewController`(pageCurl) + `paginateText`(NSLayoutManager 逐 glyph 分页) + `ReaderPageViewController` 每页 UITextView。
+   - **滚动模式**：`readerTextView` 连续滚动。
+5. **上一章/下一章**（`readerGo(delta:)`）：优先 readchapter 的 `prev/next`（注意：**服务器常返回 "0" 无效**）→ 其次 `readerChapterIds`（目录页 getchapterlist 拦截，来自章节列表）→ 兜底 `c±1`（可能不连续会失败）。导航用主 webview 整页加载新章节页，原生阅读器保持覆盖。
+
+**核心链路**（当前稳定）：
+```
+点章 → getContent 发 nativeRead + 导航章节页
+      → nativeReadChapter 显示原生"加载中"占位（覆盖章节页）
+      → 章节页加载（被覆盖，用户无感知）→ 页面 JS 发 readchapter
+      → bridgeJS XHR 拦截 code:0 → toChineseContent → chapter:content 上报
+      → Swift handleChapterMessage → presentReader → 完整原生阅读器显示正文
+      → didFinish 重发 readchapter（若早期失败）
+```
+
+---
+
+## 当前状态与待办（2026-08-31 v21 已推送）
+
+**已达成**：
+- 登录正常、语言切换中文正常、目录加载正常。
+- 点章能进入完整原生阅读器（顶部栏/底部设置栏/翻页/字号/夜间/模式）。
+- 正文中文化显示（`toChineseContent` 把 `<i>` 越南语注释替换为中文 `t` 值）。
+
+**待验证/可能问题（v21 真机反馈后再定）**：
+1. **上一章/下一章**：若 `readerChapterIds`（目录页 getchapterlist 拦截）未捕获，会 fallback 到 `c±1`，而 qidian 等章节 ID 不连续 → 上下章会失败。**需确认 readerChapterIds 是否已正确捕获**（目录页加载时拦截 `getchapterlist` 响应写入）。
+2. **翻页手势**：分页模式 pageCurl 需左右滑动；若正文只有 1 页则无法翻页（正常）。
+3. **didFinish 重发是否触发重复渲染**：有 `readerLoadedC` 去重，应只渲染一次。
+
+**仍待办**：
+1. 清理临时逆向文件：`_apk_extract/`、`_jadx_out/`、`_*.py`（`_sign*.py`/`_warp.py`/`_c40.py`/`_find*.py`/`_scan*.py`/`_diag.py` 等）、`jdk17.zip`、`jdk17_dir/`。
+2. 登录失败历史问题（`ajax=login size=7/502`）——v21 期间已确认登录正常（log8/log10 用户登录成功）。
+
+---
+
+## 关键技术结论速查表（给新会话快速上手）
+
+| 事项 | 结论 |
+|---|---|
+| 阅读器架构 | iOS app 是 WKWebView 加载 `sangtacviet.vip/app.v2.php`，注入 bridgeJS |
+| 正文获取 | 必须整页导航章节页 `/truyen/{h}/1/{bookid}/{c}/` 建立会话；纯 URLSession/隐藏 webview 均不可行（Turnstile + 页面会话） |
+| readchapter 格式 | `POST /index.php?bookid={i}&h={源名}&c={c}&ngmar=readc&sajax=readchapter&sty=1&exts=`（无 key），同源 + Referer + cookie |
+| readchapter 早期失败 | 章节页自身早期 readchapter 带过期 32-hex 校验值（body）→ 22字节失败；需 didFinish 后重发（v19.1） |
+| TLS 指纹 | iOS URLSession 与 WKWebView 均被服务器接受（非 code:1）；Python/curl 不被接受 |
+| X-STV-Sign 签名 | `MD5(sorted_query带尾部&)`，salt `erogh982^%*%^*`（signParams）、`475yvjt837y9%$^#`（signParamsK）。**但签名值不重要**，连接认证看 TLS 指纹 |
+| code 含义 | code:0=正文；code:1=连接无法验证(TLS)；code:5(4003)=h错；code:5(4002)=未知错误；code:7=非页面会话/设备；code:21=需人机验证(verifyca) |
+| 中文化 | `toChineseContent` 把 `<i h='viet' t='中文'>` 替换为中文 t 值，移除顶部灰色提示/版权提示 |
+| 原生阅读器 | `readerContainer`：顶部栏(关闭/标题/上下章) + 底部设置栏(字号/夜间/模式) + 分页(UIPageViewController)/滚动(UITextView) |
+| 当前版本 | v21（commit `e8947c1`）后台取正文 + 完整原生阅读器 |
+| 关键文件 | `SangTacReader/WebViewController.swift`（所有逻辑都在此文件） |
+
+## 用户最终明确需求（务必遵守，避免返工）
+- **正文点章后直接显示在 APP 原生界面**，不跳外部浏览器、不整页变网页、不用简陋黑底白字 UITextView。
+- **所有 UI 元素都是 APP 原生**：翻页、标题栏、顶部、底部设置。
+- 正文中文化，登录正常，语言可切中文。
+- 上一章/下一章、字号、夜间/白天、分页/滚动模式都要能用。
+
 
