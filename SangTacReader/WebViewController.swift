@@ -13,7 +13,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private var readerContentHolder: UIView!      // 滚动模式容器
     private var readerTextView: UITextView!       // 滚动模式文本视图
     private var readerPageVC: UIPageViewController? // 分页模式
-    private var readerModeIsPaged = true          // 当前模式：分页(true)/滚动(false)
+    private var readerModeIsPaged = false         // 当前模式：分页(true)/滚动(false)。默认滚动=安卓默认 slide 上下滑动
     private var readerAttributed: NSAttributedString? // 当前正文富文本
     private var readerRawHTML = ""                // 当前正文原始(中文)HTML，字号调整时重建
     private var readerTitleLabel: UILabel!
@@ -1045,14 +1045,23 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             readerPrevC = obj["prev"] as? String ?? ""
             readerNextC = obj["next"] as? String ?? ""
             appendDebugLog("[chapter:content-ok] sel=\(obj["sel"] as? String ?? "?") title=\(title) h=\(h) bookid=\(bookid) c=\(c) htmlLen=\(html.count) prev=\(readerPrevC) next=\(readerNextC)")
-            // 若用户已翻到其它章节，忽略旧章节的迟到上报，避免阅读页被错误覆盖
-            if let expected = readerExpectedC, !c.isEmpty, c != expected {
+            // 若用户已翻到其它章节，忽略旧章节的迟到上报。仅当 expected 非空且不同才过滤，
+            // 避免空 expected 误杀首章真实正文。
+            if let expected = readerExpectedC, !expected.isEmpty, !c.isEmpty, c != expected {
                 appendDebugLog("[reader] ignore stale content c=\(c) expected=\(expected)")
                 return
             }
             // 同一章节已显示则跳过，避免章节页 reload 导致的重复刷新
             if readerLoadedC == c && readerContainer != nil && !readerContainer.isHidden {
                 appendDebugLog("[reader] already loaded c=\(c), skip")
+                return
+            }
+            // 若上报缺少 h/c（如 DOM 未就绪的探针上报），且已有正确的 readerLastData，则保留旧值
+            if (h.isEmpty || c.isEmpty), let last = readerLastData, !last.h.isEmpty, !last.c.isEmpty {
+                appendDebugLog("[chapter:content] incomplete h/c, keep last data")
+                readerPrevC = obj["prev"] as? String ?? ""
+                readerNextC = obj["next"] as? String ?? ""
+                if !html.isEmpty { presentReader(html: html, title: title) }
                 return
             }
             readerLastData = (h, bookid, c)
@@ -1076,8 +1085,11 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let attr = htmlToAttributed(html)
         readerAttributed = attr
         renderReaderContent(attr)
-        // 占位(空正文)不更新已读标记，避免正文上报被去重逻辑跳过
-        if !html.isEmpty, let c = readerLastData?.c { readerLoadedC = c; readerExpectedC = c }
+        // 占位(空正文)不更新已读标记；仅当 c 非空才设期望章节，避免空 c 污染 expected
+        if !html.isEmpty, let c = readerLastData?.c, !c.isEmpty {
+            readerLoadedC = c
+            readerExpectedC = c
+        }
         appendDebugLog("[reader] presented(\(readerModeIsPaged ? "paged" : "scroll")) attrLen=\(attr.length) charLen=\(attr.string.count)")
     }
 
@@ -1176,43 +1188,67 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             vc.view.bottomAnchor.constraint(equalTo: readerContainer.bottomAnchor, constant: -(96 + view.safeAreaInsets.bottom))
         ])
         readerPageVC = vc
+        view.layoutIfNeeded()   // 确保 readerContainer 有正确尺寸后再分页
         paginateText(attr)
         if let first = makePageVC(index: 0) {
             vc.setViewControllers([first], direction: .forward, animated: false, completion: nil)
         }
     }
 
-    // 用 NSLayoutManager 把富文本按容器尺寸切成多页（逐 glyph 判定换页，可靠）
+    // 用 NSLayoutManager 按行 fragment 累积高度分页（可靠）
     private func paginateText(_ attr: NSAttributedString) {
         readerPages.removeAll()
         readerPageOffset = 0
         let pageWidth = max(readerContainer.bounds.width - 32, 50)
-        let pageHeight = max(readerContainer.bounds.height - readerTopBarHeight - 96 - view.safeAreaInsets.top - view.safeAreaInsets.bottom, 50)
+        let pageHeight = max(readerContainer.bounds.height - readerTopBarHeight - 96 - view.safeAreaInsets.top - view.safeAreaInsets.bottom, 100)
 
         let storage = NSTextStorage(attributedString: attr)
         let layout = NSLayoutManager()
         storage.addLayoutManager(layout)
-        let container = NSTextContainer(size: CGSize(width: pageWidth, height: pageHeight))
+        // 用超高容器排全文，再按行高累积切页
+        let container = NSTextContainer(size: CGSize(width: pageWidth, height: CGFloat.greatestFiniteMagnitude))
         container.lineFragmentPadding = 0
         layout.addTextContainer(container)
         layout.ensureLayout(for: container)
 
         let full = layout.glyphRange(for: container)
-        var start = full.location
-        while start < NSMaxRange(full) {
-            var end = start
-            var i = start
-            while i < NSMaxRange(full) {
-                let r = layout.boundingRect(forGlyphRange: NSRange(location: i, length: 1), in: container)
-                if r.maxY > pageHeight { break }
-                end = i + 1
-                i += 1
-            }
-            if end <= start { end = start + 1 }
-            let range = NSRange(location: start, length: end - start)
-            readerPages.append(attr.attributedSubstring(from: range))
-            start = end
+        guard full.length > 0 else {
+            readerPages.append(attr)
+            appendDebugLog("[reader] paged into 0 pages (empty)")
+            return
         }
+        // 收集每行 fragment（range + 行高）
+        var lines: [(range: NSRange, height: CGFloat)] = []
+        var gi = full.location
+        while gi < NSMaxRange(full) {
+            var eff = NSRange(location: NSNotFound, length: 0)
+            let frag = layout.lineFragmentRect(forGlyphAt: gi, effectiveRange: &eff)
+            lines.append((eff, frag.height))
+            gi = NSMaxRange(eff)
+        }
+        // 按页高累积切页
+        var pageStart = 0
+        var acc: CGFloat = 0
+        for (li, line) in lines.enumerated() {
+            acc += line.height
+            if acc > pageHeight && li > pageStart {
+                let fromG = lines[pageStart].range.location
+                let toG = lines[li].range.location
+                if toG > fromG {
+                    readerPages.append(attr.attributedSubstring(from: NSRange(location: fromG, length: toG - fromG)))
+                }
+                pageStart = li
+                acc = line.height
+            }
+        }
+        if pageStart < lines.count {
+            let fromG = lines[pageStart].range.location
+            let toG = NSMaxRange(lines[lines.count - 1].range)
+            if toG > fromG {
+                readerPages.append(attr.attributedSubstring(from: NSRange(location: fromG, length: toG - fromG)))
+            }
+        }
+        if readerPages.isEmpty { readerPages.append(attr) }
         appendDebugLog("[reader] paged into \(readerPages.count) pages")
     }
 
@@ -1230,7 +1266,18 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     private func dismissReader() {
         readerContainer.isHidden = true
-        appendDebugLog("[reader] dismissed")
+        // 若主 webview 已整页导航到章节页，返回时应回到书籍目录页（安卓行为），
+        // 而非停留在网页版章节正文页。
+        if let url = webView.url, url.path.contains("/truyen/") {
+            if webView.canGoBack {
+                webView.goBack()
+                appendDebugLog("[reader] dismissed, goBack to catalog")
+            } else {
+                appendDebugLog("[reader] dismissed (no back history)")
+            }
+        } else {
+            appendDebugLog("[reader] dismissed (webview not on chapter)")
+        }
     }
 
     // ===== v20 兜底：直接导航章节页（用 app 自带网页阅读器）=====
@@ -1476,20 +1523,35 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         ])
     }
 
-    // 设置面板（安卓 view-stylesetting）：12 主题色块 + 字号 / 行高 / 对齐 / 字体
+    // 设置面板（安卓 view-stylesetting）：全屏半透明遮罩 + 底部面板（12 主题色块 + 字号）
     private func buildReaderSettingsView() {
+        // 全屏遮罩：点击关闭面板
+        let mask = UIView()
+        mask.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        mask.translatesAutoresizingMaskIntoConstraints = false
+        mask.isHidden = true
+        let maskTap = UITapGestureRecognizer(target: self, action: #selector(readerSettingsMaskTapped))
+        mask.addGestureRecognizer(maskTap)
+        view.addSubview(mask)
+
         let panel = UIView()
-        panel.backgroundColor = UIColor.black.withAlphaComponent(0.85)
+        panel.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        panel.layer.cornerRadius = 12
         panel.translatesAutoresizingMaskIntoConstraints = false
-        panel.isHidden = true
-        view.addSubview(panel)
+        mask.addSubview(panel)
         NSLayoutConstraint.activate([
+            mask.topAnchor.constraint(equalTo: view.topAnchor),
+            mask.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            mask.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            mask.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
             panel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             panel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             panel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             panel.heightAnchor.constraint(equalToConstant: 300 + view.safeAreaInsets.bottom)
         ])
-        readerSettingsView = panel
+        // 用 panel 作为设置容器引用（关闭时隐藏整个 mask）
+        readerSettingsView = mask
 
         let title = UILabel()
         title.text = "样式设置"
@@ -1565,8 +1627,11 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             fontRow.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 16),
             fontRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
         ])
+    }
 
-        // 主题切换：更新选中框 + 重渲染
+    // 点击遮罩关闭设置面板
+    @objc private func readerSettingsMaskTapped() {
+        readerSettingsView?.isHidden = true
     }
 
     private func makeSettingsButton(title: String, action: Selector) -> UIButton {
@@ -1587,8 +1652,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     @objc private func readerThemeTapped(_ tap: UITapGestureRecognizer) {
         guard let sw = tap.view else { return }
         readerThemeIndex = sw.tag
-        // 刷新色块选中框
-        if let scroll = readerSettingsView?.subviews.compactMap({ $0 as? UIScrollView }).first {
+        // 刷新色块选中框（mask -> panel -> scroll）
+        if let scroll = findScrollView(in: readerSettingsView) {
             for v in scroll.subviews {
                 if let s = v as? UIView, s.tag < ReaderThemes.all.count {
                     s.layer.borderWidth = (s.tag == readerThemeIndex) ? 3 : 1
@@ -1597,6 +1662,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             }
         }
         applyReaderThemeChange()
+    }
+
+    // 在 mask/panel 层级里找第一个 UIScrollView（主题色块滚动区）
+    private func findScrollView(in root: UIView?) -> UIScrollView? {
+        guard let root = root else { return nil }
+        for sub in root.subviews {
+            if let sc = sub as? UIScrollView { return sc }
+            if let found = findScrollView(in: sub) { return found }
+        }
+        return nil
     }
 
     // 主题/字号变化后统一重渲染
@@ -1812,16 +1887,22 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private func adjustReaderFont(delta: CGFloat) {
         readerFontSize = max(12, min(32, readerFontSize + delta))
         appendDebugLog("[reader] font=\(readerFontSize)")
-        // 同步设置面板字号数字
-        if let panel = readerSettingsView,
-           let lbl = panel.subviews.flatMap({ $0.subviews }).compactMap({ $0 as? UILabel }).first(where: { $0.tag == 9001 }) {
-            lbl.text = "\(Int(readerFontSize))"
-        }
+        // 同步设置面板字号数字（mask 层级递归查找 tag==9001）
+        findLabel(tag: 9001, in: readerSettingsView)?.text = "\(Int(readerFontSize))"
         if !readerRawHTML.isEmpty {
             let newAttr = htmlToAttributed(readerRawHTML)
             readerAttributed = newAttr
             renderReaderContent(newAttr)
         }
+    }
+
+    private func findLabel(tag: Int, in root: UIView?) -> UILabel? {
+        guard let root = root else { return nil }
+        for sub in root.subviews {
+            if let l = sub as? UILabel, l.tag == tag { return l }
+            if let found = findLabel(tag: tag, in: sub) { return found }
+        }
+        return nil
     }
 
     @objc private func readerNightToggle() {
