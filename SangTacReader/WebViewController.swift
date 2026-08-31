@@ -1141,16 +1141,21 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { cookies in
             let cookieStr = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-            // v16.2：URLSession 已过 TLS 指纹。关键修复——h 必须用源名(qidian/fanqie)，
-            // 而不是响应里的 rObj.h(为空)。从 WebView 章节页 URL /truyen/{host}/1/... 提取。
+            // v16.3：URLSession 已过 TLS 指纹，h 已正确(源名)。还差 c 章节ID——
+            // readchapter 响应里的 rObj.c 为空(服务器不回显)，所以 readerLastData.c 为空。
+            // 从 WebView 章节页 URL /truyen/{h}/1/{bookid}/{c}/ 提取真实 c=最后一段。
             var host = h
-            if host.isEmpty, let wu = self.webView.url {
+            var chapter = c
+            if let wu = self.webView.url {
                 let segs = wu.path.split(separator: "/").map(String.init)
-                if segs.count > 2 && segs[0] == "truyen" { host = segs[1] }
+                if segs.count > 2 && segs[0] == "truyen" {
+                    if host.isEmpty { host = segs[1] }
+                    if let last = segs.last, !last.isEmpty { chapter = last }
+                }
             }
-            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(host)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
+            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(host)&c=\(chapter)&ngmar=readc&sajax=readchapter&sty=1&exts="
             let pageRef = self.webView.url?.absoluteString ?? "https://sangtacviet.vip/"
-            self.appendDebugLog("[native] h=\(host) bookid=\(bookid) c=\(c) cookies_len=\(cookieStr.count) referer=\(pageRef)")
+            self.appendDebugLog("[native] h=\(host) bookid=\(bookid) c=\(chapter) cookies_len=\(cookieStr.count) referer=\(pageRef)")
             // 复刻 WebView：POST + form + 空body + 页面Referer（无 app 头、无签名）
             self.nativeReq(url: base, cookie: cookieStr, sign: nil,
                            ua: self.iosUA, method: "POST", body: "",
