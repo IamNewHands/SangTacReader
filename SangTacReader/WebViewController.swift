@@ -891,11 +891,69 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         view.bringSubviewToFront(readerContainer)
         if let c = readerLastData?.c { readerLoadedC = c; readerExpectedC = c }
         appendDebugLog("[reader] presented, htmlLen=\(html.count)")
+        // v14 实验：章节页会话已建立，用原生 URLSession 验证签名必要性
+        if let d = readerLastData {
+            testNativeReadChapter(h: d.h, bookid: d.bookid, c: d.c)
+        }
     }
 
     private func dismissReader() {
         readerContainer.isHidden = true
         appendDebugLog("[reader] dismissed")
+    }
+
+    // ===== 原生网络实验 (v14)：验证 X-STV-Sign 签名是否必需 (com.sangtacviet) =====
+    // 安卓 app 用原生网络栈(Capacitor Http/OkHttp)发 readchapter，带 X-STV-Sign 签名头。
+    // 本实验用 iOS 原生 URLSession 复刻同样请求，对比有无签名/不同 UA，看服务器是否 code:0，
+    // 从而判定：①是否只需原生网络栈+cookie；②签名是否必需；③假签名是否够用。
+    private func testNativeReadChapter(h: String, bookid: String, c: String) {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { cookies in
+            let cookieStr = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+            // 附带章节页会话关键 cookie（若在）
+            let base = "https://sangtacviet.vip/index.php?bookid=\(bookid)&h=\(h)&c=\(c)&ngmar=readc&sajax=readchapter&sty=1&exts="
+            self.appendDebugLog("[native] cookies=\(cookieStr.prefix(200))")
+            self.nativePost(url: base, cookie: cookieStr, sign: nil, ua: self.iosUA, label: "no-sign-iosUA")
+            self.nativePost(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000", ua: self.iosUA, label: "fakesign-iosUA")
+            self.nativePost(url: base, cookie: cookieStr, sign: "00000000000000000000000000000000", ua: self.androidUA, label: "fakesign-androidUA")
+        }
+    }
+
+    private var iosUA: String {
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    }
+    private var androidUA: String {
+        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    }
+
+    private func nativePost(url: String, cookie: String, sign: String?, ua: String, label: String) {
+        guard let u = URL(string: url) else { return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.setValue(ua, forHTTPHeaderField: "User-Agent")
+        req.setValue("XmlHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        req.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
+        if let sign = sign {
+            req.setValue(sign, forHTTPHeaderField: "X-STV-Sign")
+        }
+        let start = Date()
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            var out = "[native:\(label)] "
+            if let e = err { out += "err=\(e.localizedDescription)"; self?.appendDebugLog(out); return }
+            if let r = resp as? HTTPURLResponse {
+                out += "status=\(r.statusCode) "
+                let hdrs = r.allHeaderFields
+                if let sig = hdrs["X-STV-Sign"] ?? hdrs["x-stv-sign"] { out += "respSign=\(sig) " }
+            }
+            if let d = data, let s = String(data: d, encoding: .utf8) {
+                out += "body=\(s.prefix(160))"
+            } else { out += "no-body" }
+            out += String(format: " (%.1fs)", Date().timeIntervalSince(start))
+            self?.appendDebugLog(out)
+        }
+        task.resume()
     }
 
     private func buildReaderUI() {

@@ -452,6 +452,44 @@ cookie 相同但结果不同 → 差异在**请求发起的页面环境**（完�
 
 **代码改动**：`SangTacReader/WebViewController.swift`（chapterExtractJS 就绪判定 + reader 状态管理）。
 
+---
+
+## v14：反编译安卓 APK，找到原生阅读关键机制
+
+**用户建议**：反编译 `stvmobilereader-1.2.17.apk` 完全复刻。已用 jadx 反编译成功。
+
+**安卓 app 架构**（Capacitor 打包）：
+- `assets/public/www` 是空 web 壳，运行时远程加载 `sangtacviet.vip/app.v2.php`。
+- 原生层 `com.sangtacviet.capacitorwebnative`（WebNativeViewPlugin/PViewManager/HandlerBuilder/Util）：通用原生 View 桥接（JS 动态创建 Android View 渲染富内容），**不含 readchapter/正文逻辑**。
+- `com.getcapacitor.plugin.http.Http` + `HttpRequestHandler`：**原生网络层**。JS 调 `Capacitor.Plugins.Http.request()` → 原生 OkHttp/HttpURLConnection 发请求，自动带 cookie。
+
+**关键发现：X-STV-Sign 签名**
+- `HttpRequestHandler.request()` 对**每个请求**调 `Http.signRequest(headers, url)`，加 `X-STV-Sign` 头。
+- `X-STV-Sign = signParams(排序后的 query)`，由 `libssign.so` 的 native `signParams()` 生成。
+- 签名算法（已反汇编 libssign.so arm64）：**自定义 MD5 变体**：
+  - 内置密钥 `erogh982^%*%^*.475yvjt837y9%$^#.`（28字符，.rodata 0x1da0）
+  - 用 `sin()` 生成 K 表（初始 {0,1} 每步 +2，非标准 MD5 sin 表）
+  - 输入 = 排序 query + 密钥 → 16 位 hex 输出
+- `signParamsK(query, key)` 接受显式密钥，`signParams(query)` 用内置密钥。
+
+**结论**：安卓 app 能原生阅读，是因为 readchapter 走**原生网络栈** + 带 **X-STV-Sign 签名**。我们 iOS 的 webview XHR 没签名 → 服务器判定"非原生 app" → code:7。
+
+## v14 实验（进行中）：验证签名是否必需
+
+**策略**（用户选择"先实验验证签名"）：用 iOS 原生 URLSession 复刻安卓请求，对比：
+1. 无签名 + iOS UA
+2. 假签名(32个0) + iOS UA
+3. 假签名 + Android UA
+
+章节页会话建立后自动触发，读日志 `[native:...]` 判断：签名是否必需、假签名是否够用、原生网络栈+cookie 是否已够。
+
+**代码改动**：`SangTacReader/WebViewController.swift`（nativePost + testNativeReadChapter + presentReader 触发）。
+
+### 若实验确认签名必需（code:7），下一步完整复刻签名算法
+- 需要精确反汇编 MD5 变体（sin K 表、轮函数、密钥拼接、消息填充）。
+- 签名 + URLSession 原生网络 + cookie → 预期 code:0。
+
+
 ### 待真机验证（v13.1）
 1. 进章节 → 正文应正确提取（`[chapter:content]` html 以 `<p>` 开头，非占位）。
 2. 阅读页只 present 一次（无 repeated）。
