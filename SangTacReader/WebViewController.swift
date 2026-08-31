@@ -335,35 +335,66 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             return origLoadKey.apply(this, arguments);
                         }
                     };
-                    // 覆写 getContent：跳转到【网页版章节页】读取正文。
-                    // 根因（log6/log7 实测）：本环境无法在 SPA 里读正文——
-                    //   · App 格式（/?sajax=readchapter&...&key=）需 grantcontext eval 的 key，
-                    //     但该混淆 JS 无 return、eval 恒 undefined -> 恒 code:7。
-                    //   · 网页版格式（/index.php?...&ngmar=readc&sty=1&exts=）在 SPA 里发起也恒
-                    //     code:7（log7 六次重试全 code:7）——因缺少章节页自身的反爬证明 JS
-                    //     （章节页会在加载时重置 _gac 并计算 body 证明，SPA 里没有这段 JS 运行）。
-                    //   · 唯一走通（log6）的路径：跳转到 /truyen/{h}/1/{bookid}/{c}/ 网页版章节页，
-                    //     页面自身 JS 生成证明 + 用户过 verifyca 后返回 code:0 与正文。
-                    // 因此这里直接跳转章节页（不再在 SPA 里空转请求）。
+                    // 覆写 getContent：SPA 内网页版 readchapter + 真机实验验证 proof gate。
+                    // 实验假设（基于 log7/log8 + node 实测）：
+                    //   · SPA 空 body 恒 code:7(time:1000)，章节页空 body 是 code:21——cookie 相同，
+                    //     差异极可能是【首次请求是否带 32-hex proof body】建立的会话状态。
+                    //   · 本实验：首次发带 proof 的请求，紧接着发空 body，观察是否从 code:7 变 code:21。
+                    //     若 r2 变 code:21 -> proof 是 gate，可复刻算法；若仍 code:7 -> proof 无关。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
-                        // 保留离线书逻辑
                         if (self.offlineBook && !rl) {
-                            try {
-                                var cdata = await self.offlineBook.getChapterOrNull(c);
-                                if (cdata) return JSON.parse(cdata);
-                            } catch(e) {}
+                            try { var cdata = await self.offlineBook.getChapterOrNull(c); if (cdata) return JSON.parse(cdata); } catch(e) {}
                         }
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
                         var base = window.location.origin;
+                        var url = base + "/index.php?bookid=" + encodeURIComponent(i) + "&h=" + encodeURIComponent(h) + "&c=" + encodeURIComponent(c) + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
+                        // log8 真机章节页采集的真实 proof（32-hex），用于验证 proof 是否 gate
+                        var PROOF = "63b2e877ff9a5e8368d9eedae655e5cd";
+                        function sendReq(body) {
+                            return new Promise(function(resolve) {
+                                try {
+                                    var xhr = new XMLHttpRequest();
+                                    xhr.open("POST", url, true);
+                                    xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+                                    xhr.setRequestHeader("X-Requested-With", "XmlHttpRequest");
+                                    xhr.onreadystatechange = function() {
+                                        if (xhr.readyState === 4) {
+                                            try { resolve({status: xhr.status, text: xhr.responseText}); }
+                                            catch(e) { resolve({status: 0, text: "xhr read err"}); }
+                                        }
+                                    };
+                                    xhr.onerror = function() { resolve({status: 0, text: "xhr error"}); };
+                                    if (body) xhr.send(body); else xhr.send();
+                                } catch(e) { resolve({status: 0, text: "exc:" + e}); }
+                            });
+                        }
+                        // 1) proof 首请求
+                        tryDbg('gc-p1', 'proof-request start');
+                        var r1 = await sendReq(PROOF);
+                        tryDbg('gc-p1-resp', 'status=' + r1.status + ' body=' + String(r1.text));
+                        // 2) 空 body 请求（若 proof 建立会话，这里应 code:21）
+                        tryDbg('gc-p2', 'empty-request start');
+                        var r2 = await sendReq("");
+                        tryDbg('gc-p2-resp', 'status=' + r2.status + ' body=' + String(r2.text));
+                        try {
+                            var obj = JSON.parse(r2.text);
+                            if (obj && (obj.code === "0" || obj.code == 0)) {
+                                tryDbg('gc-p2-code0', 'content ok');
+                                return obj;
+                            }
+                            if (obj && (obj.code === "21" || obj.code == 21)) {
+                                tryDbg('gc-p2-code21', 'need verifyca, trigger captcha');
+                                try { if (window.ui && ui.captcha) ui.captcha.open("read", "sangtacviet", null, ["google"]); } catch(e) {}
+                                return {code: "21", info: "需要验证"};
+                            }
+                            if (obj) return {code: String(obj.code), info: (obj.err || obj.info || "")};
+                        } catch(e) {}
+                        // 兜底：跳转章节页保证可读
                         var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
-                        tryDbg('gc-nav', 'navigating to ' + chapUrl);
-                        // 延迟导航，让日志先送出
-                        setTimeout(function() {
-                            try { window.location.href = chapUrl; } catch(e) {}
-                        }, 300);
-                        // 返回"加载中"占位，避免原逻辑再次发请求
+                        tryDbg('gc-fallback', 'navigating to ' + chapUrl);
+                        setTimeout(function() { try { window.location.href = chapUrl; } catch(e) {} }, 300);
                         return {code: "1", info: "正在打开网页版章节…"};
                     };
                     return true;
