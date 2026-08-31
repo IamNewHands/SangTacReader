@@ -1085,10 +1085,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         let attr = htmlToAttributed(html)
         readerAttributed = attr
         renderReaderContent(attr)
-        // 占位(空正文)不更新已读标记；仅当 c 非空才设期望章节，避免空 c 污染 expected
+        // 占位(空正文)不更新已读标记；仅当 c 非空才记录已加载章节。
+        // 注意：不在此覆盖 readerExpectedC，避免把用户翻章目标(expected=目标章)
+        // 误改回当前已渲染章，导致目标章正文被 stale 过滤丢弃。
         if !html.isEmpty, let c = readerLastData?.c, !c.isEmpty {
             readerLoadedC = c
-            readerExpectedC = c
+            if readerExpectedC == nil { readerExpectedC = c }
         }
         appendDebugLog("[reader] presented(\(readerModeIsPaged ? "paged" : "scroll")) attrLen=\(attr.length) charLen=\(attr.string.count)")
     }
@@ -1615,6 +1617,23 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         fontRow.addArrangedSubview(sizeLbl)
         fontRow.addArrangedSubview(plusBtn)
 
+        // 翻页模式切换：上下滑动 <-> 左右翻页（安卓 slide / pageflip）
+        let modeRow = UIStackView()
+        modeRow.axis = .horizontal
+        modeRow.spacing = 12
+        modeRow.alignment = .center
+        modeRow.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(modeRow)
+        let modeBtn = makeSettingsButton(title: readerModeIsPaged ? "左右翻页" : "上下滑动", action: #selector(readerToggleMode))
+        modeBtn.tag = 9002
+        modeRow.addArrangedSubview(modeBtn)
+        let modeHint = UILabel()
+        modeHint.text = "切换翻页方式"
+        modeHint.textColor = .white
+        modeHint.font = .systemFont(ofSize: 13)
+        modeHint.translatesAutoresizingMaskIntoConstraints = false
+        modeRow.addArrangedSubview(modeHint)
+
         NSLayoutConstraint.activate([
             title.topAnchor.constraint(equalTo: panel.topAnchor, constant: 16),
             title.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
@@ -1626,6 +1645,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
             fontRow.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 16),
             fontRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+
+            modeRow.topAnchor.constraint(equalTo: fontRow.bottomAnchor, constant: 16),
+            modeRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
         ])
     }
 
@@ -1760,13 +1782,26 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         }
     }
 
-    // 翻页模式切换：分页 <-> 滚动
+    // 翻页模式切换：分页(左右翻页) <-> 滚动(上下滑动)
     @objc private func readerToggleMode() {
         readerModeIsPaged.toggle()
         appendDebugLog("[reader] mode -> \(readerModeIsPaged ? "paged" : "scroll")")
+        // 同步设置面板切换按钮文案（tag=9002）
+        if let btn = findButton(tag: 9002, in: readerSettingsView) {
+            btn.setTitle(readerModeIsPaged ? "左右翻页" : "上下滑动", for: .normal)
+        }
         if let attr = readerAttributed {
             renderReaderContent(attr)
         }
+    }
+
+    private func findButton(tag: Int, in root: UIView?) -> UIButton? {
+        guard let root = root else { return nil }
+        for sub in root.subviews {
+            if let b = sub as? UIButton, b.tag == tag { return b }
+            if let found = findButton(tag: tag, in: sub) { return found }
+        }
+        return nil
     }
 
     // 顶栏 ⋮ 或底栏"设置"按钮 -> 显示设置面板
@@ -1864,16 +1899,42 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             appendDebugLog("[reader] no nav target")
             return
         }
+        appendDebugLog("[reader] nav to c=\(target) h=\(info.h) bookid=\(info.bookid)")
         // 更新期望章节，忽略旧章节迟到上报；清空已加载标记以便新章节可 present
         readerExpectedC = target
         readerLoadedC = nil
-        let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(target)/"
-        appendDebugLog("[reader] nav to \(chapUrl)")
-        // v19：主 webview 整页导航章节页建立会话，原生阅读器保持覆盖，
-        // 章节页 readchapter 拦截 -> 上报 -> 原生渲染更新正文。
-        if let url = URL(string: chapUrl) {
-            webView.load(URLRequest(url: url))
-        }
+        readerLastData = (info.h, info.bookid, target)
+        // 立即显示加载占位，避免闪现旧章
+        presentReader(html: "<p>加载中…</p>", title: "")
+        // 占位不算已加载，确保真实正文(c=target)能正常渲染
+        readerLoadedC = nil
+        // v23：不整页导航章节页（避免卡顿/返回错/竞态）。在当前页内直接发 readchapter
+        // XHR（会话已建立，页内 code:0 可行），由已注入的 bridgeJS readchapter 拦截
+        // 提取正文并上报 -> 原生渲染。webview 地址不变 -> 返回自然回目录、无重载卡顿。
+        let h = info.h, bi = info.bookid, c = target
+        let js = """
+        (function(){
+            try {
+                var h='\(h)', i='\(bi)', c='\(c)';
+                var u='/index.php?bookid='+encodeURIComponent(i)+'&h='+encodeURIComponent(h)+'&c='+encodeURIComponent(c)+'&ngmar=readc&sajax=readchapter&sty=1&exts=';
+                var x=new XMLHttpRequest();
+                x._dbgUrl=u;
+                x.open('POST', u);
+                x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+                x.onload=function(){
+                    try{
+                        var o=JSON.parse(x.responseText);
+                        var m='nav-readc code='+(o&&o.code)+' len='+(x.responseText||'').length;
+                        if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.dbg){
+                            window.webkit.messageHandlers.dbg.postMessage({tag:'nav-readc',msg:m});
+                        }
+                    }catch(e){}
+                };
+                x.send('');
+            }catch(e){}
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     @objc private func readerFontDown() {
