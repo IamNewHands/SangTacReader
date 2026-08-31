@@ -488,6 +488,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     var stvHosts = [
                         'sangtacviet.com',
                         'sangtacviet.app',
+                        'sangtacviet.vip',
                         'dns1.stv-appdomain-00000001.org'
                     ];
                     var origOpen = XMLHttpRequest.prototype.open;
@@ -749,10 +750,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 入口域名必须落在前端 app.v2.js 的 networkManagerXHR.defaultDomains 内，
         // 否则 fullUrl() 会把所有请求切换到镜像域名，跨域 XHR 不携带本域 Cookie，
         // 导致登录/语言切换/源目录加载失败。
-        // 与安卓 APK (capacitor.config.json: server.url) 一致，使用 sangtacviet.com。
-        let targetURL = URL(string: "https://sangtacviet.com/app.v2.php") ?? URL(string: "https://sangtacviet.com/")!
+        // 域名选择：sangtacviet.com 的 Cloudflare 挑战在 WKWebView 里无法自动完成，
+        // cf_clearance 永不签发导致 readchapter 无限 code:7。用户实测 sangtacviet.vip
+        // 的 Cloudflare 为托管型挑战（managed challenge），能在浏览器里自动完成并签发
+        // cf_clearance，从而让正文加载成功。故入口使用 sangtacviet.vip。
+        let targetURL = URL(string: "https://sangtacviet.vip/app.v2.php") ?? URL(string: "https://sangtacviet.vip/")!
         var request = URLRequest(url: targetURL)
-        request.setValue("https://sangtacviet.com", forHTTPHeaderField: "Referer")
+        request.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
         webView.load(request)
     }
 
@@ -768,8 +772,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         print("Web load failed: \(error.localizedDescription)")
         
         // 自动重试或者备选域名
-        if let currentURL = webView.url?.absoluteString, currentURL.contains("sangtacviet.com") {
-            if let fallbackURL = URL(string: "https://sangtacviet.app/app.v2.php") {
+        if let currentURL = webView.url?.absoluteString, currentURL.contains("sangtacviet.vip") {
+            if let fallbackURL = URL(string: "https://sangtacviet.com/app.v2.php") {
                 webView.load(URLRequest(url: fallbackURL))
             }
         }

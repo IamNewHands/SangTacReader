@@ -282,3 +282,29 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 1. 日志应重新出现章节页的 `[DBG:xhr-load]` + `[DBG:xhr-body] resp={...}`，确认响应 code。
 2. 若 `state` 相关/`_gac` 过期 → 尝试登出重登、清 cookie 重开会话。
 3. 若环境被检测 → 评估更换浏览器内核/换源站直连。
+
+## v9（用户洞察）：换到 sangtacviet.vip 域以通过 Cloudflare 挑战
+
+**2026-08-31 用户反馈 + 验证**：
+- 用户实测：`sangtacviet.com` 在 PC/Safari 会一直刷新，稍后弹出 **Cloudflare 认证**，认证后正文才显示。
+- 手机 Safari 用 `sangtacviet.vip` 能**自动弹出并完成 Cloudflare 认证**，正文正常显示。
+- App 里只配置了 `sangtacviet.com` 和 `sangtacviet.app`，**没有 `sangtacviet.vip`**。
+
+**根因确认（log5 + node 实测）**：
+- 章节页确实发送反爬证明 body（`[DBG:xhr-body-req] body=75dbb6c1...`），但服务器仍返回 code:7 → 因 **cf_clearance 未签发**（Cloudflare 挑战未完成）。
+- 证明 token 跨书恒定（fanqie/trxs 相同 `75dbb6c1...`），说明是会话级证明而非内容相关。
+- grantcontext 混淆 JS 无 `return`、不设 cookie、只定义 2 个解码全局函数，eval 恒 undefined → App key 机制为硬死路。
+- node 从三个域名（.com/.vip/.app）都能直接拿到正常 HTML（无 CF 挑战）→ CF 挑战是**浏览器指纹级**，非 IP 级。
+- 前端 `defaultDomains = ["https://sangtacviet.com", "https://dns1.stv-appdomain-00000001.org", "https://sangtacviet.app"]`，**不含 .vip**；`app.config.ux.app_domain` 可钉住首选域。
+
+**修复 v9（已提交）**：
+1. Swift 入口 URL 改为 `https://sangtacviet.vip/app.v2.php`，Referer 同步改 .vip。
+2. `didFailProvisionalNavigation` 回退逻辑改为 .vip → .com。
+3. bridgeJS STV 主机白名单加入 `sangtacviet.vip`。
+4. bridgeJS `patchNet` 已强制 `bestDomain()` 返回 `curOrigin`，故所有请求保持 .vip 同源；章节页导航也在 .vip 上执行，若 .vip 的托管型 CF 挑战自动完成则 readchapter 应返回 code:0。
+- JS 语法 node vm 验证通过，Swift 无诊断错误。
+
+### 待真机验证（v9）
+1. 应用入口是否成功加载 sangtacviet.vip（`[DBG:init] origin=https://sangtacviet.vip`）。
+2. Cloudflare 挑战是否自动完成并签发 cf_clearance。
+3. 章节正文是否正常显示（不再无限 reload）。
