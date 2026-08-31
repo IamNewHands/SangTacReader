@@ -255,6 +255,15 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 因此此处只做 CSS 修复，让前端进入正常的 Web 分支 (localStorage + XHR)。)
         let bridgeJS = """
         (function() {
+            // ===== iOS 章节读取修复 v8.1：章节页(/truyen/)完全不加插桩 =====
+            // 章节正文的 web readchapter 依赖页面自身混淆脚本包裹 XHR.send 注入反爬证明
+            // (gac/state proof)；任何外部对 XHR.open/send 的覆写都可能被其检测并导致
+            // readchapter 返回 code:7 -> 页面无限 location.reload()。因此当主框架是章节页
+            // 时，本脚本直接空转，让章节页与真实浏览器运行环境完全一致。
+            try {
+                if (String(window.location.pathname).indexOf('/truyen/') === 0) { return; }
+            } catch(e) {}
+
             // ===== iOS 章节读取修复 v7：注入 Capacitor.Plugins.Http + key 机制 =====
             // 已从 app.v2.read.js 源码 + 服务器实测确认真相：
             //   1) readchapter 必须带 key（服务器对无 key 的请求返回 {"code":7}）。
@@ -666,6 +675,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // ===== 临时调试插桩注入脚本 (debug-point D) =====
     private let debugJS = """
     (function(){
+        // 章节页(/truyen/)不加任何插桩，保持与真实浏览器一致，避免破坏页面自身反爬
+        try { if (String(window.location.pathname).indexOf('/truyen/') === 0) { return; } } catch(e) {}
         function dbg(tag, msg) {
             try {
                 if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg) {
