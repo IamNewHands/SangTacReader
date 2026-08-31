@@ -683,6 +683,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             } catch(e) {}
         }
         dbg('init', 'origin=' + window.location.origin + ' href=' + window.location.href + ' winOriginType=' + (typeof window.origin) + ' winOriginVal=' + (window.origin === undefined ? 'UNDEF' : String(window.origin)));
+        try { dbg('ua', navigator.userAgent); } catch(e){}
+        try { dbg('platform', navigator.platform + ' | maxTouch=' + (navigator.maxTouchPoints!==undefined?navigator.maxTouchPoints:'na') + ' | wd=' + (navigator.webdriver===true)); } catch(e){}
         var _dbgXhrOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url) {
             try { this._dbgUrl = url; } catch(e){}
@@ -705,6 +707,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             var xhr = this;
             try {
                 dbg('xhr-send', 'url=' + xhr.responseURL);
+                if (String(xhr._dbgUrl||'').indexOf('readchapter') > -1) {
+                    dbg('xhr-body-req', 'body=' + String(body === undefined ? '' : body).slice(0, 300));
+                }
                 var oldOnerror = xhr.onerror;
                 xhr.onerror = function(e) {
                     dbg('xhr-error', 'status=' + xhr.status + ' url=' + xhr.responseURL);
