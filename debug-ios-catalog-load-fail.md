@@ -243,3 +243,20 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 1. 章节页不再无限 reload，正文能渲染（Turnstile 在主框架正常运行）。
 2. 目录、登录、语言切换仍正常。
 3. 若仍 code:7，则说明 WKWebView/LiveContainer 环境本身被 Cloudflare 判定为异常（非 iframe 污染），需另行评估（如替换为可过 CF 的浏览器内核）。
+
+## v8.1（v8 验证结果 + 进一步修复）：主框架 XHR 插桩也破坏章节页反爬
+
+**2026-08-31 log2.txt 分析**：
+- `forMainFrameOnly:true` 生效：日志不再出现 `origin=https://challenges.cloudflare.com` 帧，**Cloudflare Turnstile 挑战不再触发**。
+- 但章节页 **仍无限 reload**：web readchapter 每个 POST 都返回 size=22/24 = `{"code":7,"time":1000}`，触发 `location.reload()`。`_ac`/`_gac` cookie 正常写入，页面 JS 正常执行。
+- 结论：**iframe 污染非 code:7 根因**。剩余差异是主框架内我们 debugJS 对 `XMLHttpRequest.prototype.send` 的包裹——章节页自身混淆脚本也包裹 send 注入 `_gac`/`state` 反爬证明，可能检测到外部 send 覆写而拒绝注入 → readchapter 缺证明 → code:7。
+
+### 修复 v8.1（已实施）：章节页(/truyen/)完全不加插桩
+- bridgeJS 与 debugJS 的 IIFE 顶部加守卫：`if (String(location.pathname).indexOf('/truyen/') === 0) return;`
+- 主框架为章节页时两个脚本空转，让章节页与真实浏览器运行环境一致，页面自身反爬正常注入证明。
+- SPA（app.v2.php）行为不变。
+- JS 语法 node vm.Script 验证通过；Swift 无诊断错误。
+
+### 待真机验证（v8.1）
+1. 章节页不再无限 reload，正文能渲染（页面自身反爬证明正常工作）。
+2. 若仍 code:7，则证明 WKWebView/LiveContainer 环境本身被服务器判定为异常（非我们插桩导致），需评估是否替换浏览器内核。
