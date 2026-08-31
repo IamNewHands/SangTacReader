@@ -335,13 +335,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             return origLoadKey.apply(this, arguments);
                         }
                     };
-                    // 覆写 getContent：改用【网页版】readchapter（POST /index.php?...&ngmar=readc&sty=1&exts=）。
-                    // 根因（log6 实测）：App 格式（/?sajax=readchapter&...&key=）必须带由 grantcontext
-                    // eval 生成的 key，但该混淆 JS 无 return、eval 恒 undefined -> 恒 code:7（设备不支持）。
-                    // 网页版 readchapter 不需要 key：首次可能 code:7（等待证明就绪，time=重试延时），
-                    // 随后返回 code:21（"Vui lòng xác nhận để tiếp tục"，需人机验证），用户通过 app 内置的
-                    // runCaptcha（Cloudflare Turnstile）验证后，再请求返回 code:0 与正文。
-                    // 这样正文直接在 app 原生阅读器渲染，不再跳浏览器页。
+                    // 覆写 getContent：跳转到【网页版章节页】读取正文。
+                    // 根因（log6/log7 实测）：本环境无法在 SPA 里读正文——
+                    //   · App 格式（/?sajax=readchapter&...&key=）需 grantcontext eval 的 key，
+                    //     但该混淆 JS 无 return、eval 恒 undefined -> 恒 code:7。
+                    //   · 网页版格式（/index.php?...&ngmar=readc&sty=1&exts=）在 SPA 里发起也恒
+                    //     code:7（log7 六次重试全 code:7）——因缺少章节页自身的反爬证明 JS
+                    //     （章节页会在加载时重置 _gac 并计算 body 证明，SPA 里没有这段 JS 运行）。
+                    //   · 唯一走通（log6）的路径：跳转到 /truyen/{h}/1/{bookid}/{c}/ 网页版章节页，
+                    //     页面自身 JS 生成证明 + 用户过 verifyca 后返回 code:0 与正文。
+                    // 因此这里直接跳转章节页（不再在 SPA 里空转请求）。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
                         // 保留离线书逻辑
@@ -353,60 +356,15 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         }
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
-                        // 网页版 readchapter：POST /index.php?bookid=&h=&c=&ngmar=readc&sajax=readchapter&sty=1&exts=
-                        function webRead() {
-                            var base = window.location.origin;
-                            var url = base + "/index.php?bookid=" + encodeURIComponent(i)
-                                    + "&h=" + encodeURIComponent(h)
-                                    + "&c=" + encodeURIComponent(c)
-                                    + "&ngmar=readc&sajax=readchapter&sty=1&exts=";
-                            if (rl) url += "&rescan=true";
-                            return new Promise(function(resolve, reject) {
-                                var xhr = new XMLHttpRequest();
-                                xhr.open("POST", url, true);
-                                xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-                                xhr.setRequestHeader("X-Requested-With", "XmlHttpRequest");
-                                xhr.onreadystatechange = function() {
-                                    if (xhr.readyState === 4) {
-                                        if (xhr.status === 200) {
-                                            var t = xhr.responseText;
-                                            try { resolve(JSON.parse(t)); }
-                                            catch(e) { resolve({code:-1, raw:t}); }
-                                        } else {
-                                            reject({code:-1, status:xhr.status, text:xhr.responseText});
-                                        }
-                                    }
-                                };
-                                xhr.onerror = function() { reject({code:-1, message:"xhr error", status:xhr.status}); };
-                                xhr.send();
-                            });
-                        }
-                        var last = null;
-                        // 重试：网页版首次可能返回 code:7（time=重试延时），等待证明就绪后变 code:21/code:0
-                        for (var attempt = 0; attempt < 6; attempt++) {
-                            try { last = await webRead(); } catch(e) { last = {code:-1, message:String(e)}; }
-                            var c0 = String(last.code);
-                            tryDbg('gc-resp', 'attempt=' + attempt + ' code=' + last.code + ' err=' + (last.err||'') + ' len=' + ((last.data&&last.data.length)||0));
-                            if (c0 == "0") {
-                                tryDbg('gc-ok', 'len=' + (last.data ? last.data.length : 0));
-                                return last; // 正文，交给原生阅读器渲染
-                            }
-                            if (c0 == "21") {
-                                tryDbg('gc-verify', 'need manual verify');
-                                return last; // 交给 app.handlingException -> runCaptcha
-                            }
-                            if (c0 == "7") {
-                                // 等待证明就绪后重试；time 字段若存在则按其延时（截断到 <=1s）
-                                var dly = (last.time && +last.time > 0) ? Math.min(+last.time, 1000) : 800;
-                                tryDbg('gc-retry', 'wait ' + dly + 'ms');
-                                await new Promise(function(r){ setTimeout(r, dly); });
-                                continue;
-                            }
-                            // 其它 code：直接返回，交给 app 的 handlingException（登录等）
-                            return last;
-                        }
-                        tryDbg('gc-giveup', 'retries exhausted');
-                        return {code: "1", info: "Không thể tải nội dung, vui lòng thử lại."};
+                        var base = window.location.origin;
+                        var chapUrl = base + "/truyen/" + encodeURIComponent(h) + "/1/" + encodeURIComponent(i) + "/" + encodeURIComponent(c) + "/";
+                        tryDbg('gc-nav', 'navigating to ' + chapUrl);
+                        // 延迟导航，让日志先送出
+                        setTimeout(function() {
+                            try { window.location.href = chapUrl; } catch(e) {}
+                        }, 300);
+                        // 返回"加载中"占位，避免原逻辑再次发请求
+                        return {code: "1", info: "正在打开网页版章节…"};
                     };
                     return true;
                 } catch(e) { return false; }
