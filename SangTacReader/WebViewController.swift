@@ -1,18 +1,31 @@
 import UIKit
 import WebKit
 
-class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIPageViewControllerDataSource {
 
     var webView: WKWebView!
 
-    // ===== 全屏沉浸阅读页 (v13) =====
-    // 章节页正文提取后，用独立 WKWebView 渲染正文 HTML，提供 App 级阅读体验。
-    private var readerView: WKWebView!
+    // ===== 全屏沉浸阅读页 (v13 -> v15 原生渲染) =====
+    // 章节页正文提取后，用原生 UITextView/UIPageViewController 渲染正文，
+    // 提供真正的原生 APP 阅读体验（非 webview 壳）。
     private var readerContainer: UIView!
+    private var readerContentHolder: UIView!      // 滚动模式容器
+    private var readerTextView: UITextView!       // 滚动模式文本视图
+    private var readerPageVC: UIPageViewController? // 分页模式
+    private var readerModeIsPaged = true          // 当前模式：分页(true)/滚动(false)
+    private var readerAttributed: NSAttributedString? // 当前正文富文本
+    private var readerRawHTML = ""                // 当前正文原始(中文)HTML，字号调整时重建
     private var readerTitleLabel: UILabel!
     private var readerLastData: (h: String, bookid: String, c: String)? = nil
     private var readerExpectedC: String? = nil   // 用户期望的当前章节 ID，过滤章节页迟到/重复上报
     private var readerLoadedC: String? = nil     // 阅读页已显示的章节 ID
+    private var readerFontSize: CGFloat = 18     // 当前字号
+    private var readerIsNight = false            // 夜间模式
+    private var readerPages: [NSAttributedString] = [] // 分页切片
+    private var readerPageOffset: Int = 0        // 分页文本当前页起始 glyph 索引
+    private var readerChapterIds: [String] = []  // 章节 ID 列表（真实顺序），供上一章/下一章
+    private var readerPrevC = ""                 // 上一章 ID（readchapter 提供）
+    private var readerNextC = ""                 // 下一章 ID
     private let readerTopBarHeight: CGFloat = 52
 
     private var cookieObserver: CookieObserver?
@@ -752,6 +765,43 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             return _dbgSetHeader.apply(this, arguments);
         };
         var _dbgXhrSend = XMLHttpRequest.prototype.send;
+        // v15 中文化：将 STV 正文 HTML 的 <i> 逐词注释替换为中文(t值)，移除顶部灰色提示与版权提示。
+        // 输出纯中文正文 HTML（保留 <p>/<br> 段落结构），供 Swift 原生渲染。
+        function toChineseContent(raw) {
+            try {
+                var d = document.createElement('div');
+                d.innerHTML = raw;
+                // 移除第一个元素：顶部灰色提示 "@Bạn đang đọc bản lưu trong hệ thống"
+                var first = d.firstElementChild;
+                if (first) {
+                    var ft = first.textContent || '';
+                    if (/B\\u1ea1n \\u0111ang \\u0111\\u1ecdc b\\u1ea3n l\\u01b0u|b\\u1ea3n l\\u01b0u tr\\u1ecdng h\\u1ec7 th\\u1ed1ng|@Bạn đang đọc/i.test(ft)) {
+                        first.remove();
+                    }
+                }
+                // <i> 逐词注释 -> 中文 t 值
+                var is = d.querySelectorAll('i');
+                for (var k = is.length - 1; k >= 0; k--) {
+                    var el = is[k];
+                    var cn = el.getAttribute('t');
+                    var txt = (cn && cn.length) ? cn : (el.textContent || '');
+                    var sp = document.createElement('span');
+                    sp.textContent = txt;
+                    el.parentNode.replaceChild(sp, el);
+                }
+                // 移除版权提示文本节点
+                var allNodes = d.querySelectorAll('*');
+                for (var j = 0; j < allNodes.length; j++) {
+                    var nd = allNodes[j];
+                    if (!nd.children || nd.children.length) continue;
+                    var t2 = nd.textContent || '';
+                    if (/V\\u00ec v\\u1ea5n \\u0111\\u1ec1 n\\u1ed9i dung|kh\\u00f4ng h\\u1ed7 tr\\u1ee3 xem v\\u0103n b\\u1ea3n g\\u1ed1c|由于版权问题/i.test(t2)) {
+                        nd.remove();
+                    }
+                }
+                return d.innerHTML;
+            } catch(e) { return raw; }
+        }
         XMLHttpRequest.prototype.send = function(body) {
             var xhr = this;
             try {
@@ -777,7 +827,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                 var rTxt = xhr.responseText || '';
                                 var rObj = JSON.parse(rTxt);
                                 if (rObj && (rObj.code === "0" || rObj.code == 0) && typeof rObj.data === 'string' && rObj.data.length > 0) {
-                                    dbg('readc-code0', 'c=' + (rObj.c || '') + ' dataLen=' + rObj.data.length);
+                                    dbg('readc-code0', 'c=' + (rObj.c || '') + ' dataLen=' + rObj.data.length + ' meta=' + JSON.stringify({h:rObj.h,bookid:rObj.bookid,c:rObj.c,prev:rObj.prev,next:rObj.next,prev_c:rObj.prev_c,next_c:rObj.next_c}));
+                                    // v15 中文化：<i> 替换为中文 t 值，清理顶部灰色提示与版权提示，输出纯中文正文 HTML
+                                    var cnHtml = toChineseContent(rObj.data);
                                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.chapter) {
                                         window.webkit.messageHandlers.chapter.postMessage({
                                             tag: 'content',
@@ -786,10 +838,35 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                                                 bookid: rObj.bookid || '',
                                                 c: rObj.c || '',
                                                 title: (rObj.chaptername || '').trim(),
-                                                html: rObj.data
+                                                html: cnHtml,
+                                                raw: rObj.data,
+                                                prev: rObj.prev || rObj.prev_c || '',
+                                                next: rObj.next || rObj.next_c || ''
                                             })
                                         });
                                     }
+                                }
+                            } catch(err) {}
+                        } else if (String(xhr._dbgUrl||'').indexOf('getchapterlist') > -1) {
+                            // 拦截章节列表，提取真实章节 ID 数组供上一章/下一章
+                            try {
+                                var clTxt = xhr.responseText || '';
+                                var clObj = JSON.parse(clTxt);
+                                var ids = [];
+                                (function collect(o) {
+                                    if (!o || typeof o !== 'object') return;
+                                    if (Array.isArray(o)) { for (var a=0;a<o.length;a++) collect(o[a]); return; }
+                                    for (var key in o) {
+                                        if (!o.hasOwnProperty(key)) continue;
+                                        var v = o[key];
+                                        if ((key === 'cid' || key === 'id' || key === 'chapter_id' || key === 'chapterid') && (typeof v === 'string' || typeof v === 'number')) {
+                                            ids.push(String(v));
+                                        }
+                                        collect(v);
+                                    }
+                                })(clObj);
+                                if (ids.length > 0 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.chapter) {
+                                    window.webkit.messageHandlers.chapter.postMessage({ tag: 'chapters', payload: JSON.stringify({ ids: ids }) });
                                 }
                             } catch(err) {}
                         }
@@ -875,6 +952,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // ===== 章节页正文提取 -> 全屏沉浸阅读页 (v13) =====
     private func handleChapterMessage(tag: String, payload: String) {
         appendDebugLog("[chapter:\(tag)] \(String(payload.prefix(300)))")
+        if tag == "chapters" {
+            // 保存真实章节 ID 列表（按阅读顺序）
+            if let data = payload.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let ids = obj["ids"] as? [String] {
+                readerChapterIds = ids
+                appendDebugLog("[reader] chapter ids stored: \(ids.count)")
+            }
+            return
+        }
         if tag == "content" {
             guard let data = payload.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -886,7 +973,9 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             let bookid = obj["bookid"] as? String ?? ""
             let c = obj["c"] as? String ?? ""
             let title = obj["title"] as? String ?? ""
-            appendDebugLog("[chapter:content-ok] sel=\(obj["sel"] as? String ?? "?") title=\(title) h=\(h) bookid=\(bookid) c=\(c) htmlLen=\(html.count)")
+            readerPrevC = obj["prev"] as? String ?? ""
+            readerNextC = obj["next"] as? String ?? ""
+            appendDebugLog("[chapter:content-ok] sel=\(obj["sel"] as? String ?? "?") title=\(title) h=\(h) bookid=\(bookid) c=\(c) htmlLen=\(html.count) prev=\(readerPrevC) next=\(readerNextC)")
             // 若用户已翻到其它章节，忽略旧章节的迟到上报，避免阅读页被错误覆盖
             if let expected = readerExpectedC, !c.isEmpty, c != expected {
                 appendDebugLog("[reader] ignore stale content c=\(c) expected=\(expected)")
@@ -905,16 +994,138 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private func presentReader(html: String, title: String) {
         if readerContainer == nil { buildReaderUI() }
         readerTitleLabel.text = title.isEmpty ? "阅读器" : title
-        let page = readerHTML(title: title, body: html)
-        readerView.loadHTMLString(page, baseURL: URL(string: "https://sangtacviet.vip"))
+        // v15：HTML 正文 -> 原生富文本 -> 分页/滚动原生渲染
+        readerRawHTML = html
         readerContainer.isHidden = false
         view.bringSubviewToFront(readerContainer)
+        view.layoutIfNeeded()   // 确保容器有正确尺寸后再分页
+        let attr = htmlToAttributed(html)
+        readerAttributed = attr
+        renderReaderContent(attr)
         if let c = readerLastData?.c { readerLoadedC = c; readerExpectedC = c }
-        appendDebugLog("[reader] presented, htmlLen=\(html.count)")
+        appendDebugLog("[reader] presented(\(readerModeIsPaged ? "paged" : "scroll")) attrLen=\(attr.length) charLen=\(attr.string.count)")
         // v14 实验：章节页会话已建立，用原生 URLSession 验证签名必要性
         if let d = readerLastData {
             testNativeReadChapter(h: d.h, bookid: d.bookid, c: d.c)
         }
+    }
+
+    // ===== v15 原生阅读器：HTML -> 富文本 / 分页 / 渲染 =====
+    private func htmlToAttributed(_ html: String) -> NSAttributedString {
+        // 加基础样式：字号、行高、段落间距、中文字体
+        let styled = "<span style=\"font-size:\(Int(readerFontSize))pt;line-height:1.7;\">\(html)</span>"
+        guard let data = styled.data(using: .utf8),
+              let attr = try? NSAttributedString(data: data,
+                                                 options: [.documentType: NSAttributedString.DocumentType.html,
+                                                           .characterEncoding: String.Encoding.utf8.rawValue],
+                                                 documentAttributes: nil) else {
+            return NSAttributedString(string: html, attributes: baseTextAttrs())
+        }
+        return attr
+    }
+
+    private func baseTextAttrs() -> [NSAttributedString.Key: Any] {
+        let fg = readerIsNight ? UIColor(white: 0.85, alpha: 1) : UIColor(white: 0.15, alpha: 1)
+        return [
+            .font: UIFont.systemFont(ofSize: readerFontSize),
+            .foregroundColor: fg
+        ]
+    }
+
+    // 把富文本渲染进当前模式（分页/滚动），并应用主题
+    private func renderReaderContent(_ attr: NSAttributedString) {
+        let bg = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        readerContainer.backgroundColor = bg
+        if readerModeIsPaged {
+            buildPagedContent(attr)
+        } else {
+            buildScrollContent(attr)
+        }
+    }
+
+    // 滚动模式：原生 UITextView
+    private func buildScrollContent(_ attr: NSAttributedString) {
+        readerPageVC?.view.removeFromSuperview()
+        readerPageVC = nil
+        readerContentHolder.isHidden = false
+        let tv = readerTextView
+        tv.attributedText = attr
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.isScrollEnabled = true
+        tv.backgroundColor = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        tv.textColor = readerIsNight ? UIColor(white: 0.85, alpha: 1) : UIColor(white: 0.15, alpha: 1)
+        tv.font = UIFont.systemFont(ofSize: readerFontSize)
+        tv.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 44, right: 16)
+    }
+
+    // 分页模式：UIPageViewController，每页一个 UITextView 显示一个分页切片
+    private func buildPagedContent(_ attr: NSAttributedString) {
+        readerContentHolder.isHidden = true
+        let vc = UIPageViewController(transitionStyle: .pageCurl, navigationOrientation: .horizontal, options: nil)
+        vc.dataSource = self
+        vc.view.backgroundColor = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        vc.view.translatesAutoresizingMaskIntoConstraints = false
+        if let old = readerPageVC {
+            old.view.removeFromSuperview()
+        }
+        readerContainer.addSubview(vc.view)
+        NSLayoutConstraint.activate([
+            vc.view.topAnchor.constraint(equalTo: readerContainer.topAnchor, constant: readerTopBarHeight + view.safeAreaInsets.top),
+            vc.view.leadingAnchor.constraint(equalTo: readerContainer.leadingAnchor),
+            vc.view.trailingAnchor.constraint(equalTo: readerContainer.trailingAnchor),
+            vc.view.bottomAnchor.constraint(equalTo: readerContainer.bottomAnchor, constant: -(44 + view.safeAreaInsets.bottom))
+        ])
+        readerPageVC = vc
+        paginateText(attr)
+        if let first = makePageVC(index: 0) {
+            vc.setViewControllers([first], direction: .forward, animated: false, completion: nil)
+        }
+    }
+
+    // 用 NSLayoutManager 把富文本按容器尺寸切成多页（逐 glyph 判定换页，可靠）
+    private func paginateText(_ attr: NSAttributedString) {
+        readerPages.removeAll()
+        readerPageOffset = 0
+        let pageWidth = max(readerContainer.bounds.width - 32, 50)
+        let pageHeight = max(readerContainer.bounds.height - readerTopBarHeight - 44 - view.safeAreaInsets.top - view.safeAreaInsets.bottom, 50)
+
+        let storage = NSTextStorage(attributedString: attr)
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: CGSize(width: pageWidth, height: pageHeight))
+        container.lineFragmentPadding = 0
+        layout.addTextContainer(container)
+        layout.ensureLayout(for: container)
+
+        let full = layout.glyphRange(for: container)
+        var start = full.location
+        while start < NSMaxRange(full) {
+            var end = start
+            var i = start
+            while i < NSMaxRange(full) {
+                let r = layout.boundingRect(forGlyphRange: NSRange(location: i, length: 1), in: container)
+                if r.maxY > pageHeight { break }
+                end = i + 1
+                i += 1
+            }
+            if end <= start { end = start + 1 }
+            let range = NSRange(location: start, length: end - start)
+            readerPages.append(attr.attributedSubstring(from: range))
+            start = end
+        }
+        appendDebugLog("[reader] paged into \(readerPages.count) pages")
+    }
+
+    private func makePageVC(index: Int) -> ReaderPageViewController? {
+        guard index >= 0 && index < readerPages.count else { return nil }
+        let pvc = ReaderPageViewController()
+        pvc.pageIndex = index
+        let bg = readerIsNight ? UIColor(white: 0.10, alpha: 1) : UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        pvc.attributedText = readerPages[index]
+        pvc.pageBackground = bg
+        pvc.fontSize = readerFontSize
+        return pvc
     }
 
     private func dismissReader() {
@@ -1049,22 +1260,36 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             titleLbl.centerYAnchor.constraint(equalTo: closeBtn.centerYAnchor)
         ])
 
-        // 正文 WKWebView
-        let wvConfig = WKWebViewConfiguration()
-        wvConfig.websiteDataStore = WKWebsiteDataStore.default()
-        let readerWv = WKWebView(frame: .zero, configuration: wvConfig)
-        readerWv.backgroundColor = .systemBackground
-        readerWv.isOpaque = false
-        readerWv.scrollView.contentInsetAdjustmentBehavior = .never
-        readerWv.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(readerWv)
+        // 正文原生容器（v15）：滚动模式 UITextView；分页模式由 UIPageViewController 承载
+        let holder = UIView()
+        holder.translatesAutoresizingMaskIntoConstraints = false
+        holder.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        container.addSubview(holder)
         NSLayoutConstraint.activate([
-            readerWv.topAnchor.constraint(equalTo: topBar.bottomAnchor),
-            readerWv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            readerWv.trailingAnchor.constraint(equalTo: container.trailingAnchor)
-            // 底部约束在 settingsBar 创建后统一添加，避免与 container.bottom 冲突
+            holder.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            holder.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            holder.trailingAnchor.constraint(equalTo: container.trailingAnchor)
         ])
-        readerView = readerWv
+        readerContentHolder = holder
+
+        let tv = UITextView()
+        tv.translatesAutoresizingMaskIntoConstraints = false
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.isScrollEnabled = true
+        tv.showsVerticalScrollIndicator = false
+        tv.font = UIFont.systemFont(ofSize: readerFontSize)
+        tv.backgroundColor = UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+        tv.textColor = UIColor(white: 0.15, alpha: 1)
+        tv.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 44, right: 16)
+        holder.addSubview(tv)
+        NSLayoutConstraint.activate([
+            tv.topAnchor.constraint(equalTo: holder.topAnchor),
+            tv.leadingAnchor.constraint(equalTo: holder.leadingAnchor),
+            tv.trailingAnchor.constraint(equalTo: holder.trailingAnchor),
+            tv.bottomAnchor.constraint(equalTo: holder.bottomAnchor)
+        ])
+        readerTextView = tv
 
         // 阅读设置条（底部）：字号-/A /A+ /夜间 /白天
         let settingsBar = UIView()
@@ -1099,6 +1324,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         dayBtn.translatesAutoresizingMaskIntoConstraints = false
         settingsBar.addSubview(dayBtn)
 
+        let modeBtn = UIButton(type: .system)
+        modeBtn.setTitle("翻页", for: .normal)
+        modeBtn.setTitleColor(.white, for: .normal)
+        modeBtn.addTarget(self, action: #selector(readerToggleMode), for: .touchUpInside)
+        modeBtn.translatesAutoresizingMaskIntoConstraints = false
+        settingsBar.addSubview(modeBtn)
+
         NSLayoutConstraint.activate([
             settingsBar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             settingsBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -1115,27 +1347,32 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             fontUp.widthAnchor.constraint(equalToConstant: 56),
             fontUp.heightAnchor.constraint(equalToConstant: 30),
 
-            nightBtn.trailingAnchor.constraint(equalTo: dayBtn.leadingAnchor, constant: -12),
+            nightBtn.trailingAnchor.constraint(equalTo: modeBtn.leadingAnchor, constant: -8),
             nightBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
             nightBtn.widthAnchor.constraint(equalToConstant: 72),
+
+            modeBtn.trailingAnchor.constraint(equalTo: dayBtn.leadingAnchor, constant: -8),
+            modeBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
+            modeBtn.widthAnchor.constraint(equalToConstant: 60),
 
             dayBtn.trailingAnchor.constraint(equalTo: settingsBar.trailingAnchor, constant: -16),
             dayBtn.centerYAnchor.constraint(equalTo: fontDown.centerYAnchor),
             dayBtn.widthAnchor.constraint(equalToConstant: 72)
         ])
 
-        // 把 readerWv 底部从 container.bottom 改接到 settingsBar.top，避免被设置条遮挡
-        readerWv.bottomAnchor.constraint(equalTo: settingsBar.topAnchor).isActive = true
-
-        // 让 readerWv 底部不被设置条遮挡
-        readerWvBottomInset()
+        // holder 底部接到 settingsBar.top，避免被设置条遮挡
+        holder.bottomAnchor.constraint(equalTo: settingsBar.topAnchor).isActive = true
 
         readerContainer = container
     }
 
-    private func readerWvBottomInset() {
-        // 正文底部留出设置条高度
-        readerView.scrollView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 44, right: 0)
+    // 翻页模式切换：分页 <-> 滚动
+    @objc private func readerToggleMode() {
+        readerModeIsPaged.toggle()
+        appendDebugLog("[reader] mode -> \(readerModeIsPaged ? "paged" : "scroll")")
+        if let attr = readerAttributed {
+            renderReaderContent(attr)
+        }
     }
 
     @objc private func readerCloseTapped() {
@@ -1150,19 +1387,40 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         readerGo(delta: 1)
     }
 
-    // 上一章/下一章：导航到章节页，等待提取脚本重新上报正文
+    // 上一章/下一章：优先用 readchapter 提供的 prev/next，其次用章节列表，最后 c±1
     private func readerGo(delta: Int) {
         guard let info = readerLastData else {
             appendDebugLog("[reader] no last data for nav")
             return
         }
-        var cVal = Int64(info.c) ?? 0
-        cVal += Int64(delta)
-        let newC = String(cVal)
+        var newC: String?
+        // 1) readchapter 提供的 prev/next
+        let direct = delta < 0 ? readerPrevC : readerNextC
+        if !direct.isEmpty {
+            newC = direct
+        } else if !readerChapterIds.isEmpty {
+            // 2) 章节列表顺序导航
+            if let idx = readerChapterIds.firstIndex(of: info.c) {
+                let ni = idx + delta
+                if ni >= 0 && ni < readerChapterIds.count {
+                    newC = readerChapterIds[ni]
+                }
+            }
+        }
+        if newC == nil {
+            // 3) 兜底 c±1
+            var cVal = Int64(info.c) ?? 0
+            cVal += Int64(delta)
+            newC = String(cVal)
+        }
+        guard let target = newC, !target.isEmpty else {
+            appendDebugLog("[reader] no nav target")
+            return
+        }
         // 更新期望章节，忽略旧章节迟到上报；清空已加载标记以便新章节可 present
-        readerExpectedC = newC
+        readerExpectedC = target
         readerLoadedC = nil
-        let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(newC)/"
+        let chapUrl = "https://sangtacviet.vip/truyen/\(info.h)/1/\(info.bookid)/\(target)/"
         appendDebugLog("[reader] nav to \(chapUrl)")
         // 让底层 webView 导航到章节页
         if let url = URL(string: chapUrl) {
@@ -1180,64 +1438,25 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     }
 
     private func adjustReaderFont(delta: CGFloat) {
-        readerView.evaluateJavaScript("readerAdjustFont(\(delta))", completionHandler: nil)
+        readerFontSize = max(12, min(32, readerFontSize + delta))
+        appendDebugLog("[reader] font=\(readerFontSize)")
+        if !readerRawHTML.isEmpty {
+            let newAttr = htmlToAttributed(readerRawHTML)
+            readerAttributed = newAttr
+            renderReaderContent(newAttr)
+        }
     }
 
     @objc private func readerNightToggle() {
-        readerView.evaluateJavaScript("readerNightMode(true)", completionHandler: nil)
+        readerIsNight = true
+        appendDebugLog("[reader] night")
+        if let attr = readerAttributed { renderReaderContent(attr) }
     }
 
     @objc private func readerDayMode() {
-        readerView.evaluateJavaScript("readerNightMode(false)", completionHandler: nil)
-    }
-
-    // 自包含阅读页 HTML：正文 + 沉浸式排版 + 字号/夜间模式 JS
-    private func readerHTML(title: String, body: String) -> String {
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-        <style>
-            :root { --bg:#f5f0e6; --fg:#2b2b2b; --title:#7a6a4a; }
-            @media (prefers-color-scheme: dark) {
-                :root { --bg:#1a1a1a; --fg:#c8c8c8; --title:#9a8a6a; }
-            }
-            body { background: var(--bg); color: var(--fg); margin:0; padding: 20px 20px 80px; }
-            .stv-chapter-title { text-align:center; font-size:22px; font-weight:bold; color:var(--title); margin: 8px 0 20px; line-height:1.4; }
-            .stv-body { font-size: 19px; line-height: 1.9; letter-spacing:0.2px; word-break: break-word; }
-            .stv-body p { margin: 0.6em 0; text-indent: 2em; }
-            .stv-body img { max-width: 100% !important; height: auto !important; }
-            .stv-body i[data-stv-ruby] { color: var(--title); }
-        </style>
-        </head>
-        <body>
-            <div class="stv-chapter-title">\(htmlEscape(title))</div>
-            <div class="stv-body" id="stvBody">\(body)</div>
-            <script>
-            var stvFont = 19;
-            function readerAdjustFont(d) {
-                stvFont = Math.max(14, Math.min(32, stvFont + d));
-                var b = document.getElementById('stvBody');
-                if (b) b.style.fontSize = stvFont + 'px';
-            }
-            function readerNightMode(night) {
-                var r = document.documentElement;
-                if (night) {
-                    r.style.setProperty('--bg', '#1a1a1a');
-                    r.style.setProperty('--fg', '#c8c8c8');
-                    r.style.setProperty('--title', '#9a8a6a');
-                } else {
-                    r.style.setProperty('--bg', '#f5f0e6');
-                    r.style.setProperty('--fg', '#2b2b2b');
-                    r.style.setProperty('--title', '#7a6a4a');
-                }
-            }
-            </script>
-        </body>
-        </html>
-        """
+        readerIsNight = false
+        appendDebugLog("[reader] day")
+        if let attr = readerAttributed { renderReaderContent(attr) }
     }
 
     private func htmlEscape(_ s: String) -> String {
@@ -1248,6 +1467,48 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         return out
     }
 
+    // ===== UIPageViewControllerDataSource (分页阅读) =====
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerBefore viewController: UIViewController) -> UIViewController? {
+        guard let pvc = viewController as? ReaderPageViewController else { return nil }
+        return makePageVC(index: pvc.pageIndex - 1)
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerAfter viewController: UIViewController) -> UIViewController? {
+        guard let pvc = viewController as? ReaderPageViewController else { return nil }
+        return makePageVC(index: pvc.pageIndex + 1)
+    }
+
+}
+
+// 分页阅读的一页：原生 UITextView 显示一段富文本
+private class ReaderPageViewController: UIViewController {
+    var pageIndex: Int = 0
+    var attributedText: NSAttributedString? = nil
+    var pageBackground: UIColor = UIColor(red: 0.965, green: 0.945, blue: 0.91, alpha: 1)
+    var fontSize: CGFloat = 18
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = pageBackground
+        let tv = UITextView()
+        tv.translatesAutoresizingMaskIntoConstraints = false
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.isScrollEnabled = false
+        tv.backgroundColor = pageBackground
+        tv.attributedText = attributedText
+        tv.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        tv.textContainer.lineFragmentPadding = 0
+        view.addSubview(tv)
+        NSLayoutConstraint.activate([
+            tv.topAnchor.constraint(equalTo: view.topAnchor),
+            tv.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            tv.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            tv.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+    }
 }
 
 /// 监听 WKWebView cookie 变化，回调宿主保存到 UserDefaults，
