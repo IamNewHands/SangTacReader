@@ -620,12 +620,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             })();
         })();
         """
-        let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        // forMainFrameOnly=true：只在主框架注入，避免污染第三方/Cloudflare Turnstile 挑战 iframe。
+        // 关键：章节正文的 web readchapter 受 Cloudflare Turnstile 保护；若我们的桥接脚本注入到
+        // challenges.cloudflare.com 的挑战 iframe 里并覆写其 XHR，会让 Turnstile 挑战无法完成，
+        // cf_clearance 永不签发，readchapter 因此返回 code:7 -> 页面无限 location.reload()。
+        let bridgeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         controller.addUserScript(bridgeScript)
 
         // ===== 临时调试插桩 (debug-point) =====
         // #region debug-point D:ios-evidence
-        let debugScript = WKUserScript(source: debugJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        let debugScript = WKUserScript(source: debugJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         controller.addUserScript(debugScript)
         controller.add(self, name: "dbg")
         // #endregion

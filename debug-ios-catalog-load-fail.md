@@ -219,3 +219,27 @@ Crawler（phantom-sea-limited/Crawler#sangtacviet）用 **导航到章节页** `
 1. `[DBG:gkey] key=...` 看 eval 是否真能返回有效 key（大概率 undefined）。
 2. 若 key 无效 → 应自动导航到章节页并渲染正文。
 3. 目录、登录、语言切换仍正常。
+
+## v8（真机验证结果）：章节页触发 Cloudflare Turnstile 挑战，readchapter 返回 code:7 -> 无限 reload
+
+**2026-08-31 真机日志 log.txt 分析**：
+1. grantcontext eval 返回 undefined（`[DBG:gkey] key=undefined`）→ App 格式 readchapter `key=` 空 → **code:7**。证实 App key 机制不可复现。
+2. 自动导航到章节页 `/truyen/qidian/1/1034915599/850838603/`。
+3. 章节页 web readchapter（POST `/index.php?...ngmar=readc&sajax=readchapter&sty=1&exts=`）返回 **size=22/24 = `{"code":7,"time":1000}`** → 触发页面 `if(x.code=="7"){ ... location.reload() }`（章节页源码 line 761-778）→ **无限 1 秒 reload 循环**（用户所见"一直加载不停刷新"）。
+4. 期间加载 **Cloudflare Turnstile**（`challenges.cloudflare.com`）并 POST `verifyca`（size=7，OK），但 readchapter 仍 code:7。
+
+### 决定性根因
+- **章节正文受 Cloudflare Turnstile 反爬保护**。readchapter 需在 Turnstile 完成并签发 `cf_clearance`/`_gac` 证明后才放行，否则返回 code:7（设备不支持/未认证）。
+- **node 实测**（仅获取 `_gac` cookie 而无页面 JS 生成的证明）：返回 `code:"5"` err `4002`（"Lỗi không xác định, mã 4002"），与真机 code:7 不同 → 两者都是"缺少 Turnstile 证明"的不同拒绝码。
+- **UA 无关**：iOS Safari / 桌面 Chrome / 安卓 Chrome 三 UA 结果相同。
+- **readcontextid cookie 不是 key**：直接当 key 用返回 code:7。
+
+### 修复 v8（已实施）：forMainFrameOnly=true
+- **嫌疑**：bridgeJS/debugJS 以 `forMainFrameOnly:false` 注入到**所有 iframe，包括 Cloudflare Turnstile 挑战 iframe**（日志可见大量 `origin=https://challenges.cloudflare.com` 的 `[DBG:ready] instrumentation installed`）。若我们覆写挑战 iframe 内的 XHR，会破坏 Turnstile 挑战计算 → 永不完成 → cf_clearance 不签发 → readchapter code:7 → reload 循环。
+- **修改**：`bridgeScript` 与 `debugScript` 均改为 `forMainFrameOnly: true`，只在主框架注入，避免污染第三方/Cloudflare iframe。
+- bridgeJS/debugJS 语法已用 node vm.Script 验证通过；Swift 无诊断错误。
+
+### 待真机验证（v8）
+1. 章节页不再无限 reload，正文能渲染（Turnstile 在主框架正常运行）。
+2. 目录、登录、语言切换仍正常。
+3. 若仍 code:7，则说明 WKWebView/LiveContainer 环境本身被 Cloudflare 判定为异常（非 iframe 污染），需另行评估（如替换为可过 CF 的浏览器内核）。
