@@ -9,7 +9,7 @@
 /* Begin PBXBuildFile section */
 		B1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift */; };
 		B1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift */; };
-		B1A2C3C01BAD4E1A9C1D2E3F /* ReaderTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A2C3C01BAD4E1A9C1D2E3F /* ReaderTheme.swift */; };
+		B1A2C3D01BAD4E1A9C1D2E3F /* ReaderTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1A2C3D01BAD4E1A9C1D2E3F /* ReaderTheme.swift */; };
 		B1A2C3B61BAD4E1A9C1D2E3F /* reader.js in Resources */ = {isa = PBXBuildFile; fileRef = A1A2C3B61BAD4E1A9C1D2E3F /* reader.js */; };
 		B1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets */; };
 		B1A2C3BA1BAD4E1A9C1D2E3F /* www in Resources */ = {isa = PBXBuildFile; fileRef = A1A2C3BA1BAD4E1A9C1D2E3F /* www */; };
@@ -19,7 +19,7 @@
 		A1A2C3B01BAD4E1A9C1D2E3F /* SangTacReader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SangTacReader.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		A1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewController.swift; sourceTree = "<group>"; };
-		A1A2C3C01BAD4E1A9C1D2E3F /* ReaderTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderTheme.swift; sourceTree = "<group>"; };
+		A1A2C3D01BAD4E1A9C1D2E3F /* ReaderTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderTheme.swift; sourceTree = "<group>"; };
 		A1A2C3B61BAD4E1A9C1D2E3F /* reader.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = reader.js; path = reader.js; sourceTree = "<group>"; };
 		A1A2C3B71BAD4E1A9C1D2E3F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -58,7 +58,7 @@
 			children = (
 				A1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift */,
 				A1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift */,
-				A1A2C3C01BAD4E1A9C1D2E3F /* ReaderTheme.swift */,
+				A1A2C3D01BAD4E1A9C1D2E3F /* ReaderTheme.swift */,
 				A1A2C3B61BAD4E1A9C1D2E3F /* reader.js */,
 				A1A2C3B71BAD4E1A9C1D2E3F /* Info.plist */,
 				A1A2C3B91BAD4E1A9C1D2E3F /* Assets.xcassets */,
@@ -140,7 +140,7 @@
 			files = (
 				B1A2C3B41BAD4E1A9C1D2E3F /* AppDelegate.swift in Sources */,
 				B1A2C3B51BAD4E1A9C1D2E3F /* WebViewController.swift in Sources */,
-				B1A2C3C01BAD4E1A9C1D2E3F /* ReaderTheme.swift in Sources */,
+				B1A2C3D01BAD4E1A9C1D2E3F /* ReaderTheme.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
