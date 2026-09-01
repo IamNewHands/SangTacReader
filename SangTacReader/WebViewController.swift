@@ -27,6 +27,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     private var readerChapterIds: [String] = []  // 章节 ID 列表（真实顺序），供上一章/下一章
     private var readerPrevC = ""                 // 上一章 ID（readchapter 提供）
     private var readerNextC = ""                 // 下一章 ID
+    private var readerOriginURL: URL? = nil      // 进入阅读器时的目录页 URL，返回时导航回它
     private let readerTopBarHeight: CGFloat = 52
 
     // ===== 安卓阅读器复刻 (v22)：主题 / 排版 / 底栏 =====
@@ -836,6 +837,17 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     sp.textContent = txt;
                     el.parentNode.replaceChild(sp, el);
                 }
+                // 清理逐词注释版的词间空格：删除 <span> 之间的纯空白文本节点，
+                // 让中文词连成一句（否则每个词间一个空格，阅读体验差）
+                var spans = d.querySelectorAll('span');
+                for (var m = 0; m < spans.length; m++) {
+                    var pr = spans[m].previousSibling;
+                    while (pr && pr.nodeType === 3 && /^[ \t\u00A0]+$/.test(pr.nodeValue || '')) {
+                        var gone = pr;
+                        pr = pr.previousSibling;
+                        gone.parentNode.removeChild(gone);
+                    }
+                }
                 // 移除版权提示文本节点
                 var allNodes = d.querySelectorAll('*');
                 for (var j = 0; j < allNodes.length; j++) {
@@ -885,17 +897,24 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                             try {
                                 var rTxt = xhr.responseText || '';
                                 var rObj = JSON.parse(rTxt);
+                                // 服务器可能不在 JSON 里返回 h/bookid/c（它们是请求参数），
+                                // 从请求 URL 提取作为兜底，避免上报空 c 导致正文被"保留旧数据"过滤。
+                                var urlParams = {};
+                                (rcUrl.split('?')[1] || '').split('&').forEach(function(p){ var kv = p.split('='); if(kv[0] && kv[1] !== undefined) urlParams[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]); });
+                                var rH = rObj.h || urlParams['h'] || '';
+                                var rBook = rObj.bookid || urlParams['bookid'] || '';
+                                var rC = rObj.c || urlParams['c'] || '';
                                 if (rObj && (rObj.code === "0" || rObj.code == 0) && typeof rObj.data === 'string' && rObj.data.length > 0) {
-                                    dbg('readc-code0', 'c=' + (rObj.c || '') + ' dataLen=' + rObj.data.length + ' meta=' + JSON.stringify({h:rObj.h,bookid:rObj.bookid,c:rObj.c,prev:rObj.prev,next:rObj.next,prev_c:rObj.prev_c,next_c:rObj.next_c}));
+                                    dbg('readc-code0', 'c=' + (rC || '') + ' dataLen=' + rObj.data.length + ' meta=' + JSON.stringify({h:rH,bookid:rBook,c:rC,prev:rObj.prev,next:rObj.next,prev_c:rObj.prev_c,next_c:rObj.next_c}));
                                     // v15 中文化：<i> 替换为中文 t 值，清理顶部灰色提示与版权提示，输出纯中文正文 HTML
                                     var cnHtml = toChineseContent(rObj.data);
                                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.chapter) {
                                         window.webkit.messageHandlers.chapter.postMessage({
                                             tag: 'content',
                                             payload: JSON.stringify({
-                                                h: rObj.h || '',
-                                                bookid: rObj.bookid || '',
-                                                c: rObj.c || '',
+                                                h: rH,
+                                                bookid: rBook,
+                                                c: rC,
                                                 title: (rObj.chaptername || '').trim(),
                                                 html: cnHtml,
                                                 raw: rObj.data,
@@ -1319,9 +1338,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     private func dismissReader() {
         readerContainer.isHidden = true
-        // 若主 webview 已整页导航到章节页，返回时应回到书籍目录页（安卓行为），
-        // 而非停留在网页版章节正文页。
-        if let url = webView.url, url.path.contains("/truyen/") {
+        // 返回时应回到进入阅读器时的目录页，而非停留在网页版章节正文页。
+        // 不用 goBack（连续切章会污染历史栈，goBack 回不到目录），直接导航回记录的目录 URL。
+        if let origin = readerOriginURL {
+            var req = URLRequest(url: origin)
+            req.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
+            webView.load(req)
+            appendDebugLog("[reader] dismissed, load catalog \(origin.absoluteString)")
+        } else if let url = webView.url, url.path.contains("/truyen/") {
             if webView.canGoBack {
                 webView.goBack()
                 appendDebugLog("[reader] dismissed, goBack to catalog")
@@ -1378,6 +1402,11 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
             appendDebugLog("[nativeRead] missing params, abort")
             return
+        }
+        // 记录进入阅读器时的目录页 URL（返回时导航回它，避免 goBack 历史栈不可靠）
+        if readerOriginURL == nil, let cur = webView.url, !cur.path.contains("/truyen/") {
+            readerOriginURL = cur
+            appendDebugLog("[nativeRead] record origin \(cur.absoluteString)")
         }
         // 点章前确保中文模式 cookie，让服务器下发纯中文正文
         ensureChineseTransmodeCookie()
@@ -1582,6 +1611,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         }
         // 3) 移除版权提示（含越南语/中文关键词）
         regexReplace(#"(?:Vì vấn đề nội dung|không hỗ trợ xem văn bản gốc|由于版权问题)[^<\n]*"#) { _, _ in "" }
+        // 4) 清理逐词注释版的词间空格：删除 <span> 之间的空白，让中文词连成一句
+        regexReplace(#"</span>[ \t\u00A0]+<span>"#) { _, _ in "</span><span>" }
         return html
     }
 
