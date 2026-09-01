@@ -315,47 +315,34 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             // Capacitor，且【不设置 getPlatform】，让 app.platform.isIOS 保持 false、
             // 页面布局维持纯 Web 模式（避免之前"注入 Capacitor 后点不了"的塌陷）。
             // 这样原版 loadKeyFromServer 能运行、eval 在真实 WKWebView 里生成 key。
-            // Task1：真正注入极简 Capacitor.Plugins.Http，底层走原生 URLSession(capHttp 桥)。
-            // 使原版 loadKeyFromServer/getContent2 走原生 App 通道，避开 Cloudflare 对 webview
-            // XHR 的拦截（已实测原生 URLSession 拉 grantcontext 返回混淆 JS，通道有效）。
-            // 仅注入 Http，不注入 CapacitorSQLite/Preferences，避免触发原生 SQLite 等待。
-            if (!window.hasOwnProperty('Capacitor')) { window.Capacitor = { Plugins: {} }; }
-            if (!window.Capacitor.Plugins.Http) {
-                window.__capHttpSeq = 0;
-                window.__capHttpPending = {};
-                window.__capHttpResolve = function(id, payload) {
-                    var p = window.__capHttpPending[id];
+            // Task1b：不注入 window.Capacitor（前端用 hasOwnProperty("Capacitor") 判断原生模式，
+            // 注入会触发 isCachedFrontend=true，导致 app 走原生分支、大量 Capacitor 原生 API
+            // 缺失而崩溃 —— 见 log: Capacitor.platform.toLowerCase undefined）。
+            // 改用自定义命名空间 __stvHttp 走原生 URLSession，不触发 isCachedFrontend。
+            // 混淆 JS eval 需要 Capacitor 指纹时，在覆写的 loadKeyFromServer 内临时注入再删除。
+            if (!window.__stvHttp) {
+                window.__stvHttpSeq = 0;
+                window.__stvHttpPending = {};
+                window.__stvHttpResolve = function(id, payload) {
+                    var p = window.__stvHttpPending[id];
                     if (!p) return;
-                    delete window.__capHttpPending[id];
+                    delete window.__stvHttpPending[id];
                     if (payload && payload.error) { p.reject(new Error(payload.error)); }
                     else { p.resolve({ data: (payload && payload.body) || '', status: (payload && payload.status) || 200, headers: {} }); }
                 };
-                window.Capacitor.Plugins.Http = {
-                    get: function(opts) {
-                        return new Promise(function(resolve, reject) {
-                            var id = (window.__capHttpSeq = window.__capHttpSeq + 1);
-                            window.__capHttpPending[id] = { resolve: resolve, reject: reject };
-                            var url = opts && opts.url ? String(opts.url) : '';
-                            var headers = (opts && opts.headers) || {};
-                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.capHttp) {
-                                try { window.webkit.messageHandlers.capHttp.postMessage({ id: id, url: url, headers: headers }); }
-                                catch(e) { delete window.__capHttpPending[id]; reject(e); }
-                            } else {
-                                delete window.__capHttpPending[id];
-                                reject(new Error('capHttp missing'));
-                            }
-                        });
-                    },
-                    request: function(opts) { return this.get(opts); }
+                window.__stvHttpGet = function(url, headers) {
+                    return new Promise(function(resolve, reject) {
+                        var id = (window.__stvHttpSeq = window.__stvHttpSeq + 1);
+                        window.__stvHttpPending[id] = { resolve: resolve, reject: reject };
+                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.capHttp) {
+                            try { window.webkit.messageHandlers.capHttp.postMessage({ id: id, url: url, headers: headers || {} }); }
+                            catch(e) { delete window.__stvHttpPending[id]; reject(e); }
+                        } else {
+                            delete window.__stvHttpPending[id];
+                            reject(new Error('capHttp missing'));
+                        }
+                    });
                 };
-                // 空桩插件：避免前端访问 Capacitor.Plugins.App/StatusBar/Preferences 等时
-                // 因 undefined 抛异常（前端多为 try/catch 或有插件检测，此处兜底）。
-                if (!window.Capacitor.Plugins.App) { window.Capacitor.Plugins.App = { SyncCookie: function(){}, addListener: function(){ return {remove:function(){}}; } }; }
-                if (!window.Capacitor.Plugins.StatusBar) { window.Capacitor.Plugins.StatusBar = { hide: function(){}, show: function(){}, setStyle: function(){}, setBackgroundColor: function(){}, setOverlaysWebView: function(){} }; }
-                if (!window.Capacitor.Plugins.Preferences) { window.Capacitor.Plugins.Preferences = { get: function(){ return Promise.resolve({value:null}); }, set: function(){ return Promise.resolve(); }, remove: function(){ return Promise.resolve(); } }; }
-                if (!window.Capacitor.Plugins.Device) { window.Capacitor.Plugins.Device = { getInfo: function(){ return Promise.resolve({platform:'ios'}); } }; }
-                // 不注入 CapacitorSQLite —— 前端检测到 CapacitorSQLite 才等待原生 SQLite，
-                // 不注入则走 localStorage 分支，避免 app.init() 挂起。
             }
             function tryDbg(tag, msg) {
                 try {
@@ -376,9 +363,39 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     app.reader.__getContentPatched = true;
                     var origLoadKey = app.reader.loadKeyFromServer;
                     var origGetContent = app.reader.getContent;
-                    // Task1：不再覆写 loadKeyFromServer —— 注入的 Capacitor.Plugins.Http 已让
-                    // 原版走原生 URLSession 拉 grantcontext + eval 生成 key（避开 webview XHR 被
-                    // Cloudflare 拦截，已实测原生通道拉 grantcontext 返回混淆 JS 有效）。
+                    // Task1b：覆写 loadKeyFromServer —— 用原生 URLSession 桥(__stvHttp)拉
+                    // grantcontext（实测原生通道过 Cloudflare 返回混淆 JS），再 eval 生成 key。
+                    // eval 前临时注入 Capacitor 指纹（混淆 JS 依赖它做环境指纹），eval 后删除，
+                    // 避免 window.Capacitor 常驻触发前端 isCachedFrontend 崩溃。
+                    app.reader.loadKeyFromServer = async function(h, i) {
+                        try {
+                            var base = window.location.origin;
+                            var ctxUrl = base + "/io/grantcontext/context?hostid=" + encodeURIComponent(h) + "&bookid=" + encodeURIComponent(i);
+                            tryDbg('gkey-url', ctxUrl);
+                            var resp = await window.__stvHttpGet(ctxUrl, {
+                                Cookie: (document.cookie || "") + "; mac_tt=true;",
+                                "x-stv-transport": "app",
+                                "x-requested-with": "com.sangtacviet.mobilereader"
+                            });
+                            var js = resp && resp.data ? String(resp.data) : "";
+                            tryDbg('gkey-js-len', 'len=' + js.length);
+                            // 临时注入 Capacitor 指纹供混淆 JS eval 生成 key，完成后删除
+                            var hadCap = window.hasOwnProperty('Capacitor');
+                            if (!hadCap) { window.Capacitor = { platform: 'ios', getPlatform: function(){return 'ios';}, Plugins: {} }; }
+                            var key;
+                            try {
+                                key = eval(js);
+                            } finally {
+                                if (!hadCap) { try { delete window.Capacitor; } catch(e) {} }
+                            }
+                            tryDbg('gkey', 'key=' + String(key));
+                            this.chapterkey = key;
+                            return key;
+                        } catch(e) {
+                            tryDbg('gkey-err', 'exception: ' + e);
+                            try { return origLoadKey.apply(this, arguments); } catch(e2) { return undefined; }
+                        }
+                    };
                     // 保留 getContent 覆写（整页导航章节页拿正文，由原生阅读页渲染）。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
@@ -1378,7 +1395,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         } else {
             payload = "{\"status\":0,\"body\":\"\",\"headers\":{},\"error\":" + jsonEscape(error) + "}"
         }
-        let js = "window.__capHttpResolve && window.__capHttpResolve(\(id), \(payload));"
+        let js = "window.__stvHttpResolve && window.__stvHttpResolve(\(id), \(payload));"
         DispatchQueue.main.async {
             self.webView.evaluateJavaScript(js, completionHandler: nil)
         }
