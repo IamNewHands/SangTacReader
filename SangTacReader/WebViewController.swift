@@ -1104,12 +1104,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 appendDebugLog("[chapter:content] incomplete h/c, keep last data")
                 readerPrevC = obj["prev"] as? String ?? ""
                 readerNextC = obj["next"] as? String ?? ""
-                if !html.isEmpty { presentReader(html: html, title: title) }
+                if !html.isEmpty { presentReader(html: toChineseContent(html), title: title) }
                 return
             }
             readerLastData = (h, bookid, c)
-            // v21：在完整原生阅读器渲染正文。
-            presentReader(html: html, title: title)
+            // v21：在完整原生阅读器渲染正文。服务器可能按 transmode=chinese 返回纯中文，
+            // 也可能是越南文+<i>注释(name模式)；统一用 toChineseContent 兜底转纯中文，
+            // 确保正文干净无空格、无逐词注释。
+            presentReader(html: toChineseContent(html), title: title)
         }
     }
 
@@ -1329,12 +1331,50 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
     // ===== v21 原生阅读器：主 webview 后台取正文 + 原生覆盖渲染 =====
     // 点章 -> getContent 发 nativeRead -> 这里先显示原生"加载中"占位（覆盖即将导航的章节页，
     // 用户无感知），章节页 readchapter 被拦截 -> 上报 -> 在完整原生阅读器渲染正文。
+    // 强制服务器下发纯中文正文：设置 transmode=chinese + foreignlang=vi cookie。
+    // 安卓 setTransMode("original") 即设 transmode=chinese（见 _appv2.read.js），
+    // 此时 readchapter 服务器直接返回纯中文 data（无 <i> 注释包装），正文干净无空格，
+    // 无需 JS/Swift 端做逐词替换。登录后 webview cookie store 已含会话 cookie，
+    // 我们在此确保语言相关 cookie 命中中文模式。
+    private func ensureChineseTransmodeCookie() {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        let cookies: [String: String] = [
+            "transmode": "chinese",
+            "foreignlang": "vi",
+            "lang": "zh"
+        ]
+        for (name, value) in cookies {
+            var props: [HTTPCookiePropertyKey: Any] = [
+                .name: name,
+                .value: value,
+                .domain: "sangtacviet.vip",
+                .path: "/"
+            ]
+            if let ck = HTTPCookie(properties: props) {
+                store.setCookie(ck, completionHandler: nil)
+            }
+        }
+        // 也设置到当前 webview 页面，确保页面内 XHR 能读到
+        let js = """
+        (function(){
+            try {
+                document.cookie = 'transmode=chinese; path=/; domain=sangtacviet.vip';
+                document.cookie = 'foreignlang=vi; path=/; domain=sangtacviet.vip';
+                document.cookie = 'lang=zh; path=/; domain=sangtacviet.vip';
+            } catch(e) {}
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
     private func nativeReadChapter(h: String, bookid: String, c: String, key: String = "") {
         appendDebugLog("[nativeRead] show placeholder h=\(h) bookid=\(bookid) c=\(c) keyLen=\(key.count)")
         guard !h.isEmpty, !bookid.isEmpty, !c.isEmpty else {
             appendDebugLog("[nativeRead] missing params, abort")
             return
         }
+        // 点章前确保中文模式 cookie，让服务器下发纯中文正文
+        ensureChineseTransmodeCookie()
         // Task0：用原生 URLSession 带 app 头直读 readchapter，验证能否拿到 code:0（方案B基石）
         probeNativeRead(h: h, bookid: bookid, c: c, key: key)
         // 预置期望章节，使正文上报能通过 handleChapterMessage 过滤
@@ -2102,6 +2142,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             return
         }
         appendDebugLog("[reader] nav to c=\(target) h=\(info.h) bookid=\(info.bookid)")
+        // 上一章/下一章也确保中文模式，避免切章时语言 cookie 被重置为越南文
+        ensureChineseTransmodeCookie()
         // 更新期望章节，忽略旧章节迟到上报；清空已加载标记以便新章节可 present
         readerExpectedC = target
         readerLoadedC = nil
@@ -2110,33 +2152,26 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         presentReader(html: "<p>加载中…</p>", title: "")
         // 占位不算已加载，确保真实正文(c=target)能正常渲染
         readerLoadedC = nil
-        // v23：不整页导航章节页（避免卡顿/返回错/竞态）。在当前页内直接发 readchapter
-        // XHR（会话已建立，页内 code:0 可行），由已注入的 bridgeJS readchapter 拦截
-        // 提取正文并上报 -> 原生渲染。webview 地址不变 -> 返回自然回目录、无重载卡顿。
-        let h = info.h, bi = info.bookid, c = target
-        let js = """
-        (function(){
-            try {
-                var h='\(h)', i='\(bi)', c='\(c)';
-                var u='/index.php?bookid='+encodeURIComponent(i)+'&h='+encodeURIComponent(h)+'&c='+encodeURIComponent(c)+'&ngmar=readc&sajax=readchapter&sty=1&exts=';
-                var x=new XMLHttpRequest();
-                x._dbgUrl=u;
-                x.open('POST', u);
-                x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
-                x.onload=function(){
-                    try{
-                        var o=JSON.parse(x.responseText);
-                        var m='nav-readc code='+(o&&o.code)+' len='+(x.responseText||'').length;
-                        if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.dbg){
-                            window.webkit.messageHandlers.dbg.postMessage({tag:'nav-readc',msg:m});
-                        }
-                    }catch(e){}
-                };
-                x.send('');
-            }catch(e){}
-        })();
-        """
-        webView.evaluateJavaScript(js, completionHandler: nil)
+        // 整页导航到新章节页建立会话。章节页自身 readchapter code:0 后，chapterExtractJS
+        // 从 DOM 提取正文上报 -> handleChapterMessage -> toChineseContent -> 原生渲染。
+        // 注意：必须整页导航（页内发 readchapter 依赖 bridgeJS 拦截，而 bridgeJS 在
+        // 章节页 /truyen/ 为空转，无法上报；章节页 DOM 提取通道 chapterExtractJS 可靠）。
+        let origin: String
+        if let u = webView.url, let sch = u.scheme, let host = u.host {
+            origin = sch + "://" + host
+        } else {
+            origin = "https://sangtacviet.vip"
+        }
+        func enc(_ s: String) -> String {
+            return s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
+        }
+        let chapUrl = origin + "/truyen/" + enc(info.h) + "/1/" + enc(info.bookid) + "/" + enc(target) + "/"
+        if let url = URL(string: chapUrl) {
+            var req = URLRequest(url: url)
+            req.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
+            webView.load(req)
+        }
+        appendDebugLog("[reader] navigating to \(chapUrl)")
     }
 
     @objc private func readerFontDown() {
