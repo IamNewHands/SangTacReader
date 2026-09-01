@@ -1456,15 +1456,13 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
 
     // Task0 临时验证：iOS 原生 URLSession 带 app 头 + 会话 cookie 直发 readchapter，
     // 检查返回 code 是否 0（复刻安卓 Capacitor Http 的关键假设）。
+    // 关键：即使 key 为空也照发（章节页无 key + 过 Cloudflare 也能 code:0），
+    // 验证"原生通道 + app 头"能否让 readchapter 绕过 Cloudflare 直接拿正文。
     private func probeNativeRead(h: String, bookid: String, c: String, key: String) {
         // 无论 key 是否为空，都先用原生 URLSession 拉 grantcontext，判断原生通道是否被
         // Cloudflare 拦截（若返回混淆 JS 说明原生通道有效，方案B可行；若返回 CF HTML 则受阻）。
         probeNativeGrant(h: h, bookid: bookid)
-        if key.isEmpty {
-            appendDebugLog("[probe] readchapter SKIP: key empty (getKey 未拿到 key)，仅验证了 grantcontext 原生通道")
-            return
-        }
-        appendDebugLog("[probe] start h=\(h) bookid=\(bookid) c=\(c) key=\(key)")
+        appendDebugLog("[probe] start h=\(h) bookid=\(bookid) c=\(c) keyLen=\(key.count)")
         // 收集 webview 会话 cookie
         let store = webView.configuration.websiteDataStore.httpCookieStore
         store.getAllCookies { [weak self] cookies in
@@ -1475,7 +1473,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     cookieStr += "\(ck.name)=\(ck.value); "
                 }
             }
-            let urlStr = "https://sangtacviet.vip/?sajax=readchapter&h=\(h)&bookid=\(bookid)&c=\(c)&key=\(key)"
+            let keyPart = key.isEmpty ? "" : "&key=\(key)"
+            let urlStr = "https://sangtacviet.vip/?sajax=readchapter&h=\(h)&bookid=\(bookid)&c=\(c)\(keyPart)"
             guard let url = URL(string: urlStr) else {
                 self?.appendDebugLog("[probe] bad url"); return
             }
