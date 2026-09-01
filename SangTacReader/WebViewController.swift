@@ -383,6 +383,14 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                         }
                         try { self.setTransMode(); } catch(e) {}
                         tryDbg('gc', 'h=' + h + ' i/bookid=' + i + ' c=' + c + ' rl=' + rl);
+                        // v22(Task1)：先走 getKey(覆写 loadKeyFromServer) 拿 chapterkey，
+                        // 供 Swift 原生 URLSession + key 发 readchapter 验证 code:0（方案B核心）。
+                        // 若 grantcontext(XHR) 被 Cloudflare 拦导致拿不到 key，日志会暴露 gkey-err。
+                        try {
+                            var k = await self.getKey(h, i);
+                            tryDbg('gc-key', 'got key=' + String(k));
+                            window.__lastChapterKey = String(k || '');
+                        } catch(e) { tryDbg('gc-key-err', 'exception: ' + e); }
                         // v21：后台取正文 + 完整原生阅读器。点章时主 webview 加载章节页建立
                         // 会话（被原生阅读器覆盖，用户无感知），章节页 readchapter 被拦截上报
                         // Swift，在完整的原生阅读器界面渲染正文。不跳浏览器。
@@ -1310,11 +1318,49 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         appendDebugLog("[nativeRead] placeholder shown")
     }
 
+    // Task0 临时验证：原生 URLSession 拉 /io/grantcontext/context，判断原生通道是否被
+    // Cloudflare 拦截。返回混淆 JS => 原生通道有效（方案B基石）；返回 CF HTML => 受阻。
+    private func probeNativeGrant(h: String, bookid: String) {
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { [weak self] cookies in
+            var cookieStr = ""
+            for ck in cookies {
+                let d = ck.domain
+                if d.contains("sangtacviet") {
+                    cookieStr += "\(ck.name)=\(ck.value); "
+                }
+            }
+            let urlStr = "https://sangtacviet.vip/io/grantcontext/context?hostid=\(h)&bookid=\(bookid)"
+            guard let url = URL(string: urlStr) else {
+                self?.appendDebugLog("[probe-grant] bad url"); return
+            }
+            var req = URLRequest(url: url)
+            req.setValue("app", forHTTPHeaderField: "x-stv-transport")
+            req.setValue("com.sangtacviet.mobilereader", forHTTPHeaderField: "x-requested-with")
+            req.setValue(cookieStr + "mac_tt=true;", forHTTPHeaderField: "Cookie")
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", forHTTPHeaderField: "User-Agent")
+            let task = URLSession.shared.dataTask(with: req) { data, resp, err in
+                guard let data = data, let s = String(data: data, encoding: .utf8) else {
+                    self?.appendDebugLog("[probe-grant] err=\(String(describing: err))"); return
+                }
+                if s.contains("cloudflare") || s.lowercased().contains("cf-browser") || s.contains("Just a moment") || s.contains("challenge") {
+                    self?.appendDebugLog("[probe-grant] BLOCKED by Cloudflare, bodyLen=\(s.count)")
+                } else {
+                    self?.appendDebugLog("[probe-grant] OK bodyLen=\(s.count) head=\(s.prefix(80))")
+                }
+            }
+            task.resume()
+        }
+    }
+
     // Task0 临时验证：iOS 原生 URLSession 带 app 头 + 会话 cookie 直发 readchapter，
     // 检查返回 code 是否 0（复刻安卓 Capacitor Http 的关键假设）。
     private func probeNativeRead(h: String, bookid: String, c: String, key: String) {
+        // 无论 key 是否为空，都先用原生 URLSession 拉 grantcontext，判断原生通道是否被
+        // Cloudflare 拦截（若返回混淆 JS 说明原生通道有效，方案B可行；若返回 CF HTML 则受阻）。
+        probeNativeGrant(h: h, bookid: bookid)
         if key.isEmpty {
-            appendDebugLog("[probe] SKIP: key empty (尚未缓存 chapterkey), 无法验证。需先完成一章读取后再切章才能拿到 key")
+            appendDebugLog("[probe] readchapter SKIP: key empty (getKey 未拿到 key)，仅验证了 grantcontext 原生通道")
             return
         }
         appendDebugLog("[probe] start h=\(h) bookid=\(bookid) c=\(c) key=\(key)")
