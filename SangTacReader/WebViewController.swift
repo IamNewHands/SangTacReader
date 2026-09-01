@@ -799,7 +799,16 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         XMLHttpRequest.prototype.open = function(method, url) {
             try { this._dbgUrl = url; } catch(e){}
             try { dbg('xhr-open', method + ' -> ' + url); } catch(e){}
-            return _dbgXhrOpen.apply(this, arguments);
+            var r = _dbgXhrOpen.apply(this, arguments);
+            // 模仿安卓 App：所有 XHR 统一带 x-requested-with 头，
+            // 服务器据此识别为官方 App 请求，登录/正文不再被要求 captcha（Cloudflare Turnstile）。
+            // 必须在 open() 之后、send() 之前调用。
+            try {
+                if (typeof this.setRequestHeader === 'function') {
+                    this.setRequestHeader('x-requested-with', 'com.sangtacviet.mobilereader');
+                }
+            } catch(e) {}
+            return r;
         };
         // 捕获 readchapter / chapterlist 请求实际设置的请求头，判断服务器判定依据
         var _dbgSetHeader = XMLHttpRequest.prototype.setRequestHeader;
