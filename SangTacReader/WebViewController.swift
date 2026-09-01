@@ -1897,6 +1897,53 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             modeRow.topAnchor.constraint(equalTo: fontRow.bottomAnchor, constant: 16),
             modeRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
         ])
+
+        // Cloudflare 验证入口：当正文加载不出（readchapter 被 CF 挑战拦截）时，
+        // 用户点击此按钮，隐藏原生阅读器，把主 webview 导航到当前章节页触发
+        // Cloudflare Turnstile 验证；用户完成验证后回到目录页，再重新点章即可加载正文。
+        let cfBtn = UIButton(type: .system)
+        cfBtn.setTitle("验证 Cloudflare（正文加载不出时使用）", for: .normal)
+        cfBtn.setTitleColor(.systemYellow, for: .normal)
+        cfBtn.titleLabel?.font = .systemFont(ofSize: 13)
+        cfBtn.backgroundColor = UIColor(white: 0.22, alpha: 1)
+        cfBtn.layer.cornerRadius = 8
+        cfBtn.translatesAutoresizingMaskIntoConstraints = false
+        cfBtn.addTarget(self, action: #selector(readerVerifyCloudflareTapped), for: .touchUpInside)
+        panel.addSubview(cfBtn)
+        NSLayoutConstraint.activate([
+            cfBtn.topAnchor.constraint(equalTo: modeRow.bottomAnchor, constant: 16),
+            cfBtn.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+            cfBtn.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -16),
+            cfBtn.heightAnchor.constraint(equalToConstant: 40),
+        ])
+    }
+
+    // 点击"验证 Cloudflare"：隐藏原生阅读器，导航主 webview 到当前章节页，
+    // 触发 Cloudflare Turnstile 挑战，让用户完成验证以建立会话。
+    // 完成后用户手动返回目录页，再重新点章即可加载正文。
+    @objc private func readerVerifyCloudflareTapped() {
+        readerSettingsView?.isHidden = true
+        // 暴露 webview（隐藏原生阅读器覆盖层）
+        readerContainer.isHidden = true
+        // 构造当前章节 URL 触发 CF 挑战
+        let origin = "https://sangtacviet.vip"
+        func enc(_ s: String) -> String { return s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s }
+        let url: URL
+        if let last = readerLastData, !last.h.isEmpty, !last.c.isEmpty {
+            url = URL(string: origin + "/truyen/" + enc(last.h) + "/1/" + enc(last.bookid) + "/" + enc(last.c) + "/")!
+        } else {
+            url = URL(string: origin + "/app.v2.php")!
+        }
+        var req = URLRequest(url: url)
+        req.setValue("https://sangtacviet.vip", forHTTPHeaderField: "Referer")
+        webView.load(req)
+        appendDebugLog("[reader] verify-cloudflare navigating to \(url.absoluteString)")
+        // 提示用户
+        if let toast = view.window?.rootViewController {
+            let alert = UIAlertController(title: "Cloudflare 验证", message: "已打开网页，请在弹出的页面中完成 Cloudflare 验证（可能需要点击验证或等待几秒）。完成后请返回目录，再重新点击章节即可加载正文。", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "好的", style: .default))
+            toast.present(alert, animated: true)
+        }
     }
 
     // 点击遮罩关闭设置面板
