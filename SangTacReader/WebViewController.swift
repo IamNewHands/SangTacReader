@@ -864,6 +864,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 var oldOnload = xhr.onload;
                 xhr.onload = function(e) {
                     try { dbg('xhr-load', 'status=' + xhr.status + ' size=' + (xhr.responseText ? xhr.responseText.length : 0) + ' url=' + xhr.responseURL); } catch(err){ dbg('xhr-load-err', String(err)); }
+                    // 诊断：登录请求返回内容（区分 success / failure，定位"登录没翻页"）
+                    try {
+                        if (String(xhr._dbgUrl||'').indexOf('ajax=login') > -1) {
+                            dbg('login-resp', String(xhr.responseText).slice(0, 200));
+                        }
+                    } catch(e){}
                     try {
                         if (String(xhr._dbgUrl||'').indexOf('readchapter') > -1) {
                             // Task0：提取 chapterkey 供原生 URLSession 直读验证
