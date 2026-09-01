@@ -1323,7 +1323,8 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         store.getAllCookies { [weak self] cookies in
             var cookieStr = ""
             for ck in cookies {
-                if let d = ck.domain, d.contains("sangtacviet") {
+                let d = ck.domain
+                if d.contains("sangtacviet") {
                     cookieStr += "\(ck.name)=\(ck.value); "
                 }
             }
