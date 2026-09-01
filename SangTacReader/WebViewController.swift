@@ -315,6 +315,48 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             // Capacitor，且【不设置 getPlatform】，让 app.platform.isIOS 保持 false、
             // 页面布局维持纯 Web 模式（避免之前"注入 Capacitor 后点不了"的塌陷）。
             // 这样原版 loadKeyFromServer 能运行、eval 在真实 WKWebView 里生成 key。
+            // Task1：真正注入极简 Capacitor.Plugins.Http，底层走原生 URLSession(capHttp 桥)。
+            // 使原版 loadKeyFromServer/getContent2 走原生 App 通道，避开 Cloudflare 对 webview
+            // XHR 的拦截（已实测原生 URLSession 拉 grantcontext 返回混淆 JS，通道有效）。
+            // 仅注入 Http，不注入 CapacitorSQLite/Preferences，避免触发原生 SQLite 等待。
+            if (!window.hasOwnProperty('Capacitor')) { window.Capacitor = { Plugins: {} }; }
+            if (!window.Capacitor.Plugins.Http) {
+                window.__capHttpSeq = 0;
+                window.__capHttpPending = {};
+                window.__capHttpResolve = function(id, payload) {
+                    var p = window.__capHttpPending[id];
+                    if (!p) return;
+                    delete window.__capHttpPending[id];
+                    if (payload && payload.error) { p.reject(new Error(payload.error)); }
+                    else { p.resolve({ data: (payload && payload.body) || '', status: (payload && payload.status) || 200, headers: {} }); }
+                };
+                window.Capacitor.Plugins.Http = {
+                    get: function(opts) {
+                        return new Promise(function(resolve, reject) {
+                            var id = (window.__capHttpSeq = window.__capHttpSeq + 1);
+                            window.__capHttpPending[id] = { resolve: resolve, reject: reject };
+                            var url = opts && opts.url ? String(opts.url) : '';
+                            var headers = (opts && opts.headers) || {};
+                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.capHttp) {
+                                try { window.webkit.messageHandlers.capHttp.postMessage({ id: id, url: url, headers: headers }); }
+                                catch(e) { delete window.__capHttpPending[id]; reject(e); }
+                            } else {
+                                delete window.__capHttpPending[id];
+                                reject(new Error('capHttp missing'));
+                            }
+                        });
+                    },
+                    request: function(opts) { return this.get(opts); }
+                };
+                // 空桩插件：避免前端访问 Capacitor.Plugins.App/StatusBar/Preferences 等时
+                // 因 undefined 抛异常（前端多为 try/catch 或有插件检测，此处兜底）。
+                if (!window.Capacitor.Plugins.App) { window.Capacitor.Plugins.App = { SyncCookie: function(){}, addListener: function(){ return {remove:function(){}}; } }; }
+                if (!window.Capacitor.Plugins.StatusBar) { window.Capacitor.Plugins.StatusBar = { hide: function(){}, show: function(){}, setStyle: function(){}, setBackgroundColor: function(){}, setOverlaysWebView: function(){} }; }
+                if (!window.Capacitor.Plugins.Preferences) { window.Capacitor.Plugins.Preferences = { get: function(){ return Promise.resolve({value:null}); }, set: function(){ return Promise.resolve(); }, remove: function(){ return Promise.resolve(); } }; }
+                if (!window.Capacitor.Plugins.Device) { window.Capacitor.Plugins.Device = { getInfo: function(){ return Promise.resolve({platform:'ios'}); } }; }
+                // 不注入 CapacitorSQLite —— 前端检测到 CapacitorSQLite 才等待原生 SQLite，
+                // 不注入则走 localStorage 分支，避免 app.init() 挂起。
+            }
             function tryDbg(tag, msg) {
                 try {
                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dbg) {
@@ -334,48 +376,10 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                     app.reader.__getContentPatched = true;
                     var origLoadKey = app.reader.loadKeyFromServer;
                     var origGetContent = app.reader.getContent;
-                    // 覆写 loadKeyFromServer：用 XHR 拉取混淆 JS 并 eval 得到 chapterkey。
-                    // 复刻 App 端：带 "mac_tt=true" cookie 后缀 + app 传输头。
-                    app.reader.loadKeyFromServer = async function(h, i) {
-                        try {
-                            var base = window.location.origin;
-                            var ctxUrl = base + "/io/grantcontext/context?hostid=" + encodeURIComponent(h) + "&bookid=" + encodeURIComponent(i);
-                            tryDbg('gkey-url', ctxUrl);
-                            var js = await new Promise(function(resolve, reject) {
-                                var xhr = new XMLHttpRequest();
-                                xhr.open("GET", ctxUrl, true);
-                                // 追加 mac_tt=true（服务器校验该 cookie 后缀）
-                                if (document.cookie && document.cookie.indexOf("mac_tt=") < 0) {
-                                    xhr.setRequestHeader("Cookie", document.cookie + "; mac_tt=true;");
-                                }
-                                xhr.setRequestHeader("x-stv-transport", "app");
-                                xhr.setRequestHeader("x-requested-with", "com.sangtacviet.mobilereader");
-                                xhr.onreadystatechange = function() {
-                                    if (xhr.readyState === 4) {
-                                        if (xhr.status === 200) resolve(xhr.responseText);
-                                        else reject(new Error("ctx status " + xhr.status));
-                                    }
-                                };
-                                xhr.onerror = function() { reject(new Error("ctx xhr error")); };
-                                xhr.send();
-                            });
-                            tryDbg('gkey-js-len', 'len=' + (js ? js.length : 0));
-                            var key = eval(js); // 服务器下发混淆 JS，eval 得到 chapterkey
-                            tryDbg('gkey', 'key=' + String(key));
-                            this.chapterkey = key;
-                            return key;
-                        } catch(e) {
-                            tryDbg('gkey-err', 'exception: ' + e);
-                            // 取 key 失败时回退到原实现
-                            return origLoadKey.apply(this, arguments);
-                        }
-                    };
-                    // 覆写 getContent（v13）：整页导航到章节页建立 time:30 会话。
-                    // 根因（v12 实验证实）：SPA 内同源 XHR 发 readchapter 恒返回
-                    // {"code":7,"time":1000}（非浏览器环境），无论 body/cookie/proof 怎么变；
-                    // 只有整页导航加载章节页(/truyen/)才能建立 time:30 的"浏览器页面"会话，
-                    // 从而让空 body readchapter 走 code:21 -> verifyca -> code:0（见 log8）。
-                    // 因此原生阅读的正确路径 = 先整页导航章节页拿正文，再由原生阅读页渲染。
+                    // Task1：不再覆写 loadKeyFromServer —— 注入的 Capacitor.Plugins.Http 已让
+                    // 原版走原生 URLSession 拉 grantcontext + eval 生成 key（避开 webview XHR 被
+                    // Cloudflare 拦截，已实测原生通道拉 grantcontext 返回混淆 JS 有效）。
+                    // 保留 getContent 覆写（整页导航章节页拿正文，由原生阅读页渲染）。
                     app.reader.getContent = async function(h, i, c, rl) {
                         var self = this;
                         if (self.offlineBook && !rl) {
@@ -728,6 +732,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         controller.add(self, name: "dbg")
         controller.add(self, name: "chapter")
         controller.add(self, name: "nativeRead")   // v17 原生直读正文
+        controller.add(self, name: "capHttp")       // Task1 原生 Capacitor.Http 桥
         // #endregion
 
         config.userContentController = controller
@@ -1028,6 +1033,12 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
             DispatchQueue.main.async {
                 self.nativeReadChapter(h: h, bookid: bookid, c: c, key: key)
             }
+        } else if message.name == "capHttp", let body = message.body as? [String: Any] {
+            // Task1：Capacitor.Plugins.Http 原生桥 —— JS 原生通道请求（grantcontext/readchapter）
+            let id = body["id"] as? Int ?? 0
+            let url = body["url"] as? String ?? ""
+            let headers = body["headers"] as? [String: Any] ?? [:]
+            self.capHttpRequest(id: id, url: url, headers: headers)
         }
     }
     // #endregion
@@ -1316,6 +1327,79 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 立即显示原生全屏"加载中"占位（覆盖即将导航的章节页）
         presentReader(html: "<p>加载中…</p>", title: "")
         appendDebugLog("[nativeRead] placeholder shown")
+    }
+
+    // Task1：Capacitor.Plugins.Http 原生桥实现 —— JS 原生通道请求（grantcontext/readchapter）。
+    // 用原生 URLSession 发请求（复刻安卓 Capacitor.Http），避开 webview XHR 被 Cloudflare 拦。
+    private func capHttpRequest(id: Int, url: String, headers: [String: Any]) {
+        guard let u = URL(string: url) else {
+            capHttpRespond(id: id, status: 0, body: "", error: "bad url")
+            return
+        }
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { [weak self] cookies in
+            var cookieStr = ""
+            for ck in cookies {
+                let d = ck.domain
+                if d.contains("sangtacviet") {
+                    cookieStr += "\(ck.name)=\(ck.value); "
+                }
+            }
+            // 合并 JS 传入的 Cookie 头（含 mac_tt=true）
+            var jsCookie = ""
+            if let hc = headers["Cookie"] as? String { jsCookie = hc }
+            let mergedCookie = jsCookie.isEmpty ? cookieStr : jsCookie
+            if !mergedCookie.contains("mac_tt") { cookieStr = mergedCookie + "mac_tt=true; " }
+            else { cookieStr = mergedCookie + " " }
+
+            var req = URLRequest(url: u)
+            req.setValue("app", forHTTPHeaderField: "x-stv-transport")
+            req.setValue("com.sangtacviet.mobilereader", forHTTPHeaderField: "x-requested-with")
+            req.setValue(cookieStr, forHTTPHeaderField: "Cookie")
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148", forHTTPHeaderField: "User-Agent")
+            req.setValue("no-cors", forHTTPHeaderField: "Sec-Fetch-Mode")
+            let task = URLSession.shared.dataTask(with: req) { data, resp, err in
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                if let err = err {
+                    self?.capHttpRespond(id: id, status: status, body: body, error: err.localizedDescription)
+                } else {
+                    self?.capHttpRespond(id: id, status: status, body: body, error: "")
+                }
+            }
+            task.resume()
+        }
+    }
+
+    private func capHttpRespond(id: Int, status: Int, body: String, error: String) {
+        let payload: String
+        if error.isEmpty {
+            payload = "{\"status\":\(status),\"body\":" + jsonEscape(body) + ",\"headers\":{}}"
+        } else {
+            payload = "{\"status\":0,\"body\":\"\",\"headers\":{},\"error\":" + jsonEscape(error) + "}"
+        }
+        let js = "window.__capHttpResolve && window.__capHttpResolve(\(id), \(payload));"
+        DispatchQueue.main.async {
+            self.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private func jsonEscape(_ s: String) -> String {
+        // 简单 JSON 字符串转义（正文含引号/换行/控制字符）
+        var o = ""
+        for ch in s.unicodeScalars {
+            switch ch {
+            case "\"": o += "\\\""
+            case "\\": o += "\\\\"
+            case "\n": o += "\\n"
+            case "\r": o += "\\r"
+            case "\t": o += "\\t"
+            default:
+                if ch.value < 0x20 { o += String(format: "\\u%04x", ch.value) }
+                else { o.unicodeScalars.append(ch) }
+            }
+        }
+        return "\"" + o + "\""
     }
 
     // Task0 临时验证：原生 URLSession 拉 /io/grantcontext/context，判断原生通道是否被
