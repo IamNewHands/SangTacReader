@@ -842,7 +842,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
                 var spans = d.querySelectorAll('span');
                 for (var m = 0; m < spans.length; m++) {
                     var pr = spans[m].previousSibling;
-                    while (pr && pr.nodeType === 3 && /^[ \t\u00A0]+$/.test(pr.nodeValue || '')) {
+                    while (pr && pr.nodeType === 3 && /^[ \t\\u00A0]+$/.test(pr.nodeValue || '')) {
                         var gone = pr;
                         pr = pr.previousSibling;
                         gone.parentNode.removeChild(gone);
@@ -1612,7 +1612,7 @@ class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, W
         // 3) 移除版权提示（含越南语/中文关键词）
         regexReplace(#"(?:Vì vấn đề nội dung|không hỗ trợ xem văn bản gốc|由于版权问题)[^<\n]*"#) { _, _ in "" }
         // 4) 清理逐词注释版的词间空格：删除 <span> 之间的空白，让中文词连成一句
-        regexReplace(#"</span>[ \t\u00A0]+<span>"#) { _, _ in "</span><span>" }
+        regexReplace(#"</span>[ \t\u{00A0}]+<span>"#) { _, _ in "</span><span>" }
         return html
     }
 
