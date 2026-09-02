@@ -1,6 +1,10 @@
 
+
+#目前无法解决获取小说正文绕过cloudflare验证，导致体验非常差，不搞了。
+
+
 # SangTacReader — sangtacviet.vip 轻量阅读器（iOS）
-目前无法解决获取小说正文绕过cloudflare验证，导致体验非常差，不搞了。
+
 一个极简的 iOS 阅读器：用 WKWebView 打开 sangtacviet.vip，并注入「阅读模式」脚本
 （自动加载章节正文、隐藏广告、优化排版、夜间模式、底部导航），免费自签安装。
 
