@@ -55,3 +55,27 @@
 1. `WebNativeView` 目前是占位实现 → 漫画/图片模块退化（小说正文不受影响）。
 2. `CapacitorSQLite`、`MlKit`/`MainClass`（OCR）、`AdMob` 未接 → 对应功能降级。
 3. 旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）仍留在树里，待新构建真机验证通过后再决定退役（**删除需用户确认**）。
+
+## 6. 真机问题档案
+
+### 6.1 列表能看、点小说没反应（2026-09-22 定位并修复）
+
+**现象**：小说列表正常，点任意一本没反应（详情页不出现）。
+
+**根因**：站点前端在点击回调里**先**调 `app.platform.nativeClick()`，**后**才打开详情。线上生产代码（`/asset/app.v2.bookdisplay.js`，4 处）：
+
+```js
+ele.addEventListener("click", function () {
+    app.platform.nativeClick();                    // -> nativeclick.trigger()
+    app.fun.openBookWithData(data.lid, data);      // 上一行抛错则永不执行
+});
+```
+
+`nativeclick` 这个全局在安卓 APK 里由 Cordova 插件 `cordova-plugin-nativeclicksound` 提供（`cordova_plugins.js` 的 `"clobbers": ["nativeclick"]`）。iOS 侧没有 Cordova 插件 → `nativeclick` 未定义 → 第一行抛 `ReferenceError` → 整个点击回调中断 → 详情打不开。列表渲染不涉及点击，所以看起来「只有详情坏了」。
+
+**已排除的错误假设**：以为是站点「web 通道 vs app 通道」被 Cloudflare 区别对待。用真实请求实测（`/mobile/bookinfo.php?id=<lid>`、`/io/searchtp/searchBooks`）四个域、两条通道返回**完全一致**（详情 1168 字节同一份 JSON），该假设被证伪。注意列表项用的是 `lid`（内部 id），不是 `id`。
+
+**修复**：在 `SangTacAppPlugin.load()` 里用 `WKUserScript`（`.atDocumentStart`，主框架）注入 Cordova 兼容层：`nativeclick`（空实现，iOS 无系统点击音）与 `TTS`（空对象；站点以 `if (TTS.updateMediaSession)` 形式探测，空对象即可安全跳过安卓媒体会话逻辑）。CI 增加 `strings | grep stvIOSCompatInstalled` 校验，确保兼容层真的编进产物。
+
+**同类风险（尚未触发）**：`AndroidFullScreen.*` 只在 `isAndroid` 分支使用，iOS 不可达；`TTS` 的真实朗读功能仍未实现（需要 `AVSpeechSynthesizer`）。
+

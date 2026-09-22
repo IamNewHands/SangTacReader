@@ -141,6 +141,16 @@ jobs:
               exit 1
             fi
           done
+          # Cordova 兼容层（nativeclick/TTS shim）必须真的编进产物：站点在点击
+          # 小说时会先调 app.platform.nativeClick()，缺 nativeclick 就抛
+          # ReferenceError，openBookWithData 永不执行（表现为「点不进详情」）。
+          strings -a "$bin" > "$syms.strings"
+          if grep -q -F 'stvIOSCompatInstalled' "$syms.strings"; then
+            echo "✓ Cordova 兼容层已编入产物"
+          else
+            echo "::error::Cordova 兼容层缺失（nativeclick shim 不在二进制里）"
+            exit 1
+          fi
 
       - name: Package IPA
         run: |
