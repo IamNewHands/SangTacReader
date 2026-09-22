@@ -125,9 +125,8 @@ jobs:
           echo "=== 产物中的 SangTac ObjC 类符号 ==="
           nm -a "$bin" | grep -E 'OBJC_CLASS_\$_SangTac' || echo "(没有找到任何 SangTac 类符号)"
           for cls in SangTacHttpPlugin SangTacAppPlugin SangTacWebNativeViewPlugin; do
-            # [$] avoids bash expansion of $ while still matching the literal dollar
-            # in the Mach-O symbol _OBJC_CLASS_$_<Class>.
-            if nm -a "$bin" | grep -q "OBJC_CLASS_[_][$]$cls"; then
+            # -F: match the literal Mach-O symbol _OBJC_CLASS_$_<Class>.
+            if nm -a "$bin" | grep -q -F "_OBJC_CLASS_\$_$cls"; then
               echo "✓ $cls 已链接"
             else
               echo "::error::原生插件 $cls 未链接进产物（站点会退回 web 模式）"
