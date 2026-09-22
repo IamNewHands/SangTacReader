@@ -1800,6 +1800,30 @@
     [
       "Yêu nhau",
       "恋爱"
+    ],
+    [
+      "Engine TTS",
+      "朗读引擎"
+    ],
+    [
+      "Cập nhật audio",
+      "音频播放"
+    ],
+    [
+      "Nhập thời gian tối đa để đọc (phút)",
+      "朗读最长时间（分钟）"
+    ],
+    [
+      "Viettelgroup TextToSpeech",
+      "Viettel 语音"
+    ],
+    [
+      "Đã tải",
+      "已下载"
+    ],
+    [
+      "Bạn chưa tải truyện nào.",
+      "你还没有下载任何小说。"
     ]
   ],
   "fragments": [

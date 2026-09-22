@@ -684,3 +684,70 @@ Capacitor 自带 Preferences，所以 iOS 上 `config.reader` / `config.ux` / `t
 
 策略仍是"站点库里已有值就不动它"——重装后容器是空的，那才是这个块存在的场景。
 
+
+### 6.8 第七轮真机反馈（`日志.txt`，800 行）
+
+上一轮的修法全部在日志里得到验证：`[RECT] ... #overlay[0..874 h874] #mainnavbar[789..874 h85] viewport=874 vh100=874px`
+（底栏不再穿透）、`[PATCH] chapter name place=top infos=3 were-hidden=3`（单程票被清掉）、
+`[TTS] fallback source: ... -> N sentence(s)` 后面跟着真实音频（`audioBuffer.duration: 6.78s`）。
+
+#### (1) 章节名只有「第 N 章」是中文 —— 站点协议里有中文原名，只是没走这条路
+
+`readchapter` 的 `chaptername` 永远是越南语机器翻译，即使正文已经是中文
+（`transmode=chinese`）。但章节列表响应里有 **`oridata`**：
+
+```js
+// app.v2.js:270
+if(x.oridata && app.language != "vi"){
+    x.data = x.oridata;
+    if(app.language != "zh"){ x.data = await translateWithGoogle(x.data, "zh", app.language); }
+}
+```
+
+也就是说站点自己就有中文原名，按 `cid` 关联即可。做法是在名字的生产者
+（`app.reader.getContent`）上补一次查表：
+
+- 首次打开某本书时后台拉一次 `/index.php?ngmar=chapterlist&...&sajax=getchapterlist`，
+  解析 `oridata`（格式与 `data` 相同：`flag-/-cid-/- 标题 -//-`），只保留含 CJK 的项，
+  缓存到内存（**不 await**，否则首章要等一个 100KB 响应）；
+- 命中时把 `cdata.chaptername` 换成 `第N章 <中文原名>`（原名自带编号则不再重复加）；
+- 列表到达后回写已经渲染出来的标题：主文档 `.chaptername`、iframe 里的
+  `.chapternamefixed`，同时更新 `cdata`，避免 `updateFixedChapterName()` 的
+  `oldName != name` 守卫又开始每帧 recycle；
+- 没有 `oridata`（或里面不是中文）时原样保留，并上报 `TITLE no original chapter names ...`。
+
+#### (2) 朗读读的不是当前章节 / 退出正文还在读 / 测试还是越南语
+
+- **读错内容**：阅读器 iframe 里根本没有 `#maincontent`（pageflip 模板只建了
+  `.chaptertopinfo`、`#mainscroller`、`#dragbar`），而 `#mainscroller` 里同时挂着
+  上一章、当前章、下一章，所以读 `body` 就是读"碰巧挂载着的那几章"。改成读当前章的
+  `.contentcontainer`（`chapterdisplay.js:3615` 每章一个），拿不到才退回文档。
+  日志同时暴露了另一面：`[TTS] fallback source: 0 chars` —— display 重建的瞬间
+  文档是空的，退回分支正是为这个时刻准备的。
+- **退出后继续读**：站点没有"关掉朗读"的入口。包装 `app.popPage`，pop 前
+  `#chapterview` 在、pop 后不在，就 `player.stop()` + `ttsEngine.clearQueue()`；
+  阅读器自己 push 的子页（目录）不会让 `#chapterview` 消失，所以不会误停。
+- **测试语句**：`app.tts.test` 里写死越南语样例（`app.v2.read.js:3174`），照抄五行
+  改成中文；provider 的 `props` 描述、发音人兜底名、`engineList` 里带越南语品牌名的
+  项也一并中文化；再包装 `app.tts.openSetting` 上报设置页实际显示的
+  `options=[...] engines=[...]`，免得再靠猜。
+
+#### (3) 下载报「无法读取数据」，没有继续/删除按钮
+
+日志把原因写得很清楚：
+
+```
+22:53:41 ... download=true -> 200 ... 8200b     ← 前 18 章正常
+22:53:57 ... download=true -> 429 ... 7183b     ← 之后全是 429（HTML 错误页）
+```
+
+`downloadChapter`（`app.v2.read.js:3556`）对非 JSON 响应只重试 3 次、间隔 200/300ms，
+`JSON.parse` 失败即抛 `Không thể đọc dữ liệu`；而 `start()` 是**一次性并发 3 个、无间隔**
+（`:3491`、`:3519`）。所以修法是在请求起点限速：
+
+- 包装 `DownloadManager.prototype.downloadChapter`，用全局闸门保证两次请求起点至少相隔
+  900ms（站点自己的内部重试也会经过这个包装，所以重试同样被限速）；
+- 一旦有请求失败，把间隔放大到 2500ms 并上报 `[DOWNLOAD] download failed, widening the gap`；
+- 行内按钮：站点把「暂停/重试」藏在长按菜单里，且**根本没有删除任务**的入口。包装
+  `render()` 后往每行追加「暂停下载/继续下载」和「删除任务」两个按钮
+  （`stopPropagation`，删除 = 从 `app.bookDownloaderList` 摘掉 + 移除节点）。

@@ -100,8 +100,17 @@ function makeElement(tagName) {
       child.parentNode = null;
       return child;
     },
-    addEventListener() {},
+    listeners: {},
+    addEventListener(type, handler) {
+      this.listeners[type] = (this.listeners[type] || []).concat([handler]);
+    },
     removeEventListener() {},
+    // The injected blocks attach click handlers to buttons they create, so the
+    // stub has to be able to fire them.
+    __fire(type, event) {
+      const handlers = this.listeners[type] || [];
+      for (const handler of handlers) { handler(event); }
+    },
     getBoundingClientRect() {
       return { left: 0, top: 0, width: 26, height: 26, right: 26, bottom: 26 };
     },
@@ -428,16 +437,36 @@ function installFakeApp(sandbox, options) {
     if (options.ttsStartThrows) { throw new Error('start failed'); }
     this.player = { sentences: options.ttsSentences || [] };
   };
-  app.tts.player = { sentences: [] };
+  app.tts.player = {
+    sentences: [],
+    stop() { stored.ttsStops = (stored.ttsStops || 0) + 1; },
+  };
+  app.tts.test = function () { stored.testCalls = (stored.testCalls || 0) + 1; };
+  app.tts.openSetting = function () { stored.openSettingCalls = (stored.openSettingCalls || 0) + 1; };
+  app.tts.applyPlaybackSetting = function () {};
+  app.tts.playQueue = function () {};
   const bookInfoResponses = options.bookInfoResponses || {};
   app.net.getCacheLater = (url) => {
     stored.cacheLater = (stored.cacheLater || []).concat([url]);
+    if (url.indexOf('sajax=getchapterlist') >= 0) {
+      return Promise.resolve(options.oridata
+        ? { code: 1, oridata: options.oridata }
+        : { code: 1, data: '1-/-1-/- Thứ 1 chương mở đầu -//-' });
+    }
     if (!Object.prototype.hasOwnProperty.call(bookInfoResponses, url)) {
       return Promise.resolve(null);
     }
     return Promise.resolve(bookInfoResponses[url]);
   };
   app.net.get = (url) => app.net.getCacheLater(url);
+  app.popPage = function () {
+    stored.popPageCalls = (stored.popPageCalls || 0) + 1;
+    // The real popPage tears the page down; popping a sub-page the reader
+    // pushed (the chapter list) leaves the reader mounted.
+    if (options.popKeepsReader) { return; }
+    const view = sandbox.document.getElementById('chapterview');
+    if (view && view.parentElement) { view.parentElement.removeChild(view); }
+  };
   // The single funnel every chapter name comes from (app.v2.read.js:602).
   app.reader.getContent = options.getContent || function () {
     return Promise.resolve({
@@ -459,15 +488,28 @@ function installFakeApp(sandbox, options) {
   };
   // DownloadManager renders its progress row the instant a download starts
   // (app.v2.read.js:3481), and that render is what reads the cache.
+  app.bookDownloaderList = [];
   class FakeDownloadManager {
     constructor(host, id) {
       this.host = host;
       this.id = id;
+      this.isPaused = false;
+      this.chapters = ['c1', 'c2'];
+      this.downloaded = 0;
+      this.total = 2;
+      app.bookDownloaderList.push(this);
     }
     render() {
       stored.renderCache = (stored.cacheLater || []).slice();
-      return Promise.resolve({ host: this.host, id: this.id });
+      return Promise.resolve(makeContainer('div', 'bookrowcont'));
     }
+    downloadChapter(chapter) {
+      stored.downloadStarts = (stored.downloadStarts || []).concat([Date.now()]);
+      if (options.downloadFails) { return Promise.reject(new Error('Không thể đọc dữ liệu')); }
+      return Promise.resolve(chapter);
+    }
+    pause() { this.isPaused = true; }
+    start() { this.isPaused = false; stored.resumes = (stored.resumes || 0) + 1; }
   }
   app.BookDownloadManager = FakeDownloadManager;
 
@@ -746,6 +788,40 @@ async function testI18nOverlay() {
   const again = await sandbox.app.reader.getContent('qidian', '1', '2');
   check('the source translation is idempotent so the recycle guard stays quiet',
     again.chaptername === source.chaptername, JSON.stringify(again.chaptername));
+
+  // The chapter NAME the reader receives is Vietnamese even when the body is
+  // Chinese; the chapter LIST carries the original under `oridata`
+  // (app.v2.js:270). Join them by cid.
+  const titled = makeSandbox();
+  installFakeApp(titled, {
+    displayType: 'auto',
+    oridata: '1-/-865875696-/- 交锋-//-1-/-855899892-/- 弱点',
+  });
+  vm.runInContext(loadBlocks().join('\n'), titled);
+  await tick(250);
+  const first = await titled.app.reader.getContent('qidian', '1', '865875696');
+  check('the chapter number is translated even before the list arrives',
+    first.chaptername === '第3章 Giao phong', JSON.stringify(first.chaptername));
+  await tick(300);
+  const second = await titled.app.reader.getContent('qidian', '1', '865875696');
+  check('the original Chinese chapter name is joined in from the chapter list',
+    second.chaptername === '第3章 交锋', JSON.stringify(second.chaptername));
+  const diagText = titled.window.__stvDiag.text ? titled.window.__stvDiag.text() : '';
+  check('the original-name lookup is reported',
+    String(diagText).indexOf('original chapter names') >= 0, String(diagText).slice(-200));
+
+  const noOriginal = makeSandbox();
+  installFakeApp(noOriginal, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), noOriginal);
+  await tick(250);
+  const plain = await noOriginal.app.reader.getContent('qidian', '1', '9');
+  check('without oridata the Vietnamese title is left alone',
+    plain.chaptername === '第3章 Giao phong', JSON.stringify(plain.chaptername));
+  const noOriginalDiag = noOriginal.window.__stvDiag.text
+    ? noOriginal.window.__stvDiag.text() : '';
+  check('a list without original names is reported as such',
+    String(noOriginalDiag).indexOf('no original chapter names') >= 0,
+    String(noOriginalDiag).slice(-200));
 }
 
 async function testReaderTts() {
@@ -806,6 +882,81 @@ async function testReaderTts() {
     produced[0].toText().indexOf('stv0') === 0, JSON.stringify(produced[0].toText()));
   check('the marker is not part of the sentence text the site would speak',
     produced[0].toText().slice(4) === '第一句。', JSON.stringify(produced[0].toText()));
+
+  // The reader iframe has no #maincontent -- the pageflip template builds only
+  // .chaptertopinfo, #mainscroller and #dragbar -- and the scroller holds the
+  // previous, current and next chapter side by side. Reading the document reads
+  // whichever chapters happen to be mounted, which is how the device ended up
+  // playing text that was not the chapter on screen.
+  const current = makeContainer('div', 'contentcontainer', '当前章节第一句。当前章节第二句。');
+  const view = {
+    cdata: { chaptername: 'Chương 1: 开局' },
+    q: (selector) => (selector === '.contentcontainer' ? current : null),
+  };
+  const scoped = {
+    innerWindow: frame.contentWindow,
+    getCurrentChapter: () => view,
+    tokenizeSentence() { return []; },
+  };
+  const scopedSandbox = makeSandbox();
+  installFakeApp(scopedSandbox, { displayType: 'pageflip', display: scoped });
+  scopedSandbox.document.body.appendChild(frame);
+  vm.runInContext(loadBlocks().join('\n'), scopedSandbox);
+  await tick(250);
+  const scopedOut = scoped.tokenizeSentence();
+  check('the sentence source is the current chapter, not the whole iframe',
+    scopedOut.length === 2 && scopedOut[0].toText().slice(4) === '当前章节第一句。',
+    JSON.stringify(scopedOut.map((s) => s.toText())));
+
+  // app.tts.test() hardcodes "Xin chào, đây là chuyển văn bản thành giọng nói"
+  // (app.v2.read.js:3174).
+  const testSandbox = makeSandbox();
+  const testApp = installFakeApp(testSandbox, { displayType: 'pageflip' });
+  let spoken = '';
+  testSandbox.ttsEngine = {
+    clearQueue() {},
+    requestAudio(text) { spoken = text; },
+    onFirstLoad(callback) { callback(); },
+  };
+  testSandbox.window.ttsEngine = testSandbox.ttsEngine;
+  vm.runInContext(loadBlocks().join('\n'), testSandbox);
+  await tick(250);
+  testApp.tts.test();
+  check('the TTS test sentence is Chinese',
+    /[\u4e00-\u9fff]/.test(spoken), JSON.stringify(spoken));
+
+  // Nothing in the site stops playback when the reader page goes away.
+  const closeSandbox = makeSandbox();
+  const closeApp = installFakeApp(closeSandbox, { displayType: 'pageflip' });
+  const chapterView = makeContainer('div', '');
+  chapterView.id = 'chapterview';
+  closeSandbox.document.body.appendChild(chapterView);
+  vm.runInContext(loadBlocks().join('\n'), closeSandbox);
+  await tick(250);
+  closeApp.popPage();
+  await tick(600);
+  check('the reader-close hook is installed', closeApp.__stvTtsCloseWrapped === true,
+    'wrapped=' + String(closeApp.__stvTtsCloseWrapped)
+      + ' popPageCalls=' + String(closeSandbox.__stored.popPageCalls));
+  check('leaving the reader stops playback',
+    (closeSandbox.__stored.ttsStops || 0) === 1,
+    'ttsStops=' + String(closeSandbox.__stored.ttsStops)
+      + ' popPageCalls=' + String(closeSandbox.__stored.popPageCalls));
+
+  // Popping a page the reader itself pushed (the chapter list) keeps
+  // #chapterview mounted and must not stop playback.
+  const stillSandbox = makeSandbox();
+  const stillApp = installFakeApp(stillSandbox, { displayType: 'pageflip', popKeepsReader: true });
+  const stillView = makeContainer('div', '');
+  stillView.id = 'chapterview';
+  stillSandbox.document.body.appendChild(stillView);
+  vm.runInContext(loadBlocks().join('\n'), stillSandbox);
+  await tick(250);
+  stillApp.popPage();
+  await tick(600);
+  check('a sub-page pushed from inside the reader does not stop playback',
+    (stillSandbox.__stored.ttsStops || 0) === 0,
+    'ttsStops=' + String(stillSandbox.__stored.ttsStops));
 }
 
 async function testCommentButton() {
@@ -916,6 +1067,37 @@ async function testOfflineBookDetailPage() {
   app.fun.openBookWithData(0, book);
   check('a real book still opens the detail page',
     (sandbox.__stored.opened || []).length === 1, JSON.stringify(sandbox.__stored.opened || []));
+
+  // DownloadManager.start() fires three requests at once with no spacing, and
+  // the endpoint rate limits: the device log shows 200s for the first eighteen
+  // chapters and then nothing but 429s, which JSON.parse turns into
+  // "Lỗi: Không thể đọc dữ liệu".
+  const throttled = new app.BookDownloadManager('qidian', '999');
+  await Promise.all([throttled.downloadChapter('a'), throttled.downloadChapter('b')]);
+  const starts = sandbox.__stored.downloadStarts || [];
+  check('download requests are spaced out instead of fired in a burst',
+    starts.length === 2 && starts[1] - starts[0] >= 800,
+    JSON.stringify(starts));
+
+  const row = await throttled.render();
+  const bar = row.children[0];
+  const buttons = bar ? bar.children.filter((child) => child.tagName === 'BUTTON') : [];
+  check('the download row gets its own pause and delete buttons',
+    buttons.length === 2 && buttons[0].textContent === '暂停下载'
+      && buttons[1].textContent === '删除任务',
+    JSON.stringify(buttons.map((b) => b.textContent)));
+  const clickEvent = { stopPropagation() {}, preventDefault() {} };
+  buttons[0].__fire('click', clickEvent);
+  check('the pause button pauses the task', throttled.isPaused === true);
+  buttons[0].__fire('click', clickEvent);
+  check('the same button resumes it',
+    throttled.isPaused === false && (sandbox.__stored.resumes || 0) === 1,
+    'resumes=' + String(sandbox.__stored.resumes));
+  buttons[1].__fire('click', clickEvent);
+  check('the delete button drops the task',
+    app.bookDownloaderList.indexOf(throttled) < 0,
+    'still in the list: ' + String(app.bookDownloaderList.length));
+  check('the deleted row is removed from the page', !row.parentElement);
 }
 
 async function testChapterNamePlace() {

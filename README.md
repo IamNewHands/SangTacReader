@@ -64,9 +64,9 @@ SangTacReader/
 | `safeArea` | 灵动岛 / Home Indicator：安全区补齐、`#overlay` 高度兜底 + 阅读器菜单几何量上报 |
 | `settingsBackup` | 设置镜像进 Keychain，重装后写回站点真正读取的 `app.storage` |
 | `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
-| `readerTts` | 正文朗读：补上 iframe 的 `speaker`、句子来源兜底、失败原因上报 |
-| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白（下载前预热 bookinfo 缓存） |
-| `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（含阅读器 iframe 兜底） |
+| `readerTts` | 正文朗读：句子来源取当前章、失败原因上报、测试语句改中文、退出正文自动停止 |
+| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载限速 + 行内暂停/删除按钮 |
+| `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（中文原名来自 `oridata`，含阅读器 iframe 兜底） |
 
 ## 中文字典流水线
 
@@ -112,7 +112,8 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 菜单与页面顶栏的实际几何量 + `#overlay` / `#mainnavbar` 高度 + `--vh100`（定位灵动岛
 遮挡、底栏穿透用）、`SETTINGS` 设置备份/恢复（逐键写出、保留、不可用的数量）、
 `BOOKMARK` 取消书签探测、`BOOKINFO` 评论/详情页缺数据时的补取与缓存预热、
-`COMMENT` 评论按钮拦截、`ERR` 错误。
+`COMMENT` 评论按钮拦截、`TITLE` 章节中文原名的获取结果、`DOWNLOAD` 下载限速与任务
+按钮、`ERR` 错误。
 
 ## 说明 / 免责
 

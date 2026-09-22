@@ -600,9 +600,9 @@ enum SitePatch {
             if (!this.options.rate) { this.options.rate = 1; }
             if (!this.options.pitch) { this.options.pitch = 1; }
             this.props = {
-                voice: { type: 'select', default: '', description: 'Giọng đọc' },
-                rate: { type: 'float', default: 1, min: 0.5, max: 2, description: 'Tốc độ đọc' },
-                pitch: { type: 'float', default: 1, min: 0.5, max: 2, description: 'Độ cao giọng' }
+                voice: { type: 'select', default: '', description: '发音人' },
+                rate: { type: 'float', default: 1, min: 0.5, max: 2, description: '语速' },
+                pitch: { type: 'float', default: 1, min: 0.5, max: 2, description: '音调' }
             };
         }
 
@@ -663,13 +663,13 @@ enum SitePatch {
                     var voice = list[i];
                     if (!voice || !voice.identifier) { continue; }
                     mapped.push({
-                        name: voice.name || ('Giọng ' + (i + 1)),
+                        name: voice.name || ('发音人 ' + (i + 1)),
                         value: voice.identifier,
                         gender: (voice.gender === 1) ? 0 : 1
                     });
                 }
                 if (mapped.length === 0) {
-                    mapped.push({ name: 'iOS TextToSpeech', value: '', gender: 1 });
+                    mapped.push({ name: 'iOS 语音', value: '', gender: 1 });
                 }
                 return mapped;
             });
@@ -701,12 +701,22 @@ enum SitePatch {
             if (app.tts.__stvIosEngineListInstalled) { return true; }
             app.tts.__stvIosEngineListInstalled = true;
             var originalList = app.tts.engineList;
+            // The list is a fresh array literal on every call, so renaming in
+            // place is safe. Only the Vietnamese-branded entries are renamed;
+            // Bing / Zalo / FPT are brand names either way.
+            var RENAMES = {
+                'Sáng Tác Việt': '本站语音',
+                'Viettelgroup TextToSpeech': 'Viettel 语音'
+            };
             app.tts.engineList = function () {
                 var list = originalList.call(this) || [];
                 for (var i = 0; i < list.length; i++) {
-                    if (list[i] && list[i].value === 'ios') { return list; }
+                    if (list[i] && RENAMES[list[i].name]) { list[i].name = RENAMES[list[i].name]; }
                 }
-                list.unshift({ name: 'iOS TextToSpeech', value: 'ios' });
+                for (var j = 0; j < list.length; j++) {
+                    if (list[j] && list[j].value === 'ios') { return list; }
+                }
+                list.unshift({ name: 'iOS 语音（本机）', value: 'ios' });
                 return list;
             };
 
@@ -1436,20 +1446,51 @@ enum SitePatch {
             return w;
         }
 
+        // The reader iframe has no #maincontent: the pageflip template only
+        // builds .chaptertopinfo, #mainscroller and #dragbar, and the scroller
+        // holds the previous, current and next chapter side by side. Reading
+        // body text therefore reads whichever chapters happen to be mounted --
+        // which is why the device played text that was not the chapter on
+        // screen. The current chapter owns exactly one .contentcontainer
+        // (chapterdisplay.js:3615), so read that.
+        function chapterHolder(display) {
+            var view = null;
+            try {
+                view = display.getCurrentChapter ? display.getCurrentChapter()
+                    : display.currentContainer;
+            } catch (e) { view = null; }
+            if (!view || typeof view.q !== 'function') { return null; }
+            var holder = null;
+            try { holder = view.q('.contentcontainer'); } catch (e) { holder = null; }
+            return holder || null;
+        }
+
+        function textOf(node) {
+            if (!node) { return ''; }
+            return node.innerText || node.textContent || '';
+        }
+
         function fallbackSentences(display) {
             var w = readerWindow(display);
             if (!w || !w.document) { return []; }
             var doc = w.document;
-            var root = doc.getElementById('maincontent') || doc.body;
-            if (!root) { return []; }
-            var text = root.innerText || root.textContent || '';
+            var holder = chapterHolder(display);
+            var text = textOf(holder);
+            var source = 'current chapter';
+            if (!text) {
+                // Transient: the display is being rebuilt. Fall back to whatever
+                // the document has rather than reporting nothing to play.
+                source = 'document body';
+                text = textOf(doc.getElementById('maincontent')) || textOf(doc.body);
+            }
             var pieces = splitSentences(text);
             var list = [];
             for (var i = 0; i < pieces.length; i++) {
                 list.push({ toText: toTextFor(MARK + pieces[i]), highlightOn: noop, highlightOff: noop });
             }
-            note('TTS', 'fallback source: ' + text.length + ' chars -> ' + pieces.length
-                + ' sentence(s), first=' + (pieces.length ? pieces[0].substring(0, 20) : ''));
+            note('TTS', 'fallback source [' + source + ']: ' + text.length + ' chars -> '
+                + pieces.length + ' sentence(s), first='
+                + (pieces.length ? pieces[0].substring(0, 20) : ''));
             return list;
         }
 
@@ -1484,10 +1525,118 @@ enum SitePatch {
             try { return app.reader.getDisplay(); } catch (e) { return null; }
         }
 
+        // app.tts.test() hardcodes a Vietnamese sample sentence
+        // (app.v2.read.js:3174), so a Chinese reader gets a Vietnamese voice
+        // reading Vietnamese words. Same five lines, Chinese text.
+        function attachTest() {
+            var app = window.app;
+            if (!app || !app.tts || typeof app.tts.test !== 'function') { return false; }
+            if (app.tts.__stvTestWrapped) { return true; }
+            app.tts.__stvTestWrapped = true;
+            app.tts.test = function () {
+                var text = '这是一段中文语音测试，用来检查朗读是否正常。';
+                if (typeof this.applyPlaybackSetting === 'function') { this.applyPlaybackSetting(); }
+                if (!window.ttsEngine) { return; }
+                window.ttsEngine.clearQueue();
+                window.ttsEngine.requestAudio(text, {});
+                window.ttsEngine.onFirstLoad(function () { app.tts.playQueue(); });
+                note('TTS', 'test sentence is Chinese now');
+            };
+            return true;
+        }
+
+        // The site has no way to stop playback once the reader page is gone --
+        // the queue keeps reading the old chapter from behind whatever page the
+        // user moved on to. Stop it when #chapterview leaves the document; a
+        // sub-page pushed from inside the reader keeps it mounted, so this only
+        // fires on a real exit.
+        function stopReaderTts(reason) {
+            var app = window.app;
+            if (!app || !app.tts) { return; }
+            if (app.tts.__stvStoppedFor) { return; }
+            app.tts.__stvStoppedFor = true;
+            try {
+                if (app.tts.player && typeof app.tts.player.stop === 'function') {
+                    app.tts.player.stop();
+                }
+            } catch (e) {}
+            try {
+                if (window.ttsEngine && typeof window.ttsEngine.clearQueue === 'function') {
+                    window.ttsEngine.clearQueue();
+                }
+            } catch (e) {}
+            note('TTS', 'reader closed (' + reason + ') -> playback stopped');
+        }
+
+        function attachClose() {
+            var app = window.app;
+            if (!app || typeof app.popPage !== 'function') { return false; }
+            if (app.__stvTtsCloseWrapped) { return true; }
+            app.__stvTtsCloseWrapped = true;
+            var original = app.popPage;
+            app.popPage = function () {
+                var hadReader = !!document.getElementById('chapterview');
+                var result = original.apply(this, arguments);
+                if (!hadReader) { return result; }
+                // popPage animates; the element is gone a moment later.
+                setTimeout(function () {
+                    if (!document.getElementById('chapterview')) { stopReaderTts('page popped'); }
+                }, 500);
+                return result;
+            };
+            if (app.reader && typeof app.reader.loadChapterDisplay === 'function'
+                && !app.reader.__stvTtsAliveWrapped) {
+                // Re-entering the reader clears the latch so the next exit stops
+                // again.
+                app.reader.__stvTtsAliveWrapped = true;
+                var originalLoadAlive = app.reader.loadChapterDisplay;
+                app.reader.loadChapterDisplay = function () {
+                    if (window.app && window.app.tts) { window.app.tts.__stvStoppedFor = false; }
+                    return originalLoadAlive.apply(this, arguments);
+                };
+            }
+            return true;
+        }
+
+        // The TTS settings page is the one screen whose labels come from JS
+        // literals and from the engine list, so report what it actually shows
+        // instead of assuming the overlay caught everything.
+        function reportTtsPage() {
+            var names = [];
+            var nodes = document.querySelectorAll('.optionname');
+            for (var i = 0; i < nodes.length; i++) {
+                names.push((nodes[i].textContent || '').substring(0, 16));
+            }
+            var engines = [];
+            try {
+                var list = window.app.tts.engineList() || [];
+                for (var j = 0; j < list.length; j++) { engines.push(list[j].name); }
+            } catch (e) {}
+            note('TTS', 'settings page: options=[' + names.join(' | ') + '] engines=['
+                + engines.join(' | ') + ']');
+        }
+
+        function attachTtsPageProbe() {
+            var app = window.app;
+            if (!app || !app.tts || typeof app.tts.openSetting !== 'function') { return false; }
+            if (app.tts.__stvPageProbeWrapped) { return true; }
+            app.tts.__stvPageProbeWrapped = true;
+            var originalOpen = app.tts.openSetting;
+            app.tts.openSetting = function () {
+                var result = originalOpen.apply(this, arguments);
+                setTimeout(reportTtsPage, 600);
+                return result;
+            };
+            return true;
+        }
+
         function attach() {
             var app = window.app;
             if (!app || !app.tts || typeof app.tts.start !== 'function') { return false; }
-            if (app.tts.__stvReaderTtsWrapped) { return true; }
+            var testReady = attachTest();
+            var closeReady = attachClose();
+            var pageReady = attachTtsPageProbe();
+            if (app.tts.__stvReaderTtsWrapped) { return testReady && closeReady && pageReady; }
             app.tts.__stvReaderTtsWrapped = true;
 
             var originalStart = app.tts.start;
@@ -1524,7 +1673,7 @@ enum SitePatch {
 
             patchDisplay(currentDisplay());
             note('TTS', 'reader TTS diagnostics installed');
-            return true;
+            return testReady && closeReady && pageReady;
         }
 
         if (!attach()) {
@@ -1658,6 +1807,65 @@ enum SitePatch {
             return chain;
         }
 
+        // The download endpoint is rate limited: the device log shows the first
+        // eighteen chapters answered 200 and then everything came back 429 with
+        // an HTML body, which fails JSON.parse and surfaces as
+        // "Lỗi: Không thể đọc dữ liệu". DownloadManager.start() fires three
+        // requests at once with no spacing, so the fix is to space the request
+        // starts out; a failure widens the gap for the rest of the session.
+        var DOWNLOAD_GAP = 900;
+        var DOWNLOAD_GAP_MAX = 2500;
+        var lastDownloadStart = 0;
+
+        function downloadGate() {
+            var now = Date.now();
+            var wait = lastDownloadStart + DOWNLOAD_GAP - now;
+            if (wait < 0) { wait = 0; }
+            lastDownloadStart = now + wait;
+            if (!wait) { return Promise.resolve(); }
+            return new Promise(function (resolve) { setTimeout(resolve, wait); });
+        }
+
+        // The site's download row has no controls at all: pausing and retrying
+        // live behind a long-press context menu and there is no way to drop a
+        // task. Add both as buttons.
+        function decorateRow(manager, node) {
+            if (!node || node.__stvActions) { return; }
+            node.__stvActions = true;
+            var bar = document.createElement('div');
+            bar.setAttribute('style', 'display:flex;gap:6px;padding:0 6px 8px;');
+            var toggle = document.createElement('button');
+            var drop = document.createElement('button');
+            toggle.setAttribute('style',
+                'flex:1;padding:6px 0;font-size:13px;border-radius:6px;');
+            drop.setAttribute('style',
+                'flex:1;padding:6px 0;font-size:13px;border-radius:6px;');
+            drop.textContent = '删除任务';
+            function refresh() {
+                toggle.textContent = manager.isPaused ? '继续下载' : '暂停下载';
+            }
+            toggle.addEventListener('click', function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+                if (manager.isPaused) { manager.start(); } else { manager.pause(); }
+                refresh();
+            });
+            drop.addEventListener('click', function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+                manager.pause();
+                var list = window.app.bookDownloaderList || [];
+                var index = list.indexOf(manager);
+                if (index >= 0) { list.splice(index, 1); }
+                if (node.parentElement) { node.parentElement.removeChild(node); }
+                note('DOWNLOAD', 'task removed from the download list');
+            });
+            refresh();
+            bar.appendChild(toggle);
+            bar.appendChild(drop);
+            node.appendChild(bar);
+        }
+
         // Two entry points read that cache for a list of books: the download
         // manager's rows (render) and the 储物袋 downloaded list
         // (getDownloadBooks -> populateBookInfo). Warm in front of both.
@@ -1673,9 +1881,31 @@ enum SitePatch {
                     var args = arguments;
                     return warmOne(self.host, self.id).then(function () {
                         return originalRender.apply(self, args);
+                    }).then(function (node) {
+                        decorateRow(self, node);
+                        return node;
                     });
                 };
                 note('BOOKINFO', 'download manager render warmed');
+            }
+            if (manager && manager.prototype && !manager.prototype.__stvThrottled) {
+                manager.prototype.__stvThrottled = true;
+                var originalChapter = manager.prototype.downloadChapter;
+                manager.prototype.downloadChapter = function () {
+                    var self = this;
+                    var args = arguments;
+                    return downloadGate().then(function () {
+                        return originalChapter.apply(self, args);
+                    }, function (error) {
+                        if (DOWNLOAD_GAP < DOWNLOAD_GAP_MAX) {
+                            DOWNLOAD_GAP = DOWNLOAD_GAP_MAX;
+                            note('DOWNLOAD', 'download failed, widening the gap to '
+                                + DOWNLOAD_GAP + 'ms: ' + (error && error.message));
+                        }
+                        throw error;
+                    });
+                };
+                note('DOWNLOAD', 'download throttle installed (' + DOWNLOAD_GAP + 'ms gap)');
             }
             if (typeof app.offlineBook.getDownloadBooks === 'function'
                 && !app.offlineBook.__stvWarmedList) {
@@ -1690,7 +1920,8 @@ enum SitePatch {
                 };
                 note('BOOKINFO', 'downloaded-list bookinfo warm-up installed');
             }
-            return !!(manager && manager.prototype && manager.prototype.__stvWarmed)
+            return !!(manager && manager.prototype && manager.prototype.__stvWarmed
+                    && manager.prototype.__stvThrottled)
                 && !!app.offlineBook.__stvWarmedList;
         }
 

@@ -372,17 +372,160 @@ ${data.patterns
         return cdata;
     }
 
+    // The chapter NAME the reader receives is the site's Vietnamese machine
+    // translation, and readchapter carries no original: the chaptername field stays
+    // Vietnamese even when the body comes back in Chinese (transmode=chinese).
+    // The chapter LIST does have it -- getChapterListOnline (app.v2.js:270)
+    // prefers x.oridata, the original, whenever app.language is not Vietnamese
+    // -- so the Chinese title is one chapterlist request away, keyed by the same
+    // cid the reader already knows.
+    var titleMaps = {};
+    var titleTried = {};
+
+    function note(tag, message) {
+        if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+    }
+
+    function trimText(value) {
+        var s = String(value == null ? '' : value);
+        while (s.length && s.charCodeAt(0) <= 32) { s = s.substring(1); }
+        while (s.length && s.charCodeAt(s.length - 1) <= 32) {
+            s = s.substring(0, s.length - 1);
+        }
+        return s;
+    }
+
+    function cjkCount(text) {
+        var n = 0;
+        for (var i = 0; i < text.length; i++) {
+            var code = text.charCodeAt(i);
+            if (code >= 0x3400 && code <= 0x9FFF) { n++; }
+        }
+        return n;
+    }
+
+    function parseChapterList(text) {
+        var out = {};
+        var list = String(text).split('-//-');
+        for (var i = 0; i < list.length; i++) {
+            var parts = list[i].split('-/-');
+            if (parts.length < 3) { continue; }
+            var cid = trimText(parts[1]);
+            var title = trimText(parts[2]);
+            if (cid && title) { out[cid] = title; }
+        }
+        return out;
+    }
+
+    function firstChinese(map) {
+        for (var cid in map) {
+            if (cjkCount(map[cid])) { return map[cid].substring(0, 20); }
+        }
+        return '';
+    }
+
+    // "Chương 03:. Giao phong" + original "交锋" -> "第3章 交锋". When the
+    // original already carries its own numbering the Vietnamese scaffolding is
+    // dropped instead of duplicated.
+    function chineseChapterName(vietnamese, original) {
+        var text = trimText(original);
+        if (!text) { return null; }
+        if (text.indexOf('章') >= 0) { return text; }
+        var numbered = fixChapterTitle(vietnamese || '');
+        var head = '';
+        if (numbered.indexOf('第') === 0) {
+            var index = numbered.indexOf('章');
+            if (index > 0) { head = numbered.substring(0, index + 1); }
+        }
+        return head ? head + ' ' + text : text;
+    }
+
+    function currentCid() {
+        try { return String(window.app.reader.getPCN().current.cid); } catch (e) { return ''; }
+    }
+
+    // Called once the list arrives: the chapter is already on screen with its
+    // Vietnamese name, so rewrite the rendered title and the chapter's own
+    // cdata. Keeping cdata in step is what stops updateFixedChapterName()'s
+    // oldName != name guard from firing a recycle pass on every scroll.
+    function applyTitles(host, id) {
+        var map = titleMaps[host + '/' + id];
+        if (!map) { return; }
+        var app = window.app;
+        var cid = currentCid();
+        if (!cid || !map[cid]) { return; }
+        var display = null;
+        try { display = app.reader.getDisplay(); } catch (e) { display = null; }
+        var view = null;
+        try { view = display.getCurrentChapter(); } catch (e) { view = null; }
+        var vietnamese = (view && view.cdata && view.cdata.chaptername) || '';
+        var name = chineseChapterName(vietnamese, map[cid]);
+        if (!name) { return; }
+        if (view && view.cdata) { view.cdata.chaptername = name; }
+        var nodes = document.querySelectorAll('.chaptername');
+        for (var i = 0; i < nodes.length; i++) { nodes[i].textContent = name; }
+        try {
+            var list = display.innerWindow.q('.chapternamefixed');
+            for (var j = 0; j < list.length; j++) { list[j].textContent = name; }
+        } catch (e) {}
+        note('TITLE', 'chapter ' + cid + ' -> ' + name);
+    }
+
+    // Returns the map when it is already loaded, null otherwise. The lookup is
+    // deliberately not awaited: the first chapter of a book must not wait for a
+    // 100 KB chapterlist response, so the title is corrected a moment later.
+    function chapterTitleMap(host, id) {
+        var key = host + '/' + id;
+        if (titleMaps[key]) { return titleMaps[key]; }
+        if (titleTried[key]) { return null; }
+        var app = window.app;
+        if (!app || !app.net || typeof app.net.get !== 'function') { return null; }
+        titleTried[key] = true;
+        var url = '/index.php?ngmar=chapterlist&h=' + host + '&bookid=' + id
+            + '&sajax=getchapterlist';
+        app.net.get(url).then(function (down) {
+            var map = null;
+            if (down && typeof down.oridata === 'string' && down.oridata) {
+                map = parseChapterList(down.oridata);
+            }
+            var usable = 0;
+            for (var cid in map) { if (cjkCount(map[cid])) { usable++; } }
+            if (!usable) {
+                note('TITLE', 'no original chapter names for ' + key + ' (oridata '
+                    + (down && down.oridata ? 'present but not Chinese' : 'absent') + ')');
+                return;
+            }
+            titleMaps[key] = map;
+            note('TITLE', 'original chapter names for ' + key + ': ' + usable + ' of '
+                + Object.keys(map).length + ', sample=' + firstChinese(map));
+            applyTitles(host, id);
+        }, function (error) {
+            note('ERR', 'chapter name lookup failed for ' + key + ': ' + error);
+        });
+        return null;
+    }
+
     function attachContent() {
         var app = window.app;
         if (!app || !app.reader || typeof app.reader.getContent !== 'function') { return false; }
         if (app.reader.__stvTitleSourceWrapped) { return true; }
         app.reader.__stvTitleSourceWrapped = true;
         var original = app.reader.getContent;
-        app.reader.getContent = function () {
+        app.reader.getContent = function (host, id, cid, reload) {
             var args = arguments;
             var result = original.apply(this, args);
-            if (!result || typeof result.then !== 'function') { return fixChapterData(result); }
-            return result.then(function (cdata) { return fixChapterData(cdata); });
+            if (!result || typeof result.then !== 'function') {
+                return fixChapterData(result, host, id, cid);
+            }
+            return result.then(function (cdata) {
+                var fixed = fixChapterData(cdata, host, id, cid);
+                var map = chapterTitleMap(host, id);
+                if (map && cid && map[String(cid)]) {
+                    var name = chineseChapterName(fixed && fixed.chaptername, map[String(cid)]);
+                    if (name && fixed) { fixed.chaptername = name; rewritten++; }
+                }
+                return fixed;
+            });
         };
         return true;
     }
