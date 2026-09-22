@@ -104,6 +104,21 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="" \
             2>&1 | tee xcodebuild.log | tail -80
 
+      - name: Verify native plugins are linked into the binary
+        run: |
+          set -euo pipefail
+          app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
+          bin="$app/$(basename "$app" .app)"
+          echo "binary: $bin"
+          for cls in SangTacHttpPlugin SangTacAppPlugin SangTacWebNativeViewPlugin; do
+            if nm -a "$bin" | grep -q "OBJC_CLASS_[_]$cls"; then
+              echo "✓ $cls 已链接"
+            else
+              echo "::error::原生插件 $cls 未链接进产物（站点会退回 web 模式）"
+              exit 1
+            fi
+          done
+
       - name: Package IPA
         run: |
           set -euo pipefail
