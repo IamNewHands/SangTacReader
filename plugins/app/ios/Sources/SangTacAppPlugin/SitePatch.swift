@@ -705,38 +705,35 @@ enum SitePatch {
             return String(url || '').indexOf('method=following') >= 0;
         }
 
-        function wrapMethod(plugin, name) {
-            var original = plugin[name];
-            if (typeof original !== 'function') { return; }
-            plugin[name] = function (options) {
-                var url = options && options.url;
-                var call = original.apply(this, arguments);
-                if (!call || typeof call.then !== 'function') { return call; }
-                return call.then(function (result) {
-                    if (!isFollowingCall(url)) { return result; }
-                    var status = result && result.status;
-                    if (typeof status !== 'number' || status >= 400) {
-                        probe('status ' + status);
-                    }
-                    return result;
-                }, function (error) {
-                    if (isFollowingCall(url)) { probe('rejected: ' + error); }
-                    throw error;
-                });
-            };
+        // app.net.get is a plain property on a plain object, so wrapping it is
+        // reliable -- unlike Capacitor.Plugins.Http, which is a proxy and may
+        // silently refuse the assignment. Every book-list view goes through it.
+        function looksLikeABookList(value) {
+            if (!value) { return false; }
+            if (typeof value === 'string') { return value.indexOf('"list"') >= 0; }
+            return Array.isArray(value.list);
         }
 
         function attach() {
-            var Capacitor = window.Capacitor;
-            var plugin = Capacitor && Capacitor.Plugins && Capacitor.Plugins.Http;
-            if (!plugin || plugin.__stvFollowWrapped) { return !!plugin; }
-            try {
-                plugin.__stvFollowWrapped = true;
-                wrapMethod(plugin, 'get');
-                wrapMethod(plugin, 'request');
-            } catch (e) {
-                note('ERR', 'follow probe could not wrap Http: ' + e);
-            }
+            var app = window.app;
+            if (!app || !app.net || typeof app.net.get !== 'function') { return false; }
+            if (app.net.__stvFollowWrapped) { return true; }
+            app.net.__stvFollowWrapped = true;
+
+            var original = app.net.get;
+            app.net.get = function (url) {
+                var call = original.apply(this, arguments);
+                if (!isFollowingCall(url) || !call || typeof call.then !== 'function') { return call; }
+                return call.then(function (result) {
+                    if (!looksLikeABookList(result)) {
+                        probe('unusable body: ' + String(JSON.stringify(result) || result).slice(0, 120));
+                    }
+                    return result;
+                }, function (error) {
+                    probe('rejected: ' + error);
+                    throw error;
+                });
+            };
             return true;
         }
 
