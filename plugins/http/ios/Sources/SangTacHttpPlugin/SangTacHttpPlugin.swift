@@ -6,19 +6,32 @@ import WebKit
  SangTacHttpPlugin — iOS stand-in for the Android build's
  `com.getcapacitor.plugin.http.Http` (which the APK patched to add X-STV-Sign).
 
- The site's frontend (app.v2.js / app.v2.bookdisplay.js) calls
+ The site's frontend (app.v2.js / app.v2.read.js / app.v2.bookdisplay.js) calls
  `Capacitor.Plugins.Http.get({url, headers, ...})` whenever `window.Capacitor`
  exists, with headers:
    x-stv-transport: app
    x-requested-with: com.sangtacviet.mobilereader
    Cookie: document.cookie        <- incomplete: httpOnly cookies are missing
 
- Two things this plugin must fix on iOS:
-  1. httpOnly cookies (access / useri2 / hstamp ...) never appear in
-     `document.cookie`, so the JS-supplied Cookie header is incomplete.
-     We rebuild it from WKWebsiteDataStore (which does hold httpOnly cookies).
-  2. WKWebView and URLSession do not share cookie storage, so Set-Cookie
-     responses are written back into the web view's cookie store afterwards.
+ Three things this plugin must get right on iOS:
+
+ 1. Cookies. httpOnly cookies (access / useri2 / readcontextid ...) never appear
+    in `document.cookie`, so the JS-supplied Cookie header is incomplete. We
+    rebuild it from WKWebsiteDataStore (which does hold httpOnly cookies).
+    WKWebView and URLSession do not share cookie storage, so Set-Cookie
+    responses are written back into the web view's cookie store afterwards.
+
+ 2. Response `data` typing. The Android reference implementation
+    (HttpRequestHandler.readData) parses JSON *only* when the Content-Type
+    contains "application/json"; every other content type yields a STRING
+    (or base64 for responseType blob/arraybuffer). The site depends on that:
+    app.reader.getContent2 does `r.data.replace(...)` on a response whose
+    Content-Type is text/html, so an eagerly-parsed object makes the reader
+    throw and never render the chapter.
+
+ 3. Referer. The site's read endpoints require a same-site Referer but the
+    Capacitor call sites do not send one; we fall back to the web view's
+    current URL (a browser would do the same) instead of a bare origin.
 
  Response shape matches @capacitor-community/http: {status, data, headers, url}.
  */
@@ -37,8 +50,15 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "syncCookies", returnType: CAPPluginReturnPromise)
     ]
 
+    /// Mirror of the Android plugin's default; only used when the site sends no
+    /// User-Agent of its own.
     private static let defaultUserAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    /// Fallback when the caller passes no timeout. The site passes `timeout`
+    /// (ms) on its domain-health probes; honouring it keeps a dead domain from
+    /// blocking the reader for minutes.
+    private static let defaultTimeout: TimeInterval = 60
 
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -95,15 +115,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
 
-        // Implicit browser headers the site relies on (Referer is required by
-        // the site's readchapter endpoint; URLSession does not add it itself).
-        if headers["Referer"] == nil, let scheme = url.scheme, let host = url.host {
-            headers["Referer"] = "\(scheme)://\(host)/"
-        }
-        if headers["User-Agent"] == nil, headers["user-agent"] == nil {
-            headers["User-Agent"] = SangTacHttpPlugin.defaultUserAgent
-        }
-
+        let timeout = SangTacHttpPlugin.timeoutSeconds(from: call)
         let jsCookieHeader = headers.first { $0.key.lowercased() == "cookie" }?.value
 
         nativeCookies(for: url) { [weak self] cookies in
@@ -113,12 +125,21 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                 headers["Cookie"] = SangTacHttpPlugin.mergeCookieHeader(
                     jsHeader: jsCookieHeader, nativeCookies: cookies)
             }
+            // Implicit browser headers the site relies on (the read endpoints
+            // require a same-site Referer; URLSession does not add one).
+            if headers["Referer"] == nil, headers["referer"] == nil {
+                headers["Referer"] = self.pageReferer(for: url)
+            }
+            if headers["User-Agent"] == nil, headers["user-agent"] == nil {
+                headers["User-Agent"] = SangTacHttpPlugin.defaultUserAgent
+            }
 
             // Build the body first: it may contribute a Content-Type header.
             let body = self.bodyData(for: call, headers: &headers)
 
             var request = URLRequest(url: url)
             request.httpMethod = method
+            request.timeoutInterval = timeout
             for (key, value) in headers {
                 request.setValue(value, forHTTPHeaderField: key)
             }
@@ -128,11 +149,14 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
 
             self.session.dataTask(with: request) { data, response, error in
                 if let error = error {
-                    self.callLog("err", "\(method) \(url.absoluteString) -> \(error.localizedDescription)")
-                    call.reject(error.localizedDescription, nil, error)
+                    let message = error.localizedDescription
+                    self.callLog("err", "\(method) \(url.absoluteString) -> \(message)")
+                    self.report("ERR", "\(method) \(url.path) \(message)")
+                    call.reject(message, nil, error)
                     return
                 }
                 guard let http = response as? HTTPURLResponse else {
+                    self.report("ERR", "\(method) \(url.path) no HTTP response")
                     call.reject("No HTTP response")
                     return
                 }
@@ -145,31 +169,81 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                     if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
                 }
 
+                let payload = SangTacHttpPlugin.responsePayload(
+                    body: body,
+                    contentType: contentType,
+                    responseType: call.getString("responseType"))
+
                 var result: [String: Any] = [
                     "status": http.statusCode,
                     "headers": headerMap,
-                    "url": http.url?.absoluteString ?? url.absoluteString
+                    "url": http.url?.absoluteString ?? url.absoluteString,
+                    "data": payload.value
                 ]
-
-                let text = String(data: body, encoding: .utf8) ?? ""
-                if contentType.contains("json") || (text.hasPrefix("{") || text.hasPrefix("[")) {
-                    if let parsed = try? JSONSerialization.jsonObject(with: body),
-                       let json = parsed as? [String: Any] {
-                        result["data"] = json
-                    } else if let parsed = try? JSONSerialization.jsonObject(with: body),
-                              let jsonArray = parsed as? [Any] {
-                        result["data"] = jsonArray
-                    } else {
-                        result["data"] = text
-                    }
-                } else {
-                    result["data"] = text
+                if http.statusCode >= 400 {
+                    result["error"] = true
                 }
 
-                self.callLog("ok", "\(method) \(url.path) -> \(http.statusCode) bytes=\(body.count)")
+                self.callLog("ok", "\(method) \(url.path) -> \(http.statusCode) bytes=\(body.count) data=\(payload.kind)")
+                self.report("Http", "\(method) \(url.path) -> \(http.statusCode) \(payload.kind) \(body.count)b")
                 call.resolve(result)
             }.resume()
         }
+    }
+
+    // MARK: - Response payload (Android parity)
+
+    private struct Payload {
+        let value: Any
+        let kind: String
+    }
+
+    /**
+     Mirrors com.getcapacitor.plugin.util.HttpRequestHandler.readData:
+       - Content-Type contains "application/json" -> parsed JSON
+       - otherwise responseType blob/arraybuffer    -> base64 string
+       - otherwise responseType json                -> parsed JSON
+       - otherwise                                  -> raw string
+     The site's app.reader.getContent2 calls `r.data.replace(...)` on a
+     text/html response, so this branch is load-bearing for chapter reading.
+     */
+    private static func responsePayload(body: Data, contentType: String, responseType: String?) -> Payload {
+        let text = String(data: body, encoding: .utf8) ?? ""
+        let isJSONMime = contentType.contains("application/json")
+            || contentType.contains("application/vnd.api+json")
+
+        if isJSONMime {
+            if let parsed = parseJSON(body) { return Payload(value: parsed, kind: "json") }
+            return Payload(value: text, kind: "string(unparsed-json)")
+        }
+
+        switch (responseType ?? "text").lowercased() {
+        case "arraybuffer", "blob":
+            return Payload(value: body.base64EncodedString(), kind: "base64")
+        case "json":
+            if let parsed = parseJSON(body) { return Payload(value: parsed, kind: "json") }
+            return Payload(value: text, kind: "string(unparsed-json)")
+        default:
+            return Payload(value: text, kind: "string")
+        }
+    }
+
+    private static func parseJSON(_ data: Data) -> Any? {
+        if data.isEmpty { return "" }
+        return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    // MARK: - Timeout
+
+    /// The site passes `timeout` (ms) on its /warp.php probes; the Capacitor
+    /// plugin API also has connectTimeout / readTimeout. Accept all three.
+    private static func timeoutSeconds(from call: CAPPluginCall) -> TimeInterval {
+        for key in ["timeout", "readTimeout", "connectTimeout"] {
+            if let ms = call.getDouble(key), ms > 0 {
+                return max(ms / 1000.0, 1.0)
+            }
+        }
+        return defaultTimeout
     }
 
     // MARK: - Body
@@ -195,6 +269,40 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         return nil
+    }
+
+    // MARK: - Referer
+
+    /// Browsers send the current document URL as Referer. The site's read
+    /// endpoints validate it, so prefer the web view's URL over a bare origin.
+    /// Must be called on the main thread.
+    private func pageReferer(for url: URL) -> String {
+        if let page = self.bridge?.webView?.url?.absoluteString, !page.isEmpty {
+            return page
+        }
+        if let scheme = url.scheme, let host = url.host {
+            return "\(scheme)://\(host)/"
+        }
+        return ""
+    }
+
+    // MARK: - Diagnostics
+
+    /// Push one line into the in-page diagnostic panel installed by
+    /// SangTacAppPlugin (window.__stvDiag). Silent when the panel is absent.
+    private func report(_ tag: String, _ message: String) {
+        let js = "window.__stvDiag && window.__stvDiag.log(\(SangTacHttpPlugin.jsLiteral(tag)), \(SangTacHttpPlugin.jsLiteral(message)));"
+        DispatchQueue.main.async { [weak self] in
+            self?.bridge?.webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private static func jsLiteral(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value]),
+              let array = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return String(array.dropFirst().dropLast())
     }
 
     // MARK: - Cookies

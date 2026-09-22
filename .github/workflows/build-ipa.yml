@@ -52,6 +52,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Verify injected document-start shim is valid JavaScript
+        run: node scripts/check-ios-shim.js
+
       - name: List detected plugins
         run: npx cap ls || true
 
@@ -149,6 +152,14 @@ jobs:
             echo "✓ Cordova 兼容层已编入产物"
           else
             echo "::error::Cordova 兼容层缺失（nativeclick shim 不在二进制里）"
+            exit 1
+          fi
+          # 诊断面板（window.__stvDiag）同样必须编进去，否则真机出错时没有任何
+          # 可读日志（sideload 的 iOS 包看不到 console）。
+          if grep -q -F 'stvDiagInstalled' "$syms.strings"; then
+            echo "✓ 诊断面板已编入产物"
+          else
+            echo "::error::诊断面板缺失（__stvDiag shim 不在二进制里）"
             exit 1
           fi
 
