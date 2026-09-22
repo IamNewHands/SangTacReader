@@ -33,6 +33,7 @@ const REQUIRED_MARKERS = [
   'window.__stvDiag',
   'window.__stvReaderDefaultsInstalled',
   'window.__stvTtsProviderInstalled',
+  'window.__stvI18nInstalled',
   'pageflip',
 ];
 

@@ -101,10 +101,13 @@ enum SitePatch {
          on the iOS clipboard (with an execCommand fallback), which beats asking
          for a screenshot of a scrolling list.
      Collapsed state is a 24px badge on the right edge showing the line count;
-     it turns red as soon as anything is logged with tag ERR. The expanded panel
-     is anchored to the TOP (42% height) and its title bar can be dragged
-     vertically, so the bottom 58% of the screen stays usable. Triple-tap the
-     top-left corner toggles it too.
+     it turns red as soon as anything is logged with tag ERR. The badge stays
+     HIDDEN until the first ERR and can be dismissed again from the panel — the
+     reader turns pages by tapping the right third of the screen
+     (app.reader.menuTapMode == "centerlr"), so an always-visible badge would eat
+     page turns. Triple-tap the top-left corner opens the panel regardless. The
+     expanded panel is anchored to the TOP (42% height) and its title bar can be
+     dragged vertically, so the bottom 58% of the screen stays usable.
      */
     static let diag = """
     (function () {
@@ -119,6 +122,7 @@ enum SitePatch {
         var listEl = null;
         var countEl = null;
         var badge = null;
+        var badgeHidden = false;
         var open = false;
 
         function fmt(value) {
@@ -178,7 +182,7 @@ enum SitePatch {
             badge = make('div', 'position:fixed;right:3px;top:42%;width:26px;height:26px;'
                 + 'border-radius:13px;background:rgba(25,25,25,0.6);color:#cfc;'
                 + 'font:10px/26px Menlo,monospace;text-align:center;z-index:2147483645;'
-                + 'opacity:0.7;-webkit-user-select:none;user-select:none;');
+                + 'opacity:0.7;-webkit-user-select:none;user-select:none;display:none;');
             badge.textContent = '0';
             badge.setAttribute('data-stvdiag', 'badge');
             host.appendChild(badge);
@@ -196,6 +200,7 @@ enum SitePatch {
                 badge.style.background = 'rgba(25,25,25,0.6)';
                 badge.style.color = '#cfc';
             }
+            badge.style.display = (errors > 0 && !badgeHidden) ? 'block' : 'none';
         }
 
         // ---- expanded panel --------------------------------------------------
@@ -228,6 +233,11 @@ enum SitePatch {
                 errors = 0;
                 render();
             }));
+            bar.appendChild(barButton('HIDE', function () {
+                hide();
+                badgeHidden = true;
+                paintBadge();
+            }));
             bar.appendChild(barButton('CLOSE', function () { hide(); }));
             root.appendChild(bar);
 
@@ -256,6 +266,7 @@ enum SitePatch {
         function show() {
             if (!buildPanel()) { return; }
             open = true;
+            badgeHidden = false;
             root.style.display = 'block';
             render();
         }
@@ -354,7 +365,10 @@ enum SitePatch {
         function log(tag, msg) {
             lines.push(stamp() + ' [' + tag + '] ' + fmt(msg));
             while (lines.length > MAX) { lines.shift(); }
-            if (tag === 'ERR') { errors++; }
+            if (tag === 'ERR') {
+                errors++;
+                badgeHidden = false;
+            }
             if (open) {
                 render();
             } else {
@@ -630,6 +644,7 @@ enum SitePatch {
     })();
     """
 
-    /// Injected in order; every block is independently guarded.
-    static let all: [String] = [compat, diag, readerDefaults, ttsProvider]
+    /// Injected in order; every block is independently guarded. `SiteI18nData`
+    /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
+    static let all: [String] = [compat, diag, readerDefaults, ttsProvider, SiteI18nData.script]
 }

@@ -49,17 +49,20 @@ function loadBlocks() {
 
 function makeElement(tagName) {
   const element = {
+    nodeType: 1,
     tagName: String(tagName || 'div').toUpperCase(),
     id: '',
     className: '',
     textContent: '',
     value: '',
+    nodeValue: null,
     parentNode: null,
     children: [],
     style: {},
     attributes: {},
     setAttribute(name, value) {
       this.attributes[name] = value;
+      if (name === 'class') { this.className = value; }
     },
     getAttribute(name) {
       return this.attributes[name];
@@ -71,6 +74,7 @@ function makeElement(tagName) {
     },
     removeChild(child) {
       this.children = this.children.filter((entry) => entry !== child);
+      this.childNodes = this.children;
       child.parentNode = null;
       return child;
     },
@@ -85,7 +89,26 @@ function makeElement(tagName) {
     },
     focus() {},
   };
-  // style.cssText assignment must be a plain property, which the object gives us.
+  element.childNodes = element.children;
+  return element;
+}
+
+function makeTextNode(value) {
+  return {
+    nodeType: 3,
+    nodeValue: value,
+    parentNode: null,
+    childNodes: [],
+    textContent: value,
+  };
+}
+
+function makeContainer(tagName, className, text) {
+  const element = makeElement(tagName);
+  element.className = className;
+  if (text !== undefined) {
+    element.appendChild(makeTextNode(text));
+  }
   return element;
 }
 
@@ -301,19 +324,63 @@ async function testDiagPanel() {
   const diag = sandbox.window.__stvDiag;
   check('__stvDiag installed', !!diag);
   check('badge appended to body', sandbox.document.body.children.length > 0);
+  const badge = sandbox.document.body.children[0];
+  check(
+    'badge stays hidden while nothing has errored',
+    badge.style.display === 'none',
+    `display=${badge.style.display} (the reader turns pages by tapping the right third of the screen)`
+  );
   diag.log('Http', 'GET /x -> 200');
   diag.log('ERR', 'boom');
   const text = diag.text();
   check('lines are buffered', text.includes('GET /x -> 200') && text.includes('boom'));
-  check(
-    'badge shows the line count',
-    sandbox.document.body.children[0].textContent === String(diag.lines().length),
-    `badge=${sandbox.document.body.children[0].textContent} lines=${diag.lines().length}`
-  );
+  check('badge shows the line count', badge.textContent === String(diag.lines().length));
+  check('badge reveals itself on the first error', badge.style.display === 'block');
   check('copy() returns the buffer', diag.copy() === text);
   diag.hide();
   diag.show();
   check('show/hide are safe', true);
+}
+
+async function testI18nOverlay() {
+  console.log('i18n overlay');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+
+  const settings = makeContainer('div', 'settingitem');
+  const label = makeContainer('div', 'settingitemtitle', 'Thêm name 1 nhấp');
+  settings.appendChild(label);
+  sandbox.document.body.appendChild(settings);
+
+  // Chapter body and comments hold user data and must survive untouched.
+  const chapter = makeContainer('div', 'chaptercontent');
+  chapter.appendChild(makeContainer('p', '', 'Hủy'));
+  sandbox.document.body.appendChild(chapter);
+  const comment = makeContainer('div', 'comment', 'Khác');
+  sandbox.document.body.appendChild(comment);
+
+  // An interpolated message the site builds by concatenation.
+  const toast = makeContainer('div', 'toast', 'Đã dừng đọc sau 5 phút');
+  sandbox.document.body.appendChild(toast);
+
+  const input = makeElement('input');
+  input.setAttribute('placeholder', 'Tiêu đề');
+  sandbox.document.body.appendChild(input);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+
+  check('dictionary loaded', sandbox.window.__stvI18n && sandbox.window.__stvI18n.size > 300,
+    `size=${sandbox.window.__stvI18n && sandbox.window.__stvI18n.size}`);
+  check('settings label translated', label.childNodes[0].nodeValue === '一键添加译名',
+    JSON.stringify(label.childNodes[0].nodeValue));
+  check('chapter body untouched', chapter.childNodes[0].childNodes[0].nodeValue === 'Hủy',
+    JSON.stringify(chapter.childNodes[0].childNodes[0].nodeValue));
+  check('comment untouched', comment.childNodes[0].nodeValue === 'Khác',
+    JSON.stringify(comment.childNodes[0].nodeValue));
+  check('concatenated message translated', toast.childNodes[0].nodeValue.indexOf('分钟') >= 0,
+    JSON.stringify(toast.childNodes[0].nodeValue));
+  check('placeholder attribute translated', input.getAttribute('placeholder') === '标题',
+    JSON.stringify(input.getAttribute('placeholder')));
 }
 
 (async () => {
@@ -321,6 +388,7 @@ async function testDiagPanel() {
   await testTtsProviderRespectsStoredChoice();
   await testReaderDefaults();
   await testDiagPanel();
+  await testI18nOverlay();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
