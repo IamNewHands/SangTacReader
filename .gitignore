@@ -44,3 +44,11 @@ log.txt
 jdk17.zip
 jdk17_dir/
 *脚本.js
+
+# 抓取/调试产物：ch_cookies.txt 里是登录态 cookie，绝不能进仓库。
+ch_cookies.txt
+online_*.js
+app_v2_local.js
+PROJECT_DEBUG_OVERVIEW.md
+tests/chrome_*.txt
+tests/chrome_eval.html
