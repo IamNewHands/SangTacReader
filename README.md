@@ -51,7 +51,7 @@ SangTacReader/
 
 ## 站点补丁（`plugins/app/.../SitePatch.swift`）
 
-站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 9 个块，
+站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 11 个块，
 每块独立守卫、互不依赖：
 
 | 块 | 作用 |
@@ -61,10 +61,12 @@ SangTacReader/
 | `readerDefaults` | iOS 上把阅读器 `display_type` 默认成左右翻页 |
 | `ttsProvider` | 注册 `ttsEngine` 的 `ios` provider，走原生 `AVSpeechSynthesizer` |
 | `followFallback` | 「关注」接口服务端 500 时探测站点自己的旧接口 |
-| `safeArea` | 灵动岛 / Home Indicator：阅读器浮层的安全区补齐 |
+| `safeArea` | 灵动岛 / Home Indicator：安全区补齐 + 阅读器菜单几何量上报 |
 | `settingsBackup` | 设置镜像进 Keychain，重装后写回 localStorage |
 | `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
-| `SiteI18nData.script` | 生成物：站点文案中译 + 章节标题数字改写 |
+| `readerTts` | 正文朗读：补上 iframe 的 `speaker`、句子来源兜底、失败原因上报 |
+| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白 |
+| `SiteI18nData.script` | 生成物：站点文案中译 + 章节标题数字改写（含阅读器 iframe） |
 
 ## 中文字典流水线
 
@@ -105,9 +107,11 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 侧载包看不到 console，所以出错都进页面面板：**连点左上角三次**打开，`COPY`
 把整个缓冲区放进剪贴板。徽标平时隐藏，出现第一条 `ERR` 才显示。
 
-面板里的 tag 含义：`Http` 每条原生请求（含 `in <ms>ms` 耗时）、`TTS` 语音合成
-每次尝试、`FOLLOW` 关注接口探测、`SAFE` 安全区取值、`SETTINGS` 设置备份/恢复、
-`BOOKMARK` 取消书签探测、`ERR` 错误。
+面板里的 tag 含义：`Http` 每条原生请求（含 `in <ms>ms` 耗时）、`TTS` 语音合成每次尝试
+与正文朗读的句子数/兜底来源、`FOLLOW` 关注接口探测、`SAFE` 安全区取值、`RECT` 阅读器
+菜单与页面顶栏的实际几何量（定位灵动岛遮挡用）、`SETTINGS` 设置备份/恢复、
+`BOOKMARK` 取消书签探测、`BOOKINFO` 评论/详情页缺数据时的补取、`COMMENT` 评论按钮
+拦截、`ERR` 错误。
 
 ## 说明 / 免责
 

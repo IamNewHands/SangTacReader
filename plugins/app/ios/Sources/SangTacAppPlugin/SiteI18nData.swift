@@ -629,6 +629,10 @@ enum SiteI18nData {
                 var digits = digitsAfter(text, index);
                 if (!digits) { continue; }
                 index += digits.length;
+                // qidian zero-pads ("Chương 03:. Giao phong"); 第03章 reads wrong.
+                while (digits.length > 1 && digits.charAt(0) === '0') {
+                    digits = digits.substring(1);
+                }
                 var between = TITLE_HEADS[h][1];
                 if (between) {
                     index = skipSpaces(text, index);
@@ -643,9 +647,18 @@ enum SiteI18nData {
             return raw;
         }
 
-        // .chaptername sits in SKIP, so walk() never descends into it. That is
+        // Chapter names sit in SKIP, so walk() never descends into them. That is
         // deliberate: chapter titles are per-book data and must not be run through
         // the fragment table. This pass is the only thing allowed to touch them.
+        //
+        // Two different elements carry the title and both must be covered:
+        //   .chaptername      -- the reader's bottom bar (page-readchapter)
+        //   .chapternamefixed -- the static name pinned to the top of the page
+        //                        (PageFlipChapterDisplay.updateFixedChapterName)
+        // Missing .chapternamefixed is why the top of the reader kept printing
+        // "Chương 03:. Giao phong" after the first fix.
+        var TITLE_SELECTOR = '.chaptername, .chapternamefixed';
+
         function applyChapterTitle(node) {
             var text = node.textContent || '';
             var fixed = fixChapterTitle(text);
@@ -654,9 +667,10 @@ enum SiteI18nData {
 
         function fixChapterTitles(root) {
             if (!root || root.nodeType !== 1) { return; }
-            if (root.classList && root.classList.contains('chaptername')) { applyChapterTitle(root); }
+            if (root.classList && (root.classList.contains('chaptername')
+                || root.classList.contains('chapternamefixed'))) { applyChapterTitle(root); }
             if (!root.querySelectorAll) { return; }
-            var nodes = root.querySelectorAll('.chaptername');
+            var nodes = root.querySelectorAll(TITLE_SELECTOR);
             for (var i = 0; i < nodes.length; i++) { applyChapterTitle(nodes[i]); }
         }
 
@@ -705,9 +719,66 @@ enum SiteI18nData {
             }
         }
 
+        // The chapter text -- and therefore the pinned chapter name -- lives in a
+        // same-origin srcdoc iframe, not in this document, so the main sweep can
+        // never reach it. Only the title pass runs inside frames: walking the whole
+        // frame would put the fragment table on top of novel text, and that table is
+        // only meant for the site's own UI strings.
+        function frameDocument(frame) {
+            var doc = null;
+            try { doc = frame.contentDocument; } catch (e) { doc = null; }
+            return doc || null;
+        }
+
+        function sweepFrame(frame) {
+            var doc = frameDocument(frame);
+            if (!doc || !doc.documentElement) { return; }
+            try {
+                fixChapterTitles(doc.documentElement);
+            } catch (e) {
+                if (window.__stvDiag) { window.__stvDiag.log('ERR', 'i18n frame sweep failed: ' + e); }
+            }
+        }
+
+        function frameRecords(records) {
+            for (var i = 0; i < records.length; i++) {
+                var record = records[i];
+                if (record.target && record.target.nodeType === 1) {
+                    fixChapterTitles(record.target);
+                }
+            }
+        }
+
+        function attachFrame(frame) {
+            var doc = frameDocument(frame);
+            if (!doc) { return; }
+            var win = null;
+            try { win = frame.contentWindow; } catch (e) { win = null; }
+            if (win && !win.__stvI18nFrame) {
+                win.__stvI18nFrame = true;
+                try {
+                    win.addEventListener('load', function () { sweepFrame(frame); });
+                } catch (e) {}
+                if (window.MutationObserver) {
+                    try {
+                        new window.MutationObserver(frameRecords).observe(doc, {
+                            childList: true, subtree: true, characterData: true
+                        });
+                    } catch (e) {}
+                }
+            }
+            sweepFrame(frame);
+        }
+
+        function attachFrames() {
+            var list = document.querySelectorAll('iframe');
+            for (var i = 0; i < list.length; i++) { attachFrame(list[i]); }
+        }
+
         window.__stvI18n = {
             translate: translate,
             sweep: sweep,
+            sweepFrames: attachFrames,
             fixChapterTitle: fixChapterTitle,
             size: EXACT.length,
             rewritten: function () { return rewritten; }
@@ -721,7 +792,11 @@ enum SiteI18nData {
                         walk(record.target);
                     } else {
                         var added = record.addedNodes || [];
-                        for (var j = 0; j < added.length; j++) { walk(added[j]); }
+                        for (var j = 0; j < added.length; j++) {
+                            var node = added[j];
+                            walk(node);
+                            if (node.nodeType === 1 && node.tagName === 'IFRAME') { attachFrame(node); }
+                        }
                     }
                     // The reader rewrites .chaptername.textContent on every chapter
                     // change, which arrives as a childList mutation ON that node.
@@ -738,8 +813,12 @@ enum SiteI18nData {
         } else {
             document.addEventListener('DOMContentLoaded', function () { sweep(); });
         }
-        setTimeout(sweep, 1500);
-        setTimeout(sweep, 5000);
+        // The reader builds its iframe lazily and rebuilds it on every display-type
+        // change, so re-scan a handful of times instead of trusting one pass.
+        var FRAME_DELAYS = [0, 300, 1000, 2000, 4000, 8000];
+        for (var f = 0; f < FRAME_DELAYS.length; f++) {
+            setTimeout(function () { sweep(); attachFrames(); }, FRAME_DELAYS[f]);
+        }
 
         if (window.__stvDiag) {
             window.__stvDiag.log('PATCH', 'i18n overlay ready: ' + EXACT.length + ' labels, '

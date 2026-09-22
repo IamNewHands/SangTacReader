@@ -63,14 +63,35 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
     private static let defaultTimeout: TimeInterval = 60
 
     private let session: URLSession = {
+        // Respect the server's own caching headers. The previous
+        // .reloadIgnoringLocalCacheData forced every launch to refetch through
+        // the native bridge whatever the site's PHP endpoints were willing to
+        // let the webview reuse -- lang/zh.json, cover images, page-flip.mp3,
+        // qtOnline.js -- which is a large part of "the home page still takes
+        // ages after a cold start". Requests whose answer must never be stale
+        // (chapter text, mutations) opt out per-request in `perform`.
+        URLCache.shared = URLCache(memoryCapacity: 32 * 1024 * 1024,
+                                   diskCapacity: 256 * 1024 * 1024,
+                                   diskPath: nil)
         let config = URLSessionConfiguration.default
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.requestCachePolicy = .useProtocolCachePolicy
+        config.urlCache = URLCache.shared
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 120
         config.httpCookieAcceptPolicy = .always
         config.httpShouldSetCookies = true
         return URLSession(configuration: config)
     }()
+
+    /// Endpoints whose response must be fetched fresh every time: chapter bodies
+    /// (the site already keeps its own offline copy) and anything that mutates
+    /// server state.
+    private static func mustRevalidate(_ url: URL) -> Bool {
+        let text = url.absoluteString
+        return text.contains("sajax=readchapter")
+            || text.contains("jsonify.php")
+            || text.contains("bookmanage.php")
+    }
 
     // MARK: - Bridged methods
 
@@ -167,6 +188,9 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
             var request = URLRequest(url: url)
             request.httpMethod = method
             request.timeoutInterval = timeout
+            if SangTacHttpPlugin.mustRevalidate(url) {
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+            }
             for (key, value) in headers {
                 request.setValue(value, forHTTPHeaderField: key)
             }

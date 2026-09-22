@@ -38,6 +38,8 @@ const REQUIRED_MARKERS = [
   'window.__stvSafeAreaInstalled',
   'window.__stvSettingsBackupInstalled',
   'window.__stvBookmarkToggleInstalled',
+  'window.__stvReaderTtsInstalled',
+  'window.__stvPageRepairInstalled',
   'pageflip',
 ];
 

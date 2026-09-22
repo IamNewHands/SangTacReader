@@ -386,3 +386,160 @@ app.storage.set                 ->  localStorage.setItem
 - 每个候选的返回都写进面板（`[BOOKMARK] unbookmark -> {"code":…}`），所以真机上点一次就能知道服务端到底有没有这个接口，而不是继续猜。
 
 
+### 6.6 第五轮真机反馈（`日志.txt`，685 行）
+
+七项。五项已在站点源码里钉死根因，两项（灵动岛顶栏、储物袋顶栏错位）只拿到"用户描述"，
+所以这一轮对它们是**加量测 + 给最保守的修正**，不做猜测式重写。
+
+#### (1) 正文顶部仍是越南语章节名 —— 我们改的是另一个元素，而且在另一个文档里
+
+上一轮的 `fixChapterTitles` 只查 `.chaptername`，但阅读器顶部钉住的静态章节名是
+**`.chapternamefixed`**：
+
+```
+app.v2.chapterdisplay.js:3294   <div class="chaptertopinfo"><div class="chapternamefixed"></div>…
+app.v2.chapterdisplay.js:3579   updateFixedChapterName(c) { … fixed.textContent = c.cdata.chaptername; }
+```
+
+更关键的是它**不在主文档里**：阅读器正文和这个顶栏都在一个 `srcdoc` iframe 内
+（`getMainContainer()`，`app.v2.chapterdisplay.js:1545-1551`），而注入脚本是
+`forMainFrameOnly: true`，`document.querySelectorAll` 永远查不到它。
+
+修法（`scripts/gen-site-i18n.js`，两处）：
+
+- 标题选择器扩成 `.chaptername, .chapternamefixed`，并且 `fixChapterTitles` 认这两个 class 自身；
+- 新增 iframe 桥：扫 `document.querySelectorAll('iframe')`，对**同源**的 iframe
+  挂 `MutationObserver` + `load` 监听，只跑**标题那一趟**。帧内**不跑** `walk()`——
+  片段表是给站点自己的 UI 文案用的，不该盖到小说正文上；
+- 帧是懒建且切显示模式会重建，所以按 `[0,300,1000,2000,4000,8000]ms` 重扫，并在主
+  MutationObserver 里对新增的 `<iframe>` 立刻 `attachFrame`；
+- 顺带把前导零归一（qidian 的 `Chương 03:. Giao phong` → `第3章 Giao phong`，
+  原来是 `第03章`）。
+
+#### (2)(6) 灵动岛顶栏 / 储物袋顶栏错位 —— 先量，再改，且不覆盖站点自己的值
+
+站点有安全区模型，但两个地方有洞：
+
+- `#chapterview .titlebar` 自己没有 padding，展开后 `top: 0`，撑起来全靠
+  `--status-bar-height` 在那个瞬间是对的；
+- `body[ovlwv] .titlebar { height: var(--titlebarovl); padding-top: var(--status-bar-height) }`
+  是 **content-box**，实际渲染 `102 + 62 = 164px`，底下多出 62px 空白，
+  所有紧跟 `.titlebar` 的内容（例如储物袋页的 tabbar）就被整体推下去 62px。
+
+所以 CSS 换成不依赖站点探测的形式，并让 `--titlebarovl` 恢复它字面上的含义：
+
+```css
+--inset-top:    max(var(--status-bar-height), env(safe-area-inset-top))
+--inset-bottom: max(var(--screensafebottom),    env(safe-area-inset-bottom))
+#chapterview .titlebar        { padding-top: <inset-top> !important; height:auto !important; box-sizing:content-box !important }
+#chapterview.showmenu .titlebar { top: 0 !important }
+#chapterview .coption         { padding-bottom: calc(12px + <inset-bottom>) !important }
+body[ovlwv] .titlebar         { height:auto !important; box-sizing:content-box !important; padding-top: <inset-top> !important }
+body[ovlwv] .bottombar        { padding-bottom: <inset-bottom> !important }
+```
+
+`max(var, env)` 是关键：站点那两个变量来自 `window.getSafeHeight()`，而它本身读
+`env()`，任何一环断了就是 0；`max` 让原生值和站点值谁大听谁的。
+
+同时**加量测**，因为这两条只有用户描述、没有可判定证据。包装
+`app.reader.showMenuOl`（`toggleMenu` / `showEditName` / `showTtsSetting` 三条路都会走它），
+菜单滑入稳定后打一行：
+
+```
+[RECT] #chapterview .titlebar[0..102 h102] #chapterview .coption=… #overlay .titlebar[62..164 h102] .usertop=… status-bar=62/62 env={"top":62,"bottom":34}
+```
+
+下一份日志就能直接判：顶栏是 `top: 0`（那就是 padding 没生效）还是负值（`showmenu` 没加上），
+储物袋那条栏是 102 还是 164。
+
+#### (3) 正文朗读没声音 —— 站点的句子来源没起来，而它一声不响
+
+设置页的 test 走 `app.tts.test()` → `ttsEngine.requestAudio` + `playQueue`，这条路是通的。
+阅读器走的是另一条：
+
+```
+app.tts.start() -> player.generateSentences() -> getSentences()          (app.v2.read.js:2486)
+                                 -> getCurrentWindow().speaker            (:2488 没有就 toast + return null)
+                                 -> display.tokenizeSentence()            (:2494)
+                                        -> this.getCurrentWindow().speaker.viRgx   (:2275 直接抛)
+player.play() -> sen.prefetch() -> ttsEngine.requestAudioInstant() -> provider.speak()   ← 这条已验证可用
+```
+
+`speaker` 由 iframe 里的 `qtOnline.js` 安装，而那个 script 的地址是
+`app.net.networkManagerXHR.bestDomain()`（**和页面不同源**，日志里最快的是
+`https://sangtacviet.app`）。它没到位时，`getSentences()` 静默返回 null，
+`tokenizeSentence()` 在 `speaker.viRgx` 上抛 TypeError —— 两者都不会写任何日志，
+表现就是"点朗读什么都没发生"。日志也印证了：20:45:37 点耳机、20:45:38/39 点播放，
+**零条 TTS 相关输出**。
+
+新增 `readerTts` 补丁：
+
+- 包装 `app.tts.start`，try/catch 后固定上报 `[TTS] reader TTS start: sentences=<n> provider=<x>`；
+  `n == -1` 就说明 `getSentences()` 返回了 null，`n == 0` 说明句子来源是空的 —— 下次一眼分辨；
+- 缺 `speaker` 时补一个最小桩（`senToText` / `parseSen` / `highlightOn` / `highlightOff`），
+  只为过掉 `if(!wd.speaker)` 那道闸；
+- 包装每个 display 实例的 `tokenizeSentence`：站点那版抛错或返回空时，用**章节正文自己切句**
+  （`#maincontent` 的 `innerText`，按 `. ! ? , ; 。！？，、；` 和换行切），
+  生成的节点带 `toText()`，所以 `Sentence()` 与 `highlight()` 都不会再去碰 `speaker`；
+- 同时包装 `app.reader.loadChapterDisplay`，切显示模式后的新实例也自动打上；
+- `IosTts.prototype.speak` 加一行 `[TTS] speak result kind=… payload=…`，
+  万一 `Không tìm thấy blob` 再出现，能立刻区分是 `!blob` 还是 `typeof blob == 'string'`。
+
+#### (4) 正文底部评论点了没反应 —— `app.reader.bookinfo` 是空的
+
+```js
+// app.v2.read.js:298-300
+p.q(".btncomment").addEventListener("click", function(){
+    app.fun.showComment(app.reader.bookinfo.host, app.reader.bookinfo.id);   // 无保护
+});
+```
+
+`bookinfo` 只在 `updateHistory()` 的 `bookinfo.php` 异步回调里赋值（`app.v2.read.js:840-850`），
+而且那句判断写成了 `this.bookinfo.id != i && this.bookinfo.host != h`（应为 `||`）。
+任何绕过它的打开路径都会让这个按钮抛 TypeError。
+
+`pageRepair` 用 document 捕获阶段拦下 `.btncomment`：`bookinfo` 已就绪就完全不管，
+为空时先 `getCacheLater('/mobile/bookinfo.php?hid=<id>&host=<host>')` 再调 `showComment`。
+
+#### (5) 下载完点进去连详情页都空白 —— 传进详情页的数据是 undefined
+
+```
+app.v2.read.js:3609   var bi = (await populateBookInfo([{id: this.id, host: this.host}]))[0];
+app.v2.read.js:3621   this.node.addEventListener("click", function(){ app.fun.openBookWithData(0, bi); });
+_page_vip.html:4425   openBookWithData: function(bookid, data) { var page = app.pushPage("bookinfo", data); … }
+_page_vip.html:317    <if if="['sangtac','dich'].indexOf(root.data.host) < 0">
+```
+
+`populateBookInfo`（`app.v2.read.js:3258-3278`）读的是
+`app.storage.cache.get('/mobile/bookinfo.php?...')`；**缓存未命中就返回 `[]`**，
+于是 `bi === undefined`，`pushPage("bookinfo", undefined)` 之后模板的第一句表达式就是
+`root.data.host` —— 日志里正是它：
+
+```
+20:48:19 [TAP] tap div.right
+20:48:19 [ERR] onerror TypeError: undefined is not an object (evaluating 'root.data.host') @undefined:1
+```
+
+修法两条：
+
+- **预热**：`app.offlineBook.store.data` 里每本书都先 `getCacheLater('/mobile/bookinfo.php?hid=…&host=…')`
+  一遍（顺序、有日志），缓存有了 `populateBookInfo` 自然返回真数据；
+- **兜底**：包装 `app.fun.openBookWithData`，`data` 缺 `host`/`id` 时**拒绝 push** 并 toast
+  提示，而不是推一个必崩的空白页。
+
+#### (7) 冷启动首页慢 —— 我们自己的 HTTP 插件把缓存关了
+
+```swift
+config.requestCachePolicy = .reloadIgnoringLocalCacheData   // SangTacHttpPlugin.swift:67
+```
+
+站点所有 `app.net` 请求都走这个 session，于是每次冷启动都要重新拉 `lang/zh.json`、
+封面图、`page-flip.mp3`、`qtOnline.js` 等本来可以让 WebView 复用的东西。
+
+改成 `.useProtocolCachePolicy` + 显式给 `URLCache.shared` 32MB 内存 / 256MB 磁盘；
+需要永远新鲜的端点（`sajax=readchapter`、`jsonify.php`、`bookmanage.php`）在 `perform` 里
+按请求覆盖回 `.reloadIgnoringLocalCacheData`。
+
+注意：这只解决"可缓存的东西被我们主动禁掉了"这一半。日志里 `booklist.php` 这类
+动态接口本身也要 0.7–2.1s，那部分是服务端和链路，客户端改不掉。
+

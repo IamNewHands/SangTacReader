@@ -562,6 +562,13 @@ enum SitePatch {
                 // ever sees a Blob.
                 var encoded = result;
                 if (result && typeof result === 'object') { encoded = result.data; }
+                if (window.__stvDiag) {
+                    window.__stvDiag.log('TTS', 'speak result kind='
+                        + (result === null ? 'null' : typeof result)
+                        + ' payload=' + (typeof encoded === 'string' ? encoded.length + ' chars'
+                            : typeof encoded)
+                        + ' text=' + (text || '').length + ' chars');
+                }
                 if (typeof encoded !== 'string' || encoded.length === 0) {
                     throw new Error('iOS TTS returned no audio (got '
                         + (result === null ? 'null' : typeof result) + ')');
@@ -783,9 +790,32 @@ enum SitePatch {
         if (window.__stvSafeAreaInstalled) { return; }
         window.__stvSafeAreaInstalled = true;
 
-        var CSS = '#chapterview .titlebar{padding-top:var(--status-bar-height) !important;'
-            + 'height:auto !important;}'
-            + '#chapterview .coption{padding-bottom:calc(12px + var(--screensafebottom)) !important;}';
+        // Two distinct defects, one stylesheet.
+        //
+        // 1. The reader's own bar is `position: fixed; top: var(--ntitlebarovl)`
+        //    (== -(statusBarHeight + 45)px) and only moves to 0 when
+        //    #chapterview carries .showmenu. It has no status-bar padding of its
+        //    own, so whatever the site computes for --status-bar-height has to be
+        //    correct at that instant or the back button lands under the Dynamic
+        //    Island. max(var, env()) removes the dependency on the site's own
+        //    detection (window.getSafeHeight(), which reads env() itself).
+        //
+        // 2. `body[ovlwv] .titlebar { height: var(--titlebarovl); padding-top:
+        //    var(--status-bar-height) }` is content-box, so the bar renders
+        //    102 + 62 = 164px tall with 62px of dead space under it. Every page
+        //    that follows a .titlebar (the inventory page's tab bar, for one)
+        //    is pushed down by exactly that much. height:auto makes the total
+        //    40 + 62 = 102px, which is what --titlebarovl means.
+        var INSET_TOP = 'max(var(--status-bar-height), env(safe-area-inset-top))';
+        var INSET_BOTTOM = 'max(var(--screensafebottom), env(safe-area-inset-bottom))';
+
+        var CSS = '#chapterview .titlebar{padding-top:' + INSET_TOP + ' !important;'
+            + 'height:auto !important;box-sizing:content-box !important;}'
+            + '#chapterview.showmenu .titlebar{top:0 !important;}'
+            + '#chapterview .coption{padding-bottom:calc(12px + ' + INSET_BOTTOM + ') !important;}'
+            + 'body[ovlwv] .titlebar{height:auto !important;box-sizing:content-box !important;'
+            + 'padding-top:' + INSET_TOP + ' !important;}'
+            + 'body[ovlwv] .bottombar{padding-bottom:' + INSET_BOTTOM + ' !important;}';
 
         function note(tag, message) {
             if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
@@ -854,16 +884,60 @@ enum SitePatch {
             return true;
         }
 
+        // The device is the only place these two layout complaints can be
+        // settled, so measure the real boxes instead of guessing again. Reported
+        // whenever the reader's menu opens (all three entry points go through
+        // showMenuOl) and on the boot samples.
+        function box(selector, last) {
+            var nodes = document.querySelectorAll(selector);
+            if (!nodes.length) { return selector + '=none'; }
+            var node = nodes[last ? nodes.length - 1 : 0];
+            var r = node.getBoundingClientRect();
+            return selector + '[' + Math.round(r.top) + '..' + Math.round(r.bottom)
+                + ' h' + Math.round(r.height) + ']';
+        }
+
+        function reportRects() {
+            var root = document.documentElement;
+            var declared = px(root.style.getPropertyValue('--status-bar-height'));
+            var resolved = px(window.getComputedStyle(root).getPropertyValue('--status-bar-height'));
+            note('RECT', box('#chapterview .titlebar') + ' ' + box('#chapterview .coption')
+                + ' ' + box('#overlay .titlebar', true) + ' ' + box('.usertop')
+                + ' status-bar=' + declared + '/' + resolved
+                + ' env=' + (window.getSafeHeight ? JSON.stringify(window.getSafeHeight()) : 'n/a'));
+        }
+
+        function watchReaderMenu() {
+            var app = window.app;
+            if (!app || !app.reader || typeof app.reader.showMenuOl !== 'function') { return false; }
+            if (app.reader.__stvRectWrapped) { return true; }
+            app.reader.__stvRectWrapped = true;
+            var original = app.reader.showMenuOl;
+            app.reader.showMenuOl = function () {
+                var result = original.apply(this, arguments);
+                // the bar slides for 0.3s; measure once it has settled
+                setTimeout(reportRects, 400);
+                return result;
+            };
+            note('SAFE', 'reader menu geometry probe installed');
+            return true;
+        }
+
         function tick() {
             style();
             viewportFit();
             fetchInsets();
+            watchReaderMenu();
         }
 
         // The site writes its own values about a second into boot and rewrites
         // them on resize, so sample a handful of times rather than continuously.
         var DELAYS = [0, 200, 600, 1200, 2500, 5000, 10000];
-        for (var i = 0; i < DELAYS.length; i++) { setTimeout(tick, DELAYS[i]); }
+        for (var i = 0; i < DELAYS.length; i++) {
+            (function (delay) {
+                setTimeout(function () { tick(); if (delay >= 2500) { reportRects(); } }, delay);
+            })(DELAYS[i]);
+        }
         window.addEventListener('resize', fetchInsets);
         window.addEventListener('orientationchange', fetchInsets);
         document.addEventListener('DOMContentLoaded', tick);
@@ -1095,9 +1169,342 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Reader TTS
+
+    /**
+     Tapping play inside the reader produced no audio and no log line at all,
+     while the same provider speaks fine from the TTS settings page. The reader
+     path is not the settings path:
+
+         app.tts.start() -> player.generateSentences() -> getSentences()
+             -> getCurrentWindow().speaker            (must exist)
+             -> display.tokenizeSentence()            (throws on speaker.viRgx)
+         player.play() -> sen.prefetch() -> ttsEngine.requestAudioInstant()
+             -> provider.speak()                      (works -- proven by the test)
+
+     `speaker` is installed by qtOnline.js, which the reader iframe loads from
+     networkManagerXHR.bestDomain() -- a different origin from the page. When it
+     does not arrive, getSentences() returns null after a toast and
+     PageFlipChapterDisplay.tokenizeSentence() throws on speaker.viRgx. Both
+     failures are swallowed, so the button simply does nothing.
+
+     This block does not guess: it reports what actually happened, and when the
+     sentence source is missing it supplies one built from the chapter text so
+     the site's own queue, provider and audio element still do the playing.
+     */
+    static let readerTts = """
+    (function () {
+        if (window.__stvReaderTtsInstalled) { return; }
+        window.__stvReaderTtsInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function noop() {}
+
+        // No regular expressions: this block has to survive a Swift multiline
+        // string, which forbids backslashes.
+        var BREAKS = ['.', '!', '?', ',', ';', '。', '！', '？', '，', '、', '；',
+                      String.fromCharCode(10)];
+
+        function trim(value) {
+            var s = value;
+            while (s.length && s.charCodeAt(0) <= 32) { s = s.substring(1); }
+            while (s.length && s.charCodeAt(s.length - 1) <= 32) { s = s.substring(0, s.length - 1); }
+            return s;
+        }
+
+        function isBreak(ch) {
+            for (var i = 0; i < BREAKS.length; i++) { if (ch === BREAKS[i]) { return true; } }
+            return false;
+        }
+
+        function splitSentences(text) {
+            var out = [];
+            var buffer = '';
+            for (var i = 0; i < text.length; i++) {
+                var ch = text.charAt(i);
+                buffer += ch;
+                if (isBreak(ch)) {
+                    var piece = trim(buffer);
+                    if (piece) { out.push(piece); }
+                    buffer = '';
+                }
+            }
+            var rest = trim(buffer);
+            if (rest) { out.push(rest); }
+            return out;
+        }
+
+        function toTextFor(value) {
+            return function () { return value; };
+        }
+
+        function readerWindow(display) {
+            var w = null;
+            try {
+                w = display.getCurrentWindow ? display.getCurrentWindow() : display.innerWindow;
+            } catch (e) { w = null; }
+            return w || null;
+        }
+
+        function ensureSpeaker(display) {
+            var w = readerWindow(display);
+            if (!w) { return null; }
+            if (!w.speaker) {
+                // Only the guard `if(!wd.speaker)` in getSentences() needs this.
+                // Our own sentence objects carry toText(), so senToText() is
+                // never called -- which is why an empty stub is enough.
+                w.speaker = {
+                    sentences: [],
+                    senToText: function () { return ''; },
+                    parseSen: noop,
+                    highlightOn: noop,
+                    highlightOff: noop
+                };
+                note('TTS', 'reader iframe has no speaker (qtOnline.js never installed one) -- shimmed');
+            }
+            return w;
+        }
+
+        function fallbackSentences(display) {
+            var w = readerWindow(display);
+            if (!w || !w.document) { return []; }
+            var doc = w.document;
+            var root = doc.getElementById('maincontent') || doc.body;
+            if (!root) { return []; }
+            var text = root.innerText || root.textContent || '';
+            var pieces = splitSentences(text);
+            var list = [];
+            for (var i = 0; i < pieces.length; i++) {
+                list.push({ toText: toTextFor(pieces[i]), highlightOn: noop, highlightOff: noop });
+            }
+            return list;
+        }
+
+        function patchDisplay(display) {
+            if (!display || display.__stvTtsPatched) { return; }
+            display.__stvTtsPatched = true;
+            var original = display.tokenizeSentence;
+            display.tokenizeSentence = function () {
+                ensureSpeaker(this);
+                var list = null;
+                if (typeof original === 'function') {
+                    try {
+                        list = original.call(this);
+                    } catch (e) {
+                        note('TTS', 'site tokenizeSentence threw: ' + e);
+                    }
+                }
+                if (list && list.length) { return list; }
+                var mine = fallbackSentences(this);
+                note('TTS', 'tokenizeSentence fallback -> ' + mine.length + ' sentence(s)');
+                return mine;
+            };
+        }
+
+        function currentDisplay() {
+            var app = window.app;
+            if (!app || !app.reader || typeof app.reader.getDisplay !== 'function') { return null; }
+            try { return app.reader.getDisplay(); } catch (e) { return null; }
+        }
+
+        function attach() {
+            var app = window.app;
+            if (!app || !app.tts || typeof app.tts.start !== 'function') { return false; }
+            if (app.tts.__stvReaderTtsWrapped) { return true; }
+            app.tts.__stvReaderTtsWrapped = true;
+
+            var originalStart = app.tts.start;
+            app.tts.start = function () {
+                var display = currentDisplay();
+                patchDisplay(display);
+                ensureSpeaker(display);
+                var failure = '';
+                try {
+                    originalStart.apply(this, arguments);
+                } catch (e) {
+                    failure = ' threw: ' + e;
+                }
+                var player = this.player;
+                var count = (player && player.sentences) ? player.sentences.length : -1;
+                note(failure ? 'ERR' : 'TTS', 'reader TTS start: sentences=' + count
+                    + ' provider=' + ((this.setting || {}).provider || '?') + failure);
+            };
+
+            if (app.reader && typeof app.reader.loadChapterDisplay === 'function'
+                && !app.reader.__stvTtsDisplayWrapped) {
+                app.reader.__stvTtsDisplayWrapped = true;
+                var originalLoad = app.reader.loadChapterDisplay;
+                app.reader.loadChapterDisplay = function () {
+                    var display = originalLoad.apply(this, arguments);
+                    patchDisplay(display);
+                    ensureSpeaker(display);
+                    return display;
+                };
+            }
+
+            patchDisplay(currentDisplay());
+            note('TTS', 'reader TTS diagnostics installed');
+            return true;
+        }
+
+        if (!attach()) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (attach() || attempts > 400) { clearInterval(timer); }
+            }, 100);
+        }
+    })();
+    """
+
+    // MARK: - Comment button and offline book detail page
+
+    /**
+     Two unrelated dead ends that share one cause: the site reads a value the
+     app-mode webview never populated.
+
+       * `.btncomment` dereferences `app.reader.bookinfo.host` unguarded
+         (app.v2.read.js:299). bookinfo is only filled in by updateHistory()'s
+         asynchronous bookinfo.php response, so any open path that skips
+         updateHistory makes the button throw -- "tapping comment does nothing".
+
+       * The download manager builds its rows from
+         `app.storage.cache.get('/mobile/bookinfo.php?...')` and hands the result
+         to `openBookWithData(0, bi)`. On a cache miss `bi` is undefined and
+         `page-bookinfo`'s first expression is
+         `['sangtac','dich'].indexOf(root.data.host)` -- a TypeError, so the
+         detail page renders blank ("even the detail page will not load").
+
+     So: resolve bookinfo on demand for the comment button, warm the cache for
+     every downloaded book, and refuse to push a detail page with no data.
+     */
+    static let pageRepair = """
+    (function () {
+        if (window.__stvPageRepairInstalled) { return; }
+        window.__stvPageRepairInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function resolveBookInfo() {
+            var app = window.app;
+            var reader = app && app.reader;
+            if (!reader) { return null; }
+            var info = reader.bookinfo;
+            if (info && info.host && info.id) { return Promise.resolve(info); }
+            var host = reader.host;
+            var id = reader.id;
+            if (!host || !id) { return null; }
+            return app.net.getCacheLater('/mobile/bookinfo.php?hid=' + id + '&host=' + host)
+                .then(function (down) {
+                    var book = down && down.book;
+                    if (!book) { throw new Error('bookinfo.php returned no book'); }
+                    reader.bookinfo = book;
+                    note('BOOKINFO', 'resolved ' + host + '/' + id + ' for the comment button');
+                    return book;
+                });
+        }
+
+        document.addEventListener('click', function (event) {
+            var node = event.target;
+            while (node && node.nodeType === 1) {
+                if (node.classList && node.classList.contains('btncomment')) { break; }
+                node = node.parentElement;
+            }
+            if (!node || node.nodeType !== 1) { return; }
+            var app = window.app;
+            var info = app && app.reader && app.reader.bookinfo;
+            if (info && info.host && info.id) { return; }
+            event.stopImmediatePropagation();
+            event.preventDefault();
+            note('COMMENT', 'app.reader.bookinfo is empty; resolving it before opening comments');
+            var pending = resolveBookInfo();
+            if (!pending) {
+                if (app && app.toast) { app.toast('无法确定书籍信息，评论暂不可用'); }
+                return;
+            }
+            pending.then(function (book) {
+                app.fun.showComment(book.host, book.id);
+            }, function (error) {
+                note('ERR', 'comment bookinfo lookup failed: ' + error);
+                if (app && app.toast) { app.toast('评论加载失败'); }
+            });
+        }, true);
+
+        function warmBookInfo() {
+            var app = window.app;
+            if (!app || !app.offlineBook || !app.offlineBook.store) { return; }
+            var books = app.offlineBook.store.data || [];
+            var index = 0;
+            function step() {
+                if (index >= books.length) {
+                    note('BOOKINFO', 'offline bookinfo cache warm-up done ('
+                        + books.length + ' book(s))');
+                    return;
+                }
+                var book = books[index++];
+                var base = (book && book.baseObject) || {};
+                var host = (book && book.host) || base.host;
+                var id = (book && book.id) || base.id;
+                if (!host || !id) { step(); return; }
+                var url = '/mobile/bookinfo.php?hid=' + id + '&host=' + host;
+                app.net.getCacheLater(url).then(function (down) {
+                    if (down && down.book) { note('BOOKINFO', 'cached ' + host + '/' + id); }
+                    step();
+                }, function (error) {
+                    note('ERR', 'bookinfo warm-up failed for ' + host + '/' + id + ': ' + error);
+                    step();
+                });
+            }
+            step();
+        }
+
+        function attach() {
+            var app = window.app;
+            if (!app || !app.fun || typeof app.fun.openBookWithData !== 'function') { return false; }
+            if (app.fun.__stvOpenBookWrapped) { return true; }
+            app.fun.__stvOpenBookWrapped = true;
+            var original = app.fun.openBookWithData;
+            app.fun.openBookWithData = function (bookid, data) {
+                if (data && data.host && data.id) { return original.call(this, bookid, data); }
+                note('ERR', 'openBookWithData called with no book data (bookid=' + bookid
+                    + ') -- refusing to push a blank detail page');
+                if (app.toast) { app.toast('书籍信息缺失，请返回后重试'); }
+                return null;
+            };
+            note('BOOKINFO', 'openBookWithData guard installed');
+            return true;
+        }
+
+        if (!attach()) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (attach() || attempts > 400) { clearInterval(timer); }
+            }, 100);
+        }
+
+        var warmAttempts = 0;
+        var warmTimer = setInterval(function () {
+            warmAttempts++;
+            var app = window.app;
+            var store = app && app.offlineBook && app.offlineBook.store;
+            if ((store && store.data && store.data.length) || warmAttempts > 300) {
+                clearInterval(warmTimer);
+                warmBookInfo();
+            }
+        }, 200);
+    })();
+    """
+
     /// Injected in order; every block is independently guarded. `SiteI18nData`
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
     static let all: [String] = [compat, diag, readerDefaults, ttsProvider,
                                 followFallback, safeArea, settingsBackup,
-                                bookmarkToggle, SiteI18nData.script]
+                                bookmarkToggle, readerTts, pageRepair,
+                                SiteI18nData.script]
 }

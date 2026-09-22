@@ -110,13 +110,27 @@ function makeElement(tagName) {
       return null;
     },
     querySelectorAll(selector) {
-      const wanted = selector.charAt(0) === '.' ? selector.slice(1) : null;
+      // Supports the shapes the injected blocks actually use: one or more
+      // comma-separated class selectors, plus bare tag and #id selectors.
+      const matchers = String(selector)
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .map((part) => {
+          if (part.charAt(0) === '.') { return { cls: part.slice(1) }; }
+          if (part.charAt(0) === '#') { return { id: part.slice(1) }; }
+          return { tag: part.toUpperCase() };
+        });
       const found = [];
       const visit = (node) => {
         for (const child of node.children) {
           if (child.nodeType !== 1) { continue; }
-          if (wanted && String(child.className || '').split(/\s+/).indexOf(wanted) >= 0) {
-            found.push(child);
+          const names = String(child.className || '').split(/\s+/);
+          for (const matcher of matchers) {
+            const hit = (matcher.cls && names.indexOf(matcher.cls) >= 0)
+              || (matcher.id && child.id === matcher.id)
+              || (matcher.tag && child.tagName === matcher.tag);
+            if (hit) { found.push(child); break; }
           }
           visit(child);
         }
@@ -127,6 +141,14 @@ function makeElement(tagName) {
     focus() {},
   };
   element.childNodes = element.children;
+
+  // parentElement mirrors parentNode, like the real DOM (the comment-button
+  // capture listener walks up with it).
+  Object.defineProperty(element, 'parentElement', {
+    get() {
+      return element.parentNode;
+    },
+  });
 
   // classList mirrors className, like the real DOM.
   Object.defineProperty(element, 'classList', {
@@ -212,12 +234,16 @@ function makeSandbox() {
     keys: () => Object.keys(store),
   };
 
+  const listeners = {};
   const document = {
     body,
     head,
     documentElement,
     createElement: (tag) => makeElement(tag),
-    addEventListener() {},
+    addEventListener(type, handler) {
+      listeners[type] = listeners[type] || [];
+      listeners[type].push(handler);
+    },
     removeEventListener() {},
     getElementById: byId,
     querySelectorAll: (selector) => documentElement.querySelectorAll(selector),
@@ -258,7 +284,44 @@ function makeSandbox() {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   sandbox.__dom = { byId, store, head };
+  // The page-repair block installs a capture-phase click listener on document;
+  // the tests need to be able to fire it.
+  sandbox.__dispatch = (type, event) => {
+    for (const handler of listeners[type] || []) { handler(event); }
+  };
+  sandbox.__listenerCount = (type) => (listeners[type] || []).length;
   return sandbox;
+}
+
+/**
+ * A same-origin srcdoc iframe, which is where the reader puts the chapter text
+ * (and the pinned chapter name) -- `getMainContainer()` builds one in
+ * app.v2.chapterdisplay.js and writes baseSrcDoc into it.
+ */
+function makeFakeFrame(contentElements) {
+  const frame = makeElement('iframe');
+  const html = makeElement('html');
+  const frameBody = makeElement('body');
+  html.appendChild(frameBody);
+  for (const element of contentElements || []) { frameBody.appendChild(element); }
+  const byId = (id) => {
+    let found = null;
+    const visit = (node) => {
+      if (found) { return; }
+      if (node.id === id) { found = node; return; }
+      for (const child of node.children || []) { visit(child); }
+    };
+    visit(html);
+    return found;
+  };
+  const doc = { documentElement: html, body: frameBody, getElementById: byId };
+  frame.contentDocument = doc;
+  frame.contentWindow = {
+    document: doc,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  return frame;
 }
 
 // ---------------------------------------------------------------- fake site
@@ -332,6 +395,42 @@ function installFakeApp(sandbox, options) {
   app.config.reader.__defineGetter__('display_type', function () {
     return app.config._reader.display_type;
   });
+
+  // ---- reader / TTS / navigation surface used by the newer blocks ----------
+  const display = options.display || null;
+  app.reader = {
+    bookinfo: options.readerBookInfo === undefined ? null : options.readerBookInfo,
+    host: options.readerHost || 'qidian',
+    id: options.readerId || '1034915599',
+    getDisplay() { return display; },
+    loadChapterDisplay() { return display; },
+    showMenuOl() { stored.menuOlCalls = (stored.menuOlCalls || 0) + 1; },
+  };
+  app.fun = {
+    openBookWithData(bookid, data) {
+      stored.opened = (stored.opened || []).concat([{ bookid, data }]);
+      return 'pushed-page';
+    },
+    showComment(host, id) {
+      stored.comments = (stored.comments || []).concat([{ host, id }]);
+    },
+  };
+  app.tts.start = function () {
+    stored.startCalls = (stored.startCalls || 0) + 1;
+    if (options.ttsStartThrows) { throw new Error('start failed'); }
+    this.player = { sentences: options.ttsSentences || [] };
+  };
+  app.tts.player = { sentences: [] };
+  const bookInfoResponses = options.bookInfoResponses || {};
+  app.net.getCacheLater = (url) => {
+    stored.cacheLater = (stored.cacheLater || []).concat([url]);
+    if (!Object.prototype.hasOwnProperty.call(bookInfoResponses, url)) {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve(bookInfoResponses[url]);
+  };
+  app.net.get = (url) => app.net.getCacheLater(url);
+  app.offlineBook = { store: { data: options.offlineBooks || [] } };
 
   sandbox.app = app;
   sandbox.window.app = app;
@@ -529,7 +628,16 @@ async function testI18nOverlay() {
   const plainName = makeContainer('div', 'chaptername', 'Chương');
   sandbox.document.body.appendChild(plainName);
 
+  // The pinned name at the top of the chapter page is a different element and
+  // lives inside the reader's same-origin srcdoc iframe, which is why the first
+  // version of this fix never reached it.
+  const pinned = makeContainer('div', 'chapternamefixed', 'Chương 03:. Giao phong');
+  const frameLabel = makeContainer('div', 'settingitemtitle', 'Thêm name 1 nhấp');
+  const frame = makeFakeFrame([pinned, frameLabel]);
+  sandbox.document.body.appendChild(frame);
+
   vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
 
   check('dictionary loaded', sandbox.window.__stvI18n && sandbox.window.__stvI18n.size > 300,
     `size=${sandbox.window.__stvI18n && sandbox.window.__stvI18n.size}`);
@@ -558,6 +666,149 @@ async function testI18nOverlay() {
   check('unrelated Vietnamese is left alone',
     sandbox.window.__stvI18n.fixChapterTitle('Thứ tự chương') === 'Thứ tự chương',
     JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('Thứ tự chương')));
+  check('zero-padded chapter numbers are normalised',
+    sandbox.window.__stvI18n.fixChapterTitle('Chương 03:. Giao phong') === '第3章 Giao phong',
+    JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('Chương 03:. Giao phong')));
+  check('the pinned name inside the reader iframe is translated',
+    pinned.textContent === '第3章 Giao phong', JSON.stringify(pinned.textContent));
+  check('only the title pass runs inside the iframe',
+    frameLabel.textContent === 'Thêm name 1 nhấp', JSON.stringify(frameLabel.textContent));
+}
+
+async function testReaderTts() {
+  console.log('reader TTS sentence source');
+  const maincontent = makeContainer('div', 'maincontent', '第一句。第二句！第三句？');
+  maincontent.id = 'maincontent';
+  const frame = makeFakeFrame([maincontent]);
+  const display = {
+    innerWindow: frame.contentWindow,
+    getCurrentWindow() { return frame.contentWindow; },
+    tokenizeSentence() { throw new Error('speaker is undefined'); },
+  };
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'pageflip', display, ttsSentences: [] });
+  sandbox.document.body.appendChild(frame);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  let threw = null;
+  try { app.tts.start(); } catch (error) { threw = error; }
+  await tick(20);
+  check('a speaker is installed so getSentences() stops bailing out',
+    !!frame.contentWindow.speaker, 'without it the site returns null and shows a toast');
+  check('tapping play no longer throws out of the click handler', threw === null,
+    threw ? String(threw.message) : 'ok');
+  check('the site\'s own tokenizer is used when it works',
+    display.tokenizeSentence() .length === 3,
+    JSON.stringify(display.tokenizeSentence().map((s) => s.toText())));
+
+  const diag = sandbox.window.__stvDiag.text ? sandbox.window.__stvDiag.text() : '';
+  check('the TTS outcome is reported instead of failing silently',
+    String(diag).indexOf('reader TTS start') >= 0, String(diag).slice(-200));
+  check('the sentence source is reported when it had to be replaced',
+    String(diag).indexOf('tokenizeSentence fallback') >= 0, String(diag).slice(-200));
+
+  // A display whose tokenizer returns nothing must still produce sentences.
+  const emptyDisplay = {
+    innerWindow: frame.contentWindow,
+    getCurrentWindow() { return frame.contentWindow; },
+    tokenizeSentence() { return []; },
+  };
+  const emptySandbox = makeSandbox();
+  installFakeApp(emptySandbox, { displayType: 'pageflip', display: emptyDisplay });
+  emptySandbox.document.body.appendChild(frame);
+  vm.runInContext(loadBlocks().join('\n'), emptySandbox);
+  await tick(250);
+  const produced = emptyDisplay.tokenizeSentence();
+  check('an empty sentence list falls back to the chapter text',
+    produced.length === 3, JSON.stringify(produced.map((s) => s.toText())));
+  check('fallback sentences expose toText so Sentence() never needs the speaker',
+    typeof produced[0].toText === 'function');
+}
+
+async function testCommentButton() {
+  console.log('reader comment button');
+  const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    readerBookInfo: null,
+    bookInfoResponses: { [url]: { book: { id: '1034915599', host: 'qidian', tname: '这些仙子全都不正常！' } } },
+  });
+  const button = makeContainer('button', 'btncomment');
+  const icon = makeContainer('i', 'fas fa-comment');
+  button.appendChild(icon);
+  sandbox.document.body.appendChild(button);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  let stopped = false;
+  sandbox.__dispatch('click', {
+    target: icon,
+    preventDefault() {},
+    stopImmediatePropagation() { stopped = true; },
+  });
+  await tick(50);
+
+  check('the click is intercepted when app.reader.bookinfo is empty', stopped,
+    'the site handler would throw on bookinfo.host');
+  check('bookinfo is fetched for the open book',
+    (sandbox.__stored.cacheLater || []).indexOf(url) >= 0,
+    JSON.stringify(sandbox.__stored.cacheLater || []));
+  check('comments open with the resolved book',
+    JSON.stringify(sandbox.__stored.comments) === JSON.stringify([{ host: 'qidian', id: '1034915599' }]),
+    JSON.stringify(sandbox.__stored.comments));
+
+  // When bookinfo is already loaded the site's own handler must stay in charge.
+  const ready = makeSandbox();
+  installFakeApp(ready, {
+    displayType: 'pageflip',
+    readerBookInfo: { id: '7', host: 'fanqie' },
+  });
+  const readyButton = makeContainer('button', 'btncomment');
+  ready.document.body.appendChild(readyButton);
+  vm.runInContext(loadBlocks().join('\n'), ready);
+  await tick(250);
+  let readyStopped = false;
+  ready.__dispatch('click', {
+    target: readyButton,
+    preventDefault() {},
+    stopImmediatePropagation() { readyStopped = true; },
+  });
+  check('a loaded bookinfo is left to the site handler', !readyStopped);
+}
+
+async function testOfflineBookDetailPage() {
+  console.log('downloaded book detail page');
+  const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    offlineBooks: [{ host: 'qidian', id: '1034915599', key: 'offlineBook_qidian_1034915599' }],
+    bookInfoResponses: { [url]: { book: { id: '1034915599', host: 'qidian' } } },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  check('every downloaded book has its bookinfo cached',
+    (sandbox.__stored.cacheLater || []).indexOf(url) >= 0,
+    JSON.stringify(sandbox.__stored.cacheLater || []));
+
+  const blank = app.fun.openBookWithData(0, undefined);
+  check('a detail page is never pushed without book data', blank === null,
+    String(blank));
+  check('the user is told why nothing happened',
+    (sandbox.__stored.toasts || []).some((t) => t.indexOf('书籍信息缺失') >= 0),
+    JSON.stringify(sandbox.__stored.toasts || []));
+  check('the site implementation is not reached with undefined data',
+    (sandbox.__stored.opened || []).length === 0);
+
+  const book = { id: '1034915599', host: 'qidian' };
+  app.fun.openBookWithData(0, book);
+  check('a real book still opens the detail page',
+    (sandbox.__stored.opened || []).length === 1, JSON.stringify(sandbox.__stored.opened || []));
 }
 
 async function testSafeArea() {
@@ -691,6 +942,9 @@ async function testBookmarkToggle() {
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();
   await testBookmarkToggle();
+  await testReaderTts();
+  await testCommentButton();
+  await testOfflineBookDetailPage();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
