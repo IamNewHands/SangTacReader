@@ -309,13 +309,19 @@ ${data.patterns
     function attachFrame(frame) {
         var doc = frameDocument(frame);
         if (!doc) { return; }
-        var win = null;
-        try { win = frame.contentWindow; } catch (e) { win = null; }
-        if (win && !win.__stvI18nFrame) {
-            win.__stvI18nFrame = true;
-            try {
-                win.addEventListener('load', function () { sweepFrame(frame); });
-            } catch (e) {}
+        // The flag lives on the document, not the window: assigning srcdoc
+        // navigates the iframe and swaps the document out, so a window-scoped
+        // flag would leave the observer attached to a dead document and the
+        // pinned name would stop being translated after the first chapter change.
+        if (!doc.__stvI18nFrame) {
+            doc.__stvI18nFrame = true;
+            var win = null;
+            try { win = frame.contentWindow; } catch (e) { win = null; }
+            if (win) {
+                try {
+                    win.addEventListener('load', function () { sweepFrame(frame); });
+                } catch (e) {}
+            }
             if (window.MutationObserver) {
                 try {
                     new window.MutationObserver(frameRecords).observe(doc, {

@@ -673,6 +673,17 @@ async function testI18nOverlay() {
     pinned.textContent === '第3章 Giao phong', JSON.stringify(pinned.textContent));
   check('only the title pass runs inside the iframe',
     frameLabel.textContent === 'Thêm name 1 nhấp', JSON.stringify(frameLabel.textContent));
+
+  // Assigning srcdoc navigates the iframe and swaps its document out, so the
+  // observer has to be re-armed on the new one or the pinned name stops being
+  // translated after the first chapter change.
+  const repinned = makeContainer('div', 'chapternamefixed', 'Chương 12: Nhập môn');
+  const replacement = makeFakeFrame([repinned]);
+  frame.contentDocument = replacement.contentDocument;
+  frame.contentWindow = replacement.contentWindow;
+  sandbox.window.__stvI18n.sweepFrames();
+  check('a re-navigated iframe document is picked up again',
+    repinned.textContent === '第12章 Nhập môn', JSON.stringify(repinned.textContent));
 }
 
 async function testReaderTts() {

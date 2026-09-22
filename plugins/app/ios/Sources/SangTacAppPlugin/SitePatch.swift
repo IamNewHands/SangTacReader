@@ -1488,12 +1488,16 @@ enum SitePatch {
             }, 100);
         }
 
+        // `store.data` starts empty and is filled by the site's own async
+        // store.load(); wait for it, but do not keep a 200ms timer alive for a
+        // minute when the user has simply never downloaded a book.
         var warmAttempts = 0;
         var warmTimer = setInterval(function () {
             warmAttempts++;
             var app = window.app;
             var store = app && app.offlineBook && app.offlineBook.store;
-            if ((store && store.data && store.data.length) || warmAttempts > 300) {
+            var loaded = !!(store && store.data && store.data.length);
+            if (loaded || warmAttempts > 25) {
                 clearInterval(warmTimer);
                 warmBookInfo();
             }
