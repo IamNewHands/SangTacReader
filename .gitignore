@@ -8,6 +8,7 @@ xcuserdata/
 # Capacitor / Node
 node_modules/
 .capacitor/
+dist-ipa/
 # ios/ 平台目录由 macOS 上的 `npx cap add ios` 生成（Windows 生成会写坏
 # CapApp-SPM/Package.swift 的路径），因此不入库。
 ios/App/build/

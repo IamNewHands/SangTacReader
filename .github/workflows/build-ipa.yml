@@ -27,6 +27,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
 
+    # 发布滚动 Release 需要写权限（默认 GITHUB_TOKEN 只有读权限）。
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -163,6 +167,39 @@ jobs:
           name: SangTacReader-unsigned
           path: SangTacReader-unsigned.ipa
           if-no-files-found: error
+
+      # 滚动 Release：tag 固定为 latest、资产名固定为 SangTacReader-unsigned.ipa，
+      # 于是下载地址长期稳定，可直接填进 SideStore / LiveContainer 的源：
+      #   https://github.com/IamNewHands/SangTacReader/releases/latest/download/SangTacReader-unsigned.ipa
+      # 每次构建先删旧 release 再建（--cleanup-tag），这样 tag 会跟着移动到最新提交。
+      - name: Publish rolling release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          asset=SangTacReader-unsigned.ipa
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/latest/download/$asset"
+          notes="$(mktemp)"
+          cat > "$notes" <<EOF
+          **未签名 IPA**，需在设备上用 SideStore / LiveContainer / SideInstaller
+          以你自己的 Apple ID 本地签名后安装（仓库不含任何证书或描述文件）。
+
+          - 提交：\`${GITHUB_SHA:0:7}\`
+          - 构建：[#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+          - 内容：Capacitor iOS 工程（远程加载站点 + 自定义 Http/App/WebNativeView 插件）
+          - 架构与证据链：docs/capacitor-port.md
+
+          **稳定下载地址**（每次构建覆盖同一个文件）：
+          $url
+          EOF
+          echo "=== release notes ==="; cat "$notes"
+          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create latest "$asset" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SangTacReader iOS（未签名最新构建）" \
+            --notes-file "$notes" \
+            --latest
 
       - name: Upload build log on failure
         if: failure()
