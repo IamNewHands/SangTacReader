@@ -462,7 +462,9 @@ ${data.patterns
         var name = chineseChapterName(vietnamese, map[cid]);
         if (!name) { return; }
         if (view && view.cdata) { view.cdata.chaptername = name; }
-        var nodes = document.querySelectorAll('.chaptername');
+        // Scoped to the reader page: .chaptername is the bottom bar there, and
+        // an unscoped query could catch an unrelated element.
+        var nodes = document.querySelectorAll('#chapterview .chaptername');
         for (var i = 0; i < nodes.length; i++) { nodes[i].textContent = name; }
         try {
             var list = display.innerWindow.q('.chapternamefixed');

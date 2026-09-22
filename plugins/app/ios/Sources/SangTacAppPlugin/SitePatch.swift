@@ -1584,17 +1584,6 @@ enum SitePatch {
                 }, 500);
                 return result;
             };
-            if (app.reader && typeof app.reader.loadChapterDisplay === 'function'
-                && !app.reader.__stvTtsAliveWrapped) {
-                // Re-entering the reader clears the latch so the next exit stops
-                // again.
-                app.reader.__stvTtsAliveWrapped = true;
-                var originalLoadAlive = app.reader.loadChapterDisplay;
-                app.reader.loadChapterDisplay = function () {
-                    if (window.app && window.app.tts) { window.app.tts.__stvStoppedFor = false; }
-                    return originalLoadAlive.apply(this, arguments);
-                };
-            }
             return true;
         }
 
@@ -1641,6 +1630,9 @@ enum SitePatch {
 
             var originalStart = app.tts.start;
             app.tts.start = function () {
+                // Playing again clears the "already stopped for this reader"
+                // latch that app.popPage set.
+                this.__stvStoppedFor = false;
                 var display = currentDisplay();
                 patchDisplay(display);
                 ensureSpeaker(display);
