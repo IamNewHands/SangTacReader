@@ -1,58 +1,52 @@
-# SangTacReader — sangtacviet.vip 轻量阅读器（iOS）
+# SangTacReader — sangtacviet 的非官方 iOS 客户端
 
-一个极简的 iOS 阅读器：用 WKWebView 打开 sangtacviet.vip，并注入「阅读模式」脚本
-（自动加载章节正文、隐藏广告、优化排版、夜间模式、底部导航），免费自签安装。
+与安卓版**同构**的 iOS 客户端：Capacitor 应用，`server.url` 远程加载
+`sangtacviet.com/app.v2.php`，并补齐站点前端依赖的原生插件，使站点走
+「app 模式」——这正是安卓版拿到完整阅读体验的原因。
 
-> 官方目前无 iOS 版（只有安卓 APK）。本项目自行封装官网阅读页，**不逆向正文 API**，
-> 尊重官网反爬设计。若官网改版导致脚本失效，改 `reader.js` 即可。
+> 官方只发布安卓 APK。本项目自行封装，仅供个人学习使用。
+> 架构与证据链见 [`docs/capacitor-port.md`](docs/capacitor-port.md)。
 
-## 功能
-- ✅ 打开即进官网（已设为手机 UA）
-- ✅ 自动点掉「加载章节」按钮（正文一次加载好）
-- ✅ 阅读排版：宽 720 / 字号 19 / 行高 1.9 / 段首缩进 / 图片自适应
-- ✅ 隐藏广告、侧栏、页脚、弹窗
-- ✅ 夜间模式自动跟随系统
-- ✅ 底部「目录 / ↑」导航栏
+## 为什么不是「WKWebView + 注入脚本」
+
+早期版本是纯 WKWebView 套壳，效果很差。原因不是「iOS 没有 Capacitor」，而是：
+
+| | 安卓版 | 旧 iOS 版 |
+|---|---|---|
+| 运行时 | Capacitor 应用 | 纯 WKWebView |
+| 站点判定 | `window.Capacitor` 存在 → **app 模式** | 无 → **web 模式** |
+| 数据请求 | 原生网络栈（`Capacitor.Plugins.Http`） | 网页 XHR，撞 Cloudflare / 设备判定 |
+| 结果 | 正文 `code:0` | 正文 `code:7`，体验差 |
 
 ## 目录结构
+
 ```
 SangTacReader/
-├── SangTacReader.xcodeproj      # Xcode 工程
-├── SangTacReader/
-│   ├── AppDelegate.swift
-│   ├── WebViewController.swift  # WKWebView + 注入 reader.js
-│   ├── Info.plist
-│   ├── LaunchScreen.storyboard
-│   └── Assets.xcassets
-└── Resources/InjectScripts/
-    └── reader.js                # ★ 阅读模式核心脚本，可自行调试
+├── capacitor.config.json        # 照抄安卓 APK 的配置（server.url 远程加载）
+├── package.json                 # Capacitor 8 依赖 + 三个本地插件
+├── dist/index.html              # 仅占位（webDir 在 server.url 模式下不使用）
+├── plugins/
+│   ├── http/                    # 原生 URLSession 版 Http（含 WKWebView cookie 桥接）
+│   ├── app/                     # App 插件 + 安卓版自定义的 SyncCookie
+│   └── webnativeview/           # 安卓反射桥的 iOS 占位（仅漫画模块）
+├── docs/capacitor-port.md       # ★ 迁移档案：证据链、决策、缺口
+├── .github/workflows/build-ipa.yml  # macOS 上构建未签名 IPA
+└── SangTacReader.xcodeproj/     # 旧 WKWebView 工程，待新构建验证后退役
 ```
 
-## 如何在 iPhone 上安装（免费，需自签）
+`ios/` **不入库**：必须由 macOS 上的 `npx cap add ios` 生成（Windows 会把反斜杠
+路径写进 `CapApp-SPM/Package.swift`，macOS 的 SwiftPM 无法解析）。
 
-iOS 无法像安卓那样直接装，需要先在你的电脑上**签名**一次。任选一种：
+## 构建与安装
 
-### 方式 A：AltStore（推荐，自动续签）
-1. Mac 或 Windows 上安装 **AltServer**：https://altstore.io
-2. iPhone 连接同一 Wi-Fi，用数据线连电脑
-3. 电脑上 `open -a AltServer`（Mac），然后 iPhone 上从
-   Tools 触发 AltStore 安装（或直接 `altinstall`）
-4. 电脑上用 Xcode 或命令行把本项目构建成 .ipa：
-   `xcodebuild -project SangTacReader.xcodeproj -scheme SangTacReader -archivePath build -archive` 然后导出 .ipa
-5. 把 .ipa 通过 AltStore 安装到 iPhone
-   （AltStore 会要求你的 Apple ID，7 天自动重签）
+1. 推送后由 GitHub Actions（`macos-26`）自动构建**未签名** IPA，产物名
+   `SangTacReader-unsigned.ipa`。
+2. 下载后由设备端签名安装（SideStore / LiveContainer / SideInstaller，用你自己的
+   Apple ID；仓库不需要任何证书或描述文件）。
 
-### 方式 B：Sideloadly（Windows / Mac）
-1. 下载 **Sideloadly**：https://sideloadly.io
-2. 电脑上装好本项目编译出的 .ipa
-3. iPhone 连电脑，用 Sideloadly 把 .ipa + 你的 Apple ID 拖进去安装
-   （免费 Apple ID 7 天续签一次；可开启 app 内自动刷新）
-
-### 需要
-- 一台电脑（Mac 或 Windows）
-- 一个免费 Apple ID（自签用，不收费）
-- Xcode（Mac 上构建 .ipa 用）
+本机（Windows）无法编译 Swift，任何 Swift 改动都必须等 CI 结果验证。
 
 ## 说明 / 免责
-- 本项目仅供个人学习使用，数据与版权归 sangtacviet.vip 所有，请勿用于商用。
-- 图标为占位，如需自定义替换 `Assets.xcassets/AppIcon.appiconset` 内的 1024x1024 图。
+
+- 本项目仅供个人学习使用，数据与版权归 sangtacviet 所有，请勿用于商用。
+- 图标为占位，如需自定义替换 AppIcon 资源内的 1024x1024 图。
