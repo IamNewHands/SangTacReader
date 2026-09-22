@@ -117,6 +117,9 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
 
         let timeout = SangTacHttpPlugin.timeoutSeconds(from: call)
         let jsCookieHeader = headers.first { $0.key.lowercased() == "cookie" }?.value
+        // Resolve the Referer fallback here, on the calling (main) thread, so we
+        // never touch bridge.webView from a cookie-store callback queue.
+        let refererFallback = pageReferer(for: url)
 
         nativeCookies(for: url) { [weak self] cookies in
             guard let self = self else { return }
@@ -127,8 +130,8 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             // Implicit browser headers the site relies on (the read endpoints
             // require a same-site Referer; URLSession does not add one).
-            if headers["Referer"] == nil, headers["referer"] == nil {
-                headers["Referer"] = self.pageReferer(for: url)
+            if headers["Referer"] == nil, headers["referer"] == nil, !refererFallback.isEmpty {
+                headers["Referer"] = refererFallback
             }
             if headers["User-Agent"] == nil, headers["user-agent"] == nil {
                 headers["User-Agent"] = SangTacHttpPlugin.defaultUserAgent
@@ -237,9 +240,20 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
 
     /// The site passes `timeout` (ms) on its /warp.php probes; the Capacitor
     /// plugin API also has connectTimeout / readTimeout. Accept all three.
+    /// Read the raw option rather than relying on a typed accessor so a
+    /// non-numeric value can never trap.
     private static func timeoutSeconds(from call: CAPPluginCall) -> TimeInterval {
         for key in ["timeout", "readTimeout", "connectTimeout"] {
-            if let ms = call.getDouble(key), ms > 0 {
+            guard let raw = call.options[key], !(raw is NSNull) else { continue }
+            let ms: Double?
+            if let number = raw as? NSNumber {
+                ms = number.doubleValue
+            } else if let text = raw as? String {
+                ms = Double(text)
+            } else {
+                ms = nil
+            }
+            if let ms = ms, ms > 0 {
                 return max(ms / 1000.0, 1.0)
             }
         }
