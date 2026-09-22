@@ -112,6 +112,13 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Core request path
 
     private func perform(_ method: String, _ call: CAPPluginCall) {
+        // Wall-clock cost of everything this plugin owns: cookie-store read,
+        // request build, network round trip. The site's own book-list/reader
+        // calls were reported as "very slow"; without this number there is no
+        // way to tell a slow server from slow JS in the web view.
+        let started = Date()
+        func elapsedMs() -> Int { Int(Date().timeIntervalSince(started) * 1000) }
+
         guard var urlString = call.getString("url"), !urlString.isEmpty else {
             call.reject("Missing 'url'")
             return
@@ -171,7 +178,8 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                 if let error = error {
                     let message = error.localizedDescription
                     self.callLog("err", "\(method) \(url.absoluteString) -> \(message)")
-                    self.report("ERR", "\(method) \(url.absoluteString) \(message)")
+                    self.report("ERR", "\(method) \(url.absoluteString) FAILED in "
+                        + "\(elapsedMs())ms: \(message)")
                     call.reject(message, nil, error)
                     return
                 }
@@ -212,7 +220,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                 let tag = http.statusCode >= 500 ? "ERR" : "Http"
                 self.report(tag, "\(method) \(url.absoluteString) -> \(http.statusCode) "
                     + "\(contentType.isEmpty ? "no-content-type" : contentType) "
-                    + "\(payload.kind) \(body.count)b "
+                    + "\(payload.kind) \(body.count)b in \(elapsedMs())ms "
                     + SangTacHttpPlugin.preview(payload: payload, body: body))
                 call.resolve(result)
             }.resume()

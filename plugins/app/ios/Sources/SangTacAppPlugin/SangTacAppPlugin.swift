@@ -1,5 +1,6 @@
 import Foundation
 import Capacitor
+import Security
 import UIKit
 import WebKit
 
@@ -39,7 +40,10 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "speak", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "speakToFile", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopSpeech", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getVoices", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getVoices", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getSafeArea", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "settingsSave", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "settingsRestore", returnType: CAPPluginReturnPromise)
     ]
 
     private var observers: [NSObjectProtocol] = []
@@ -235,6 +239,101 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         if let number = raw as? NSNumber { return number.doubleValue }
         if let text = raw as? String, let parsed = Double(text) { return parsed }
         return fallback
+    }
+
+    // MARK: - Safe area
+
+    /**
+     The site derives its own safe-area variables from `env(safe-area-inset-*)`,
+     but only inside `window.onresize`, which `overlayStatusBar(true)` schedules.
+     Hand the real insets to the `safeArea` site patch so it can fill in whatever
+     the site leaves at 0 -- without them the reader's overlay title bar sits
+     under the Dynamic Island and its buttons cannot be tapped.
+     */
+    @objc func getSafeArea(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            var insets = UIEdgeInsets.zero
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            let window = scenes.flatMap { $0.windows }.first { $0.isKeyWindow }
+                ?? scenes.first?.windows.first
+            if let window = window {
+                insets = window.safeAreaInsets
+            }
+            call.resolve([
+                "top": Double(insets.top),
+                "bottom": Double(insets.bottom),
+                "left": Double(insets.left),
+                "right": Double(insets.right)
+            ])
+        }
+    }
+
+    // MARK: - Settings backup
+
+    /**
+     The site stores its configuration in localStorage, which lives in the app's
+     data container and is therefore erased by every reinstall of a sideloaded
+     IPA. Keychain items are not removed when an app is deleted, so they are the
+     only device-local store that survives; the `settingsBackup` site patch
+     mirrors `config.reader` / `config.ux` / `config.comicReader` / `tts.setting`
+     here and writes them back before the site reads its config.
+     */
+    private static let settingsService = "com.sangtacviet.mobilereader.settings"
+
+    @objc func settingsSave(_ call: CAPPluginCall) {
+        guard let key = call.getString("key"), !key.isEmpty,
+              let value = call.getString("value") else {
+            call.reject("Missing 'key' or 'value'")
+            return
+        }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: SangTacAppPlugin.settingsService,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
+        var insert = query
+        insert[kSecValueData as String] = Data(value.utf8)
+        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let status = SecItemAdd(insert as CFDictionary, nil)
+        if status == errSecSuccess {
+            call.resolve(["value": true, "bytes": value.count])
+        } else {
+            // Sideloaded builds can lack the keychain entitlement; the patch
+            // treats this as "no backup" rather than breaking the setting.
+            CAPLog.print("[SangTacApp:settings] keychain write failed for \(key): \(status)")
+            call.reject("keychain write failed (\(status))")
+        }
+    }
+
+    /**
+     Returns every backed-up key. The patch filters by key on the JS side so a
+     dynamic key (`reader.style.<name>`) needs no bookkeeping here.
+     */
+    @objc func settingsRestore(_ call: CAPPluginCall) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: SangTacAppPlugin.settingsService,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true
+        ]
+        var items: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &items)
+        guard status == errSecSuccess, let list = items as? [[String: Any]] else {
+            CAPLog.print("[SangTacApp:settings] no keychain backup yet (status \(status))")
+            call.resolve(["entries": [:]])
+            return
+        }
+        var entries: [String: String] = [:]
+        for item in list {
+            guard let account = item[kSecAttrAccount as String] as? String,
+                  let data = item[kSecValueData as String] as? Data,
+                  let text = String(data: data, encoding: .utf8) else { continue }
+            entries[account] = text
+        }
+        CAPLog.print("[SangTacApp:settings] \(entries.count) key(s) found in keychain")
+        call.resolve(["entries": entries])
     }
 
     // MARK: - Diagnostics

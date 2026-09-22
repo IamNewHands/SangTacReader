@@ -35,6 +35,9 @@ const REQUIRED_MARKERS = [
   'window.__stvTtsProviderInstalled',
   'window.__stvI18nInstalled',
   'window.__stvFollowFallbackInstalled',
+  'window.__stvSafeAreaInstalled',
+  'window.__stvSettingsBackupInstalled',
+  'window.__stvBookmarkToggleInstalled',
   'pageflip',
 ];
 

@@ -169,7 +169,8 @@ jobs:
             exit 1
           fi
           # 阅读翻页默认值 + 原生 TTS provider 注册同样要在产物里。
-          for marker in stvReaderDefaultsInstalled stvTtsProviderInstalled stvI18nInstalled; do
+          for marker in stvReaderDefaultsInstalled stvTtsProviderInstalled stvI18nInstalled \
+                        stvSafeAreaInstalled stvSettingsBackupInstalled stvBookmarkToggleInstalled; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
@@ -184,6 +185,15 @@ jobs:
             echo "::error::原生 TTS 桥接方法缺失（speakToFile 不在二进制里）"
             exit 1
           fi
+          # 安全区与设置备份的原生桥接方法名同样要在产物里。
+          for marker in getSafeArea settingsRestore settingsSave; do
+            if grep -q -F "$marker" "$syms.strings"; then
+              echo "✓ $marker 已编入产物"
+            else
+              echo "::error::$marker 缺失"
+              exit 1
+            fi
+          done
 
       - name: Package IPA
         run: |

@@ -293,4 +293,96 @@ async getVoices()            -> [{name, value, gender}]
 
 每次尝试、解析到的 voice identifier、buffer 回调次数、最终字节数都通过 `SangTacAppPlugin.report()` 同步进**页面面板**（`window.__stvDiag`）——侧载包没有可读的控制台，而站点自己的报错（`Không tìm thấy blob`）完全不说明原因。
 
+### 6.5 第四轮真机反馈（2026-09-22 晚）
+
+日志 `日志2.txt`（278 行）。五项。
+
+#### (1) 覆盖安装后设置全恢复默认 —— 容器被换掉了，不是补丁写坏的
+
+站点的配置存在 **localStorage** 里，链路是：
+
+```
+app.config.saveReaderSetting()  ->  app.storage.cache.setFile('config.reader', …)
+app.storage.cache.setFile       ->  app.storage.set
+app.storage.set                 ->  localStorage.setItem
+```
+
+（`app.v2.config.js:100-111`、`app.v2.js:551-586`。`CapacitorSQLite` 不在 iOS 依赖里，所以走的就是 localStorage 那条分支。）
+
+侧载包每次重装都会拿到**全新的数据容器**，localStorage 是空的，于是 `$.extend({}, readerDefault, loadedReaderSetting)` 里的 `loadedReaderSetting` 就是 `{}`。日志也印证了：本次启动 `[PATCH] reader display_type auto -> pageflip` —— `auto` 就是默认值，说明读回来的配置是空的。
+
+修法：**iOS Keychain 不随 App 删除而清除**，把配置镜像进去。新增 `settingsBackup` 站点补丁 + `SangTacAppPlugin.settingsSave/settingsRestore`：
+
+- 包装 `app.storage.set`（**唯一漏斗**，`cache.set` / `cache.setFile` / `save*Setting` 全部经过它），对 `config.reader`、`config.ux`、`config.comicReader`、`tts.setting`、`readthemeset` 以及动态前缀 `reader.style.*` 做镜像；
+- document start 时调 `settingsRestore({})`，把 Keychain 里的值写回 localStorage（**只在 localStorage 缺该键时写**，绝不覆盖本次已存在的值）；
+- 时机是安全的：站点要等 `onDbLoad.waitForLoad()` 才读配置（本次日志里我们 20:04:20 注入、`db loaded` 在 20:04:24），异步的 Keychain 读取毫秒级返回，一定先落地；
+- Keychain 写失败（侧载包可能缺 entitlement，`errSecMissingEntitlement`）只是记一条日志，不影响设置本身。
+
+注意：**这一次重装仍然是默认值**（备份是空的），需要用户重新设一次；从下一个版本开始才会自动恢复。
+
+#### (2) TTS 仍报 no voice —— 原生已经成功，是 shim 把返回值认错了
+
+这一轮的日志把根因钉死了：
+
+```
+20:07:10 [TTS] speakToFile 47 chars voice=com.apple.voice.compact.vi-VN.Linh
+20:07:11 [TTS] audio session active (playback/default/mixWithOthers)
+20:07:11 [TTS] attempt 1/3 [own-session+voice] voice=com.apple.voice.compact.vi-VN.Linh
+20:07:11 [TTS] attempt 1 ok: 152238 bytes
+20:07:11 [TTS] synthesised 152238 bytes
+20:07:11 [LOG] iOS TTS returned no audio        <- 站点侧，来自我们的 shim
+20:07:11 [LOG] Không tìm thấy blob
+```
+
+**原生合成一次成功，152238 字节**，上一轮的三种配置重试根本没用到。失败在 shim：`SangTacAppPlugin.speakToFile` resolve 的是 `{data: <base64>, mime: 'audio/wav'}`（对象），而 `IosTts.prototype.speak` 写的是 `typeof encoded !== 'string'` → 直接抛 `iOS TTS returned no audio`。
+
+契约对不上是因为两边各取一半：`cordova-plugin-tts-advanced` 的 `speakToFile` 把原生返回值原样 resolve，而站点 `_dl_stv.tts.js:743-744` 做的是 `new Blob([await TTS.speakToFile(param)])`。**shim 就是这两者的适配层**，所以修在 shim：接受 `{data}` 与裸字符串两种形状，统一转成 Blob。`speak()` 的契约（返回 Blob）不变。
+
+#### (3) 搜索/最新更新/排行/目录/正文都慢 —— 先测出时间花在哪，再改
+
+日志里的耗时是**跳变**的：同一个 `searchBooks` 端点，`20:07:43 → 20:07:50` 用了 7 秒（79 KB），紧接着 `20:07:50 → 20:07:51` 只用 1 秒（70 KB）；`grantcontext/context` 864 KB 用了 6 秒。没有一条 `[ERR]`、没有超时重试痕迹。
+
+本机无法复现测量（`sangtacviet.com` 从这台机器直接 TLS 被重置），所以**不猜**：给 `SangTacHttpPlugin` 的每条上报加了墙钟耗时，并给失败路径补了上报行：
+
+```
+[Http] GET <url> -> 200 application/json json 78926b in 120ms {…}
+[ERR]  GET <url> FAILED in 10021ms: The request timed out.
+```
+
+下一份日志就能一眼分开「服务端慢」和「WebView 里 JS/渲染慢」。如果 `in` 很小但用户仍觉得久等，问题在站点自己的 `checkDomains()`（启动时并行探测 3 个域名，每个 5s 超时）或渲染，而不是网络层。
+
+#### (4) 灵动岛没适配，顶部按钮点不到、底部多一行空白
+
+站点自己**有**安全区模型，但只覆盖它自己画的那几条栏：
+
+- `.titlebar` / `body[ovlwv] .titlebar` 有 `padding-top: var(--status-bar-height)`；
+- `.bottombar` 有 `padding-bottom: var(--screensafebottom)`（`box-sizing: content-box`，背景会一起长下去）。
+
+漏掉的是阅读器那两个浮层（`app.v2.css:959-1005`）：
+
+```css
+#chapterview .titlebar { position: fixed; top: var(--ntitlebarovl); height: 40px; }  /* 无 status-bar padding */
+#chapterview.showmenu .titlebar { top: 0; }                                          /* 展开后就在 y=0 */
+#chapterview .coption { position: fixed; bottom: 0; padding: 12px; }                 /* 无 screensafebottom */
+```
+
+`contentInset: "never"` + `viewport-fit=cover` 让 WebView 全屏出血，没有别的东西补偿，于是**阅读器顶栏展开后正好压在灵动岛下面（顶栏左右按钮点不到）**，底部选项面板则顶到 Home Indicator。
+
+新增 `safeArea` 站点补丁 + `SangTacAppPlugin.getSafeArea()`：
+
+- 注入 `#chapterview .titlebar{padding-top:var(--status-bar-height) !important;height:auto !important}`（隐藏态的 `top: var(--ntitlebarovl)` = `-(62+45)` = −107px 仍大于展开后的 102px，不影响滑入滑出动画）和 `#chapterview .coption{padding-bottom:calc(12px + var(--screensafebottom))}`；
+- 值来自**原生 `window.safeAreaInsets`**，不依赖 `env(safe-area-inset-*)`：站点那两个变量只在 `window.onresize` 里写，而 `onresize` 只由 `overlayStatusBar(true)` 调度，任何一环断了就是 0；
+- 只在**站点没给出值（≤0）时**才补，站点自己算出来的值（本次日志 `detect status bar height: 62`）一律不覆盖；
+- 顺带幂等补上 `viewport-fit=cover`（站点只在 `setOverlaysWebView` 成功后才加）。
+
+#### (5) 书签点不掉 —— 站点客户端根本没有「取消书签」这条路
+
+`app.api.bookmark`（`app.v2.js:4831-4847`）**只**调 `ajax=addbookmark`；把 `app.v2.js` 里所有 `ajax=` 动作列一遍，没有 un-bookmark（点赞反倒有配对的 `ajax=unlike`）。所以已收藏的书再点一次就是**重新添加**，安卓同样如此。
+
+新增 `bookmarkToggle` 补丁，把按钮做成真正的开关：
+
+- 站点用 `querybookmarkstatus` 的结果给按钮加 `.active`（`app.v2.js:4946-4954`），所以「是否已收藏」直接读 `.btnbookmark.active`，不用额外请求；
+- 已收藏时按顺序试 `unbookmark` / `removebookmark` / `delbookmark` / `deletebookmark`（`POST /mobile/jsonify.php`，和 `unlike` 同一形状），**第一个回 `code 100` 的生效**，并清掉 `.active`；
+- 每个候选的返回都写进面板（`[BOOKMARK] unbookmark -> {"code":…}`），所以真机上点一次就能知道服务端到底有没有这个接口，而不是继续猜。
+
 

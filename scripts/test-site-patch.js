@@ -15,6 +15,13 @@
  *   - an untouched reader display_type is seeded to "pageflip", while a value the
  *     user already chose is left alone
  *   - the diagnostics panel builds without throwing and buffers lines
+ *   - the safe-area patch fills in `--status-bar-height` / `--screensafebottom`
+ *     from the native insets, pads the reader's overlay title bar, and leaves a
+ *     value the site already produced alone
+ *   - the settings backup writes keychain entries back into localStorage, keeps
+ *     an existing localStorage value, and mirrors `app.storage.set` writes
+ *   - the bookmark button cancels (probing removal actions) instead of re-adding
+ *     when the book is already bookmarked
  *
  * Run: node scripts/test-site-patch.js
  */
@@ -47,6 +54,22 @@ function loadBlocks() {
 
 // ---------------------------------------------------------------- DOM stub
 
+function makeStyle() {
+  // A plain object that also answers setProperty/getPropertyValue, because the
+  // safe-area patch writes and reads CSS custom properties on :root.
+  return {
+    setProperty(name, value) {
+      this[name] = String(value);
+    },
+    getPropertyValue(name) {
+      return this[name] === undefined ? '' : String(this[name]);
+    },
+    removeProperty(name) {
+      delete this[name];
+    },
+  };
+}
+
 function makeElement(tagName) {
   const element = {
     nodeType: 1,
@@ -57,7 +80,7 @@ function makeElement(tagName) {
     nodeValue: null,
     parentNode: null,
     children: [],
-    style: {},
+    style: makeStyle(),
     attributes: {},
     setAttribute(name, value) {
       this.attributes[name] = value;
@@ -165,14 +188,39 @@ function makeContainer(tagName, className, text) {
 
 function makeSandbox() {
   const body = makeElement('body');
+  const head = makeElement('head');
   const documentElement = makeElement('html');
+  documentElement.appendChild(head);
   documentElement.appendChild(body);
+
+  const byId = (id) => {
+    let found = null;
+    const visit = (node) => {
+      if (found) { return; }
+      if (node.id === id) { found = node; return; }
+      for (const child of node.children || []) { visit(child); }
+    };
+    visit(documentElement);
+    return found;
+  };
+
+  const store = {};
+  const localStorage = {
+    getItem: (key) => (Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null),
+    setItem: (key, value) => { store[key] = String(value); },
+    removeItem: (key) => { delete store[key]; },
+    keys: () => Object.keys(store),
+  };
+
   const document = {
     body,
+    head,
     documentElement,
     createElement: (tag) => makeElement(tag),
     addEventListener() {},
     removeEventListener() {},
+    getElementById: byId,
+    querySelectorAll: (selector) => documentElement.querySelectorAll(selector),
     elementFromPoint() {
       return null;
     },
@@ -185,12 +233,18 @@ function makeSandbox() {
     innerWidth: 400,
     addEventListener() {},
     removeEventListener() {},
+    getComputedStyle: (element) => ({
+      getPropertyValue: (name) => (element.style && element.style.getPropertyValue
+        ? element.style.getPropertyValue(name)
+        : ''),
+    }),
   };
   window.window = window;
 
   const sandbox = {
     window,
     document,
+    localStorage,
     navigator: { userAgent: 'node-test' },
     console: { log() {}, warn() {}, error() {} },
     setTimeout,
@@ -203,6 +257,7 @@ function makeSandbox() {
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
+  sandbox.__dom = { byId, store, head };
   return sandbox;
 }
 
@@ -211,6 +266,8 @@ function makeSandbox() {
 function installFakeApp(sandbox, options) {
   const calls = [];
   const stored = {};
+  const keychain = Object.assign({}, options.keychain || {});
+  const posts = [];
 
   const setting = {
     provider: options.provider || 'bing',
@@ -228,11 +285,17 @@ function installFakeApp(sandbox, options) {
       reader: {},
     },
     storage: {
+      set(key, value) {
+        stored[key] = value;
+        return Promise.resolve();
+      },
       cache: {
         getFile() {
           return Promise.resolve(options.storedTtsSetting || '');
         },
-        setFile() {},
+        setFile(key, value) {
+          return app.storage.set(key, value);
+        },
       },
     },
     tts: {
@@ -243,6 +306,23 @@ function installFakeApp(sandbox, options) {
           { name: 'Zalo AI', value: 'zalo' },
         ];
       },
+    },
+    api: {
+      bookmark(bookdata) {
+        stored.bookmarkAdds = (stored.bookmarkAdds || 0) + 1;
+        return Promise.resolve({ code: 100, bookdata: bookdata });
+      },
+    },
+    net: {
+      post(url, body) {
+        posts.push({ url, body });
+        const action = String(body).replace('ajax=', '').split('&')[0];
+        const ok = options.bookmarkRemoval === action;
+        return Promise.resolve(ok ? { code: 100 } : { code: 101 });
+      },
+    },
+    toast(message) {
+      stored.toasts = (stored.toasts || []).concat([message]);
     },
   };
   app.config.reader.__defineSetter__('display_type', function (value) {
@@ -257,13 +337,19 @@ function installFakeApp(sandbox, options) {
   sandbox.window.app = app;
   sandbox.__calls = calls;
   sandbox.__stored = stored;
+  sandbox.__posts = posts;
+  sandbox.__keychain = keychain;
 
   sandbox.Capacitor = {
     Plugins: {
       App: {
         speakToFile(payload) {
           calls.push(payload);
-          return Promise.resolve(Buffer.from('RIFFfakewav').toString('base64'));
+          // The real plugin resolves an object, not a bare string.
+          return Promise.resolve({
+            data: Buffer.from('RIFFfakewav').toString('base64'),
+            mime: 'audio/wav',
+          });
         },
         getVoices() {
           return Promise.resolve({
@@ -274,6 +360,16 @@ function installFakeApp(sandbox, options) {
         },
         stopSpeech() {
           return Promise.resolve({ value: true });
+        },
+        getSafeArea() {
+          return Promise.resolve(options.safeArea || { top: 62, bottom: 34, left: 0, right: 0 });
+        },
+        settingsSave(payload) {
+          keychain[payload.key] = payload.value;
+          return Promise.resolve({ value: true });
+        },
+        settingsRestore() {
+          return Promise.resolve({ entries: Object.assign({}, keychain) });
         },
       },
     },
@@ -308,8 +404,12 @@ async function testCompatAndTtsProvider() {
     'the site guards this call with if (TTS.updateMediaSession)'
   );
 
-  const base64 = await sandbox.window.TTS.speakToFile({ text: 'Xin chào', identifier: 'v', rate: 1, pitch: 1 });
-  check('speakToFile returns base64 through Capacitor.Plugins.App', typeof base64 === 'string' && base64.length > 0);
+  const raw = await sandbox.window.TTS.speakToFile({ text: 'Xin chào', identifier: 'v', rate: 1, pitch: 1 });
+  check(
+    'speakToFile reaches Capacitor.Plugins.App',
+    !!raw && typeof raw === 'object' && typeof raw.data === 'string' && raw.data.length > 0,
+    'SangTacAppPlugin resolves { data, mime }, not a bare base64 string'
+  );
   check('speakToFile forwarded the text', sandbox.__calls[0] && sandbox.__calls[0].text === 'Xin chào');
 
   // The provider registration polls; give it a tick.
@@ -322,7 +422,8 @@ async function testCompatAndTtsProvider() {
   check('provider exposes props', !!provider.props && !!provider.props.voice);
 
   const blob = await provider.speak('Xin chào', { voice: 'v', rate: 1.2 });
-  check('provider.speak returns a Blob', !!blob && typeof blob.size === 'number' && blob.size > 0);
+  check('provider.speak returns a Blob', !!blob && typeof blob.size === 'number' && blob.size > 0,
+    'regression: the shim used to reject the plugin object as "no audio"');
   check('provider.speak asks for audio/wav', !!blob && blob.type === 'audio/wav');
 
   const voices = await provider.getVoices();
@@ -459,12 +560,137 @@ async function testI18nOverlay() {
     JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('Thứ tự chương')));
 }
 
+async function testSafeArea() {
+  console.log('iOS safe area');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  const meta = makeElement('meta');
+  meta.id = 'metaviewport';
+  meta.setAttribute('content', 'width=device-width, initial-scale=1, user-scalable=no');
+  sandbox.document.head.appendChild(meta);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  const root = sandbox.document.documentElement;
+  check('status bar height filled in from the native safe area',
+    root.style.getPropertyValue('--status-bar-height') === '62px',
+    root.style.getPropertyValue('--status-bar-height'));
+  check('bottom safe area filled in',
+    root.style.getPropertyValue('--screensafebottom') === '34px',
+    root.style.getPropertyValue('--screensafebottom'));
+  check('viewport-fit added to the site viewport meta',
+    String(meta.getAttribute('content')).includes('viewport-fit=cover'),
+    String(meta.getAttribute('content')));
+  const style = sandbox.__dom.byId('stv-safe-area');
+  check('reader overlay title bar gets status-bar padding',
+    !!style && style.textContent.includes('#chapterview .titlebar'),
+    'without it the bar renders under the Dynamic Island');
+  check('reader option sheet gets bottom padding',
+    !!style && style.textContent.includes('#chapterview .coption'));
+}
+
+async function testSafeAreaRespectsSiteValues() {
+  console.log('iOS safe area keeps values the site already set');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  const root = sandbox.document.documentElement;
+  root.style.setProperty('--status-bar-height', '59px');
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  check('an existing status bar height is not overwritten',
+    root.style.getPropertyValue('--status-bar-height') === '59px',
+    root.style.getPropertyValue('--status-bar-height'));
+  check('a missing bottom inset is still filled in',
+    root.style.getPropertyValue('--screensafebottom') === '34px',
+    root.style.getPropertyValue('--screensafebottom'));
+}
+
+async function testSettingsBackup() {
+  console.log('settings backup across reinstalls');
+
+  const restore = makeSandbox();
+  installFakeApp(restore, {
+    displayType: 'auto',
+    keychain: {
+      'config.reader': '{"display_type":"pageflip","show_title":false}',
+      'reader.style.fontsize': '22px',
+      'some.other.key': 'not-a-setting',
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), restore);
+  await tick(250);
+  check('keychain value written back into localStorage',
+    restore.localStorage.getItem('config.reader') === '{"display_type":"pageflip","show_title":false}',
+    String(restore.localStorage.getItem('config.reader')));
+  check('dynamic reader.style.* keys are restored too',
+    restore.localStorage.getItem('reader.style.fontsize') === '22px',
+    String(restore.localStorage.getItem('reader.style.fontsize')));
+  check('an unrelated keychain key is ignored',
+    restore.localStorage.getItem('some.other.key') === null);
+
+  const existing = makeSandbox();
+  installFakeApp(existing, { displayType: 'auto', keychain: { 'config.reader': '{"a":1}' } });
+  existing.localStorage.setItem('config.reader', '{"b":2}');
+  vm.runInContext(loadBlocks().join('\n'), existing);
+  await tick(250);
+  check('an existing localStorage value wins over the backup',
+    existing.localStorage.getItem('config.reader') === '{"b":2}',
+    String(existing.localStorage.getItem('config.reader')));
+
+  const write = makeSandbox();
+  const app = installFakeApp(write, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), write);
+  await tick(250);
+  await app.storage.set('config.reader', '{"display_type":"pageflip"}');
+  await tick(50);
+  check('writes are mirrored to the keychain',
+    write.__keychain['config.reader'] === '{"display_type":"pageflip"}',
+    String(write.__keychain['config.reader']));
+  await app.storage.set('chaptercache.1', 'x');
+  await tick(50);
+  check('a cached chapter is not mirrored', write.__keychain['chaptercache.1'] === undefined);
+}
+
+async function testBookmarkToggle() {
+  console.log('bookmark cancel');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'auto', bookmarkRemoval: 'removebookmark' });
+  const button = makeContainer('button', 'btnbookmark active');
+  sandbox.document.body.appendChild(button);
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  await app.api.bookmark({ id: '42', host: 'fanqie' });
+  await tick(50);
+  const actions = sandbox.__posts.map((p) => String(p.body).split('&')[0].replace('ajax=', ''));
+  check('probing stops at the first action answering code 100',
+    actions.join(',') === 'unbookmark,removebookmark',
+    actions.join(',') || '(no probe was sent)');
+  check('the button stops showing as bookmarked', !button.classList.contains('active'));
+  check('the add path is not used while cancelling', !sandbox.__stored.bookmarkAdds);
+
+  const add = makeSandbox();
+  const addApp = installFakeApp(add, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), add);
+  await tick(250);
+  await addApp.api.bookmark({ id: '42', host: 'fanqie' });
+  await tick(50);
+  check('a book that is not bookmarked still goes through addbookmark',
+    add.__stored.bookmarkAdds === 1);
+  check('no removal probe without an active bookmark', add.__posts.length === 0);
+}
+
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
   await testReaderDefaults();
   await testDiagPanel();
   await testI18nOverlay();
+  await testSafeArea();
+  await testSafeAreaRespectsSiteValues();
+  await testSettingsBackup();
+  await testBookmarkToggle();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

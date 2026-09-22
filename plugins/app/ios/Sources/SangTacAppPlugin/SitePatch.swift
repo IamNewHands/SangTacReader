@@ -554,11 +554,19 @@ enum SitePatch {
             };
             if (merged.voice) { self.options.voice = merged.voice; }
             if (merged.rate) { self.options.rate = merged.rate; }
-            return window.TTS.speakToFile(param).then(function (encoded) {
+            return window.TTS.speakToFile(param).then(function (result) {
+                // SangTacAppPlugin.speakToFile resolves {data, mime}; Cordova's
+                // TTS.speakToFile resolves the payload itself. This shim is the
+                // adapter between the two, so accept either shape -- the site's
+                // provider does `new Blob([await TTS.speakToFile(...)])` and only
+                // ever sees a Blob.
+                var encoded = result;
+                if (result && typeof result === 'object') { encoded = result.data; }
                 if (typeof encoded !== 'string' || encoded.length === 0) {
-                    throw new Error('iOS TTS returned no audio');
+                    throw new Error('iOS TTS returned no audio (got '
+                        + (result === null ? 'null' : typeof result) + ')');
                 }
-                return base64ToBlob(encoded, 'audio/wav');
+                return base64ToBlob(encoded, (result && result.mime) || 'audio/wav');
             });
         };
 
@@ -747,8 +755,349 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - iOS safe area (Dynamic Island / home indicator)
+
+    /**
+     The site models the notch itself, but only for the chrome it draws: its
+     stylesheet pads `body[ovlwv] .titlebar` with `--status-bar-height` and
+     `.bottombar` with `--screensafebottom`. Two of its own surfaces are left out:
+
+         #chapterview .titlebar   position:fixed; top:0 when the menu opens,
+                                  height 40px, no status-bar padding -> the
+                                  reader's top bar renders under the Dynamic
+                                  Island, where its left/right buttons cannot be
+                                  tapped.
+         #chapterview .coption    position:fixed; bottom:0, no
+                                  --screensafebottom -> the reader's option
+                                  sheet runs into the home indicator.
+
+     With `contentInset: never` and `viewport-fit=cover` the web view is
+     full-bleed, so nothing else compensates. The insets come from the native
+     safe area (App.getSafeArea) rather than `env(safe-area-inset-*)` so the
+     patch still works if the site's own detection never runs -- its
+     `--status-bar-height` is written from `getSafeHeight()` inside
+     `window.onresize`, which is only ever scheduled by `overlayStatusBar(true)`.
+     */
+    static let safeArea = """
+    (function () {
+        if (window.__stvSafeAreaInstalled) { return; }
+        window.__stvSafeAreaInstalled = true;
+
+        var CSS = '#chapterview .titlebar{padding-top:var(--status-bar-height) !important;'
+            + 'height:auto !important;}'
+            + '#chapterview .coption{padding-bottom:calc(12px + var(--screensafebottom)) !important;}';
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function style() {
+            if (document.getElementById('stv-safe-area')) { return true; }
+            var head = document.head;
+            if (!head) { return false; }
+            var el = document.createElement('style');
+            el.id = 'stv-safe-area';
+            el.textContent = CSS;
+            head.appendChild(el);
+            return true;
+        }
+
+        function viewportFit() {
+            var meta = document.getElementById('metaviewport');
+            if (!meta) { return; }
+            var content = meta.getAttribute('content') || '';
+            if (content.indexOf('viewport-fit') >= 0) { return; }
+            meta.setAttribute('content', content + ', viewport-fit=cover');
+        }
+
+        function px(value) {
+            var n = parseFloat(value);
+            return isNaN(n) ? 0 : n;
+        }
+
+        var applied = null;
+
+        function apply(insets) {
+            if (!insets) { return; }
+            var root = document.documentElement;
+            if (!root) { return; }
+            var computed = window.getComputedStyle(root);
+            var top = px(computed.getPropertyValue('--status-bar-height'));
+            var bottom = px(computed.getPropertyValue('--screensafebottom'));
+            // Only fill in what the site failed to set; never fight a value it
+            // already produced (it re-derives both on every resize).
+            if (top <= 0 && insets.top > 0) {
+                root.style.setProperty('--status-bar-height', insets.top + 'px');
+            }
+            if (bottom <= 0 && insets.bottom > 0) {
+                root.style.setProperty('--screensafebottom', insets.bottom + 'px');
+            }
+            style();
+            viewportFit();
+            var key = insets.top + 'x' + insets.bottom;
+            if (applied !== key) {
+                applied = key;
+                note('SAFE', 'safe area top=' + insets.top + ' bottom=' + insets.bottom
+                    + ' | css status-bar-height='
+                    + root.style.getPropertyValue('--status-bar-height')
+                    + ' screensafebottom=' + root.style.getPropertyValue('--screensafebottom'));
+            }
+        }
+
+        function fetchInsets() {
+            var plugin = (window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App) || null;
+            if (!plugin || typeof plugin.getSafeArea !== 'function') { return false; }
+            plugin.getSafeArea({}).then(apply).catch(function (e) {
+                note('ERR', 'getSafeArea failed: ' + e);
+            });
+            return true;
+        }
+
+        function tick() {
+            style();
+            viewportFit();
+            fetchInsets();
+        }
+
+        // The site writes its own values about a second into boot and rewrites
+        // them on resize, so sample a handful of times rather than continuously.
+        var DELAYS = [0, 200, 600, 1200, 2500, 5000, 10000];
+        for (var i = 0; i < DELAYS.length; i++) { setTimeout(tick, DELAYS[i]); }
+        window.addEventListener('resize', fetchInsets);
+        window.addEventListener('orientationchange', fetchInsets);
+        document.addEventListener('DOMContentLoaded', tick);
+    })();
+    """
+
+    // MARK: - Settings backup across reinstalls
+
+    /**
+     The site persists every setting in localStorage:
+
+         app.config.saveReaderSetting() -> app.storage.cache.setFile('config.reader', ...)
+         app.storage.cache.setFile     -> app.storage.set
+         app.storage.set               -> localStorage.setItem
+
+     A sideloaded IPA gets reinstalled constantly (every build of this project),
+     and a reinstall hands the app a fresh data container, so localStorage is
+     empty and every reader/UX/TTS setting silently falls back to its default.
+     `app.storage.set` is the single funnel, so wrapping it is enough to mirror
+     the keys that hold the user's own configuration -- including the dynamic
+     `reader.style.<name>` font/size entries.
+
+     The iOS keychain is not deleted with the app, so it is the one place on the
+     device that survives a reinstall. The restore runs at document start; the
+     site does not read its config until `onDbLoad.waitForLoad()` resolves
+     (measured at ~4s on device), so the write always lands first.
+     */
+    static let settingsBackup = """
+    (function () {
+        if (window.__stvSettingsBackupInstalled) { return; }
+        window.__stvSettingsBackupInstalled = true;
+
+        var KEYS = ['config.reader', 'config.ux', 'config.comicReader', 'tts.setting',
+                    'readthemeset'];
+        var PREFIXES = ['reader.style.'];
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function appPlugin() {
+            return (window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App) || null;
+        }
+
+        function isBackedUp(key) {
+            if (typeof key !== 'string') { return false; }
+            for (var i = 0; i < KEYS.length; i++) { if (KEYS[i] === key) { return true; } }
+            for (var j = 0; j < PREFIXES.length; j++) {
+                if (key.indexOf(PREFIXES[j]) === 0) { return true; }
+            }
+            return false;
+        }
+
+        var restored = false;
+
+        function restore() {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.settingsRestore !== 'function') { return false; }
+            restored = true;
+            plugin.settingsRestore({}).then(function (result) {
+                var entries = (result && result.entries) || {};
+                var written = 0;
+                var seen = 0;
+                for (var key in entries) {
+                    if (!isBackedUp(key)) { continue; }
+                    seen++;
+                    var value = entries[key];
+                    if (typeof value !== 'string' || value.length === 0) { continue; }
+                    var existing = null;
+                    try { existing = localStorage.getItem(key); } catch (e) { existing = null; }
+                    if (existing) { continue; }
+                    try { localStorage.setItem(key, value); written++; } catch (e) {}
+                }
+                note('SETTINGS', 'keychain restore: ' + written + ' of ' + seen
+                    + ' backed-up key(s) written back');
+            }).catch(function (e) {
+                note('ERR', 'settingsRestore failed: ' + e);
+            });
+            return true;
+        }
+
+        function mirror(key, value) {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.settingsSave !== 'function') { return; }
+            try {
+                var call = plugin.settingsSave({ key: key, value: value });
+                if (call && typeof call.catch === 'function') { call.catch(function () {}); }
+            } catch (e) {}
+        }
+
+        function attach() {
+            var app = window.app;
+            if (!app || !app.storage || typeof app.storage.set !== 'function') { return false; }
+            if (app.storage.__stvBackedUp) { return true; }
+            app.storage.__stvBackedUp = true;
+            var original = app.storage.set;
+            app.storage.set = function (key, value) {
+                if (isBackedUp(key) && typeof value === 'string' && value.length > 0) {
+                    mirror(key, value);
+                }
+                return original.apply(this, arguments);
+            };
+            note('SETTINGS', 'settings mirror attached');
+            return true;
+        }
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            if (!restored) { restore(); }
+            if ((restored && attach()) || attempts > 400) { clearInterval(timer); }
+        }, 25);
+    })();
+    """
+
+    // MARK: - Bookmark cancel
+
+    /**
+     The site can add a bookmark but its client cannot remove one:
+     `app.api.bookmark` only ever calls `ajax=addbookmark`, and there is no
+     un-bookmark action anywhere in app.v2.js (likes, by contrast, do have
+     `ajax=unlike`). Tapping the bookmark button on an already-bookmarked book
+     therefore just re-adds it -- which is exactly what "点击书签就取消不了"
+     describes, and the Android build behaves the same way.
+
+     This block makes the button a real toggle: when the book is already
+     bookmarked (the site marks the button `.active` from `querybookmarkstatus`)
+     it tries the plausible removal actions and reports each answer to the
+     panel, so the working endpoint -- if one exists -- is identified from the
+     device instead of guessed. The first action answering code 100 wins.
+     */
+    static let bookmarkToggle = """
+    (function () {
+        if (window.__stvBookmarkToggleInstalled) { return; }
+        window.__stvBookmarkToggleInstalled = true;
+
+        var ACTIONS = ['unbookmark', 'removebookmark', 'delbookmark', 'deletebookmark'];
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function bookmarked() {
+            var nodes = document.querySelectorAll('.btnbookmark');
+            for (var i = 0; i < nodes.length; i++) {
+                if (nodes[i].classList && nodes[i].classList.contains('active')) { return true; }
+            }
+            return false;
+        }
+
+        function clearActive() {
+            var nodes = document.querySelectorAll('.btnbookmark');
+            for (var i = 0; i < nodes.length; i++) {
+                if (nodes[i].classList) { nodes[i].classList.remove('active'); }
+            }
+        }
+
+        function target(bookdata) {
+            var app = window.app || {};
+            var context = app.context || {};
+            var candidates = [bookdata, bookdata && bookdata.data, context.attach,
+                              context.attach && context.attach.data];
+            for (var i = 0; i < candidates.length; i++) {
+                var item = candidates[i];
+                if (item && item.id && item.host) { return item; }
+            }
+            return null;
+        }
+
+        function attach() {
+            var app = window.app;
+            if (!app || !app.api || typeof app.api.bookmark !== 'function') { return false; }
+            if (app.api.__stvBookmarkWrapped) { return true; }
+            app.api.__stvBookmarkWrapped = true;
+            var original = app.api.bookmark;
+
+            function remove(book) {
+                note('BOOKMARK', 'already bookmarked; probing removal actions for '
+                    + book.host + '/' + book.id);
+                var index = 0;
+                function next() {
+                    if (index >= ACTIONS.length) {
+                        note('BOOKMARK', 'no removal action answered code 100 -- the site has '
+                            + 'no un-bookmark endpoint');
+                        return null;
+                    }
+                    var action = ACTIONS[index++];
+                    var body = 'ajax=' + action + '&id=' + encodeURIComponent(book.id)
+                        + '&host=' + encodeURIComponent(book.host);
+                    return app.net.post('/mobile/jsonify.php', body).then(function (down) {
+                        note('BOOKMARK', action + ' -> '
+                            + String(JSON.stringify(down)).slice(0, 200));
+                        if (down && down.code == 100) {
+                            clearActive();
+                            if (app.toast) { app.toast('已取消书签'); }
+                            return down;
+                        }
+                        return next();
+                    }, function (error) {
+                        note('BOOKMARK', action + ' rejected: ' + error);
+                        return next();
+                    });
+                }
+                return next();
+            }
+
+            app.api.bookmark = function (bookdata) {
+                if (!bookmarked()) { return original.apply(this, arguments); }
+                var book = target(bookdata);
+                if (!book) {
+                    note('BOOKMARK', 'bookmarked, but the tapped book could not be resolved; '
+                        + 'falling back to add');
+                    return original.apply(this, arguments);
+                }
+                return remove(book);
+            };
+            note('BOOKMARK', 'bookmark toggle installed');
+            return true;
+        }
+
+        if (!attach()) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (attach() || attempts > 400) { clearInterval(timer); }
+            }, 100);
+        }
+    })();
+    """
+
     /// Injected in order; every block is independently guarded. `SiteI18nData`
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
     static let all: [String] = [compat, diag, readerDefaults, ttsProvider,
-                                followFallback, SiteI18nData.script]
+                                followFallback, safeArea, settingsBackup,
+                                bookmarkToggle, SiteI18nData.script]
 }
