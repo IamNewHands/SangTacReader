@@ -55,6 +55,9 @@ jobs:
       - name: Verify injected document-start shim is valid JavaScript
         run: node scripts/check-ios-shim.js
 
+      - name: Verify site-patch behaviour
+        run: node scripts/test-site-patch.js
+
       - name: List detected plugins
         run: npx cap ls || true
 
@@ -160,6 +163,22 @@ jobs:
             echo "✓ 诊断面板已编入产物"
           else
             echo "::error::诊断面板缺失（__stvDiag shim 不在二进制里）"
+            exit 1
+          fi
+          # 阅读翻页默认值 + 原生 TTS provider 注册同样要在产物里。
+          for marker in stvReaderDefaultsInstalled stvTtsProviderInstalled; do
+            if grep -q -F "$marker" "$syms.strings"; then
+              echo "✓ $marker 已编入产物"
+            else
+              echo "::error::$marker 缺失"
+              exit 1
+            fi
+          done
+          # 原生语音合成的桥接方法名必须存在，否则站点调用 speakToFile 会 reject。
+          if grep -q -F 'speakToFile' "$syms.strings"; then
+            echo "✓ 原生 TTS 桥接方法已编入产物"
+          else
+            echo "::error::原生 TTS 桥接方法缺失（speakToFile 不在二进制里）"
             exit 1
           fi
 

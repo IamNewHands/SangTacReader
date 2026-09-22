@@ -19,6 +19,11 @@ import WebKit
 
  SyncCookie is an acknowledged no-op because SangTacHttpPlugin already bridges
  WKWebsiteDataStore cookies (including httpOnly ones) into every native request.
+
+ This plugin is also where the site-patch JavaScript is injected (see
+ SitePatch.swift) and where native text-to-speech lives (see NativeSpeech.swift).
+ `speak` / `speakToFile` / `stopSpeech` / `getVoices` exist because the iOS build
+ has to stand in for cordova-plugin-tts-advanced, which the Android APK ships.
  */
 @objc(SangTacAppPlugin)
 public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -30,7 +35,11 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getInfo", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getLaunchUrl", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getState", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "SyncCookie", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "SyncCookie", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "speak", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "speakToFile", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stopSpeech", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getVoices", returnType: CAPPluginReturnPromise)
     ]
 
     private var observers: [NSObjectProtocol] = []
@@ -54,185 +63,27 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
             self?.notifyListeners("resume", data: nil)
         })
 
-        installDocumentStartShim()
+        installDocumentStartScripts()
     }
 
-    // MARK: - Site compatibility
+    // MARK: - Site patches
 
     /**
-     The site's frontend calls globals that the Android APK gets from Cordova
-     plugins. On iOS those globals are missing, and the site references them
-     *unguarded* on hot paths, so one missing global aborts the whole handler.
+     Every block in SitePatch is injected as its own WKUserScript at document
+     start, so the globals exist before any page script runs. The page itself is
+     loaded remotely (capacitor.config.json `server.url`), so these are the only
+     hooks we have into the site.
 
-     Concretely (book-row click handler in the list module):
-
-         e.addEventListener("click", function () {
-             app.platform.nativeClick();                       // -> nativeclick.trigger()
-             app.fun.openBookWithData(this.data.lid, this.data);
-         });
-
-     `nativeclick` comes from cordova-plugin-nativeclicksound in the APK. Without
-     it the first line throws ReferenceError and the book never opens — the
-     "list loads but tapping a novel does nothing" symptom.
-
-     Injected at document start so the globals exist before any page script runs.
-     `TTS` is intentionally an empty object: the site only probes it as
-     `if (TTS.updateMediaSession)` for Android media-session integration, so an
-     empty object makes those branches skip cleanly instead of throwing.
-
-     The same script installs a diagnostics panel (window.__stvDiag). A
-     sideloaded iOS build has no console we can read, so it captures
-     window.onerror, unhandledrejection, all console output and every
-     SangTacHttpPlugin request. It stays hidden until a line is logged with tag
-     ERR, then opens itself; triple-tap the top-left corner to toggle it and
-     CLOSE to dismiss. SangTacHttpPlugin pushes request lines in via
-     evaluateJavaScript.
+     Why document start matters: the site references `nativeclick` unguarded on
+     the book-list click path, so without it the very first line of the handler
+     throws and the book never opens.
      */
-    private func installDocumentStartShim() {
-        let source = """
-        (function () {
-            if (window.__stvIOSCompatInstalled) { return; }
-            window.__stvIOSCompatInstalled = true;
-            if (typeof window.nativeclick === 'undefined') {
-                window.nativeclick = {
-                    trigger: function () {},
-                    watch: function () {}
-                };
-            }
-            if (typeof window.TTS === 'undefined') {
-                window.TTS = {};
-            }
-
-            if (window.__stvDiagInstalled) { return; }
-            window.__stvDiagInstalled = true;
-            var NL = String.fromCharCode(10);
-            var MAX = 400;
-            var lines = [];
-            var panel = null;
-            var list = null;
-            var pending = false;
-
-            function fmt(v) {
-                try {
-                    if (typeof v === 'string') { return v; }
-                    if (v && v.message) { return v.message; }
-                    if (typeof v === 'object') { return JSON.stringify(v); }
-                    return String(v);
-                } catch (e) {
-                    return '<unprintable>';
-                }
-            }
-
-            function stamp() {
-                var d = new Date();
-                function p(n) { return ('0' + n).slice(-2); }
-                return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-            }
-
-            function build() {
-                if (panel) { return !!panel.parentNode; }
-                panel = document.createElement('div');
-                panel.style.cssText = 'position:fixed;left:0;right:0;bottom:0;height:60%;'
-                    + 'z-index:2147483647;background:rgba(0,0,0,0.93);color:#5f5;'
-                    + 'font:11px/1.35 Menlo,monospace;padding:26px 8px 8px;overflow:auto;'
-                    + '-webkit-user-select:text;user-select:text;white-space:pre-wrap;'
-                    + 'word-break:break-all;display:none;';
-                var bar = document.createElement('div');
-                bar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:24px;background:#111;text-align:right;';
-                var btn = document.createElement('button');
-                btn.textContent = 'CLOSE';
-                btn.style.cssText = 'font:11px monospace;padding:2px 10px;margin:2px 6px;';
-                btn.onclick = function (e) { e.stopPropagation(); e.preventDefault(); hide(); };
-                bar.appendChild(btn);
-                panel.appendChild(bar);
-                list = document.createElement('div');
-                panel.appendChild(list);
-                var host = document.body || document.documentElement;
-                if (!host) { return false; }
-                host.appendChild(panel);
-                return true;
-            }
-
-            function render() {
-                if (list) { list.textContent = lines.join(NL); }
-            }
-
-            function show() {
-                if (!build()) {
-                    if (!pending) {
-                        pending = true;
-                        document.addEventListener('DOMContentLoaded', function () {
-                            pending = false;
-                            show();
-                        });
-                    }
-                    return;
-                }
-                panel.style.display = 'block';
-                render();
-                panel.scrollTop = panel.scrollHeight;
-            }
-
-            function hide() {
-                if (panel) { panel.style.display = 'none'; }
-            }
-
-            function log(tag, msg) {
-                lines.push(stamp() + ' [' + tag + '] ' + fmt(msg));
-                while (lines.length > MAX) { lines.shift(); }
-                if (panel && panel.style.display === 'block') {
-                    render();
-                    panel.scrollTop = panel.scrollHeight;
-                }
-                if (tag === 'ERR') { show(); }
-            }
-
-            window.__stvDiag = { log: log, show: show, hide: hide };
-
-            window.addEventListener('error', function (e) {
-                log('ERR', 'onerror ' + (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || 0));
-            }, true);
-            window.addEventListener('unhandledrejection', function (e) {
-                var r = e.reason;
-                log('ERR', 'unhandledrejection ' + fmt((r && (r.stack || r.message)) || r));
-            });
-
-            var origError = console.error;
-            var origWarn = console.warn;
-            var origLog = console.log;
-            function tee(orig, tag) {
-                return function () {
-                    var parts = [];
-                    for (var i = 0; i < arguments.length; i++) { parts.push(fmt(arguments[i])); }
-                    log(tag, parts.join(' '));
-                    return orig.apply(console, arguments);
-                };
-            }
-            console.error = tee(origError, 'ERR');
-            console.warn = tee(origWarn, 'WARN');
-            console.log = tee(origLog, 'LOG');
-
-            var taps = 0;
-            var last = 0;
-            document.addEventListener('touchstart', function (e) {
-                var t = e.touches && e.touches[0];
-                if (!t) { return; }
-                if (t.clientX < 70 && t.clientY < 70) {
-                    var now = Date.now();
-                    taps = (now - last < 700) ? taps + 1 : 1;
-                    last = now;
-                    if (taps >= 3) {
-                        taps = 0;
-                        if (panel && panel.style.display === 'block') { hide(); } else { show(); }
-                    }
-                }
-            }, true);
-        })();
-        """
-
-        let script = WKUserScript(source: source,
-                                  injectionTime: .atDocumentStart,
-                                  forMainFrameOnly: true)
+    private func installDocumentStartScripts() {
+        let scripts = SitePatch.all.map { source in
+            WKUserScript(source: source,
+                         injectionTime: .atDocumentStart,
+                         forMainFrameOnly: true)
+        }
 
         // The web view exists before plugins load (CAPBridgeViewController
         // .loadView() -> prepareWebView() -> CapacitorBridge.init() -> plugins)
@@ -240,14 +91,16 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         // time. Retry briefly anyway: a missed injection would be invisible.
         func attach(_ attemptsLeft: Int) {
             if let controller = self.bridge?.webView?.configuration.userContentController {
-                controller.addUserScript(script)
-                CAPLog.print("[SangTacApp] Cordova globals shim installed (nativeclick, TTS)")
+                for script in scripts {
+                    controller.addUserScript(script)
+                }
+                CAPLog.print("[SangTacApp] site patches installed (\(scripts.count) scripts)")
             } else if attemptsLeft > 0 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     attach(attemptsLeft - 1)
                 }
             } else {
-                CAPLog.print("[SangTacApp] WARNING: no webView, Cordova globals shim NOT installed")
+                CAPLog.print("[SangTacApp] WARNING: no webView, site patches NOT installed")
             }
         }
         attach(20)
@@ -301,5 +154,77 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.resolve(["value": true, "count": cookies.count])
             }
         }
+    }
+
+    // MARK: - Text to speech
+
+    /**
+     Cordova's `TTS.speak(options)` plays immediately; `TTS.speakToFile(options)`
+     returns the audio bytes. The site's iOS path only ever needs speakToFile —
+     it hands the bytes to ttsEngine, which decodes them and plays through its
+     own WebAudio graph so the equaliser and per-sentence pacing keep working.
+     */
+    @objc func speak(_ call: CAPPluginCall) {
+        guard let text = call.getString("text"), !text.isEmpty else {
+            call.reject("Missing 'text'")
+            return
+        }
+        NativeSpeech.shared.speakDirectly(text: text,
+                                          identifier: call.getString("identifier"),
+                                          rate: SangTacAppPlugin.numberOption(call, "rate", fallback: 1),
+                                          pitch: SangTacAppPlugin.numberOption(call, "pitch", fallback: 1))
+        call.resolve(["value": true])
+    }
+
+    @objc func speakToFile(_ call: CAPPluginCall) {
+        guard let text = call.getString("text"), !text.isEmpty else {
+            call.reject("Missing 'text'")
+            return
+        }
+        let identifier = call.getString("identifier")
+        let rate = SangTacAppPlugin.numberOption(call, "rate", fallback: 1)
+        let pitch = SangTacAppPlugin.numberOption(call, "pitch", fallback: 1)
+        CAPLog.print("[SangTacApp:tts] speakToFile \(text.count) chars voice=\(identifier ?? "default")")
+
+        NativeSpeech.shared.synthesize(text: text,
+                                       identifier: identifier,
+                                       rate: rate,
+                                       pitch: pitch) { result in
+            switch result {
+            case .success(let data):
+                CAPLog.print("[SangTacApp:tts] synthesised \(data.count) bytes")
+                call.resolve(["data": data.base64EncodedString(), "mime": "audio/wav"])
+            case .failure(let error):
+                CAPLog.print("[SangTacApp:tts] failed: \(error.localizedDescription)")
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
+
+    @objc func stopSpeech(_ call: CAPPluginCall) {
+        NativeSpeech.shared.stopAll()
+        call.resolve(["value": true])
+    }
+
+    @objc func getVoices(_ call: CAPPluginCall) {
+        let voices = NativeSpeech.shared.availableVoices().map { voice -> [String: Any] in
+            return [
+                "identifier": voice.identifier,
+                "name": voice.name,
+                "language": voice.language,
+                "gender": voice.gender
+            ]
+        }
+        CAPLog.print("[SangTacApp:tts] \(voices.count) Vietnamese voice(s)")
+        call.resolve(["voices": voices])
+    }
+
+    /// Read the raw bridged value rather than a typed accessor, so a non-numeric
+    /// option can never trap (same reasoning as SangTacHttpPlugin.timeoutSeconds).
+    private static func numberOption(_ call: CAPPluginCall, _ key: String, fallback: Double) -> Double {
+        guard let raw = call.options[key], !(raw is NSNull) else { return fallback }
+        if let number = raw as? NSNumber { return number.doubleValue }
+        if let text = raw as? String, let parsed = Double(text) { return parsed }
+        return fallback
     }
 }

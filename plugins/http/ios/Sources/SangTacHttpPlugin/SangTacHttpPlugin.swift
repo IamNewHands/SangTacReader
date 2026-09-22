@@ -47,7 +47,9 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "patch", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "delete", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "request", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "syncCookies", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "syncCookies", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "startForeground", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stopForeground", returnType: CAPPluginReturnPromise)
     ]
 
     /// Mirror of the Android plugin's default; only used when the site sends no
@@ -90,6 +92,21 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
             self?.callLog("syncCookies", "bridged \(cookies.count) cookie(s)")
             call.resolve(["value": true, "count": cookies.count])
         }
+    }
+
+    /**
+     The Android build's Http plugin carries the read-aloud foreground service.
+     iOS keeps playing while the app is foregrounded and there is nothing to
+     start, but app.v2.read.js calls these through
+     `Capacitor.nativePromise("Http", ...)` without a catch, so an unregistered
+     method would surface as an unhandled rejection in the diagnostic panel.
+     */
+    @objc func startForeground(_ call: CAPPluginCall) {
+        call.resolve(["value": true])
+    }
+
+    @objc func stopForeground(_ call: CAPPluginCall) {
+        call.resolve(["value": true])
     }
 
     // MARK: - Core request path
@@ -154,12 +171,12 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                 if let error = error {
                     let message = error.localizedDescription
                     self.callLog("err", "\(method) \(url.absoluteString) -> \(message)")
-                    self.report("ERR", "\(method) \(url.path) \(message)")
+                    self.report("ERR", "\(method) \(url.absoluteString) \(message)")
                     call.reject(message, nil, error)
                     return
                 }
                 guard let http = response as? HTTPURLResponse else {
-                    self.report("ERR", "\(method) \(url.path) no HTTP response")
+                    self.report("ERR", "\(method) \(url.absoluteString) no HTTP response")
                     call.reject("No HTTP response")
                     return
                 }
@@ -187,8 +204,16 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
                     result["error"] = true
                 }
 
-                self.callLog("ok", "\(method) \(url.path) -> \(http.statusCode) bytes=\(body.count) data=\(payload.kind)")
-                self.report("Http", "\(method) \(url.path) -> \(http.statusCode) \(payload.kind) \(body.count)b")
+                self.callLog("ok", "\(method) \(url.absoluteString) -> \(http.statusCode) bytes=\(body.count) data=\(payload.kind)")
+                // A 5xx is what we are usually hunting (the home "关注" tab was
+                // reported blank); tag it ERR so it also flips the panel badge
+                // red, and always carry a body preview so the server's own error
+                // text is readable on device.
+                let tag = http.statusCode >= 500 ? "ERR" : "Http"
+                self.report(tag, "\(method) \(url.absoluteString) -> \(http.statusCode) "
+                    + "\(contentType.isEmpty ? "no-content-type" : contentType) "
+                    + "\(payload.kind) \(body.count)b "
+                    + SangTacHttpPlugin.preview(payload: payload, body: body))
                 call.resolve(result)
             }.resume()
         }
@@ -317,6 +342,22 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
             return "\"\""
         }
         return String(array.dropFirst().dropLast())
+    }
+
+    /// One line of the response body, so a server-side error message is readable
+    /// in the on-device panel instead of just "status 500".
+    private static func preview(payload: Payload, body: Data) -> String {
+        let text: String
+        if let string = payload.value as? String {
+            text = string
+        } else {
+            text = String(data: body, encoding: .utf8) ?? ""
+        }
+        let collapsed = text
+            .split(whereSeparator: { $0.isNewline || $0 == "\t" })
+            .joined(separator: " ")
+        if collapsed.count <= 240 { return collapsed }
+        return String(collapsed.prefix(240)) + "..."
     }
 
     // MARK: - Cookies

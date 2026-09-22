@@ -52,9 +52,12 @@
 
 ## 5. 已知缺口（按优先级）
 
-1. `WebNativeView` 目前是占位实现 → 漫画/图片模块退化（小说正文不受影响）。
-2. `CapacitorSQLite`、`MlKit`/`MainClass`（OCR）、`AdMob` 未接 → 对应功能降级。
-3. 旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）仍留在树里，待新构建真机验证通过后再决定退役（**删除需用户确认**）。
+1. **「关注」列表登录后空白**（站点侧疑似 500）——需要真机 `__stvDiag` 面板的 URL + 状态码 + 响应体才能定性，见 §6.3 (4)。
+2. **「取消收藏」在站点侧不存在**：客户端只有 `ajax=addbookmark`，`delbookmark`/`removebookmark`/`unbookmark` 全部返回空响应（未知动作）。只能去网页版取消，客户端无法补。
+3. `WebNativeView` 目前是占位实现 → 漫画/图片模块退化（小说正文不受影响）。
+4. `CapacitorSQLite`、`MlKit`/`MainClass`（OCR）、`AdMob` 未接 → 对应功能降级。
+5. 旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）仍留在树里，待新构建真机验证通过后再决定退役（**删除需用户确认**）。
+6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）。
 
 ## 6. 真机问题档案
 
@@ -125,4 +128,104 @@ var j = r.data.replace(/^\uFEFF/, '');   // r.data 是对象 -> TypeError
 **待取证（下一轮真机日志）**：历史为空、关注 500。这两条都走 `app.net.get/post`，与正文不是同一条路径；需要 `__stvDiag` 面板里对应请求的状态码与 URL（判断是否落到了 `bestDomain()` 选出的跨域 `.app` 而丢掉 httpOnly 会话 cookie）。
 
 **顺手补的护栏**：`scripts/check-ios-shim.js` + workflow 步骤，校验 `SangTacAppPlugin.swift` 里 `"""…"""` 的注入脚本是**合法 JS 且不含反斜杠**——这正是历史 v5 事故（Swift 转义导致整段 shim 语法错误、静默失效）的同类风险；另有 `strings | grep stvDiagInstalled` 确保诊断面板真的编进产物。
+
+### 6.3 正文能读之后的五项（2026-09-22 第二轮真机反馈）
+
+用户反馈原文：正文可以看了，但是上下滑动（安卓是左右翻页）；语言切中文后部分设置项仍是越南语；详情页底部书签点不动、书签取消不了；顶部「关注」空白且诊断面板挡住底栏；TTS 要用 iOS 原生实现。
+
+#### (1) 阅读模式默认「上下滑动」——不是 iOS 的锅，是站点默认值
+
+站点自己的默认值就是竖向滚动，**与平台无关**：
+
+```js
+// /asset/app.v2.config.js
+"display_type": "auto",
+
+// /asset/app.v2.read.js  loadChapterDisplay()
+if (displayType == "auto" || !displayType) { displayType = "default"; }
+
+// /asset/app.v2.chapterdisplay.js  (注册表末尾)
+const ChapterDisplayTypeRegistry = {
+    slide: SlideChapterDisplay,
+    pageflip: PageFlipChapterDisplay,
+    simulatedpageflip: SimulatedPageFlipChapterDisplay,
+    flashpageflip: FlashPageFlipChapterDisplay,
+    continuos: ContinuosChapterDisplay,
+    default: SlideChapterDisplay,     // <- auto/default 落到「上下滑动」
+};
+```
+
+全前端**没有任何一处**写过 `display_type`（`grep` 只有 config 的默认值、i18n 标签、read.js 的两处读取），安卓 APK 加载的也是同一个 `/asset/app.v2.config.js`。所以安卓那边的左右翻页是**那台设备自己在「阅读设置」里选过**并存进本机 `config.reader` 的，不是平台差异。
+
+**修复**：`SitePatch.readerDefaults` 在 `app.config._reader` 就绪后轮询，**仅当值仍是未动过的 `auto`/`default`/空**时写入 `pageflip`（走 `app.config.reader` 的 setter，等于一次正常的手动修改）。用户自己在阅读设置里选过的值（含 `simulatedpageflip`/`continuos`）**不会被覆盖**——`scripts/test-site-patch.js` 有对应用例。
+
+#### (2) 语言切中文后仍有越南语——站点自己把文案硬编码在 HTML/JS 里
+
+站点 i18n 机制是：HTML 写 `<text>some_key</text>`，`app.celoader.text(el)` 用 `app.text[key]` 替换；`app.text.changeLanguage()` 把 `/mobile/lang/<lang>.json` **`$.extend` 合并**到越南语基底上。实测 `zh.json` 与 `vi.json` **键数完全相同（各 188 个）**，所以 `<text>` 驱动的标签全部能翻译。
+
+剩下的越南语是**硬编码字面量**，例如：
+
+```html
+<div class="settingitemtitle">Thêm name 1 nhấp</div>     <!-- 没有 <text> -->
+<div class="settingsection mt-3">Bộ lọc name</div>
+<div class="settingitemtitle">Cho phép hoạt động</div>
+```
+
+以及 `app.context.menu.*` 的 `text: "Đánh dấu"`、`app.toast(...)` 等。**服务器不归我们管**，所以唯一可动的 owner 是客户端：`SitePatch.i18n` 在 DOM 上做**整节点精确匹配**替换（`vi` → `zh`），并排除正文/评论/简介等内容容器，避免误伤用户内容。
+
+#### (3) 详情页书签点不动 / 取消不了——两个独立原因
+
+**「点不动」**：旧诊断面板是**贴底 60% 高的浮层**，且**任何 ERR 都会自动展开**。详情页的 `app.api.updateBookPage` 里有一处站点自身的空指针：
+
+```js
+app.api.queryBookExtStatus = async function(bookinfo){
+    if(!app.user.isLogin){ return null; }
+    return app.net.post(url,params).then(down => down.code == 100 ? down : null);
+};
+app.api.updateBookPage = function(p,bookinfo){
+    app.api.queryBookExtStatus(bookinfo).then((status)=>{
+        if(status.like){ ... }        // status === null -> TypeError
+```
+
+这个 TypeError 触发 `window.onerror` → 面板自动弹出 → **盖住详情页底部那条 60px 的 `.bottombar`**（书签/评论/立即阅读/目录四个按钮都在里面）。用户看到的「书签点不动」和「面板挡住底栏」是**同一个现象**。
+
+**「取消不了」**：站点**根本没有取消收藏的接口**。把候选 action 全部匿名实测（`/mobile/jsonify.php?ajax=…`，两个域各一遍）：
+
+| action | 返回 |
+| --- | --- |
+| `addbookmark` | `{"text":"Permission denied","code":102}`（动作存在，需要登录） |
+| `querybookmarkstatus` | `{"text":"Permission denied","code":102}` |
+| `followbook` | `{"text":"Permission denied","code":102}` |
+| `delbookmark` / `removebookmark` / `unbookmark` / `deletebookmark` / `bookmark` | **空响应**（等于「未知动作」） |
+
+客户端也只有 `app.api.bookmark` 一处写操作（`ajax=addbookmark`）。**所以「取消收藏」在安卓上同样不存在**，只能在网页版操作。这一条是站点功能缺口，客户端无法补（没有 endpoint）。
+
+**修复**：面板重做（见 (4)），自动展开取消；底部栏不再被遮挡。
+
+#### (4) 关注空白 + 面板挡住底栏
+
+- **面板**：改成**贴顶 42% 高**的浮窗，标题栏可纵向拖动，按钮 `COPY` / `CLEAR` / `CLOSE`。折叠态是右侧一个 24px 小圆点，显示日志行数，**出现 ERR 时变红**；不再自动展开（旧行为正是「挡底栏」的成因）。`COPY` 把整个缓冲区写进剪贴板（`navigator.clipboard` + `execCommand` 兜底），比截图更好用。同时新增**点击日志**：每次 tap 记录 `目标元素`，并在 `document.elementFromPoint` 命中的元素与目标不一致时追加 `topmost=…`——这正好区分「回调没绑上」和「被别的东西盖住了」。
+- **关注空白**：`view-bookfollowing` 的 `<bookdisplay from="/mobile/booklist.php?method=following&p=0">`。匿名实测 `method=following` 与 `method=bookmarked` 都返回 `{"code":102}`，`method=history` 返回 `{"code":101}`，`method=bookpush` 正常返回列表——**匿名态看不出区别**，登录后的 500 只能在真机取证。为此 `SangTacHttpPlugin` 的上报行升级为：**完整 URL + 状态码 + Content-Type + data 类型 + 字节数 + 响应体前 240 字符**，且 **`status >= 500` 用 `ERR` 标签**（会点亮红色角标）。另外补了 `Http.startForeground` / `Http.stopForeground` 空实现——`app.v2.read.js` 通过 `Capacitor.nativePromise("Http", …)` 调用且**不 catch**，方法缺失会变成 unhandledrejection 噪音。
+
+#### (5) TTS 用 iOS 原生
+
+安卓的 `app.tts.engineList()` 第一项就是原生引擎 `{name:"Android TextToSpeech", value:"google"}`；**iOS 分支只给了网络 provider**（Bing / Zalo / FPT / Viettel / Sáng Tác Việt），没有任何本机选项。
+
+`/stv.tts.js` 的 provider 契约（`TtsProvider` / `AndroidTts`）是：
+
+```
+props                        -> 设置项描述
+async speak(text, options)   -> 音频 Blob（ttsEngine.decodeAudio() 交给 AudioContext.decodeAudioData）
+async getVoices()            -> [{name, value, gender}]
+```
+
+`AndroidTts.speak()` 正是 `await TTS.speakToFile(param)` → `new Blob([arrayBuffer], {type:'audio/wav'})`。iOS 照抄这条路径：
+
+- `NativeSpeech.swift`：`AVSpeechSynthesizer.write(_:toBufferCallback:)` 取 PCM（float32/int16/int32、交错与非交错都归一化成 16-bit），拼一个标准 44 字节 WAV 头，base64 回传。`speakToFile` 走这条路；`speak` 用 `AVSpeechSynthesizer.speak()` 直接播放（站点实际不调，但 Cordova 插件有这个方法）。
+- 语速映射：站点 `rate` 是倍率（安卓直接交给 `setSpeechRate`），iOS 是 `AVSpeechUtterance.rate ∈ [0,1]`、默认 0.5 → `rate_ios = clamp(0.5 × rate, min, max)`；`pitch` 直接 clamp 到 `[0.5, 2]`。
+- `SitePatch.ttsProvider`：包装 `ttsEngine.createProvider` 增加 `"ios"` 分支，并把 `app.tts.engineList()` 的 `"ios"` 项插到最前。首次安装（`tts.setting` 为空）自动把 provider 设为 `ios`；用户选过别的 provider 则不动。
+- 两个必须照顾的站点细节：`loadProviderOption` 会**无保护地**读 `app.tts.setting[provider].voice`，所以 provider 子对象要预先建好；`getVoices()` 为空时 `voices[0].value` 会抛错，所以**永远至少返回一项**。
+
+**本轮护栏**：`scripts/test-site-patch.js` 在 stub 的 DOM/Capacitor 环境里真跑一遍注入脚本（TTS facade → Blob、provider 注册、engineList 顺序、provider 默认值不被覆盖、display_type 只在未动过时改写、面板构建与缓冲），CI 增加一步 `node scripts/test-site-patch.js`；`check-ios-shim.js` 改成扫描该 target 下**所有**多行字符串块。
+
 
