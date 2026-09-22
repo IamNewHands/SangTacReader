@@ -175,7 +175,9 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Body
 
     private func bodyData(for call: CAPPluginCall, headers: inout [String: String]) -> Data? {
-        guard let data = call.getValue("data"), !(data is NSNull) else { return nil }
+        // Read the raw bridged value rather than JSValue so both string and
+        // JSON-object bodies are handled uniformly.
+        guard let data = call.options["data"], !(data is NSNull) else { return nil }
 
         if let text = data as? String {
             if headers["Content-Type"] == nil, headers["content-type"] == nil {

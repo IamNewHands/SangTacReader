@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "SangTacApp",
+    name: "SangtacApp",
     platforms: [.iOS(.v15)],
     products: [
         .library(
-            name: "SangTacApp",
+            name: "SangtacApp",
             targets: ["SangTacAppPlugin"])
     ],
     dependencies: [

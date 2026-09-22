@@ -70,7 +70,7 @@ jobs:
           # 三个本地插件必须被 cap sync 写进清单，否则原生插件不参与编译。
           # Capacitor 可能写 npm 包名（@sangtac/http）或反解后的真实路径
           # （plugins/http），两种都接受。
-          hits="$(grep -c -E 'SangTac|@sangtac|plugins/(http|app|webnativeview)' ios/App/CapApp-SPM/Package.swift || true)"
+          hits="$(grep -c -E 'plugins/(http|app|webnativeview)' ios/App/CapApp-SPM/Package.swift || true)"
           echo "本地插件清单命中行数: $hits"
           if [ "$hits" -lt 3 ]; then
             echo "::error::Package.swift 未包含全部本地插件（命中 $hits 行，期望 >= 3）"

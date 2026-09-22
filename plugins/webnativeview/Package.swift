@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "SangTacWebNativeView",
+    name: "SangtacWebnativeview",
     platforms: [.iOS(.v15)],
     products: [
         .library(
-            name: "SangTacWebNativeView",
+            name: "SangtacWebnativeview",
             targets: ["SangTacWebNativeViewPlugin"])
     ],
     dependencies: [
