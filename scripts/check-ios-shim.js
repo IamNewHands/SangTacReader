@@ -6,7 +6,7 @@
  * Why this exists: a Swift string-escaping slip inside one of those blocks once
  * shipped a shim that was a JS syntax error, so it never executed and the whole
  * compatibility layer was silently dead on device (see
- * debug-ios-catalog-load-fail.md, "v5 根因"). Nothing else in the build would
+ * docs/capacitor-port.md §6.1). Nothing else in the build would
  * have caught it — Swift compiles it happily, and the binary-level check only
  * proves the marker string is present, not that it parses.
  *

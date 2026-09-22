@@ -1,11 +1,11 @@
 # SangTacReader — sangtacviet 的非官方 iOS 客户端
 
-与安卓版**同构**的 iOS 客户端：Capacitor 应用，`server.url` 远程加载
+与安卓版**同构**的 iOS 客户端：Capacitor 8 应用，`server.url` 远程加载
 `sangtacviet.com/app.v2.php`，并补齐站点前端依赖的原生插件，使站点走
 「app 模式」——这正是安卓版拿到完整阅读体验的原因。
 
 > 官方只发布安卓 APK。本项目自行封装，仅供个人学习使用。
-> 架构与证据链见 [`docs/capacitor-port.md`](docs/capacitor-port.md)。
+> 架构、证据链与每一轮真机问题的根因见 [`docs/capacitor-port.md`](docs/capacitor-port.md)。
 
 ## 为什么不是「WKWebView + 注入脚本」
 
@@ -18,33 +18,96 @@
 | 数据请求 | 原生网络栈（`Capacitor.Plugins.Http`） | 网页 XHR，撞 Cloudflare / 设备判定 |
 | 结果 | 正文 `code:0` | 正文 `code:7`，体验差 |
 
+## 目前能做什么
+
+书列表 / 搜索 / 最新更新 / 排行榜、小说详情、关注与书签、章节目录、正文阅读
+（默认左右翻页）、原生 TTS 朗读、界面中文化、设置跨重装保留。
+
+站点自身的问题（例如「关注」tab 服务端 500、章节标题只有越南语机翻、书签没有
+取消接口）已在 `docs/capacitor-port.md` 中逐条定位并说明哪些能补、哪些补不了。
+
 ## 目录结构
 
 ```
 SangTacReader/
 ├── capacitor.config.json        # 照抄安卓 APK 的配置（server.url 远程加载）
 ├── package.json                 # Capacitor 8 依赖 + 三个本地插件
-├── dist/index.html              # 仅占位（webDir 在 server.url 模式下不使用）
+├── dist/index.html              # 仅占位（server.url 模式下 webDir 不被使用）
 ├── plugins/
 │   ├── http/                    # 原生 URLSession 版 Http（含 WKWebView cookie 桥接）
-│   ├── app/                     # App 插件 + 安卓版自定义的 SyncCookie
-│   └── webnativeview/           # 安卓反射桥的 iOS 占位（仅漫画模块）
-├── docs/capacitor-port.md       # ★ 迁移档案：证据链、决策、缺口
-├── .github/workflows/build-ipa.yml  # macOS 上构建未签名 IPA
-└── SangTacReader.xcodeproj/     # 旧 WKWebView 工程，待新构建验证后退役
+│   ├── app/                     # App 插件 + 站点补丁注入 + 原生 TTS + 安全区/设置备份
+│   └── webnativeview/           # 安卓反射桥的 iOS 占位（仅漫画模块，尚未实现）
+├── data/site-i18n.json          # 站点文案中译字典（唯一真源）
+├── scripts/                     # 三条本地/CI 守护（见下）
+├── docs/capacitor-port.md       # ★ 迁移档案：证据链、决策、逐轮真机问题
+└── .github/workflows/build-ipa.yml   # macOS 上构建未签名 IPA 并发布滚动 Release
 ```
 
 `ios/` **不入库**：必须由 macOS 上的 `npx cap add ios` 生成（Windows 会把反斜杠
 路径写进 `CapApp-SPM/Package.swift`，macOS 的 SwiftPM 无法解析）。
 
+旧 WKWebView 工程（`SangTacReader.xcodeproj/`、`SangTacReader/` 及其打包的 `www/`
+资源）与 `tests/` 下的一次性探测脚本已在 2026-09-22 退役，需要时从 git 历史取回。
+
+## 站点补丁（`plugins/app/.../SitePatch.swift`）
+
+站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 9 个块，
+每块独立守卫、互不依赖：
+
+| 块 | 作用 |
+|---|---|
+| `compat` | `nativeclick` 空实现 + `window.TTS` 门面（站点不调则整条点击链抛错） |
+| `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台） |
+| `readerDefaults` | iOS 上把阅读器 `display_type` 默认成左右翻页 |
+| `ttsProvider` | 注册 `ttsEngine` 的 `ios` provider，走原生 `AVSpeechSynthesizer` |
+| `followFallback` | 「关注」接口服务端 500 时探测站点自己的旧接口 |
+| `safeArea` | 灵动岛 / Home Indicator：阅读器浮层的安全区补齐 |
+| `settingsBackup` | 设置镜像进 Keychain，重装后写回 localStorage |
+| `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
+| `SiteI18nData.script` | 生成物：站点文案中译 + 章节标题数字改写 |
+
+## 中文字典流水线
+
+```
+data/site-i18n.json            ← 手工维护（唯一真源，可编辑）
+  → scripts/gen-site-i18n.js   → SiteI18nData.swift（生成物，勿手改）
+  → SitePatch.all              → 注入页面
+```
+
+改了 JSON 要重新生成，否则 CI 的 `--check` 会失败。
+
 ## 构建与安装
 
-1. 推送后由 GitHub Actions（`macos-26`）自动构建**未签名** IPA，产物名
-   `SangTacReader-unsigned.ipa`。
-2. 下载后由设备端签名安装（SideStore / LiveContainer / SideInstaller，用你自己的
+1. 推送到 `main` 后 GitHub Actions（`macos-26`）自动构建**未签名** IPA
+   （`.md` 改动不触发构建）。产物名 `SangTacReader-unsigned.ipa`。
+2. 推送到 `main` 的每次构建都会刷新同一个滚动 Release（tag `latest`）：
+
+   ```
+   https://github.com/IamNewHands/SangTacReader/releases/latest/download/SangTacReader-unsigned.ipa
+   ```
+
+3. 下载后由设备端签名安装（SideStore / LiveContainer / SideInstaller，用你自己的
    Apple ID；仓库不需要任何证书或描述文件）。
 
-本机（Windows）无法编译 Swift，任何 Swift 改动都必须等 CI 结果验证。
+## 本地能验证什么
+
+本机（Windows）无法编译 Swift，**Swift 改动只能等 CI 结果**。注入的 JavaScript
+可以本地全量验证，CI 每次构建也会跑这三条：
+
+```bash
+node scripts/check-ios-shim.js      # 注入块能解析、无转义陷阱、必需标记齐全
+node scripts/test-site-patch.js     # 在 stub DOM 里验证每个补丁的行为
+node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
+```
+
+## 诊断面板
+
+侧载包看不到 console，所以出错都进页面面板：**连点左上角三次**打开，`COPY`
+把整个缓冲区放进剪贴板。徽标平时隐藏，出现第一条 `ERR` 才显示。
+
+面板里的 tag 含义：`Http` 每条原生请求（含 `in <ms>ms` 耗时）、`TTS` 语音合成
+每次尝试、`FOLLOW` 关注接口探测、`SAFE` 安全区取值、`SETTINGS` 设置备份/恢复、
+`BOOKMARK` 取消书签探测、`ERR` 错误。
 
 ## 说明 / 免责
 
