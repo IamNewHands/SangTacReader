@@ -97,6 +97,7 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath ios/App/build \
+            OTHER_LDFLAGS="\$(inherited) -ObjC" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -110,8 +111,10 @@ jobs:
           app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
           bin="$app/$(basename "$app" .app)"
           echo "binary: $bin"
+          echo "=== 产物中的 SangTac ObjC 类符号 ==="
+          nm -a "$bin" | grep -E 'OBJC_CLASS_\$_SangTac' || echo "(没有找到任何 SangTac 类符号)"
           for cls in SangTacHttpPlugin SangTacAppPlugin SangTacWebNativeViewPlugin; do
-            if nm -a "$bin" | grep -q "OBJC_CLASS_[_]$cls"; then
+            if nm -a "$bin" | grep -q "OBJC_CLASS_[_]\$$cls"; then
               echo "✓ $cls 已链接"
             else
               echo "::error::原生插件 $cls 未链接进产物（站点会退回 web 模式）"
