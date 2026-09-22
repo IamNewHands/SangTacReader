@@ -449,6 +449,14 @@ async function testI18nOverlay() {
   check('chapter title pass is idempotent',
     sandbox.window.__stvI18n.fixChapterTitle('第1章 Uống thuốc') === '第1章 Uống thuốc',
     JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('第1章 Uống thuốc')));
+  // The fanqie host uses a different scaffold: "Thứ 2 chương <title>".
+  check('fanqie chapter numbering translated',
+    sandbox.window.__stvI18n.fixChapterTitle('Thứ 2 chương Ngọc Long linh tuyền không gian')
+      === '第2章 Ngọc Long linh tuyền không gian',
+    JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('Thứ 2 chương Ngọc Long linh tuyền không gian')));
+  check('unrelated Vietnamese is left alone',
+    sandbox.window.__stvI18n.fixChapterTitle('Thứ tự chương') === 'Thứ tự chương',
+    JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('Thứ tự chương')));
 }
 
 (async () => {

@@ -132,44 +132,72 @@ ${data.patterns
     var rewritten = 0;
 
     // The reader header prints the site's own Vietnamese machine translation of
-    // the chapter name ("Chương 1:. Uống thuốc"). The server never exposes the
-    // original Chinese title: sajax=readchapter returns only bookname and
-    // chaptername, mobile/bookinfo.php carries no chapter list, and
-    // transmode=original switches the BODY to Chinese while leaving the title
-    // Vietnamese. So the words cannot be recovered here. What we can fix is the
-    // scaffolding: "Chương <n>:" becomes "第<n>章".
+    // the chapter name. The server never exposes the original Chinese title:
+    // sajax=readchapter returns only bookname and chaptername,
+    // mobile/bookinfo.php carries no chapter list, and transmode=original
+    // switches the BODY to Chinese while leaving the title Vietnamese. So the
+    // words cannot be recovered here. What we can fix is the scaffolding.
+    //
+    // Two number formats show up in the wild:
+    //     "Chương 3:. Giao phong"   (qidian)
+    //     "Thứ 2 chương Ngọc Long"  (fanqie)
+    // both become "第<n>章 <title>".
     //
     // Deliberately no regular expression: the whole block has to survive being
     // embedded in a Swift multiline string, which forbids backslashes.
-    function fixChapterTitle(raw) {
-        if (!raw) { return raw; }
-        var head = 'Chương';
-        var text = raw;
-        while (text.length && text.charCodeAt(0) <= 32) { text = text.substring(1); }
-        if (text.substring(0, head.length) !== head) { return raw; }
-        var rest = text.substring(head.length);
-        var i = 0;
-        while (i < rest.length && rest.charCodeAt(i) <= 32) { i++; }
+    function skipSpaces(text, index) {
+        while (index < text.length && text.charCodeAt(index) <= 32) { index++; }
+        return index;
+    }
+
+    function digitsAfter(text, index) {
         var digits = '';
-        while (i < rest.length) {
-            var code = rest.charCodeAt(i);
+        while (index < text.length) {
+            var code = text.charCodeAt(index);
             if (code < 48 || code > 57) { break; }
-            digits += rest.charAt(i);
-            i++;
+            digits += text.charAt(index);
+            index++;
         }
-        if (!digits) { return raw; }
-        var tail = rest.substring(i);
-        while (tail.length) {
-            var c0 = tail.charAt(0);
-            if (c0 === ':' || c0 === '.' || c0 === '-' || tail.charCodeAt(0) <= 32) {
-                tail = tail.substring(1);
+        return digits;
+    }
+
+    function stripSeparators(text) {
+        while (text.length) {
+            var first = text.charAt(0);
+            if (first === ':' || first === '.' || first === '-' || text.charCodeAt(0) <= 32) {
+                text = text.substring(1);
             } else {
                 break;
             }
         }
-        var out = '第' + digits + '章';
-        if (tail.length) { out += ' ' + tail; }
-        return out;
+        return text;
+    }
+
+    var TITLE_HEADS = [['Chương', ''], ['Thứ', 'chương']];
+
+    function fixChapterTitle(raw) {
+        if (!raw) { return raw; }
+        var text = raw;
+        var start = skipSpaces(text, 0);
+        for (var h = 0; h < TITLE_HEADS.length; h++) {
+            var head = TITLE_HEADS[h][0];
+            if (text.substring(start, start + head.length) !== head) { continue; }
+            var index = skipSpaces(text, start + head.length);
+            var digits = digitsAfter(text, index);
+            if (!digits) { continue; }
+            index += digits.length;
+            var between = TITLE_HEADS[h][1];
+            if (between) {
+                index = skipSpaces(text, index);
+                if (text.substring(index, index + between.length) !== between) { continue; }
+                index += between.length;
+            }
+            var tail = stripSeparators(text.substring(index));
+            var out = '第' + digits + '章';
+            if (tail.length) { out += ' ' + tail; }
+            return out;
+        }
+        return raw;
     }
 
     // .chaptername sits in SKIP, so walk() never descends into it. That is
