@@ -5,6 +5,16 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 
+# Capacitor / Node
+node_modules/
+.capacitor/
+# ios/ 平台目录由 macOS 上的 `npx cap add ios` 生成（Windows 生成会写坏
+# CapApp-SPM/Package.swift 的路径），因此不入库。
+ios/App/build/
+ios/App/Pods/
+ios/App/App/public/
+ios/App/App.xcodeproj/project.xcworkspace/xcuserdata/
+
 # Temp analysis
 apk_extracted/
 error.txt

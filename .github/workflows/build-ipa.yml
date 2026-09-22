@@ -1,52 +1,127 @@
-name: Build unsigned IPA
+name: Build unsigned IPA (Capacitor)
 
-# 云端编译出未签名 .ipa，下载后用 AltStore / Sideloadly 本地签名安装。
-# 说明：不在此处签名（免费 Apple ID 云端签名易风控/禁号），
-#       改为本地 AltStore/Sideloadly 用你的 Apple ID 签名，安全且免费。
+# 云端只编译出**未签名** IPA；签名与安装交给设备端
+# （SideStore / LiveContainer / SideInstaller 用你自己的 Apple ID 本地签名）。
+#
+# 架构说明：本 workflow 构建的是 Capacitor iOS 工程，与安卓 APK 同构
+# （server.url 远程加载 sangtacviet.com/app.v2.php + 原生插件）。
+#
+# ios/ 平台目录**故意不入库**：它由 macOS runner 上的 `npx cap add ios` 生成，
+# 避免 Windows 上生成时把反斜杠路径写进 CapApp-SPM/Package.swift
+# （macOS 的 Swift 无法解析反斜杠，见 newsnook-ios 的同类踩坑）。
 
 on:
-  workflow_dispatch:      # 手动触发（GitHub 仓库页面 Actions → Build unsigned IPA → Run workflow）
+  workflow_dispatch:
   push:
-    branches: [ main ]    # push 到 main 也触发
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Compile
-    runs-on: macos-14
-    timeout-minutes: 30
+    runs-on: macos-26
+    timeout-minutes: 60
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app || echo "Xcode_15.4 不存在，使用默认 Xcode"
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app || true
+          latest="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$latest"
           xcodebuild -version
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: List detected plugins
+        run: npx cap ls || true
+
+      - name: Add iOS platform
+        run: |
+          set -euo pipefail
+          if [ ! -d ios/App ]; then
+            npx cap add ios
+          else
+            echo "ios/App 已存在，跳过 cap add"
+          fi
+
+      - name: Sync web assets and Capacitor plugins
+        run: npx cap sync ios
+
+      - name: Verify generated SPM manifest
+        run: |
+          set -euo pipefail
+          cat ios/App/CapApp-SPM/Package.swift
+          # 三个本地插件必须被 cap sync 写进清单，否则原生插件不参与编译。
+          # Capacitor 可能写 npm 包名（@sangtac/http）或反解后的真实路径
+          # （plugins/http），两种都接受。
+          hits="$(grep -c -E 'SangTac|@sangtac|plugins/(http|app|webnativeview)' ios/App/CapApp-SPM/Package.swift || true)"
+          echo "本地插件清单命中行数: $hits"
+          if [ "$hits" -lt 3 ]; then
+            echo "::error::Package.swift 未包含全部本地插件（命中 $hits 行，期望 >= 3）"
+            exit 1
+          fi
+          if grep -q '\\' ios/App/CapApp-SPM/Package.swift; then
+            echo "::error::Package.swift 含 Windows 反斜杠路径"
+            exit 1
+          fi
+
+      - name: Resolve Swift packages
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project ios/App/App.xcodeproj \
+            -scheme App
 
       - name: Build (unsigned)
         run: |
-          xcodebuild \
-            -project SangTacReader.xcodeproj \
-            -scheme SangTacReader \
+          set -euo pipefail
+          xcodebuild build \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
             -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/App/build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            CODE_SIGN_ENTITLEMENTS="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            2>&1 | tee xcodebuild.log | tail -80
 
-      - name: Package .ipa
+      - name: Package IPA
         run: |
-          APP_FILE=$(find build/Build/Products -name "*.app" -type d | head -1)
-          echo "找到应用包: $APP_FILE"
-          mkdir -p Payload
-          cp -r "${APP_FILE}" Payload/
-          echo "--- 确认 reader.js 已打进包 ---"
-          ls Payload/SangTacReader.app/ | grep -i reader || echo "(说明在 subdir)"
-          # 打 zip 并改名 .ipa（未签名，AltStore 可接受）
-          zip -qr SangTacReader-unsigned.ipa Payload
+          set -euo pipefail
+          app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
+          if [ -z "$app" ] || [ ! -d "$app" ]; then
+            echo "::error::未找到 .app 产物"
+            find ios/App/build/Build/Products -maxdepth 3 -type d || true
+            exit 1
+          fi
+          echo "找到应用包: $app"
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$app" Payload/
+          rm -rf Payload/*.app/_CodeSignature
+          rm -f Payload/*.app/embedded.mobileprovision
+          zip -qry SangTacReader-unsigned.ipa Payload
+          rm -rf Payload
           ls -lh SangTacReader-unsigned.ipa
+          unzip -l SangTacReader-unsigned.ipa | head -20
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -54,3 +129,11 @@ jobs:
           name: SangTacReader-unsigned
           path: SangTacReader-unsigned.ipa
           if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore

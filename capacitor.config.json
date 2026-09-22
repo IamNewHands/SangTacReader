@@ -1,0 +1,33 @@
+{
+  "appId": "com.sangtacviet.mobilereader",
+  "appName": "SangTacViet",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "url": "https://sangtacviet.com/app.v2.php",
+    "hostname": "sangtacviet.com",
+    "scheme": "https",
+    "iosScheme": "https",
+    "allowNavigation": [
+      "sangtacviet.com",
+      "*.sangtacviet.com",
+      "sangtacviet.vip",
+      "*.sangtacviet.vip",
+      "sangtacviet.app",
+      "*.sangtacviet.app",
+      "challenges.cloudflare.com"
+    ]
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 0
+    },
+    "CapacitorHttp": {
+      "enabled": false
+    }
+  },
+  "ios": {
+    "contentInset": "never",
+    "limitsNavigationsToAppBoundDomains": false
+  }
+}

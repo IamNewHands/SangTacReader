@@ -1,0 +1,27 @@
+{
+  "name": "sangtac-reader-ios",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SangTacReader iOS — Capacitor shell that loads sangtacviet.com in app mode (same architecture as the Android APK)",
+  "scripts": {
+    "ios:add": "cap add ios",
+    "ios:sync": "cap sync ios",
+    "ios:open": "cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/browser": "^8.0.0",
+    "@capacitor/core": "^8.4.2",
+    "@capacitor/haptics": "^8.0.0",
+    "@capacitor/keyboard": "^8.0.0",
+    "@capacitor/preferences": "^8.0.0",
+    "@capacitor/share": "^8.0.0",
+    "@capacitor/status-bar": "^8.0.3",
+    "@sangtac/app": "file:plugins/app",
+    "@sangtac/http": "file:plugins/http",
+    "@sangtac/webnativeview": "file:plugins/webnativeview"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.4.2",
+    "@capacitor/ios": "^8.4.2"
+  }
+}

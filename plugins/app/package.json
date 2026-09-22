@@ -1,0 +1,20 @@
+{
+  "name": "@sangtac/app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "iOS App plugin with the Android build's SyncCookie method",
+  "main": "dist/plugin.js",
+  "files": [
+    "ios/Sources",
+    "Package.swift",
+    "dist/"
+  ],
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    }
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=8.0.0"
+  }
+}

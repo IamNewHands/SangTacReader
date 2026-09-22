@@ -1,0 +1,20 @@
+{
+  "name": "@sangtac/webnativeview",
+  "version": "0.1.0",
+  "private": true,
+  "description": "iOS stub for the APK's Android-only WebNativeView reflection bridge (comic module)",
+  "main": "dist/plugin.js",
+  "files": [
+    "ios/Sources",
+    "Package.swift",
+    "dist/"
+  ],
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    }
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=8.0.0"
+  }
+}
