@@ -1,0 +1,86 @@
+SangTacReader 个人非商业同源开源许可 1.0
+SangTacReader Personal Non-Commercial Share-Alike License 1.0
+
+版权所有 (C) 2026 IamNewHands
+https://github.com/IamNewHands/SangTacReader
+
+SPDX-License-Identifier: LicenseRef-SangTacReader-NC-SA-1.0
+
+--------------------------------------------------------------------------
+0. 适用范围
+
+本许可只覆盖本仓库中由本项目作者编写的源代码、构建脚本与文档（下称"本软件"）。
+
+本软件是第三方网站（sangtacviet）的客户端外壳。该网站的内容、接口、商标、
+以及任何第三方素材（包括但不限于站点自身的脚本、样式、字体、封面图片）均
+不在本许可范围内，本许可也不对其授予任何权利。使用本软件访问第三方服务时，
+你还须遵守该服务自身的条款。
+
+--------------------------------------------------------------------------
+1. 个人自用（允许）
+
+允许为个人学习、研究、自用目的复制、安装、运行、修改本软件。
+
+--------------------------------------------------------------------------
+2. 禁止商用（禁止）
+
+不得将本软件及其任何修改版、衍生版用于任何商业目的。
+
+"商业目的"包括但不限于：
+
+  a. 出售、出租、许可、按次收费、按订阅收费；
+  b. 随广告、付费墙、会员服务或其他营利性服务一起分发；
+  c. 用于企业内部的生产经营，或作为付费产品或服务的一部分；
+  d. 以本软件或其衍生品为基础提供任何收费的技术支持、托管或代运营服务。
+
+--------------------------------------------------------------------------
+3. 保留署名（必须）
+
+必须在所有副本、修改版与衍生版中：
+
+  a. 完整保留本许可文本，不得删除或替换；
+  b. 保留原始作者的版权声明与署名 —— 名称 "IamNewHands" 及本仓库地址
+     https://github.com/IamNewHands/SangTacReader —— 且不得隐藏、弱化、
+     改名或移除；
+  c. 在修改版中明确标注你做了哪些修改。
+
+--------------------------------------------------------------------------
+4. 同源开源（必须）
+
+任何修改版或衍生版，只要以任何形式向他人提供（包括但不限于源码、
+编译产物、IPA/APK、应用商店、TestFlight、侧载包、镜像站、二次封装、
+SaaS 形式的远程访问），都必须：
+
+  a. 以本许可（或与本许可条款等价的许可）公开其完整对应的源代码；
+  b. 让接收者同样受第 1–4 条约束，不得附加任何额外限制。
+
+仅自己使用、不向他人分发的修改版，不需要公开。
+
+--------------------------------------------------------------------------
+5. 无担保
+
+本软件按"现状"提供，不附带任何明示或默示的担保，包括但不限于对适销性、
+特定用途适用性和非侵权性的担保。在任何情况下，作者均不对因使用或无法
+使用本软件而产生的任何索赔、损害或其他责任负责。
+
+--------------------------------------------------------------------------
+6. 终止
+
+违反上述任一条款，本许可授予你的全部权利自动终止。你须立即停止使用并
+销毁所有副本。
+
+--------------------------------------------------------------------------
+English summary (non-authoritative; the Chinese text above governs)
+
+This license covers only the source code, build scripts and documentation
+written by this project's author. The wrapped third-party website and its
+content are not covered.
+
+You may use, modify and run this software for personal, non-commercial
+purposes only. Commercial use of any kind is prohibited. You must keep this
+license, the copyright notice and the attribution "IamNewHands" together with
+the repository URL intact, and you must mark your changes. If you distribute
+the software or any derivative in any form, you must publish the complete
+corresponding source under this same license. The software is provided "as is",
+without warranty of any kind. Any violation terminates your rights
+automatically.

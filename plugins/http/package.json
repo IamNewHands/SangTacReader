@@ -1,6 +1,7 @@
 {
   "name": "@sangtac/http",
   "version": "0.1.0",
+  "license": "SEE LICENSE IN LICENSE",
   "private": true,
   "description": "iOS replacement for @capacitor-community/http: native URLSession HTTP with WKWebView cookie bridging",
   "main": "dist/plugin.js",

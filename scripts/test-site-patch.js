@@ -256,6 +256,7 @@ function makeSandbox() {
     removeEventListener() {},
     getElementById: byId,
     querySelectorAll: (selector) => documentElement.querySelectorAll(selector),
+    styleSheets: [],
     elementFromPoint() {
       return null;
     },
@@ -959,6 +960,33 @@ async function testReaderTts() {
     'ttsStops=' + String(stillSandbox.__stored.ttsStops));
 }
 
+async function testBootShell() {
+  console.log('first-paint shell');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+
+  const root = sandbox.document.documentElement;
+  check('the boot shell class is applied at document start',
+    String(root.className).indexOf('stv-boot') >= 0, String(root.className));
+  const style = sandbox.__dom.byId('stv-boot-css');
+  check('the boot stylesheet is injected',
+    !!style && style.textContent.indexOf('#mainnavbar') >= 0,
+    'without it the tabs are unstyled text for the whole boot');
+  check('a loading hint is shown', !!sandbox.__dom.byId('stv-boot-hint'));
+
+  // The site's own stylesheet is the signal that boot is over.
+  sandbox.document.styleSheets.push({ href: 'https://sangtacviet.app/asset/app.v2.css?v=4' });
+  await tick(1200);
+  check('the shell is released once the site stylesheet is in play',
+    String(root.className).indexOf('stv-boot') < 0, String(root.className));
+  check('the loading hint is removed', !sandbox.__dom.byId('stv-boot-hint'));
+  const diag = sandbox.window.__stvDiag.text ? sandbox.window.__stvDiag.text() : '';
+  check('the boot timeline is reported',
+    String(diag).indexOf('[BOOT]') >= 0 && String(diag).indexOf('shell released') >= 0,
+    String(diag).slice(-200));
+}
+
 async function testCommentButton() {
   console.log('reader comment button');
   const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
@@ -1220,6 +1248,14 @@ async function testSettingsBackup() {
     String(restore.localStorage.getItem('reader.style.fontsize')));
   check('an unrelated keychain key is ignored',
     restore.localStorage.getItem('some.other.key') === null);
+  // app.v2.config.js reads config.reader right after app.v2.js evaluates, which
+  // can beat the keychain round trip; the running app has to be corrected too.
+  check('the restored values are pushed into the running config',
+    restore.__stored.reader === 'pageflip', String(restore.__stored.reader));
+  const restoreDiag = restore.window.__stvDiag.text ? restore.window.__stvDiag.text() : '';
+  check('the live-config push is reported',
+    String(restoreDiag).indexOf('live config updated') >= 0,
+    String(restoreDiag).slice(-200));
 
   const existing = makeSandbox();
   installFakeApp(existing, { displayType: 'auto', keychain: { 'config.reader': '{"a":1}' } });
@@ -1285,6 +1321,7 @@ await testChapterNamePlace();
   await testSettingsBackup();
   await testBookmarkToggle();
   await testReaderTts();
+await testBootShell();
   await testCommentButton();
   await testOfflineBookDetailPage();
   console.log('');

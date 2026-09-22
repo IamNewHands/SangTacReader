@@ -1174,11 +1174,49 @@ enum SitePatch {
                         + kept.length + ' kept [' + kept.join(' ') + '], '
                         + unusable.length + ' unusable [' + unusable.join(' ') + '], of '
                         + keys.length + ' backed-up key(s)');
+                    return applyToLiveConfig(entries);
                 });
             }).catch(function (e) {
                 note('ERR', 'settingsRestore failed: ' + e);
             });
             return true;
+        }
+
+        // The site reads config.reader / config.ux / config.comicReader in
+        // app.v2.config.js, right after app.v2.js evaluates -- which can easily
+        // beat this block's keychain round trip. When it does, the running app
+        // is already sitting on the defaults even though the store now holds the
+        // restored values, so push them into the live config as well. Each key
+        // has a setter that writes through to app.config._reader and re-saves,
+        // so this also keeps the store and the UI consistent.
+        var CONFIG_TARGETS = {
+            'config.reader': 'reader',
+            'config.ux': 'ux',
+            'config.comicReader': 'comicReader'
+        };
+
+        function applyToLiveConfig(entries) {
+            var app = window.app;
+            if (!app || !app.config) { return null; }
+            var applied = 0;
+            for (var storageKey in CONFIG_TARGETS) {
+                var target = app.config[CONFIG_TARGETS[storageKey]];
+                var raw = entries[storageKey];
+                if (!target || typeof raw !== 'string' || !raw) { continue; }
+                var parsed = null;
+                try { parsed = JSON.parse(raw); } catch (e) { continue; }
+                if (!parsed || typeof parsed !== 'object') { continue; }
+                for (var key in parsed) {
+                    try {
+                        target[key] = parsed[key];
+                        applied++;
+                    } catch (e) {}
+                }
+            }
+            if (applied) {
+                note('SETTINGS', 'live config updated: ' + applied + ' key(s)');
+            }
+            return applied;
         }
 
         function mirror(key, value) {
@@ -1955,10 +1993,147 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - First-paint shell
+
+    /**
+     The site's HTML arrives complete: `<tab id="mainview">` already contains
+     `<tabbar id="mainnavbar">` with the four tabs. None of it is styled or wired
+     until the site's stylesheet and roughly 750 KB of unminified JavaScript have
+     been fetched and parsed, which on the device takes 8-20s (the boot samples
+     in 日志.txt show `db loaded` -- i.e. app.v2.js finished evaluating -- eight
+     seconds after document start). Until then the page is an unstyled pile of
+     text on a white background.
+
+     This block paints that window: a themed background, the bottom tab bar laid
+     out, and a hint that fades itself out. It is scoped to `html.stv-boot` and
+     the class is dropped as soon as the site's own stylesheet is in play, so
+     nothing here can outlive the boot or fight the real UI.
+
+     It also records the boot timeline, because "启动慢" needs numbers before it
+     can be improved twice.
+     */
+    static let bootShell = """
+    (function () {
+        if (window.__stvBootShellInstalled) { return; }
+        window.__stvBootShellInstalled = true;
+
+        var started = Date.now();
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        var CSS = 'html.stv-boot{--background:#101014;--color:#e8e8ea;}'
+            + 'html.stv-boot body{margin:0;background:var(--background);color:var(--color);'
+            + 'font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;}'
+            + 'html.stv-boot #mainview{display:flex;flex-direction:column;height:100vh;}'
+            + 'html.stv-boot #mainnavbar{display:flex;align-items:stretch;'
+            + 'justify-content:space-around;background:rgba(255,255,255,0.04);'
+            + 'border-top:1px solid rgba(255,255,255,0.08);'
+            + 'padding-bottom:env(safe-area-inset-bottom);}'
+            + 'html.stv-boot #mainnavbar tabitem{flex:1;display:flex;flex-direction:column;'
+            + 'align-items:center;justify-content:center;gap:2px;padding:8px 0;'
+            + 'font-size:12px;opacity:0.7;}'
+            + 'html.stv-boot #mainnavbar tabitem.active{opacity:1;}'
+            + 'html.stv-boot #stv-boot-hint{position:fixed;left:0;right:0;top:44%;'
+            + 'text-align:center;font-size:14px;opacity:0.55;'
+            + 'animation:stv-boot-fade 1s ease 8s forwards;}'
+            + '@keyframes stv-boot-fade{to{opacity:0;}}';
+
+        var applied = false;
+        var released = false;
+
+        function style() {
+            if (applied) { return true; }
+            var head = document.head;
+            if (!head) { return false; }
+            var el = document.createElement('style');
+            el.id = 'stv-boot-css';
+            el.textContent = CSS;
+            head.appendChild(el);
+            applied = true;
+            return true;
+        }
+
+        function hint() {
+            if (!applied || document.getElementById('stv-boot-hint')) { return; }
+            var node = document.createElement('div');
+            node.id = 'stv-boot-hint';
+            node.textContent = '载入中…';
+            var host = document.body || document.documentElement;
+            if (host) { host.appendChild(node); }
+        }
+
+        function release(reason) {
+            if (released) { return; }
+            released = true;
+            var root = document.documentElement;
+            if (root && root.className) {
+                root.className = root.className.split('stv-boot').join('')
+                    .split('  ').join(' ').replace(' ', '');
+            }
+            var node = document.getElementById('stv-boot-hint');
+            if (node && node.parentNode) { node.parentNode.removeChild(node); }
+            note('BOOT', 'shell released at +' + (Date.now() - started) + 'ms (' + reason + ')');
+        }
+
+        // The site's own stylesheet is the signal that the real UI is styled.
+        function siteCssReady() {
+            var sheets = document.styleSheets || [];
+            for (var i = 0; i < sheets.length; i++) {
+                var href = sheets[i].href || '';
+                if (href.indexOf('app.v2.css') >= 0) { return true; }
+            }
+            return false;
+        }
+
+        var samples = [
+            [0, 'document start'],
+            [1000, 'stylesheet'],
+            [3000, 'stylesheet'],
+            [6000, 'stylesheet'],
+            [10000, 'stylesheet'],
+            [20000, 'stylesheet']
+        ];
+        for (var i = 0; i < samples.length; i++) {
+            (function (delay, label) {
+                setTimeout(function () {
+                    if (label === 'stylesheet' && siteCssReady()) { release('app.v2.css at +'
+                        + (Date.now() - started) + 'ms'); }
+                    note('BOOT', '+' + (Date.now() - started) + 'ms ' + label
+                        + ': app=' + (window.app ? 'yes' : 'no')
+                        + ' config=' + ((window.app && window.app.config && window.app.config.reader)
+                            ? 'yes' : 'no')
+                        + ' navbar=' + (function () {
+                            var node = document.getElementById('mainnavbar');
+                            if (!node) { return 'absent'; }
+                            return node.getBoundingClientRect
+                                ? Math.round(node.getBoundingClientRect().height) + 'px' : 'unknown';
+                        })());
+                }, delay);
+            })(samples[i][0], samples[i][1]);
+        }
+
+        var root = document.documentElement;
+        if (root) {
+            root.className = (root.className ? root.className + ' ' : '') + 'stv-boot';
+        }
+        if (!style()) {
+            var headTimer = setInterval(function () {
+                if (style()) { clearInterval(headTimer); }
+            }, 20);
+            setTimeout(function () { clearInterval(headTimer); }, 10000);
+        }
+        if (document.body) { hint(); }
+        else { document.addEventListener('DOMContentLoaded', hint); }
+        setTimeout(function () { release('timeout'); }, 30000);
+    })();
+    """
+
     /// Injected in order; every block is independently guarded. `SiteI18nData`
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
     static let all: [String] = [compat, diag, readerDefaults, ttsProvider,
                                 followFallback, safeArea, settingsBackup,
-                                bookmarkToggle, readerTts, pageRepair,
+                                bookmarkToggle, readerTts, pageRepair, bootShell,
                                 SiteI18nData.script]
 }

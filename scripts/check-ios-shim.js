@@ -40,6 +40,7 @@ const REQUIRED_MARKERS = [
   'window.__stvBookmarkToggleInstalled',
   'window.__stvReaderTtsInstalled',
   'window.__stvPageRepairInstalled',
+  'window.__stvBootShellInstalled',
   'pageflip',
 ];
 

@@ -1,6 +1,7 @@
 {
   "name": "sangtac-reader-ios",
   "version": "0.1.0",
+  "license": "SEE LICENSE IN LICENSE",
   "private": true,
   "description": "SangTacReader iOS — Capacitor shell that loads sangtacviet.com in app mode (same architecture as the Android APK)",
   "scripts": {
