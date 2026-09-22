@@ -34,6 +34,7 @@ const REQUIRED_MARKERS = [
   'window.__stvReaderDefaultsInstalled',
   'window.__stvTtsProviderInstalled',
   'window.__stvI18nInstalled',
+  'window.__stvFollowFallbackInstalled',
   'pageflip',
 ];
 

@@ -76,10 +76,35 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
     // MARK: - Synthesis to WAV
 
+    /**
+     AVSpeechSynthesizer.write() hands back an immediately-empty buffer in
+     several field situations: the app's audio session was never activated; the
+     utterance's voice cannot be resolved for buffer writing; or the synthesizer
+     shares the app's session, which the reader's own WebAudio graph has already
+     reconfigured.
+
+     Rather than guess which one applies on a given device, walk a short list of
+     configurations and keep the first that produces samples. Every attempt is
+     traced into the on-device diagnostic panel, so a total failure is
+     diagnosable without another blind build.
+     */
+    private struct Attempt {
+        let usesApplicationAudioSession: Bool
+        let useRequestedVoice: Bool
+        let label: String
+    }
+
+    private static let attempts: [Attempt] = [
+        Attempt(usesApplicationAudioSession: false, useRequestedVoice: true, label: "own-session+voice"),
+        Attempt(usesApplicationAudioSession: false, useRequestedVoice: false, label: "own-session+vi-default"),
+        Attempt(usesApplicationAudioSession: true, useRequestedVoice: true, label: "app-session+voice")
+    ]
+
     func synthesize(text: String,
                     identifier: String?,
                     rate: Double,
                     pitch: Double,
+                    trace: @escaping (String) -> Void,
                     completion: @escaping (Result<Data, Error>) -> Void) {
 
         guard !text.isEmpty else {
@@ -88,67 +113,116 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         }
 
         DispatchQueue.main.async {
-            // AVSpeechSynthesizer.write() is unreliable when the app has never
-            // configured an audio session. `.mixWithOthers` is deliberate: the
-            // reader plays the synthesised WAV through its own WebAudio graph,
-            // and we must not duck or stop it.
             let session = AVAudioSession.sharedInstance()
-            try? session.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers])
+            do {
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try session.setActive(true)
+                trace("audio session active (playback/default/mixWithOthers)")
+            } catch {
+                trace("audio session setup failed: \(error.localizedDescription)")
+            }
+            self.run(text: text,
+                     identifier: identifier,
+                     rate: rate,
+                     pitch: pitch,
+                     attemptIndex: 0,
+                     trace: trace,
+                     completion: completion)
+        }
+    }
 
-            let synthesizer = AVSpeechSynthesizer()
-            let utterance = AVSpeechUtterance(string: text)
-            utterance.voice = self.voice(for: identifier)
-            utterance.rate = NativeSpeech.utteranceRate(fromSiteRate: rate)
-            utterance.pitchMultiplier = NativeSpeech.utterancePitch(fromSitePitch: pitch)
-            utterance.volume = 1.0
+    private func run(text: String,
+                     identifier: String?,
+                     rate: Double,
+                     pitch: Double,
+                     attemptIndex: Int,
+                     trace: @escaping (String) -> Void,
+                     completion: @escaping (Result<Data, Error>) -> Void) {
 
-            let key = UUID().uuidString
-            self.writers[key] = synthesizer
+        guard attemptIndex < NativeSpeech.attempts.count else {
+            completion(.failure(NativeSpeech.error(
+                "no audio in any of the \(NativeSpeech.attempts.count) synthesis configurations")))
+            return
+        }
 
-            let accumulator = PcmAccumulator()
-            let lock = NSLock()
-            var finished = false
+        let attempt = NativeSpeech.attempts[attemptIndex]
+        let synthesizer = AVSpeechSynthesizer()
+        synthesizer.usesApplicationAudioSession = attempt.usesApplicationAudioSession
 
-            func finish(_ result: Result<Data, Error>) {
-                lock.lock()
-                if finished {
-                    lock.unlock()
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = attempt.useRequestedVoice
+            ? self.voice(for: identifier)
+            : AVSpeechSynthesisVoice(language: "vi-VN")
+        utterance.rate = NativeSpeech.utteranceRate(fromSiteRate: rate)
+        utterance.pitchMultiplier = NativeSpeech.utterancePitch(fromSitePitch: pitch)
+        utterance.volume = 1.0
+
+        trace("attempt \(attemptIndex + 1)/\(NativeSpeech.attempts.count) [\(attempt.label)]"
+            + " voice=\(utterance.voice?.identifier ?? "nil")")
+
+        let key = UUID().uuidString
+        self.writers[key] = synthesizer
+
+        let accumulator = PcmAccumulator()
+        let lock = NSLock()
+        var finished = false
+
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if finished { return false }
+            finished = true
+            return true
+        }
+
+        func succeed(_ data: Data) {
+            guard claim() else { return }
+            DispatchQueue.main.async {
+                self.writers.removeValue(forKey: key)
+                trace("attempt \(attemptIndex + 1) ok: \(data.count) bytes")
+                completion(.success(data))
+            }
+        }
+
+        func retry(_ reason: String) {
+            guard claim() else { return }
+            DispatchQueue.main.async {
+                self.writers.removeValue(forKey: key)
+                trace("attempt \(attemptIndex + 1) produced nothing (\(reason))")
+                self.run(text: text,
+                         identifier: identifier,
+                         rate: rate,
+                         pitch: pitch,
+                         attemptIndex: attemptIndex + 1,
+                         trace: trace,
+                         completion: completion)
+            }
+        }
+
+        synthesizer.write(utterance) { buffer in
+            guard let pcm = buffer as? AVAudioPCMBuffer else { return }
+            if pcm.frameLength == 0 {
+                let snapshot = accumulator.snapshot()
+                if snapshot.samples.isEmpty {
+                    retry("\(snapshot.buffers) buffer callback(s), all empty")
                     return
                 }
-                finished = true
-                lock.unlock()
-                DispatchQueue.main.async {
-                    self.writers.removeValue(forKey: key)
-                    completion(result)
-                }
+                let wav = NativeSpeech.wavContainer(samples: snapshot.samples,
+                                                    sampleRate: snapshot.sampleRate,
+                                                    channels: snapshot.channels)
+                succeed(wav)
+                return
             }
+            accumulator.append(pcm)
+        }
 
-            synthesizer.write(utterance) { buffer in
-                guard let pcm = buffer as? AVAudioPCMBuffer else { return }
-                if pcm.frameLength == 0 {
-                    let snapshot = accumulator.snapshot()
-                    if snapshot.samples.isEmpty {
-                        finish(.failure(NativeSpeech.error("speech synthesis produced no audio")))
-                        return
-                    }
-                    let wav = NativeSpeech.wavContainer(samples: snapshot.samples,
-                                                        sampleRate: snapshot.sampleRate,
-                                                        channels: snapshot.channels)
-                    finish(.success(wav))
-                    return
-                }
-                accumulator.append(pcm)
-            }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-                lock.lock()
-                let done = finished
-                lock.unlock()
-                if !done {
-                    synthesizer.stopSpeaking(at: .immediate)
-                    finish(.failure(NativeSpeech.error("speech synthesis timed out")))
-                }
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+            lock.lock()
+            let done = finished
+            lock.unlock()
+            guard !done else { return }
+            synthesizer.stopSpeaking(at: .immediate)
+            retry("timed out after 30s")
         }
     }
 
@@ -157,7 +231,8 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
     func speakDirectly(text: String, identifier: String?, rate: Double, pitch: Double) {
         DispatchQueue.main.async {
             let session = AVAudioSession.sharedInstance()
-            try? session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try? session.setCategory(.playback, mode: .default, options: [.duckOthers])
+            try? session.setActive(true)
 
             let synthesizer = AVSpeechSynthesizer()
             synthesizer.delegate = self
@@ -270,6 +345,7 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         private var samples: [Int16] = []
         private var rate: Double = 22050
         private var channelCount: Int = 1
+        private var buffers: Int = 0
 
         func append(_ buffer: AVAudioPCMBuffer) {
             let format = buffer.format
@@ -279,6 +355,7 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
             lock.lock()
             defer { lock.unlock() }
+            buffers += 1
             if format.sampleRate > 0 { rate = format.sampleRate }
             channelCount = channels
 
@@ -315,10 +392,10 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
             }
         }
 
-        func snapshot() -> (samples: [Int16], sampleRate: Double, channels: Int) {
+        func snapshot() -> (samples: [Int16], sampleRate: Double, channels: Int, buffers: Int) {
             lock.lock()
             defer { lock.unlock() }
-            return (samples, rate, channelCount)
+            return (samples, rate, channelCount, buffers)
         }
     }
 }

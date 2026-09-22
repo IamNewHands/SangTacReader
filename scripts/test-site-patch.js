@@ -53,7 +53,6 @@ function makeElement(tagName) {
     tagName: String(tagName || 'div').toUpperCase(),
     id: '',
     className: '',
-    textContent: '',
     value: '',
     nodeValue: null,
     parentNode: null,
@@ -87,9 +86,61 @@ function makeElement(tagName) {
     querySelector() {
       return null;
     },
+    querySelectorAll(selector) {
+      const wanted = selector.charAt(0) === '.' ? selector.slice(1) : null;
+      const found = [];
+      const visit = (node) => {
+        for (const child of node.children) {
+          if (child.nodeType !== 1) { continue; }
+          if (wanted && String(child.className || '').split(/\s+/).indexOf(wanted) >= 0) {
+            found.push(child);
+          }
+          visit(child);
+        }
+      };
+      visit(element);
+      return found;
+    },
     focus() {},
   };
   element.childNodes = element.children;
+
+  // classList mirrors className, like the real DOM.
+  Object.defineProperty(element, 'classList', {
+    get() {
+      const names = () => String(element.className || '').split(/\s+/).filter(Boolean);
+      return {
+        contains: (name) => names().indexOf(name) >= 0,
+        add: (name) => { if (names().indexOf(name) < 0) { element.className = names().concat([name]).join(' '); } },
+        remove: (name) => { element.className = names().filter((n) => n !== name).join(' '); },
+        toggle: (name) => {
+          if (names().indexOf(name) >= 0) { element.className = names().filter((n) => n !== name).join(' '); }
+          else { element.className = names().concat([name]).join(' '); }
+        },
+      };
+    },
+  });
+
+  // textContent has to reflect the children, because the i18n chapter-title
+  // pass reads and rewrites it.
+  let detached = '';
+  Object.defineProperty(element, 'textContent', {
+    get() {
+      if (element.children.length === 0) { return detached; }
+      let out = '';
+      for (const child of element.children) {
+        out += child.nodeType === 3 ? (child.nodeValue || '') : (child.textContent || '');
+      }
+      return out;
+    },
+    set(value) {
+      detached = value === undefined || value === null ? '' : String(value);
+      element.children.length = 0;
+      element.childNodes = element.children;
+      if (detached !== '') { element.appendChild(makeTextNode(detached)); }
+    },
+  });
+
   return element;
 }
 
@@ -115,6 +166,7 @@ function makeContainer(tagName, className, text) {
 function makeSandbox() {
   const body = makeElement('body');
   const documentElement = makeElement('html');
+  documentElement.appendChild(body);
   const document = {
     body,
     documentElement,
@@ -367,6 +419,15 @@ async function testI18nOverlay() {
   input.setAttribute('placeholder', 'Tiêu đề');
   sandbox.document.body.appendChild(input);
 
+  // The reader header chapter title. The site only ever sends a Vietnamese
+  // machine translation, so all we can fix is the "Chương <n>:" scaffolding.
+  const header = makeContainer('div', 'chaptertopinfo');
+  const chapterName = makeContainer('div', 'chaptername', 'Chương 1:. Uống thuốc');
+  header.appendChild(chapterName);
+  sandbox.document.body.appendChild(header);
+  const plainName = makeContainer('div', 'chaptername', 'Chương');
+  sandbox.document.body.appendChild(plainName);
+
   vm.runInContext(loadBlocks().join('\n'), sandbox);
 
   check('dictionary loaded', sandbox.window.__stvI18n && sandbox.window.__stvI18n.size > 300,
@@ -381,6 +442,13 @@ async function testI18nOverlay() {
     JSON.stringify(toast.childNodes[0].nodeValue));
   check('placeholder attribute translated', input.getAttribute('placeholder') === '标题',
     JSON.stringify(input.getAttribute('placeholder')));
+  check('chapter title numbering translated', chapterName.textContent === '第1章 Uống thuốc',
+    JSON.stringify(chapterName.textContent));
+  check('title without a number is left alone', plainName.textContent === 'Chương',
+    JSON.stringify(plainName.textContent));
+  check('chapter title pass is idempotent',
+    sandbox.window.__stvI18n.fixChapterTitle('第1章 Uống thuốc') === '第1章 Uống thuốc',
+    JSON.stringify(sandbox.window.__stvI18n.fixChapterTitle('第1章 Uống thuốc')));
 }
 
 (async () => {

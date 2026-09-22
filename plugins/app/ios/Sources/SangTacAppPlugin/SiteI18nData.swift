@@ -574,6 +574,64 @@ enum SiteI18nData {
 
         var rewritten = 0;
 
+        // The reader header prints the site's own Vietnamese machine translation of
+        // the chapter name ("Chương 1:. Uống thuốc"). The server never exposes the
+        // original Chinese title: sajax=readchapter returns only bookname and
+        // chaptername, mobile/bookinfo.php carries no chapter list, and
+        // transmode=original switches the BODY to Chinese while leaving the title
+        // Vietnamese. So the words cannot be recovered here. What we can fix is the
+        // scaffolding: "Chương <n>:" becomes "第<n>章".
+        //
+        // Deliberately no regular expression: the whole block has to survive being
+        // embedded in a Swift multiline string, which forbids backslashes.
+        function fixChapterTitle(raw) {
+            if (!raw) { return raw; }
+            var head = 'Chương';
+            var text = raw;
+            while (text.length && text.charCodeAt(0) <= 32) { text = text.substring(1); }
+            if (text.substring(0, head.length) !== head) { return raw; }
+            var rest = text.substring(head.length);
+            var i = 0;
+            while (i < rest.length && rest.charCodeAt(i) <= 32) { i++; }
+            var digits = '';
+            while (i < rest.length) {
+                var code = rest.charCodeAt(i);
+                if (code < 48 || code > 57) { break; }
+                digits += rest.charAt(i);
+                i++;
+            }
+            if (!digits) { return raw; }
+            var tail = rest.substring(i);
+            while (tail.length) {
+                var c0 = tail.charAt(0);
+                if (c0 === ':' || c0 === '.' || c0 === '-' || tail.charCodeAt(0) <= 32) {
+                    tail = tail.substring(1);
+                } else {
+                    break;
+                }
+            }
+            var out = '第' + digits + '章';
+            if (tail.length) { out += ' ' + tail; }
+            return out;
+        }
+
+        // .chaptername sits in SKIP, so walk() never descends into it. That is
+        // deliberate: chapter titles are per-book data and must not be run through
+        // the fragment table. This pass is the only thing allowed to touch them.
+        function applyChapterTitle(node) {
+            var text = node.textContent || '';
+            var fixed = fixChapterTitle(text);
+            if (fixed !== text) { node.textContent = fixed; rewritten++; }
+        }
+
+        function fixChapterTitles(root) {
+            if (!root || root.nodeType !== 1) { return; }
+            if (root.classList && root.classList.contains('chaptername')) { applyChapterTitle(root); }
+            if (!root.querySelectorAll) { return; }
+            var nodes = root.querySelectorAll('.chaptername');
+            for (var i = 0; i < nodes.length; i++) { applyChapterTitle(nodes[i]); }
+        }
+
         function walk(node) {
             if (!node) { return; }
             if (node.nodeType === 3) {
@@ -613,6 +671,7 @@ enum SiteI18nData {
         function sweep() {
             try {
                 walk(document.body || document.documentElement);
+                fixChapterTitles(document.documentElement);
             } catch (e) {
                 if (window.__stvDiag) { window.__stvDiag.log('ERR', 'i18n sweep failed: ' + e); }
             }
@@ -621,6 +680,7 @@ enum SiteI18nData {
         window.__stvI18n = {
             translate: translate,
             sweep: sweep,
+            fixChapterTitle: fixChapterTitle,
             size: EXACT.length,
             rewritten: function () { return rewritten; }
         };
@@ -634,6 +694,11 @@ enum SiteI18nData {
                     } else {
                         var added = record.addedNodes || [];
                         for (var j = 0; j < added.length; j++) { walk(added[j]); }
+                    }
+                    // The reader rewrites .chaptername.textContent on every chapter
+                    // change, which arrives as a childList mutation ON that node.
+                    if (record.target && record.target.nodeType === 1) {
+                        fixChapterTitles(record.target);
                     }
                 }
             });
@@ -650,7 +715,7 @@ enum SiteI18nData {
 
         if (window.__stvDiag) {
             window.__stvDiag.log('PATCH', 'i18n overlay ready: ' + EXACT.length + ' labels, '
-                + FRAGMENTS.length + ' fragments, ' + PATTERNS.length + ' patterns');
+                + FRAGMENTS.length + ' fragments, ' + PATTERNS.length + ' patterns, chapter titles on');
         }
     })();
     """

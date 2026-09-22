@@ -184,18 +184,27 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         let identifier = call.getString("identifier")
         let rate = SangTacAppPlugin.numberOption(call, "rate", fallback: 1)
         let pitch = SangTacAppPlugin.numberOption(call, "pitch", fallback: 1)
-        CAPLog.print("[SangTacApp:tts] speakToFile \(text.count) chars voice=\(identifier ?? "default")")
+        report("TTS", "speakToFile \(text.count) chars voice=\(identifier ?? "default")")
 
+        // Every synthesis attempt is mirrored into the in-page panel: the site's
+        // own failure message ("Không tìm thấy blob") says nothing about WHY the
+        // audio was empty, and a sideloaded build has no readable console.
         NativeSpeech.shared.synthesize(text: text,
                                        identifier: identifier,
                                        rate: rate,
-                                       pitch: pitch) { result in
+                                       pitch: pitch,
+                                       trace: { [weak self] message in
+            CAPLog.print("[SangTacApp:tts] \(message)")
+            self?.report("TTS", message)
+        }) { [weak self] result in
             switch result {
             case .success(let data):
                 CAPLog.print("[SangTacApp:tts] synthesised \(data.count) bytes")
+                self?.report("TTS", "synthesised \(data.count) bytes")
                 call.resolve(["data": data.base64EncodedString(), "mime": "audio/wav"])
             case .failure(let error):
                 CAPLog.print("[SangTacApp:tts] failed: \(error.localizedDescription)")
+                self?.report("ERR", "TTS failed: \(error.localizedDescription)")
                 call.reject(error.localizedDescription)
             }
         }
@@ -226,5 +235,25 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         if let number = raw as? NSNumber { return number.doubleValue }
         if let text = raw as? String, let parsed = Double(text) { return parsed }
         return fallback
+    }
+
+    // MARK: - Diagnostics
+
+    /// Push one line into the in-page diagnostic panel installed by the `diag`
+    /// site patch (window.__stvDiag). Silent when the panel is absent.
+    private func report(_ tag: String, _ message: String) {
+        let js = "window.__stvDiag && window.__stvDiag.log(\(SangTacAppPlugin.jsLiteral(tag)), "
+            + "\(SangTacAppPlugin.jsLiteral(message)));"
+        DispatchQueue.main.async { [weak self] in
+            self?.bridge?.webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private static func jsLiteral(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value]),
+              let array = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return String(array.dropFirst().dropLast())
     }
 }

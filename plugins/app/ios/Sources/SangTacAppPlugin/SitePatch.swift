@@ -644,7 +644,114 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Followed-books fallback probe
+
+    /**
+     The 关注 (following) tab is broken on the site itself, not here:
+
+         GET /mobile/booklist.php?method=following&p=0   -> 500, zero-byte body
+         GET /mobile/booklist.php?method=bookmarked&p=0  -> 200, 34 KB of JSON
+         GET /mobile/booklist.php?method=mybook&p=0      -> 200, {"list":[],"code":100}
+
+     Same host, same cookies, same headers, same endpoint — only the `method`
+     value differs. Anonymous probes answer {"code":102} for all three, so the
+     handler exists and the auth check passes; it then crashes. The site's own
+     markup declares the broken URL (`<bookdisplay from="/mobile/booklist.php
+     ?method=following&p=0">`), so the Android build is equally broken.
+
+     Nothing on the client can repair a server-side crash. What this block does
+     is capture the site's own legacy replacement, which its markup still
+     references in a commented-out line and which is still alive:
+
+         GET /?ajax=getfollowing&user=0  ->  "Bạn chưa đăng nhập." when anonymous
+
+     With a session that endpoint should return the same book items. The
+     response is logged to the diagnostic panel so the next build can convert it
+     into the JSON shape <bookgrid from="..."> expects, instead of guessing.
+     */
+    static let followFallback = """
+    (function () {
+        if (window.__stvFollowFallbackInstalled) { return; }
+        window.__stvFollowFallbackInstalled = true;
+
+        var PROBE = '/?ajax=getfollowing&user=0';
+        var tried = false;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function probe(reason) {
+            if (tried) { return; }
+            tried = true;
+            note('FOLLOW', 'method=following failed (' + reason + '); probing ' + PROBE);
+            try {
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', PROBE, true);
+                xhr.withCredentials = true;
+                xhr.onload = function () {
+                    var body = String(xhr.responseText || '');
+                    note('FOLLOW', PROBE + ' -> ' + xhr.status + ' ' + body.length + 'b :: '
+                        + body.slice(0, 400));
+                };
+                xhr.onerror = function () { note('ERR', PROBE + ' request failed'); };
+                xhr.send();
+            } catch (e) {
+                note('ERR', PROBE + ' threw: ' + e);
+            }
+        }
+
+        function isFollowingCall(url) {
+            return String(url || '').indexOf('method=following') >= 0;
+        }
+
+        function wrapMethod(plugin, name) {
+            var original = plugin[name];
+            if (typeof original !== 'function') { return; }
+            plugin[name] = function (options) {
+                var url = options && options.url;
+                var call = original.apply(this, arguments);
+                if (!call || typeof call.then !== 'function') { return call; }
+                return call.then(function (result) {
+                    if (!isFollowingCall(url)) { return result; }
+                    var status = result && result.status;
+                    if (typeof status !== 'number' || status >= 400) {
+                        probe('status ' + status);
+                    }
+                    return result;
+                }, function (error) {
+                    if (isFollowingCall(url)) { probe('rejected: ' + error); }
+                    throw error;
+                });
+            };
+        }
+
+        function attach() {
+            var Capacitor = window.Capacitor;
+            var plugin = Capacitor && Capacitor.Plugins && Capacitor.Plugins.Http;
+            if (!plugin || plugin.__stvFollowWrapped) { return !!plugin; }
+            try {
+                plugin.__stvFollowWrapped = true;
+                wrapMethod(plugin, 'get');
+                wrapMethod(plugin, 'request');
+            } catch (e) {
+                note('ERR', 'follow probe could not wrap Http: ' + e);
+            }
+            return true;
+        }
+
+        if (!attach()) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (attach() || attempts > 200) { clearInterval(timer); }
+            }, 100);
+        }
+    })();
+    """
+
     /// Injected in order; every block is independently guarded. `SiteI18nData`
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
-    static let all: [String] = [compat, diag, readerDefaults, ttsProvider, SiteI18nData.script]
+    static let all: [String] = [compat, diag, readerDefaults, ttsProvider,
+                                followFallback, SiteI18nData.script]
 }
