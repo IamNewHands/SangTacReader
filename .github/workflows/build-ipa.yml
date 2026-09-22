@@ -122,11 +122,15 @@ jobs:
           app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
           bin="$app/$(basename "$app" .app)"
           echo "binary: $bin"
+          # Dump the symbol table once: piping nm into `grep -q` makes grep exit
+          # early, SIGPIPE-kills nm, and `set -o pipefail` then reports failure
+          # even when the symbol is present.
+          syms="$(mktemp)"
+          nm -a "$bin" > "$syms"
           echo "=== 产物中的 SangTac ObjC 类符号 ==="
-          nm -a "$bin" | grep -E 'OBJC_CLASS_\$_SangTac' || echo "(没有找到任何 SangTac 类符号)"
+          grep -F 'OBJC_CLASS_$_SangTac' "$syms" || echo "(没有找到任何 SangTac 类符号)"
           for cls in SangTacHttpPlugin SangTacAppPlugin SangTacWebNativeViewPlugin; do
-            # -F: match the literal Mach-O symbol _OBJC_CLASS_$_<Class>.
-            if nm -a "$bin" | grep -q -F "_OBJC_CLASS_\$_$cls"; then
+            if grep -q -F "_OBJC_CLASS_\$_$cls" "$syms"; then
               echo "✓ $cls 已链接"
             else
               echo "::error::原生插件 $cls 未链接进产物（站点会退回 web 模式）"
