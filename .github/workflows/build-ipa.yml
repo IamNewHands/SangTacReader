@@ -81,6 +81,17 @@ jobs:
             exit 1
           fi
 
+      - name: Verify plugin registration list
+        run: |
+          set -euo pipefail
+          capjson="ios/App/App/capacitor.config.json"
+          echo "=== $capjson (packageClassList) ==="
+          python3 -c "import json,sys; d=json.load(open('$capjson')); print('\n'.join(d.get('packageClassList', [])))"
+          for cls in SangTacHttpPlugin SangTacAppPlugin SangTacWebNativeViewPlugin; do
+            grep -q "\"$cls\"" "$capjson" \
+              || { echo "::error::$cls 不在 packageClassList 中，Capacitor 不会注册它"; exit 1; }
+          done
+
       - name: Resolve Swift packages
         run: |
           set -euo pipefail
@@ -114,7 +125,9 @@ jobs:
           echo "=== 产物中的 SangTac ObjC 类符号 ==="
           nm -a "$bin" | grep -E 'OBJC_CLASS_\$_SangTac' || echo "(没有找到任何 SangTac 类符号)"
           for cls in SangTacHttpPlugin SangTacAppPlugin SangTacWebNativeViewPlugin; do
-            if nm -a "$bin" | grep -q "OBJC_CLASS_[_]\$$cls"; then
+            # [$] avoids bash expansion of $ while still matching the literal dollar
+            # in the Mach-O symbol _OBJC_CLASS_$_<Class>.
+            if nm -a "$bin" | grep -q "OBJC_CLASS_[_][$]$cls"; then
               echo "✓ $cls 已链接"
             else
               echo "::error::原生插件 $cls 未链接进产物（站点会退回 web 模式）"
