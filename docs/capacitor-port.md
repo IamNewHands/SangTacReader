@@ -263,7 +263,14 @@ async getVoices()            -> [{name, value, gender}]
 1. **覆盖层没碰它**：`.chaptername` 在 i18n 覆盖层的 `SKIP` 集合里，`walk()` 根本不下沉。这个设计本身是对的（章节标题是每本书的数据，不能拿片段表去替换），所以修法是**加一条专用 pass**，而不是把它从 SKIP 里删掉。
 2. **标题正文无法翻译**：服务端从来不暴露中文原标题。`sajax=readchapter` 只回 `bookname` + `chaptername`；`mobile/bookinfo.php` 只回 `{"book":{…}}`，**没有章节列表**；`transmode=original`（cookie `transmode=chinese`）只把**正文**切成中文，标题照旧越南语。日志里 `"chaptername":"Chương 03:. Giao phong"` 与纯中文 `data` 同时出现，就是这个组合。
 
-能修的是**外壳**：`Chương <n>:` → `第<n>章`，于是标题变成 `第1章 Uống thuốc`。实现刻意**不用正则**（整块要被嵌进 Swift 多行字符串，反斜杠是硬错误），改用 `charCodeAt` 逐字符扫描；幂等（`第…` 开头的直接原样返回，也避免了 MutationObserver 自激）。测试补 3 条断言。
+能修的是**外壳**，而且有两种数字格式（日志里都出现了）：
+
+| 站点 | 原文 | 改写后 |
+| --- | --- | --- |
+| qidian | `Chương 3:. Giao phong` | `第3章 Giao phong` |
+| fanqie | `Thứ 2 chương Ngọc Long linh tuyền không gian` | `第2章 Ngọc Long linh tuyền không gian` |
+
+实现刻意**不用正则**（整块要被嵌进 Swift 多行字符串，反斜杠是硬错误），改成 `TITLE_HEADS = [['Chương',''],['Thứ','chương']]` 表 + `charCodeAt` 逐字符扫描；幂等（`第…` 开头的直接原样返回，也避免了 MutationObserver 自激），且 `Thứ tự chương`（以 `Thứ` 开头但没有数字）原样保留。测试补 5 条断言。
 
 #### (3) TTS 报「no voice / 没有音频」——声音是有的，是合成返回空
 
