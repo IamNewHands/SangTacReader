@@ -751,3 +751,66 @@ if(x.oridata && app.language != "vi"){
 - 行内按钮：站点把「暂停/重试」藏在长按菜单里，且**根本没有删除任务**的入口。包装
   `render()` 后往每行追加「暂停下载/继续下载」和「删除任务」两个按钮
   （`stopPropagation`，删除 = 从 `app.bookDownloaderList` 摘掉 + 移除节点）。
+
+### 6.9 第八轮反馈：设置跨重启丢失、首屏外壳、许可
+
+#### (1) 设置「完整退出应用后重新进入全没了」
+
+`app.v2.config.js` 的时序是关键：
+
+```js
+await onDbLoad.waitForLoad();                                   // 立即 resolve
+var loadedReaderSetting = JSON.parse((await app.storage.cache.getFile("config.reader")) || "{}");
+app.config._reader = $.extend({}, app.config.readerDefault, loadedReaderSetting);
+```
+
+它紧跟 `app.v2.js` 求值之后就读 `config.reader` / `config.ux` / `config.comicReader`，
+而我们的 Keychain 恢复是一次原生往返（查询 + 每个键 `get`/`set`），很容易跑输。
+一旦跑输，运行中的应用已经落在默认值上；更糟的是默认值随后会被任何一次 setter
+写回存储，把用户的设置覆盖掉。
+
+修法：恢复完成后除了写存储，还把值**回灌进运行中的 `app.config`**
+（每个键的 setter 会同步 `_reader` 并重存，所以 UI 与存储保持一致），并上报
+`SETTINGS live config updated: N key(s)`。
+
+恢复摘要行也改成可判读的形式：
+
+```
+[SETTINGS] keychain restore: N written, M kept [key:len …], K unusable [key:typeof …], of T backed-up key(s)
+```
+
+- `written > 0` ⇒ 启动时存储是空的（容器被换掉 / 写入没落地）；
+- `kept` 列表里的 `key:len` ⇒ 存储本来就有值，问题不在恢复。
+
+下一份**启动日志**（重启后立刻复制面板）就能定死是哪一类。
+
+#### (2) 首屏要等很久才出现底部标签
+
+站点 HTML 本身就是完整的 —— `_page_vip.html` 里 `<tab id="mainview">` 已经包含
+`<tabbar id="mainnavbar">` 和四个 `tabitem` —— 只是要等站点 CSS 和约 750KB 未压缩
+JS（`app.v2.js` 261KB、`chapterdisplay` 158KB、`read` 145KB、`comicprovider` 80KB、
+`stv.tts` 47KB…）到齐。设备日志里 `db loaded`（即 `app.v2.js` 求值完）出现在文档开始
+后第 8 秒。
+
+新增 `bootShell` 块：文档开始就往 `<head>` 注入一段最小样式，把这段空白画成应用的
+样子 —— 主题背景、底部标签栏布局、淡出的「载入中…」提示。样式全部限定在
+`html.stv-boot` 下，一旦站点自己的 `app.v2.css` 出现在 `document.styleSheets`
+（或 `app.config` 已经建立，作为文件改名的兜底）就摘掉这个 class，因此不会和真实 UI
+抢规则。同时按 0/1/3/6/10/20s 采样上报：
+
+```
+[BOOT] +Nms stylesheet: app=yes/no config=yes/no navbar=NNpx
+[BOOT] shell released at +Nms (app.v2.css)
+```
+
+顺带否掉一个看起来更直接、实际没用的方案：把上次可用域名固化进
+`app.config.ux.app_domain`。`networkManagerXHR.bestDomain()`（app.v2.js:933）仍然要等
+`this.domains` 被探测填好，`app_domain` 只决定存活域名里选哪个，省不掉那几秒探测。
+
+#### (3) 许可证
+
+新增 `LICENSE`：个人非商业同源开源许可 1.0（SPDX
+`LicenseRef-SangTacReader-NC-SA-1.0`），四条核心约束 —— 个人自用允许、任何商业用途
+禁止、必须保留许可/版权/署名并标注修改、分发修改版必须以同一许可公开完整源代码。
+只覆盖本仓库作者编写的代码与文档；站点内容与第三方素材不在授权范围内。
+`README.md` 增补许可证一节，四个 `package.json` 加 `license` 字段。

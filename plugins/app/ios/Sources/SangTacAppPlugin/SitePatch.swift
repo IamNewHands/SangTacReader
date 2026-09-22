@@ -2078,13 +2078,17 @@ enum SitePatch {
         }
 
         // The site's own stylesheet is the signal that the real UI is styled.
+        // app.config is the belt-and-braces signal: if the file is ever renamed
+        // or served from a different path, the site's JS booting is still proof
+        // that our shell has done its job and must stop applying.
         function siteCssReady() {
             var sheets = document.styleSheets || [];
             for (var i = 0; i < sheets.length; i++) {
                 var href = sheets[i].href || '';
-                if (href.indexOf('app.v2.css') >= 0) { return true; }
+                if (href.indexOf('app.v2.css') >= 0) { return 'app.v2.css'; }
             }
-            return false;
+            if (window.app && window.app.config && window.app.config.reader) { return 'app.config'; }
+            return '';
         }
 
         var samples = [
@@ -2098,8 +2102,10 @@ enum SitePatch {
         for (var i = 0; i < samples.length; i++) {
             (function (delay, label) {
                 setTimeout(function () {
-                    if (label === 'stylesheet' && siteCssReady()) { release('app.v2.css at +'
-                        + (Date.now() - started) + 'ms'); }
+                    var ready = siteCssReady();
+                    if (ready) {
+                        release(ready + ' at +' + (Date.now() - started) + 'ms');
+                    }
                     note('BOOT', '+' + (Date.now() - started) + 'ms ' + label
                         + ': app=' + (window.app ? 'yes' : 'no')
                         + ' config=' + ((window.app && window.app.config && window.app.config.reader)
