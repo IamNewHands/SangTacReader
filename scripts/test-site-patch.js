@@ -348,7 +348,15 @@ function installFakeApp(sandbox, options) {
       reader: {},
     },
     storage: {
+      // The site reads its config through app.storage, which on iOS is
+      // Capacitor Preferences -- NOT localStorage. The stub has to expose the
+      // same pair, or the settings backup can pass here while restoring into a
+      // store the site never reads (which is what the device showed).
+      get(key) {
+        return Promise.resolve(sandbox.localStorage.getItem(key) || '');
+      },
       set(key, value) {
+        sandbox.localStorage.setItem(key, value);
         stored[key] = value;
         return Promise.resolve();
       },
@@ -430,7 +438,38 @@ function installFakeApp(sandbox, options) {
     return Promise.resolve(bookInfoResponses[url]);
   };
   app.net.get = (url) => app.net.getCacheLater(url);
-  app.offlineBook = { store: { data: options.offlineBooks || [] } };
+  // The single funnel every chapter name comes from (app.v2.read.js:602).
+  app.reader.getContent = options.getContent || function () {
+    return Promise.resolve({
+      chaptername: options.chapterName === undefined ? 'Chương 03:. Giao phong'
+        : options.chapterName,
+    });
+  };
+  app.offlineBook = {
+    store: { data: options.offlineBooks || [] },
+    getDownloadBooks(from, to) {
+      stored.listReads = (stored.listReads || []).concat([from + ':' + to]);
+      // Stands in for populateBookInfo(), which answers from the bookinfo cache
+      // and silently returns [] on a miss.
+      const cache = stored.cacheLater || [];
+      return Promise.resolve(app.offlineBook.store.data.slice(from, to).filter((book) => {
+        return cache.indexOf('/mobile/bookinfo.php?hid=' + book.id + '&host=' + book.host) >= 0;
+      }));
+    },
+  };
+  // DownloadManager renders its progress row the instant a download starts
+  // (app.v2.read.js:3481), and that render is what reads the cache.
+  class FakeDownloadManager {
+    constructor(host, id) {
+      this.host = host;
+      this.id = id;
+    }
+    render() {
+      stored.renderCache = (stored.cacheLater || []).slice();
+      return Promise.resolve({ host: this.host, id: this.id });
+    }
+  }
+  app.BookDownloadManager = FakeDownloadManager;
 
   sandbox.app = app;
   sandbox.window.app = app;
@@ -528,6 +567,18 @@ async function testCompatAndTtsProvider() {
   const voices = await provider.getVoices();
   check('getVoices returns the native voice', voices.length === 1 && voices[0].value.includes('vi-VN'));
   check('female voice maps to site gender 1', voices[0].gender === 1);
+
+  // The reader hands every sentence it builds to the site with a leading
+  // marker, because the site's own filter only lets an ASCII word character
+  // through and Chinese text has none. The marker must never be spoken.
+  await provider.speak('stv0第一句', { voice: 'v', rate: 1 });
+  const forwarded = sandbox.__calls[sandbox.__calls.length - 1];
+  check('the reader sentence marker is stripped before synthesis',
+    forwarded && forwarded.text === '第一句', forwarded ? forwarded.text : '(no call)');
+  await provider.speak('Xin chào', { voice: 'v', rate: 1 });
+  const plain = sandbox.__calls[sandbox.__calls.length - 1];
+  check('unmarked text is forwarded untouched', plain && plain.text === 'Xin chào',
+    plain ? plain.text : '(no call)');
 
   const list = sandbox.app.tts.engineList();
   check('engineList lists iOS first', list[0].value === 'ios', JSON.stringify(list));
@@ -684,6 +735,17 @@ async function testI18nOverlay() {
   sandbox.window.__stvI18n.sweepFrames();
   check('a re-navigated iframe document is picked up again',
     repinned.textContent === '第12章 Nhập môn', JSON.stringify(repinned.textContent));
+
+  // Translating the title element alone makes the site's own
+  // `oldName != name` guard in updateFixedChapterName() true forever, which
+  // re-runs its recycle + updateHistory2 branch on every scroll tick. The name
+  // is translated where it is produced instead, so the comparison stays equal.
+  const source = await sandbox.app.reader.getContent('qidian', '1', '2');
+  check('the chapter name is translated at its source',
+    source.chaptername === '第3章 Giao phong', JSON.stringify(source.chaptername));
+  const again = await sandbox.app.reader.getContent('qidian', '1', '2');
+  check('the source translation is idempotent so the recycle guard stays quiet',
+    again.chaptername === source.chaptername, JSON.stringify(again.chaptername));
 }
 
 async function testReaderTts() {
@@ -718,7 +780,7 @@ async function testReaderTts() {
   check('the TTS outcome is reported instead of failing silently',
     String(diag).indexOf('reader TTS start') >= 0, String(diag).slice(-200));
   check('the sentence source is reported when it had to be replaced',
-    String(diag).indexOf('tokenizeSentence fallback') >= 0, String(diag).slice(-200));
+    String(diag).indexOf('chapter-text fallback') >= 0, String(diag).slice(-200));
 
   // A display whose tokenizer returns nothing must still produce sentences.
   const emptyDisplay = {
@@ -736,6 +798,14 @@ async function testReaderTts() {
     produced.length === 3, JSON.stringify(produced.map((s) => s.toText())));
   check('fallback sentences expose toText so Sentence() never needs the speaker',
     typeof produced[0].toText === 'function');
+  // The site's own filter is `text.match(ASCII_WORD)` (app.v2.read.js:2357), so
+  // a Chinese sentence is dropped unless it carries a word character. Without
+  // the marker the device reported "fallback -> 23 sentence(s)" and then
+  // "reader TTS start: sentences=0" on the very next line.
+  check('fallback sentences carry the marker the site\'s ASCII filter needs',
+    produced[0].toText().indexOf('stv0') === 0, JSON.stringify(produced[0].toText()));
+  check('the marker is not part of the sentence text the site would speak',
+    produced[0].toText().slice(4) === '第一句。', JSON.stringify(produced[0].toText()));
 }
 
 async function testCommentButton() {
@@ -803,9 +873,35 @@ async function testOfflineBookDetailPage() {
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(400);
 
-  check('every downloaded book has its bookinfo cached',
+  // A row rendered for a download that has just started must already have the
+  // bookinfo cache filled: populateBookInfo() answers from it and returns []
+  // otherwise, and the row's click handler captures that undefined.
+  const manager = new app.BookDownloadManager('qidian', '1034915599');
+  await manager.render();
+  check('the download manager warms the bookinfo cache before rendering its row',
+    (sandbox.__stored.renderCache || []).indexOf(url) >= 0,
+    JSON.stringify(sandbox.__stored.renderCache || []));
+
+  const rows = await app.offlineBook.getDownloadBooks(0, 20);
+  check('the downloaded list warms the cache before building its rows',
     (sandbox.__stored.cacheLater || []).indexOf(url) >= 0,
     JSON.stringify(sandbox.__stored.cacheLater || []));
+  check('the warmed cache makes populateBookInfo() find the book',
+    rows.length === 1, JSON.stringify(rows));
+
+  // A book downloaded after boot only appears in store.data later.
+  const lateUrl = '/mobile/bookinfo.php?hid=999&host=fanqie';
+  sandbox.app.offlineBook.store.data.push({ host: 'fanqie', id: '999' });
+  await tick(3200);
+  check('a book downloaded after boot is warmed by the periodic sweep',
+    (sandbox.__stored.cacheLater || []).indexOf(lateUrl) >= 0,
+    JSON.stringify(sandbox.__stored.cacheLater || []));
+
+  const before = (sandbox.__stored.cacheLater || []).length;
+  await tick(3200);
+  check('an already warmed book is not refetched',
+    (sandbox.__stored.cacheLater || []).length === before,
+    JSON.stringify((sandbox.__stored.cacheLater || []).slice(before)));
 
   const blank = app.fun.openBookWithData(0, undefined);
   check('a detail page is never pushed without book data', blank === null,
@@ -820,6 +916,44 @@ async function testOfflineBookDetailPage() {
   app.fun.openBookWithData(0, book);
   check('a real book still opens the detail page',
     (sandbox.__stored.opened || []).length === 1, JSON.stringify(sandbox.__stored.opened || []));
+}
+
+async function testChapterNamePlace() {
+  console.log('static chapter name place');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'pageflip' });
+  // The pinned name lives in the reader iframe's own document.
+  const info = makeContainer('div', 'chaptertopinfo');
+  info.style.display = 'none'; // what the 不显示 option left behind
+  app.reader.getDisplay = () => ({ innerWindow: { q: () => [info] } });
+  app.config.reader.chapter_name_fixed_place = 'top';
+  app.reader.behaviour = {
+    chapter_name_fixed_place: {
+      apply() {
+        // The site only ever rewrites top/bottom here -- never display.
+        info.style.top = 'unset';
+        info.style.bottom = 'unset';
+      },
+    },
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('the display:none left by the 不显示 option is cleared',
+    info.style.display !== 'none', String(info.style.display));
+  check('the chosen side is applied to the pinned name',
+    info.style.top === '0', String(info.style.top));
+
+  app.config.reader.chapter_name_fixed_place = 'none';
+  app.reader.behaviour.chapter_name_fixed_place.apply();
+  check('choosing 不显示 still hides it', info.style.display === 'none',
+    String(info.style.display));
+
+  app.config.reader.chapter_name_fixed_place = 'bottom';
+  app.reader.behaviour.chapter_name_fixed_place.apply();
+  check('switching back to 底部 brings it back',
+    info.style.display !== 'none' && info.style.bottom === '0',
+    'display=' + String(info.style.display) + ' bottom=' + String(info.style.bottom));
 }
 
 async function testSafeArea() {
@@ -850,6 +984,15 @@ async function testSafeArea() {
     'without it the bar renders under the Dynamic Island');
   check('reader option sheet gets bottom padding',
     !!style && style.textContent.includes('#chapterview .coption'));
+  // #overlay is `height: var(--vh100)` while #mainview (which owns the main
+  // navbar) gets an inline 100vh from the site's own onresize, so a --vh100
+  // sample below the real viewport leaves the navbar showing under every page.
+  check('the pushed-page overlay is never shorter than the viewport',
+    !!style && style.textContent.includes('#overlay{height:max(var(--vh100, 100vh), 100vh) !important;}'),
+    'a short --vh100 leaves 首页/搜索/社区/用户 visible under every pushed page');
+  check('the overlay rule is skipped while the keyboard is open',
+    !!style && style.textContent.includes('body:not([keyboardopen]) #overlay'),
+    'the site shrinks the overlay on purpose for the keyboard');
 }
 
 async function testSafeAreaRespectsSiteValues() {
@@ -871,6 +1014,8 @@ async function testSafeAreaRespectsSiteValues() {
 async function testSettingsBackup() {
   console.log('settings backup across reinstalls');
 
+  // The reinstall case: the app data container is gone, so the site's store has
+  // nothing and the keychain is the only surviving copy.
   const restore = makeSandbox();
   installFakeApp(restore, {
     displayType: 'auto',
@@ -882,9 +1027,12 @@ async function testSettingsBackup() {
   });
   vm.runInContext(loadBlocks().join('\n'), restore);
   await tick(250);
-  check('keychain value written back into localStorage',
+  check('keychain value is restored into the site\'s own store',
     restore.localStorage.getItem('config.reader') === '{"display_type":"pageflip","show_title":false}',
     String(restore.localStorage.getItem('config.reader')));
+  check('the restore goes through app.storage.set, not localStorage directly',
+    restore.__stored['config.reader'] === '{"display_type":"pageflip","show_title":false}',
+    String(restore.__stored['config.reader']));
   check('dynamic reader.style.* keys are restored too',
     restore.localStorage.getItem('reader.style.fontsize') === '22px',
     String(restore.localStorage.getItem('reader.style.fontsize')));
@@ -896,7 +1044,7 @@ async function testSettingsBackup() {
   existing.localStorage.setItem('config.reader', '{"b":2}');
   vm.runInContext(loadBlocks().join('\n'), existing);
   await tick(250);
-  check('an existing localStorage value wins over the backup',
+  check('an existing stored value wins over the backup',
     existing.localStorage.getItem('config.reader') === '{"b":2}',
     String(existing.localStorage.getItem('config.reader')));
 
@@ -947,6 +1095,7 @@ async function testBookmarkToggle() {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
   await testReaderDefaults();
+await testChapterNamePlace();
   await testDiagPanel();
   await testI18nOverlay();
   await testSafeArea();

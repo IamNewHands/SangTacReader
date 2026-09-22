@@ -543,3 +543,144 @@ config.requestCachePolicy = .reloadIgnoringLocalCacheData   // SangTacHttpPlugin
 注意：这只解决"可缓存的东西被我们主动禁掉了"这一半。日志里 `booklist.php` 这类
 动态接口本身也要 0.7–2.1s，那部分是服务端和链路，客户端改不掉。
 
+### 6.7 第六轮真机反馈（`日志2.txt`，445 行）
+
+上一轮上报的 `[RECT]` / `[TTS]` 都按预期出现了，这一轮六个问题里五个由它们或站点源码
+直接定死。上一轮的 (2)(6)（灵动岛顶栏、储物袋顶栏）本轮没有再被提及。
+
+#### (5) 顶部章节名「都不显示了」—— 站点自己把「不显示」做成了单程票
+
+`app.reader.behaviour.chapter_name_fixed_place.apply()`（`app.v2.chapterdisplay.js:3350`）：
+
+```js
+var cs = app.reader.getDisplay().innerWindow.q(".chaptertopinfo")[0];
+switch (app.config.reader.chapter_name_fixed_place) {
+    case "top":    { cs.style.top = "0";      cs.style.bottom = "unset"; break; }
+    case "bottom": { cs.style.top = "unset";  cs.style.bottom = "0";     break; }
+    case "none":   { cs.style.display = "none"; break; }   // ← 没有任何地方清掉它
+}
+```
+
+`display:none` 一旦被写上就再也没人清。改回 顶部 / 底部 只改 `top`/`bottom`，元素仍然
+`display:none`，所以"无论设顶部还是底部都不显示"。日志里 21:32:06 / 21:32:17 /
+21:32:26 / 21:33:07 四次 `app.config.reader.chapter_name_fixed_place` 就是用户在反复试。
+
+修法（`readerDefaults` 块）：包装 `apply`，调用站点原逻辑后按当前设置把
+`.chaptertopinfo` 的 `display` 重新算一遍并补上 `top`/`bottom`，顺带上报
+`PATCH chapter name place=… infos=… were-hidden=…`。
+
+**同一轮还修掉了标题翻译的副作用。** 上一轮是直接在 DOM 里把 `.chapternamefixed` 改成
+中文，但站点靠"值有没有变"来决定要不要做重活（`chapterdisplay.js:3584`）：
+
+```js
+var oldName = fixed.textContent;
+if (oldName != name) { fixed.textContent = name; this.recycle(c); app.reader.updateHistory2(); }
+```
+
+DOM 里永远是中文、`name` 永远是越南语 ⇒ 每次滚动都判定"变了" ⇒ 每帧 `recycle()` +
+`updateHistory2()`。这一轮改成在**名字的生产者**上翻译：包装 `app.reader.getContent`
+（`app.v2.read.js:602`，离线章节、`getContent2`、网络三条路都从这里出去），只改
+`cdata.chaptername`。`createPage` / `resetPageHtml` / `getPrependChapterNameHTML` /
+`updateFixedChapterName` / 底栏全部读这一个字段，于是比较恒等、重活不再触发，DOM 那一趟
+保留成兜底。
+
+#### (2) TTS 还是没声音 —— 站点的句子过滤器只认 ASCII
+
+日志把因果写成了两行：
+
+```
+21:26:43 [TTS] tokenizeSentence fallback -> 23 sentence(s)
+21:26:43 [TTS] reader TTS start: sentences=0 provider=ios
+```
+
+句子造出来了 23 条，进队列后变成 0 条。中间只有一道过滤器
+（`app.v2.read.js:2357`）：
+
+```js
+this.hasText = function () { return this.text.match(/\w/); }
+```
+
+`\w` 只匹配 ASCII 词字符，中文句子一条都过不去。而站点自己的句子源
+（`PageFlipChapterDisplay.tokenizeSentence`，`chapterdisplay.js:2235`）要求
+`<i>` 是 `<p>` 的子节点，实际返回的章节 HTML 里 `<i>` 是 `</p>` 的**兄弟**，所以它返回空
+数组——两边都不通，于是"点播放没声音、也不报错"。
+
+修法：站点那一趟仍然先试；为空时用章节正文兜底，并且**给每条句子加一个 ASCII 前缀
+`stv0`**，让它通过 `hasText()`；我们自己的 provider（`ttsProvider` 块）在调用
+`AVSpeechSynthesizer` 之前把前缀剥掉，所以不会念出多余内容。同时上报
+`fallback source: N chars -> M sentence(s)`、`site tokenizeSentence -> N`、
+`reader TTS start: sentences=N first=M chars`。
+
+语种也一起修了：`NativeSpeech.availableVoices()` 原来硬过滤 `vi*`，`voice(for:)` 也永远
+回落到 `vi-VN`。中文正文配越南语发音人基本等于没声音，所以现在语音列表覆盖 `vi` + `zh`，
+并且**只在所选发音人的语种和文本语种一致时才用它**，否则按文本语种（CJK → `zh-CN`）挑。
+
+#### (1) 底部首页/搜索/社区/用户一直显示 —— `#overlay` 比 `#mainview` 矮
+
+```css
+#overlay { position: fixed; top: 0; width: 100vw; height: var(--vh100); z-index: 100 }  /* app.v2.css:262 */
+```
+
+`#mainview`（`#mainnavbar` 就在里面）的高度则由站点自己的 `window.onresize` 写成
+内联 `mainview.style.height = "100vh"`（`app.v2.js:4507`），而 `--vh100` 来自
+`visualViewport.height`（`:4484`）。两者只要有一次不一致、`--vh100` 偏小，`#overlay`
+就盖不满，`#mainview` 底部那条（就是主导航）露出来，翻页进详情页也照样露。重启后
+`onresize` 重新采样一次，所以"退出重进又恢复正常"。
+
+修法（`safeArea` 块，键盘弹出时除外——站点是故意缩小的，用 `body[keyboardopen]` 标记）：
+
+```css
+body:not([keyboardopen]) #overlay     { height: max(var(--vh100, 100vh), 100vh) !important }
+body:not([keyboardopen]) #overlay > div { height: max(var(--vh100, 100vh), 100vh) !important }
+```
+
+`[RECT]` 同时加上 `#overlay`、`#mainnavbar` 的实测框、`viewport=` 和 `--vh100` 的解析值，
+下一份日志可以直接判定（`#overlay` 底边 < viewport 就是没盖住）。
+
+#### (4) 下载的书点进去「书籍信息缺失」—— 上一轮的兜底拦住了，但缓存还是空的
+
+上一轮加的 `openBookWithData` 守卫确实生效了（日志
+`[ERR] openBookWithData called with no book data (bookid=0)`），可它只是把"空白页"换成
+"提示"。真正的因是 `populateBookInfo()`（`app.v2.read.js:3258`）只读缓存、未命中直接返回
+`[]`，而 `DownloadManager` 的构造**在下载刚开始时**就调 `onUpdate()` → `render()`
+（`:3481` → `:3609`）读这个缓存，那时候谁都还没写进去；`render` 里
+`app.fun.openBookWithData(0, bi)` 的 `bi` 就被永久固化成了 `undefined`。
+
+修法（`pageRepair` 块）：按生产者顺序预热，而不是事后拦截——
+
+- 包装 `app.BookDownloadManager.prototype.render`，先 `getCacheLater(bookinfo url)` 再渲染
+  （`render()` 本来就是被 `await` 的，`app.v2.read.js:3432`）；
+- 包装 `app.offlineBook.getDownloadBooks`（储物袋下载列表走这里 → `populateBookInfo`），
+  先把 `store.data` 里每本书都预热一遍；
+- 保留 3 秒一轮的 `warmStore()` 扫描，覆盖"启动之后才下载"的书；
+- 上一轮的 `openBookWithData` 守卫保留成最后一道防线。
+
+#### (6) 覆盖安装后设置还是丢了 —— 恢复写进了站点根本不读的库
+
+站点 `app.v2.js:531`：
+
+```js
+if (Capacitor && Capacitor.Plugins.Preferences) { app.storage.get/set = prefs.get/set }  // iOS 走这条
+else                                            { app.storage.get/set = localStorage }
+```
+
+Capacitor 自带 Preferences，所以 iOS 上 `config.reader` / `config.ux` / `tts.setting` 这些
+键全在 **UserDefaults**，而上一轮的恢复是 `localStorage.setItem` —— 备份写对了，回程扔了。
+日志证据：
+
+```
+21:24:23 [SETTINGS] keychain restore: 0 of 3 backed-up key(s) written back
+```
+
+（旧消息把"值不可用"和"本地已有值"两种跳过混在一个数字里，看不出是哪种，这一轮也一并
+拆开了。）
+
+修法：恢复改走 `app.storage.get` / `app.storage.set`（`siteStorage()` 等 `app.storage`
+就绪再动手），并逐键上报结果：
+
+```
+[SETTINGS] keychain restore: N written, M kept [key:len …], K unusable [key:typeof …], of T backed-up key(s)
+```
+
+策略仍是"站点库里已有值就不动它"——重装后容器是空的，那才是这个块存在的场景。
+

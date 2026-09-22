@@ -781,6 +781,55 @@ enum SiteI18nData {
             for (var i = 0; i < list.length; i++) { attachFrame(list[i]); }
         }
 
+        // Translating the title element in place is not enough on its own: the site
+        // compares what it wrote last time with the chapter's own name and, when the
+        // two differ, re-runs a whole recycle pass --
+        //
+        //     updateFixedChapterName(c)  (chapterdisplay.js:3579)
+        //         var oldName = fixed.textContent;
+        //         if (oldName != name) { fixed.textContent = name; this.recycle(c);
+        //                                app.reader.updateHistory2(); }
+        //
+        // so a translated DOM value makes that branch fire on every scroll tick.
+        // The name itself comes from one place -- cdata.chaptername, produced by
+        // app.reader.getContent() -- and every consumer (createPage, resetPageHtml,
+        // getPrependChapterNameHTML, updateFixedChapterName, the bottom bar) reads
+        // it from there. Translating at that single source keeps the comparison
+        // equal, so the title is Chinese everywhere and the recycle branch stays
+        // quiet. The DOM pass above remains as a fallback for anything rendered
+        // before this wrapper is installed.
+        var CONTENT_FIELDS = ['chaptername'];
+
+        function fixChapterData(cdata) {
+            if (!cdata || typeof cdata !== 'object') { return cdata; }
+            for (var i = 0; i < CONTENT_FIELDS.length; i++) {
+                var field = CONTENT_FIELDS[i];
+                var raw = cdata[field];
+                if (typeof raw !== 'string' || !raw) { continue; }
+                var fixed = fixChapterTitle(raw);
+                if (fixed !== raw) {
+                    cdata[field] = fixed;
+                    rewritten++;
+                }
+            }
+            return cdata;
+        }
+
+        function attachContent() {
+            var app = window.app;
+            if (!app || !app.reader || typeof app.reader.getContent !== 'function') { return false; }
+            if (app.reader.__stvTitleSourceWrapped) { return true; }
+            app.reader.__stvTitleSourceWrapped = true;
+            var original = app.reader.getContent;
+            app.reader.getContent = function () {
+                var args = arguments;
+                var result = original.apply(this, args);
+                if (!result || typeof result.then !== 'function') { return fixChapterData(result); }
+                return result.then(function (cdata) { return fixChapterData(cdata); });
+            };
+            return true;
+        }
+
         window.__stvI18n = {
             translate: translate,
             sweep: sweep,
@@ -823,8 +872,14 @@ enum SiteI18nData {
         // change, so re-scan a handful of times instead of trusting one pass.
         var FRAME_DELAYS = [0, 300, 1000, 2000, 4000, 8000];
         for (var f = 0; f < FRAME_DELAYS.length; f++) {
-            setTimeout(function () { sweep(); attachFrames(); }, FRAME_DELAYS[f]);
+            setTimeout(function () { sweep(); attachFrames(); attachContent(); }, FRAME_DELAYS[f]);
         }
+
+        var contentAttempts = 0;
+        var contentTimer = setInterval(function () {
+            contentAttempts++;
+            if (attachContent() || contentAttempts > 600) { clearInterval(contentTimer); }
+        }, 200);
 
         if (window.__stvDiag) {
             window.__stvDiag.log('PATCH', 'i18n overlay ready: ' + EXACT.length + ' labels, '

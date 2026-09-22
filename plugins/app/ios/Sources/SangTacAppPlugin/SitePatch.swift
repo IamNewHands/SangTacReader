@@ -490,6 +490,75 @@ enum SitePatch {
         }, 200);
 
         setTimeout(function () { clearInterval(timer); }, 180000);
+
+        // The "static chapter name" option (static_chapter_name) is a one-way
+        // trap in the site's own code. chapterdisplay.js:3350 apply() does
+        //
+        //     case "none": { cs.style.display = "none"; break; }
+        //
+        // and nothing ever clears that flag: the "top" / "bottom" cases only
+        // rewrite cs.style.top / .bottom on a node that is still display:none.
+        // So the moment 不显示 is chosen once, the pinned chapter name can never
+        // come back -- switching the setting to 顶部 or 底部 changes nothing,
+        // which is exactly "无论在设置里设置顶部还是底部 都不显示了".
+        //
+        // The pinned element itself (the body-level .chaptertopinfo in the
+        // srcdoc template) is never removed, so re-applying the chosen side and
+        // clearing the display flag is enough to bring the name straight back.
+        function fixChapterPlace() {
+            var app = window.app;
+            if (!app || !app.config || !app.config.reader) { return; }
+            var place = app.config.reader.chapter_name_fixed_place;
+            var visible = (place === 'top' || place === 'bottom');
+            var win = null;
+            try { win = app.reader.getDisplay().innerWindow; } catch (e) { win = null; }
+            if (!win || typeof win.q !== 'function') { return; }
+            var list = win.q('.chaptertopinfo');
+            var hidden = 0;
+            for (var i = 0; i < list.length; i++) {
+                var el = list[i];
+                if (!el || !el.style) { continue; }
+                if (el.style.display === 'none') { hidden++; }
+                el.style.display = visible ? '' : 'none';
+                if (!visible) { continue; }
+                el.style.top = (place === 'top') ? '0' : 'unset';
+                el.style.bottom = (place === 'bottom') ? '0' : 'unset';
+            }
+            if (window.__stvDiag) {
+                window.__stvDiag.log('PATCH', 'chapter name place=' + place
+                    + ' infos=' + list.length + ' were-hidden=' + hidden);
+            }
+        }
+
+        function patchChapterPlace() {
+            var app = window.app;
+            if (!app || !app.reader || !app.reader.behaviour
+                || !app.reader.behaviour.chapter_name_fixed_place) { return false; }
+            var behaviour = app.reader.behaviour.chapter_name_fixed_place;
+            if (behaviour.__stvPlacePatched) { return true; }
+            behaviour.__stvPlacePatched = true;
+            var original = behaviour.apply;
+            behaviour.apply = function () {
+                var result = null;
+                try {
+                    result = original.apply(this, arguments);
+                } catch (e) {
+                    if (window.__stvDiag) {
+                        window.__stvDiag.log('ERR', 'chapter_name_fixed_place apply threw: ' + e);
+                    }
+                }
+                fixChapterPlace();
+                return result;
+            };
+            fixChapterPlace();
+            return true;
+        }
+
+        var placeAttempts = 0;
+        var placeTimer = setInterval(function () {
+            placeAttempts++;
+            if (patchChapterPlace() || placeAttempts > 400) { clearInterval(placeTimer); }
+        }, 250);
     })();
     """
 
@@ -543,11 +612,19 @@ enum SitePatch {
             return new Promise(function (resolve) { setTimeout(resolve, ms); });
         };
 
+        // Counterpart of the MARK prefix the readerTts block puts on every
+        // sentence it builds. The site's hasText() filter needs one ASCII word
+        // character for a sentence to survive, and this is that character;
+        // stripping it here is what keeps it out of the audio.
+        var READER_MARK = 'stv0';
+
         IosTts.prototype.speak = function (text, options) {
             var self = this;
             var merged = options || {};
+            var marked = (typeof text === 'string' && text.indexOf(READER_MARK) === 0);
+            var spoken = marked ? text.substring(READER_MARK.length) : text;
             var param = {
-                text: text,
+                text: spoken,
                 identifier: merged.voice || self.options.voice || '',
                 rate: merged.rate || self.options.rate || 1,
                 pitch: merged.pitch || self.options.pitch || 1
@@ -567,7 +644,8 @@ enum SitePatch {
                         + (result === null ? 'null' : typeof result)
                         + ' payload=' + (typeof encoded === 'string' ? encoded.length + ' chars'
                             : typeof encoded)
-                        + ' text=' + (text || '').length + ' chars');
+                        + ' text=' + (spoken || '').length + ' chars'
+                        + (marked ? ' (reader sentence, mark stripped)' : ''));
                 }
                 if (typeof encoded !== 'string' || encoded.length === 0) {
                     throw new Error('iOS TTS returned no audio (got '
@@ -808,14 +886,27 @@ enum SitePatch {
         //    40 + 62 = 102px, which is what --titlebarovl means.
         var INSET_TOP = 'max(var(--status-bar-height), env(safe-area-inset-top))';
         var INSET_BOTTOM = 'max(var(--screensafebottom), env(safe-area-inset-bottom))';
+        var VH100 = 'max(var(--vh100, 100vh), 100vh)';
 
+        // 3. The main navbar (首页/搜索/社区/用户) shows through under every
+        //    pushed page. #overlay is `position: fixed; height: var(--vh100)`
+        //    (app.v2.css:262) while #mainview -- which owns #mainnavbar -- is
+        //    given an inline `height: 100vh` by the site's own window.onresize
+        //    (app.v2.js:4507). --vh100 comes from visualViewport.height and is
+        //    re-derived on every resize, so any sample where it lands below the
+        //    real viewport leaves the bottom strip of #mainview uncovered and
+        //    the navbar sits in it. Matching the overlay to 100vh removes the
+        //    dependency. The keyboard case is excluded: the site shrinks the
+        //    overlay on purpose there and marks it with body[keyboardopen].
         var CSS = '#chapterview .titlebar{padding-top:' + INSET_TOP + ' !important;'
             + 'height:auto !important;box-sizing:content-box !important;}'
             + '#chapterview.showmenu .titlebar{top:0 !important;}'
             + '#chapterview .coption{padding-bottom:calc(12px + ' + INSET_BOTTOM + ') !important;}'
             + 'body[ovlwv] .titlebar{height:auto !important;box-sizing:content-box !important;'
             + 'padding-top:' + INSET_TOP + ' !important;}'
-            + 'body[ovlwv] .bottombar{padding-bottom:' + INSET_BOTTOM + ' !important;}';
+            + 'body[ovlwv] .bottombar{padding-bottom:' + INSET_BOTTOM + ' !important;}'
+            + 'body:not([keyboardopen]) #overlay{height:' + VH100 + ' !important;}'
+            + 'body:not([keyboardopen]) #overlay > div{height:' + VH100 + ' !important;}';
 
         function note(tag, message) {
             if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
@@ -901,9 +992,13 @@ enum SitePatch {
             var root = document.documentElement;
             var declared = px(root.style.getPropertyValue('--status-bar-height'));
             var resolved = px(window.getComputedStyle(root).getPropertyValue('--status-bar-height'));
+            var vh100 = (window.getComputedStyle(root).getPropertyValue('--vh100') || '').replace(' ', '');
             note('RECT', box('#chapterview .titlebar') + ' ' + box('#chapterview .coption')
                 + ' ' + box('#overlay .titlebar', true) + ' ' + box('.usertop')
+                + ' ' + box('#overlay') + ' ' + box('#mainnavbar')
+                + ' viewport=' + window.innerHeight
                 + ' status-bar=' + declared + '/' + resolved
+                + ' vh100=' + (vh100 || 'unset')
                 + ' env=' + (window.getSafeHeight ? JSON.stringify(window.getSafeHeight()) : 'n/a'));
         }
 
@@ -947,23 +1042,35 @@ enum SitePatch {
     // MARK: - Settings backup across reinstalls
 
     /**
-     The site persists every setting in localStorage:
+     The site persists every setting through `app.storage`:
 
          app.config.saveReaderSetting() -> app.storage.cache.setFile('config.reader', ...)
          app.storage.cache.setFile     -> app.storage.set
-         app.storage.set               -> localStorage.setItem
+
+     and `app.storage.set` is NOT localStorage. app.v2.js:531 picks the backend:
+
+         if (Capacitor && Capacitor.Plugins.Preferences) { ... prefs.set ... }
+         else { ... localStorage.setItem ... }
+
+     Capacitor ships Preferences, so on iOS every one of these keys lands in
+     UserDefaults -- while the previous version of this block restored into
+     localStorage, which the site never reads. The backup was written correctly
+     and then thrown away on the way back in: the device log said
+     "0 of 3 backed-up key(s) written back" and the settings were still default.
 
      A sideloaded IPA gets reinstalled constantly (every build of this project),
-     and a reinstall hands the app a fresh data container, so localStorage is
+     and a reinstall hands the app a fresh data container, so both stores are
      empty and every reader/UX/TTS setting silently falls back to its default.
      `app.storage.set` is the single funnel, so wrapping it is enough to mirror
      the keys that hold the user's own configuration -- including the dynamic
      `reader.style.<name>` font/size entries.
 
      The iOS keychain is not deleted with the app, so it is the one place on the
-     device that survives a reinstall. The restore runs at document start; the
-     site does not read its config until `onDbLoad.waitForLoad()` resolves
-     (measured at ~4s on device), so the write always lands first.
+     device that survives a reinstall. The restore runs as soon as app.storage
+     exists, and the site does not read its config until
+     `onDbLoad.waitForLoad()` resolves (measured at ~4s on device), so the write
+     always lands first. A key the store already holds is left alone; the backup
+     only fills gaps, which after a wipe is every key.
      */
     static let settingsBackup = """
     (function () {
@@ -992,28 +1099,72 @@ enum SitePatch {
             return false;
         }
 
+        // The store the site actually reads. Restoring anywhere else is a no-op,
+        // which is what the localStorage version was.
+        function siteStorage() {
+            var app = window.app;
+            if (!app || !app.storage) { return null; }
+            if (typeof app.storage.get !== 'function' || typeof app.storage.set !== 'function') {
+                return null;
+            }
+            return app.storage;
+        }
+
+        function read(storage, key) {
+            return Promise.resolve(storage.get(key)).then(function (value) {
+                return typeof value === 'string' ? value : '';
+            }, function () { return ''; });
+        }
+
         var restored = false;
 
         function restore() {
             var plugin = appPlugin();
             if (!plugin || typeof plugin.settingsRestore !== 'function') { return false; }
+            var storage = siteStorage();
+            if (!storage) { return false; }
+            if (restored) { return true; }
             restored = true;
             plugin.settingsRestore({}).then(function (result) {
                 var entries = (result && result.entries) || {};
+                var keys = [];
+                for (var key in entries) { if (isBackedUp(key)) { keys.push(key); } }
                 var written = 0;
-                var seen = 0;
-                for (var key in entries) {
-                    if (!isBackedUp(key)) { continue; }
-                    seen++;
-                    var value = entries[key];
-                    if (typeof value !== 'string' || value.length === 0) { continue; }
-                    var existing = null;
-                    try { existing = localStorage.getItem(key); } catch (e) { existing = null; }
-                    if (existing) { continue; }
-                    try { localStorage.setItem(key, value); written++; } catch (e) {}
-                }
-                note('SETTINGS', 'keychain restore: ' + written + ' of ' + seen
-                    + ' backed-up key(s) written back');
+                var kept = [];
+                var unusable = [];
+                var chain = Promise.resolve();
+                keys.forEach(function (key) {
+                    chain = chain.then(function () {
+                        var value = entries[key];
+                        if (typeof value !== 'string' || value.length === 0) {
+                            unusable.push(key + ':' + (value === null ? 'null' : typeof value));
+                            return null;
+                        }
+                        return read(storage, key).then(function (existing) {
+                            // The store the site reads is authoritative whenever
+                            // it has something: after a wipe it is empty and the
+                            // backup is the only thing left, which is the case
+                            // this whole block exists for.
+                            if (existing) {
+                                kept.push(key + ':' + existing.length);
+                                return null;
+                            }
+                            return Promise.resolve(storage.set(key, value)).then(function () {
+                                written++;
+                                note('SETTINGS', 'restore ' + key + ' -> ' + value.length
+                                    + ' chars (store was empty)');
+                            }, function (error) {
+                                note('ERR', 'restore write failed for ' + key + ': ' + error);
+                            });
+                        });
+                    });
+                });
+                return chain.then(function () {
+                    note('SETTINGS', 'keychain restore: ' + written + ' written, '
+                        + kept.length + ' kept [' + kept.join(' ') + '], '
+                        + unusable.length + ' unusable [' + unusable.join(' ') + '], of '
+                        + keys.length + ' backed-up key(s)');
+                });
             }).catch(function (e) {
                 note('ERR', 'settingsRestore failed: ' + e);
             });
@@ -1208,6 +1359,23 @@ enum SitePatch {
         var BREAKS = ['.', '!', '?', ',', ';', '。', '！', '？', '，', '、', '；',
                       String.fromCharCode(10)];
 
+        // The site's sentence filter is
+        //
+        //     this.hasText = function () { return this.text.match(ASCII_WORD); }
+        //     (app.v2.read.js:2357, written there as a literal regex)
+        //
+        // and that regex matches ASCII only, so every pure-Chinese sentence is
+        // dropped before it ever reaches the queue. That is the whole of the
+        // reader-TTS silence, and the device log proves it: the fallback built 23
+        // sentences and the very next line reported sentences=0.
+        //
+        // Each sentence therefore carries this marker. It satisfies the regex,
+        // it survives the site's own formatText(), and IosTts.speak strips it
+        // again before the string is handed to AVSpeechSynthesizer -- so nothing
+        // extra is ever spoken and the site's queue, prefetch and auto-advance
+        // all keep working untouched.
+        var MARK = 'stv0';
+
         function trim(value) {
             var s = value;
             while (s.length && s.charCodeAt(0) <= 32) { s = s.substring(1); }
@@ -1278,8 +1446,10 @@ enum SitePatch {
             var pieces = splitSentences(text);
             var list = [];
             for (var i = 0; i < pieces.length; i++) {
-                list.push({ toText: toTextFor(pieces[i]), highlightOn: noop, highlightOff: noop });
+                list.push({ toText: toTextFor(MARK + pieces[i]), highlightOn: noop, highlightOff: noop });
             }
+            note('TTS', 'fallback source: ' + text.length + ' chars -> ' + pieces.length
+                + ' sentence(s), first=' + (pieces.length ? pieces[0].substring(0, 20) : ''));
             return list;
         }
 
@@ -1297,9 +1467,13 @@ enum SitePatch {
                         note('TTS', 'site tokenizeSentence threw: ' + e);
                     }
                 }
-                if (list && list.length) { return list; }
+                if (list && list.length) {
+                    note('TTS', 'site tokenizeSentence -> ' + list.length + ' sentence(s)');
+                    return list;
+                }
                 var mine = fallbackSentences(this);
-                note('TTS', 'tokenizeSentence fallback -> ' + mine.length + ' sentence(s)');
+                note('TTS', 'site tokenizeSentence empty, using the chapter-text fallback -> '
+                    + mine.length + ' sentence(s)');
                 return mine;
             };
         }
@@ -1329,8 +1503,11 @@ enum SitePatch {
                 }
                 var player = this.player;
                 var count = (player && player.sentences) ? player.sentences.length : -1;
+                var first = (player && player.sentences && player.sentences[0])
+                    ? (player.sentences[0].text || '') : '';
                 note(failure ? 'ERR' : 'TTS', 'reader TTS start: sentences=' + count
-                    + ' provider=' + ((this.setting || {}).provider || '?') + failure);
+                    + ' first=' + first.length + ' chars provider='
+                    + ((this.setting || {}).provider || '?') + failure);
             };
 
             if (app.reader && typeof app.reader.loadChapterDisplay === 'function'
@@ -1435,32 +1612,86 @@ enum SitePatch {
             });
         }, true);
 
-        function warmBookInfo() {
+        var warmed = {};
+
+        // populateBookInfo() (app.v2.read.js:3258) answers from
+        // app.storage.cache.get('/mobile/bookinfo.php?hid=<id>&host=<host>') and
+        // silently returns [] on a cache miss. DownloadManager.render() (:3609)
+        // then hands that `undefined` to openBookWithData, and the row's click
+        // handler is bound to it -- so tapping a downloaded book opens nothing.
+        // DownloadManager's constructor renders the row the instant the download
+        // starts (:3481), before anything has had a chance to fill the cache, so
+        // the only reliable repair is to fill it before render() reads it.
+        function warmOne(host, id) {
             var app = window.app;
-            if (!app || !app.offlineBook || !app.offlineBook.store) { return; }
-            var books = app.offlineBook.store.data || [];
-            var index = 0;
-            function step() {
-                if (index >= books.length) {
-                    note('BOOKINFO', 'offline bookinfo cache warm-up done ('
-                        + books.length + ' book(s))');
-                    return;
-                }
-                var book = books[index++];
-                var base = (book && book.baseObject) || {};
-                var host = (book && book.host) || base.host;
-                var id = (book && book.id) || base.id;
-                if (!host || !id) { step(); return; }
-                var url = '/mobile/bookinfo.php?hid=' + id + '&host=' + host;
-                app.net.getCacheLater(url).then(function (down) {
-                    if (down && down.book) { note('BOOKINFO', 'cached ' + host + '/' + id); }
-                    step();
-                }, function (error) {
-                    note('ERR', 'bookinfo warm-up failed for ' + host + '/' + id + ': ' + error);
-                    step();
-                });
+            if (!host || !id || !app || !app.net
+                || typeof app.net.getCacheLater !== 'function') {
+                return Promise.resolve(null);
             }
-            step();
+            var key = host + '/' + id;
+            if (warmed[key]) { return Promise.resolve(null); }
+            var url = '/mobile/bookinfo.php?hid=' + id + '&host=' + host;
+            return app.net.getCacheLater(url).then(function (down) {
+                warmed[key] = true;
+                note('BOOKINFO', 'warmed ' + key + ' -> '
+                    + ((down && down.book) ? 'book cached' : 'no book in response'));
+                return down;
+            }, function (error) {
+                note('ERR', 'bookinfo warm-up failed for ' + key + ': ' + error);
+                return null;
+            });
+        }
+
+        function warmStore() {
+            var app = window.app;
+            var store = app && app.offlineBook && app.offlineBook.store;
+            var books = (store && store.data) || [];
+            var chain = Promise.resolve();
+            for (var i = 0; i < books.length; i++) {
+                (function (book) {
+                    var base = (book && book.baseObject) || {};
+                    var host = (book && book.host) || base.host;
+                    var id = (book && book.id) || base.id;
+                    chain = chain.then(function () { return warmOne(host, id); });
+                })(books[i]);
+            }
+            return chain;
+        }
+
+        // Two entry points read that cache for a list of books: the download
+        // manager's rows (render) and the 储物袋 downloaded list
+        // (getDownloadBooks -> populateBookInfo). Warm in front of both.
+        function patchReaders() {
+            var app = window.app;
+            if (!app || !app.offlineBook) { return false; }
+            var manager = app.BookDownloadManager;
+            if (manager && manager.prototype && !manager.prototype.__stvWarmed) {
+                manager.prototype.__stvWarmed = true;
+                var originalRender = manager.prototype.render;
+                manager.prototype.render = function () {
+                    var self = this;
+                    var args = arguments;
+                    return warmOne(self.host, self.id).then(function () {
+                        return originalRender.apply(self, args);
+                    });
+                };
+                note('BOOKINFO', 'download manager render warmed');
+            }
+            if (typeof app.offlineBook.getDownloadBooks === 'function'
+                && !app.offlineBook.__stvWarmedList) {
+                app.offlineBook.__stvWarmedList = true;
+                var originalList = app.offlineBook.getDownloadBooks;
+                app.offlineBook.getDownloadBooks = function () {
+                    var self = this;
+                    var args = arguments;
+                    return warmStore().then(function () {
+                        return originalList.apply(self, args);
+                    });
+                };
+                note('BOOKINFO', 'downloaded-list bookinfo warm-up installed');
+            }
+            return !!(manager && manager.prototype && manager.prototype.__stvWarmed)
+                && !!app.offlineBook.__stvWarmedList;
         }
 
         function attach() {
@@ -1488,20 +1719,16 @@ enum SitePatch {
             }, 100);
         }
 
-        // `store.data` starts empty and is filled by the site's own async
-        // store.load(); wait for it, but do not keep a 200ms timer alive for a
-        // minute when the user has simply never downloaded a book.
-        var warmAttempts = 0;
-        var warmTimer = setInterval(function () {
-            warmAttempts++;
-            var app = window.app;
-            var store = app && app.offlineBook && app.offlineBook.store;
-            var loaded = !!(store && store.data && store.data.length);
-            if (loaded || warmAttempts > 25) {
-                clearInterval(warmTimer);
-                warmBookInfo();
-            }
+        var patchAttempts = 0;
+        var patchTimer = setInterval(function () {
+            patchAttempts++;
+            if (patchReaders() || patchAttempts > 600) { clearInterval(patchTimer); }
         }, 200);
+
+        // Books downloaded after boot enter store.data later, so keep sweeping.
+        // Cheap: warmOne() answers immediately for anything already warmed, and
+        // the store holds a handful of entries.
+        setInterval(warmStore, 3000);
     })();
     """
 

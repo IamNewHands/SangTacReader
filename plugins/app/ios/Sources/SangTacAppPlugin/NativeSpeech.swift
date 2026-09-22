@@ -46,9 +46,20 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
     // MARK: - Voices
 
+    /**
+     The site's own voice list is Vietnamese-only, because the site reads Chinese
+     novels as Sino-Vietnamese. This app displays the same novels in Chinese, and
+     a Vietnamese voice reading Chinese characters produces nothing usable, so
+     the list has to cover both scripts.
+     */
+    private static let voiceLanguages = ["vi", "zh"]
+
     func availableVoices() -> [VoiceInfo] {
         return AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language.lowercased().hasPrefix("vi") }
+            .filter { voice in
+                let language = voice.language.lowercased()
+                return NativeSpeech.voiceLanguages.contains { language.hasPrefix($0) }
+            }
             .map { voice in
                 let gender: Int
                 switch voice.gender {
@@ -63,13 +74,38 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
             }
     }
 
-    private func voice(for identifier: String?) -> AVSpeechSynthesisVoice? {
+    /// The language the text itself is written in, as far as one can tell from
+    /// its code points. CJK wins because that is what this reader shows.
+    private static func scriptLanguage(for text: String) -> String {
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if (0x3040...0x30FF).contains(value)      // kana
+                || (0x3400...0x4DBF).contains(value)  // CJK ext A
+                || (0x4E00...0x9FFF).contains(value)  // CJK unified
+                || (0xF900...0xFAFF).contains(value)  // compatibility ideographs
+                || (0x20000...0x2FA1F).contains(value) {
+                return "zh-CN"
+            }
+        }
+        return "vi-VN"
+    }
+
+    /// A requested voice is honoured only when it can actually pronounce the
+    /// text: the setting stores one identifier, but the reader switches between
+    /// Chinese chapters and Vietnamese UI strings.
+    private func voice(for identifier: String?, text: String) -> AVSpeechSynthesisVoice? {
+        let language = NativeSpeech.scriptLanguage(for: text)
+        let prefix = String(language.prefix(2))
         if let identifier = identifier, !identifier.isEmpty,
-           let resolved = AVSpeechSynthesisVoice(identifier: identifier) {
+           let resolved = AVSpeechSynthesisVoice(identifier: identifier),
+           resolved.language.lowercased().hasPrefix(prefix) {
             return resolved
         }
-        if let vietnamese = AVSpeechSynthesisVoice(language: "vi-VN") {
-            return vietnamese
+        if let matched = AVSpeechSynthesisVoice(language: language) {
+            return matched
+        }
+        if let fallback = AVSpeechSynthesisVoice(language: "vi-VN") {
+            return fallback
         }
         return AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
     }
@@ -96,7 +132,7 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
     private static let attempts: [Attempt] = [
         Attempt(usesApplicationAudioSession: false, useRequestedVoice: true, label: "own-session+voice"),
-        Attempt(usesApplicationAudioSession: false, useRequestedVoice: false, label: "own-session+vi-default"),
+        Attempt(usesApplicationAudioSession: false, useRequestedVoice: false, label: "own-session+script-default"),
         Attempt(usesApplicationAudioSession: true, useRequestedVoice: true, label: "app-session+voice")
     ]
 
@@ -151,8 +187,8 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = attempt.useRequestedVoice
-            ? self.voice(for: identifier)
-            : AVSpeechSynthesisVoice(language: "vi-VN")
+            ? self.voice(for: identifier, text: text)
+            : AVSpeechSynthesisVoice(language: NativeSpeech.scriptLanguage(for: text))
         utterance.rate = NativeSpeech.utteranceRate(fromSiteRate: rate)
         utterance.pitchMultiplier = NativeSpeech.utterancePitch(fromSitePitch: pitch)
         utterance.volume = 1.0
@@ -237,7 +273,7 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
             let synthesizer = AVSpeechSynthesizer()
             synthesizer.delegate = self
             let utterance = AVSpeechUtterance(string: text)
-            utterance.voice = self.voice(for: identifier)
+            utterance.voice = self.voice(for: identifier, text: text)
             utterance.rate = NativeSpeech.utteranceRate(fromSiteRate: rate)
             utterance.pitchMultiplier = NativeSpeech.utterancePitch(fromSitePitch: pitch)
             self.players[ObjectIdentifier(synthesizer)] = synthesizer

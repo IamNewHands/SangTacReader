@@ -58,15 +58,15 @@ SangTacReader/
 |---|---|
 | `compat` | `nativeclick` 空实现 + `window.TTS` 门面（站点不调则整条点击链抛错） |
 | `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台） |
-| `readerDefaults` | iOS 上把阅读器 `display_type` 默认成左右翻页 |
-| `ttsProvider` | 注册 `ttsEngine` 的 `ios` provider，走原生 `AVSpeechSynthesizer` |
+| `readerDefaults` | iOS 上把阅读器 `display_type` 默认成左右翻页；修「静态章节名称」选过不显示后再也回不来的单程 bug |
+| `ttsProvider` | 注册 `ttsEngine` 的 `ios` provider，走原生 `AVSpeechSynthesizer`；按文本语种挑发音人 |
 | `followFallback` | 「关注」接口服务端 500 时探测站点自己的旧接口 |
-| `safeArea` | 灵动岛 / Home Indicator：安全区补齐 + 阅读器菜单几何量上报 |
-| `settingsBackup` | 设置镜像进 Keychain，重装后写回 localStorage |
+| `safeArea` | 灵动岛 / Home Indicator：安全区补齐、`#overlay` 高度兜底 + 阅读器菜单几何量上报 |
+| `settingsBackup` | 设置镜像进 Keychain，重装后写回站点真正读取的 `app.storage` |
 | `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
 | `readerTts` | 正文朗读：补上 iframe 的 `speaker`、句子来源兜底、失败原因上报 |
-| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白 |
-| `SiteI18nData.script` | 生成物：站点文案中译 + 章节标题数字改写（含阅读器 iframe） |
+| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白（下载前预热 bookinfo 缓存） |
+| `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（含阅读器 iframe 兜底） |
 
 ## 中文字典流水线
 
@@ -109,9 +109,10 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 
 面板里的 tag 含义：`Http` 每条原生请求（含 `in <ms>ms` 耗时）、`TTS` 语音合成每次尝试
 与正文朗读的句子数/兜底来源、`FOLLOW` 关注接口探测、`SAFE` 安全区取值、`RECT` 阅读器
-菜单与页面顶栏的实际几何量（定位灵动岛遮挡用）、`SETTINGS` 设置备份/恢复、
-`BOOKMARK` 取消书签探测、`BOOKINFO` 评论/详情页缺数据时的补取、`COMMENT` 评论按钮
-拦截、`ERR` 错误。
+菜单与页面顶栏的实际几何量 + `#overlay` / `#mainnavbar` 高度 + `--vh100`（定位灵动岛
+遮挡、底栏穿透用）、`SETTINGS` 设置备份/恢复（逐键写出、保留、不可用的数量）、
+`BOOKMARK` 取消书签探测、`BOOKINFO` 评论/详情页缺数据时的补取与缓存预热、
+`COMMENT` 评论按钮拦截、`ERR` 错误。
 
 ## 说明 / 免责
 
