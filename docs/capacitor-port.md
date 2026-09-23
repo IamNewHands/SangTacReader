@@ -1440,7 +1440,9 @@ iframe，父页面取不到内部文字，**不支持**；两个 Facebook 按钮
 
 #### 验证（本轮）
 
-- `node scripts/check-ios-shim.js` → 19 块 / 260186 字节 / 21 markers
+- `node scripts/check-ios-shim.js` → 19 块 / 260412 字节 / **24** markers（新增
+  `stv.diag.settings`、`action=stvqueue`、`window.__stvActivityLogInstalled` 三个必需
+  标记，被删掉就红）
 - `node scripts/test-site-patch.js` → **350 条断言**全过。本轮新增/重写 4 组：诊断面板的
   开/关两种状态（关着时无窗、无缓冲、console 不接管、`show()` 也建不出窗；开着时徽标常显、
   面板在屏、`setEnabled(false)` 删窗清缓冲、`setEnabled(true)` 重建）、设置页两行与

@@ -31,6 +31,12 @@ const REQUIRED_MARKERS = [
   'window.nativeclick',
   'window.TTS',
   'window.__stvDiag',
+  // The logging switch (off by default) and the two things that make it
+  // permanent: its keychain-mirrored store key, and the "view downloads" button
+  // of the download-started dialog.
+  'stv.diag.settings',
+  'action=stvqueue',
+  'window.__stvActivityLogInstalled',
   'window.__stvTabProbeInstalled',
   'window.__stvStorageAccessorInstalled',
   'window.__stvGridLayoutInstalled',
