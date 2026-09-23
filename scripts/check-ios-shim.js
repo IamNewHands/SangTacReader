@@ -139,6 +139,10 @@ const REQUIRED_MARKERS = [
   // ...and the way back out: if the declaration is ever refused, the trap is
   // dropped for good and the page reloaded once instead of the site never booting.
   'stv.domain.trap.off',
+  // 关注/书签的结果上报：站点把回调传给了 `app.net.get` 的 `force` 参数（不是回调），
+  // 所以站点自己写的 toast 与列表刷新是死代码，成与不成看起来一模一样。
+  'function attachFollow(',
+  '站点没有取消关注的接口',
 ];
 
 function fail(message) {

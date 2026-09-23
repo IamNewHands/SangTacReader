@@ -3895,6 +3895,116 @@ async function testBookmarkToggle() {
   check('a book that is not bookmarked still goes through addbookmark',
     add.__stored.bookmarkAdds === 1);
   check('no removal probe without an active bookmark', add.__posts.length === 0);
+  // The site's own confirmation for this path never ran (its handler is
+  // `app.net.get`'s `force` argument) and its text was the follow message
+  // (app.v2.js:4844), so the reader got no confirmation at all.
+  check('a new bookmark confirms with the right wording',
+    (add.__stored.toasts || []).indexOf('已加入书签') >= 0,
+    JSON.stringify(add.__stored.toasts || []));
+}
+
+/**
+ * 关注 is the third action in the same row, and its answer never arrives for the
+ * same reason: `app.api.follow` passes its result handler as the second argument
+ * of `app.net.get`, which is `force` (app.v2.js:4856 vs :696), so the site's
+ * toast and list refresh are dead code. On the 关注 list's long-press menu there
+ * is no other feedback, so a follow the server refused and one it accepted look
+ * identical -- which is the whole of "点了没反应".
+ *
+ * The device log holds the case that matters: that menu's 删除 item calls
+ * `app.api.follow` (the site has no un-follow endpoint), the book was already in
+ * the 关注 list, and the server answered {"status":"success","code":400}. So
+ * nothing changing was correct; the defect was that nothing said so.
+ */
+async function testFollowOutcome() {
+  console.log('follow outcome reporting');
+
+  function build(answers) {
+    const sandbox = makeSandbox();
+    const app = installFakeApp(sandbox, { displayType: 'auto' });
+    app.user = { isLogin: true };
+    const mainview = makeContainer('div', 'mainview');
+    mainview.id = 'mainview';
+    sandbox.document.body.appendChild(mainview);
+    const pane = makeContainer('div', 'pane');
+    pane.setAttribute('view', 'bookfollowing');
+    mainview.appendChild(pane);
+    const rendered = [];
+    app.rerender = (node) => { rendered.push(node); return Promise.resolve(); };
+    const asked = [];
+    app.api.queryBookExtStatus = (book) => {
+      asked.push(book.host + '/' + book.id);
+      const follow = answers.length ? answers.shift() : null;
+      return Promise.resolve(follow === null ? null
+        : { like: false, bookmark: false, follow: follow });
+    };
+    let reply = { code: 100 };
+    app.api.follow = () => Promise.resolve(reply);
+    vm.runInContext(loadBlocks().join('\n'), sandbox);
+    return {
+      sandbox,
+      app,
+      rendered,
+      asked,
+      pane,
+      answer(value) { reply = value; },
+      toasts: () => sandbox.__stored.toasts || [],
+      diag: () => sandbox.window.__stvDiag.text(),
+    };
+  }
+
+  const book = { id: '7594444988159642686', host: 'fanqie',
+    name: '大唐：开局青帝，吓退突厥二十万', author: '百花齐舞' };
+  const key = 'fanqie/7594444988159642686';
+
+  // The device case: the 删除 item in the 关注 list, on a book already in it.
+  const already = build([true, true]);
+  already.answer({ status: 'success', code: 400 });
+  await already.app.api.follow(book);
+  await tick(30);
+  check('an already-followed book says so instead of doing nothing',
+    already.toasts().indexOf('已经在关注列表里（站点没有取消关注的接口）') >= 0,
+    JSON.stringify(already.toasts()));
+  check('and the code the server answered is in the panel',
+    already.diag().indexOf('followbook ' + key + ' -> code 400') >= 0,
+    already.diag().slice(-300));
+  check('the state is read before and after the call',
+    already.asked.length === 2, JSON.stringify(already.asked));
+  check('and no success is claimed', already.toasts().indexOf('已关注') < 0);
+
+  const fresh = build([false, true]);
+  fresh.answer({ code: 100 });
+  await fresh.app.api.follow(book);
+  await tick(30);
+  check('a follow that sticks is confirmed', fresh.toasts().indexOf('已关注') >= 0,
+    JSON.stringify(fresh.toasts()));
+  check('and the 关注 list is refreshed the way the site intended',
+    fresh.rendered.length === 1 && fresh.rendered[0] === fresh.pane);
+
+  const refused = build([false, false]);
+  refused.answer({ status: 'success', code: 400 });
+  await refused.app.api.follow(book);
+  await tick(30);
+  check('a refused follow reports its code instead of pretending',
+    refused.toasts().indexOf('关注没生效（code 400）') >= 0,
+    JSON.stringify(refused.toasts()));
+
+  const silent = build([null, null]);
+  silent.answer({ status: 'success', code: 400 });
+  await silent.app.api.follow(book);
+  await tick(30);
+  check('an unverifiable follow claims nothing at all',
+    silent.toasts().length === 0, JSON.stringify(silent.toasts()));
+
+  // Signed out is the site's own business: its guard opens the login page, and
+  // an extra status call would be noise.
+  const signedOut = build([false, true]);
+  signedOut.app.user.isLogin = false;
+  await signedOut.app.api.follow(book);
+  await tick(30);
+  check('signed out goes straight to the site, with no status call',
+    signedOut.asked.length === 0 && signedOut.toasts().length === 0,
+    JSON.stringify(signedOut.asked));
 }
 
 /**
@@ -5872,6 +5982,7 @@ await testLanguageGuard();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();
   await testBookmarkToggle();
+  await testFollowOutcome();
   await testLikeToggle();
   await testDownloadSkipsDownloaded();
   await testExportDownloadedBook();

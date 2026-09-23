@@ -3060,6 +3060,15 @@ enum SitePatch {
      `updateBookPage` only rewrites the `.active` class; bookinfo.php re-sends
      the real number when the page is reopened, so a drift cannot survive a
      reload.
+
+     The third action in the same row is 关注, and it has the same "no answer ever
+     arrives" problem for a different reason: both `app.api.follow` and
+     `app.api.bookmark` pass their result handler as the second argument of
+     `app.net.get`, which is `force` -- so the handler never runs and neither the
+     toast nor the list refresh the site wrote can happen. On the 关注 list's
+     long-press menu there is no other feedback at all, which is why a follow that
+     the server refused and one it accepted look identical. See `attachFollow`
+     below: the calls are untouched, the outcome is reported and verified.
      */
     static let bookmarkToggle = """
     (function () {
@@ -3167,14 +3176,30 @@ enum SitePatch {
             }
 
             app.api.bookmark = function (bookdata) {
-                if (!bookmarked()) { return original.apply(this, arguments); }
-                var book = target(bookdata);
-                if (!book) {
-                    note('BOOKMARK', 'bookmarked, but the tapped book could not be resolved; '
-                        + 'falling back to add');
-                    return original.apply(this, arguments);
+                var self = this;
+                var args = arguments;
+                if (bookmarked()) {
+                    var book = target(bookdata);
+                    if (!book) {
+                        note('BOOKMARK', 'bookmarked, but the tapped book could not be resolved; '
+                            + 'falling back to add');
+                        return original.apply(self, args);
+                    }
+                    return remove(book);
                 }
-                return remove(book);
+                // The add path's confirmation is what the site wrote and never
+                // ran: its handler is passed as `app.net.get`'s `force` argument,
+                // and its text is the *follow* message -- see the note below this
+                // function.
+                return Promise.resolve(original.apply(self, args)).then(function (down) {
+                    note('BOOKMARK', 'addbookmark -> code ' + codeOf(down) + ' raw='
+                        + String(JSON.stringify(down)).slice(0, 200));
+                    if (down && down.code == 100) {
+                        rerenderList('bookmarked');
+                        if (app.toast) { app.toast('已加入书签'); }
+                    }
+                    return down;
+                });
             };
             note('BOOKMARK', 'bookmark toggle installed');
             return true;
@@ -3393,8 +3418,149 @@ enum SitePatch {
             return true;
         }
 
+        // ---- the site's own write actions swallow their answer ----------------
+        //
+        // `app.api.bookmark` (app.v2.js:4839) and `app.api.follow` (app.v2.js:4856)
+        // hand their result handler to `app.net.get` as its SECOND argument, and
+        // that parameter is `force` (app.v2.js:696) -- not a callback -- so the
+        // handler is dead code. A follow or a bookmark can therefore succeed with
+        // no toast and no list refresh at all, and a refusal looks exactly the
+        // same. The device log has a refusal: the 关注 list's long-press menu wires
+        // its 删除 item to `app.api.follow` (app.v2.js:2685-2686 -- the site has no
+        // un-follow endpoint anywhere), the book was already in that list
+        // (`booklist.php?method=following` answered with exactly that one book 11
+        // seconds before the tap), and the server answered
+        // {"status":"success","code":400} to the duplicate.
+        //
+        // The requests are left exactly as the site makes them. What is added is
+        // the report, the verification against the endpoint that owns the reader's
+        // state (`ajax=querybookmarkstatus`, whose answer carries `follow` and
+        // `bookmark`), and a truthful toast -- so a menu item that cannot do what
+        // its label says says so instead of doing nothing.
+        function codeOf(down) {
+            if (!down || down.code === undefined || down.code === null) { return 'none'; }
+            return String(down.code);
+        }
+
+        /**
+         The site's own refresh target (`q("#mainview div[view=bookfollowing]")`,
+         app.v2.js:4858). Written as a walk instead of a descendant selector because
+         the stub DOM that verifies these blocks has no descendant combinators, and
+         the answer on the device is the same one: the `div[view=...]` under
+         #mainview. An element outside #mainview is deliberately not accepted.
+         */
+        function listView(name) {
+            var nodes = document.querySelectorAll('div[view=' + name + ']');
+            for (var i = 0; i < nodes.length; i++) {
+                var parent = nodes[i].parentNode;
+                while (parent) {
+                    if (parent.id === 'mainview') { return nodes[i]; }
+                    parent = parent.parentNode;
+                }
+            }
+            return null;
+        }
+
+        function rerenderList(name) {
+            var app = window.app;
+            var node = listView(name);
+            if (!node || !app || typeof app.rerender !== 'function') { return false; }
+            try { app.rerender(node); } catch (e) { return false; }
+            return true;
+        }
+
+        /**
+         `null` means "the site would not say" (signed out, or the call failed) and
+         is never turned into a guess -- the same rule the like block follows.
+         */
+        function readFollowed(book) {
+            var app = window.app;
+            if (!app || !app.api || typeof app.api.queryBookExtStatus !== 'function') {
+                return Promise.resolve({ followed: null, raw: '' });
+            }
+            return Promise.resolve(app.api.queryBookExtStatus(book)).then(function (status) {
+                return { followed: status ? !!status.follow : null,
+                         raw: String(JSON.stringify(status)).slice(0, 200) };
+            }, function (error) {
+                return { followed: null, raw: 'rejected: ' + error };
+            });
+        }
+
+        function attachFollow() {
+            var app = window.app;
+            if (!app || !app.api || typeof app.api.follow !== 'function') { return false; }
+            if (app.api.__stvFollowWrapped) { return true; }
+            app.api.__stvFollowWrapped = true;
+            var api = app.api;
+            var original = api.follow;
+
+            app.api.follow = function (bookdata) {
+                var self = this;
+                var args = arguments;
+                // Signed out: the site shows its own login page and there is
+                // nothing to verify. Only a definite `false` skips the wrapper, so
+                // a page that has not built `app.user` yet still gets the report.
+                if (app.user && app.user.isLogin === false) {
+                    return original.apply(self, args);
+                }
+                var book = target(bookdata);
+                if (!book) {
+                    note('FOLLOW', 'the tapped book could not be resolved');
+                    return original.apply(self, args);
+                }
+                var key = book.host + '/' + book.id;
+                return readFollowed(book).then(function (before) {
+                    return Promise.resolve(original.apply(self, args)).then(function (down) {
+                        note('FOLLOW', 'followbook ' + key + ' -> code ' + codeOf(down)
+                            + ' raw=' + String(JSON.stringify(down)).slice(0, 200));
+                        return readFollowed(book).then(function (after) {
+                            note('FOLLOW', key + ' before=' + before.followed
+                                + ' after=' + after.followed + ' raw=' + after.raw);
+                            report(before, after, codeOf(down));
+                            return down;
+                        });
+                    });
+                });
+
+                function report(before, after, code) {
+                    if (after.followed === true && before.followed === true) {
+                        // What the 关注 list's 删除 item hits: the site has no
+                        // un-follow endpoint at all, so the tap re-follows.
+                        if (app.toast) { app.toast('已经在关注列表里（站点没有取消关注的接口）'); }
+                        return;
+                    }
+                    if (after.followed === true) {
+                        rerenderList('bookfollowing');
+                        if (app.toast) { app.toast('已关注'); }
+                        return;
+                    }
+                    if (after.followed === false && code === '100') {
+                        if (app.toast) { app.toast('站点说成功，但复查仍显示未关注'); }
+                        return;
+                    }
+                    if (after.followed === false) {
+                        if (app.toast) { app.toast('关注没生效（code ' + code + '）'); }
+                    }
+                    // followed === null: nothing is claimed; the panel has the raw
+                    // answer, which is what the next log needs.
+                }
+            };
+            note('FOLLOW', 'follow outcome reporting installed');
+            return true;
+        }
+
+        /**
+         Every wrapper is attempted on every attempt. `a && b && c` would skip the
+         rest as soon as one of them is not ready yet, and the three arrive at
+         different times: `app.api.bookmark` exists as soon as app.v2.js has run,
+         while `likeBook`/`unlike` and `follow` are separate assignments. The
+         `__stv*Wrapped` guards make the repeats free.
+         */
         function install() {
-            return attachBookmark() && attachLike();
+            var a = attachBookmark();
+            var b = attachLike();
+            var c = attachFollow();
+            return a && b && c;
         }
 
         if (!install()) {

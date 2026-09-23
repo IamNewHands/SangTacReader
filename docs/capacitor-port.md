@@ -2513,10 +2513,111 @@ CI 的二进制 strings 标记新增 `stv.domain.trap.off`（在注入块里，�
   而 `.com`/`.app` 都已回 `yes`** 都还没动：前两个是下一轮的低风险目标，第三个要改站点自己的
   `verifyDomain()` 排名，风险更高。
 - 日志里还有个**独立**的观察待确认：`jsonify.php?ajax=followbook` 回 `{"status":"success","code":400}`
-  （本站 `code 100` 才算成功），随后的状态查询是 `"follow":false` —— 「关注」这条动作没生效；
-  同一份日志里 `[SAFE] safe area top=0` 出现过两次（`css status-bar-height=62px` 未变，
-  viewport 874→768，同一时刻 navbar 从 `[789..874]` 跳到 `[683..768]`），顶栏会有一次视觉跳动。
-  这两条与本轮的两处改动静默无关，留给下一轮。
+  （本站 `code 100` 才算成功），我当时写的「随后的状态查询是 `"follow":false`，所以这条动作没生效」
+  是**错的** —— 那条 `querybookmarkstatus` 是当时打开的**另一本书**的（见 §6.24 (1)）；
+  同一份日志里 `[SAFE] safe area top=0` 出现过两次、`viewport` 从 874 变成过 768，我据此猜的
+  「顶栏会有一次视觉跳动」也**不成立**（见 §6.24 (2)：两处都不写坏变量，且 `--vh100` 的两个
+  使用点都已被钳住）。两条都已在下一轮查清。
+
+
+### 6.24 第二十二轮（用户要求「查」这两条）：关注为什么没反应 + 安全区 top=0
+
+用户点名要查 §6.23 末尾挂着的两条观察。结论：**「关注」是真缺陷（已修）；安全区那两条不是
+缺陷，而且我上一轮的描述是错的，撤回。**
+
+#### (1) 「关注」：站点自己的客户端把结果吞掉了（与 `code 400` 是什么无关）
+
+**调用链只有一条**：`app.api.follow(bookdata)` → `GET /mobile/jsonify.php?ajax=followbook&
+name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它：详情页的 `.followbook`
+按钮（外壳 `:4215-4219`，`app.api.follow(d)`）与长按菜单（`app.v2.js:2386-2390`、`:2700-2701`、
+`:2711`）。全站没有第二个「加关注」接口。
+
+**死回调**：`app.api.follow` 把结果处理函数当作**第二个实参**交给 `app.net.get`
+（`app.v2.js:4856`），而 `app.net.get = async function(url, force, retry)`（`app.v2.js:696`，
+全文件只定义这一次）的第二位是 **`force`**，不是回调。所以那段 `if(down.code == 100){ …toast…
+}` **永远不会执行**。后果：从长按菜单关注任何书，成功不提示、关注列表不刷新；被服务端拒绝
+也一样安静——**「点了没反应」不需要 `code 400` 就能解释**。同一处缺陷也在
+`app.api.bookmark`（`app.v2.js:4839`），而且它成功时弹的是 `app.text.followed`（「关注成功」）
+——收藏弹关注的文案，同样因为回调是死的而从未暴露。
+
+**日志里那条 `code 400` 现在有解释了**：`日志.txt` 里
+
+- `:28` `GET /mobile/booklist.php?method=following&p=0 -> 200 1564b`，返回的列表**只有一本书**
+  ——`fanqie/7594444988159642686` 大唐：开局青帝，吓退突厥二十万 / 百花齐舞；
+- `:36` `[NAV] tab 1 关注`（用户当时就在关注页）；`:39` `[TAP] tap div.contextmenuitem`
+  长按菜单；`:40` `ajax=followbook&name=大唐…&author=百花齐舞 -> {"status":"success","code":400}`。
+
+也就是说：**这本书 11 秒前就已经在关注列表里**，而关注列表长按菜单的第一项（文案是
+`app.text.w.delete`，即「删除」）被站点自己接到了 **`follow`** 上（`app.v2.js:2685-2686`）
+——**站点没有任何「取消关注」接口**（全站 grep 只有 `followbook` 一个写接口）。所以：
+用户想做的是取消关注，发出去的却是「再关注一次」，服务端回 `code 400`（「重复/已经在列表里」
+是对这条日志最合理的解释，但**服务端语义仍是推断**，不是证明）。「什么都没变」其实是**正确的
+服务端行为**；缺陷在于没有任何一处告诉用户这件事。
+
+**改动**（在 `bookmarkToggle` 块里——它已经拥有「站点自己的写动作必须说实话」这件事）：
+
+1. `attachFollow()`：把 `app.api.follow` 包一层，**请求本身原样交给站点**，只加
+   「调用前读一次 → 调用 → 调用后读一次」（`app.api.queryBookExtStatus`，也就是
+   `ajax=querybookmarkstatus`，它的回答里带 `follow`），再把两端写进 `[FOLLOW]` 面板行：
+   `followbook <host>/<id> -> code <code> raw=…` 与 `<host>/<id> before=<bool> after=<bool> raw=…`。
+2. 提示按**复查过的**结果说：`after=true && before=true` → 「已经在关注列表里（站点没有取消
+   关注的接口）」；`after=true && before=false` → 「已关注」并重排关注列表（这正是站点那段死
+   回调本来要做的事）；`after=false && code=100` → 「站点说成功，但复查仍显示未关注」；
+   `after=false && code≠100` → 「关注没生效（code X）」；**读不到状态（未登录/请求失败）时
+   什么都不声称**，只把原文写进面板（与 like 块同一条规矩：`null` 不许变成猜测）。
+3. 未登录（`app.user.isLogin === false`）直接原样交给站点——它自己会弹登录页，多一次状态查询
+   是噪音。判断写成「**明确等于 false** 才跳过」，所以页面还没建好 `app.user` 时仍然会上报。
+4. 顺带把 `app.api.bookmark` 的**加入**路径也接上：成功时重排书签列表并提示
+   「已加入书签」（站点原意如此，只是文案写错且回调是死的）。
+5. **`install()` 不再短路**：原来是 `attachBookmark() && attachLike()`，`attachLike()` 一返回
+   false 就永远轮不到后面（`app.api.bookmark` 在 `app.v2.js` 跑完就有，而 `likeBook`/`unlike`、
+   `follow` 是各自独立赋值），新增的 `attachFollow()` 会因此永远装不上——写测试时先撞上了这个
+   坑（三个 wrap 都带 `__stv*Wrapped` 守卫，重复尝试是免费的），改成 `a = …; b = …; c = …;
+   return a && b && c;`。
+
+#### (2) 安全区 `top=0` / `viewport=768`：不是缺陷，先撤回我上一轮的说法
+
+我上一轮说「`[SAFE] top=0` 出现过两次…顶栏会有一次视觉跳动」——**这句是错的**，`日志.txt`
+里两个来源都不写坏任何东西：
+
+| 采样 | 来源 | 值 | 后果 |
+|---|---|---|---|
+| `[SAFE] safe area top=0`（`:24`、`:41:02`） | 原生 `App.getSafeArea` 的 `safeAreaInsets` | `{top:0,bottom:34}` | 无：`apply()` 只在站点自己的值 **≤0** 时才写 CSS 变量（`SitePatch.swift:1999-2006`），报告行里 `status-bar-height` 一直是 62px |
+| `[RECT] env={"top":0,…}`（`:28`，+10s 采样） | **站点自己**的 `window.getSafeHeight()`（`app.v2.js:4433-4452`：往 body 塞一个 `height:env(safe-area-inset-top)` 的探针量出来） | `{top:0,bottom:34}` | 无：同一行的 `status-bar=62/62`，站点那次量到 0 并没有写回变量（站点自己的 `statusBarHeight` 只在 `isCheckingStatusBarHeight` 那一次里更新，日志 `:19` 已记 `detect status bar height: 62`） |
+
+而 `viewport=768`（`window.innerHeight`，站点据此写 `--vh100: 768px`）是**已知**的站点行为，
+`--vh100` 来自 `visualViewport.height`、任何一次 resize 都会写进一个偏小的值；它的可见后果
+（导航栏从推入页面底下露出来）**上一轮就已经修掉了**：我们的样式表把 `#overlay` 钳到
+`max(var(--vh100,100vh),100vh)`（`SitePatch.swift:1959`），站点自己在 `onresize` 里又把
+`#mainview` 内联成 `100vh`（`app.v2.js:4507`），所以这两个面都不跟着过期的 768 走。`:28`
+那次采样里 navbar 在 `683..768`——对 768 的视口是自洽的，不是错位。
+
+**顺带记一个站点侧的隐患**（本轮不改）：站点的键盘保护是
+`if(vh100 < winHeight - 150){ vh100 = Math.max(maxWinHeight, winHeight); }`（`app.v2.js:4489-4491`），
+阈值 150px 是「键盘至少这么高」的假设；874−768 = **106 < 150**，所以这种幅度的视口收缩
+会被站点当成真实高度接受并写进 `--vh100`。当前两处使用它的地方都被钳住了，所以没有可见后果。
+
+#### (3) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **413210 字节** / **61 个标记**（新增 `function attachFollow(`、`站点没有取消关注的接口`） |
+| `scripts/test-site-patch.js` | **587 条断言**（上一轮 577，新增 10 条：已关注时说「已经在关注列表里」、面板里有 `followbook … code 400`、调用前后各读一次状态、不声称成功、「已关注」+ 重排关注列表、被拒时报 code、读不到状态时什么都不说、未登录不查状态、书签加入提示文案正确） |
+
+新增的 `testFollowOutcome` 用四组脚本化的「调用前/调用后」状态把上面每一条提示都钉住，
+并显式断言「面板里没有成功提示」这种**否定**条件——「什么都不说」正是这条缺陷原来的样子。
+
+#### 未证实项
+
+- **`code 400` = 「已经关注过」是推断**，依据是那本书 11 秒前就在关注列表里；下一次真机日志
+  里 `[FOLLOW] <host>/<id> before=… after=…` 会直接给出状态，不再需要推断。
+- **站点没有取消关注接口**：全站（外壳、`stv.ui.js`、`app.v2.js`、`app.v2.read.js`）只有
+  `followbook` 一个写接口，匿名探测也只能看到 `followbook`；「取消关注」与「取消收藏」
+  「取消点赞」同类——**站点的功能缺口，客户端补不了**，只能如实说。
+- `reportRects` 只把 `window.innerHeight` 打进面板；把 `visualViewport.height` 与
+  `documentElement.clientHeight` 一起打出来，下一次就能直接看出 768 是什么
+  （目前**没有必要**：两处使用 `--vh100` 的地方都已被钳住，没有可见后果）。
+
 
 
 
