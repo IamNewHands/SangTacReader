@@ -174,7 +174,8 @@ jobs:
                         stvBookmarkToggleInstalled stvStorageAccessorInstalled \
                         stvGridLayoutInstalled stvTabProbeInstalled \
                         stvKeyboardPopupInstalled \
-                        stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled; do
+                        stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled \
+                        stvCommentTranslateInstalled; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
@@ -198,6 +199,32 @@ jobs:
               exit 1
             fi
           done
+          # 系统离线翻译的三个桥接方法名。iOS 15-17 上它们也必须在（返回
+          # "unsupported" 让 JS 换联网引擎），缺了会变成不透明的桥接错误。
+          for marker in translationStatus translationPrepare translationTranslate; do
+            if grep -q -F "$marker" "$syms.strings"; then
+              echo "✓ $marker 已编入产物"
+            else
+              echo "::error::$marker 缺失"
+              exit 1
+            fi
+          done
+
+      - name: Verify Translation.framework is weak linked
+        run: |
+          set -euo pipefail
+          app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
+          bin="$app/$(basename "$app" .app)"
+          echo "binary: $bin"
+          # 部署目标是 15.0，而 Translation 是 iOS 18 的框架。强链接会让
+          # iOS 15-17 的 dyld 在任何代码执行前就中止启动，而这一点在编译期
+          # 完全看不出来（本机 Windows 更看不到），所以只能查产物里的加载命令。
+          linked="$(otool -l "$bin" | awk '/^ *cmd LC_LOAD_WEAK_DYLIB/ {k="weak"} /^ *cmd LC_LOAD_DYLIB/ {k="strong"} /Translation[.]framework/ {print k}')"
+          echo "Translation.framework 链接方式: ${linked:-未链接}"
+          if [ "$linked" != "weak" ]; then
+            echo "::error::Translation.framework 必须是 LC_LOAD_WEAK_DYLIB（当前：${linked:-未链接}）"
+            exit 1
+          fi
 
       - name: Package IPA
         run: |

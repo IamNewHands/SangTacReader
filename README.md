@@ -21,7 +21,8 @@
 ## 目前能做什么
 
 书列表 / 搜索 / 最新更新 / 排行榜、小说详情、关注与书签、章节目录、正文阅读
-（默认左右翻页）、原生 TTS 朗读、界面中文化、设置跨重装保留。
+（默认左右翻页）、原生 TTS 朗读、评论翻译（系统离线优先，可自备 API Key）、
+界面中文化、设置跨重装保留。
 
 站点自身的问题（例如「关注」tab 服务端 500、章节标题只有越南语机翻、书签没有
 取消接口）已在 `docs/capacitor-port.md` 中逐条定位并说明哪些能补、哪些补不了。
@@ -35,7 +36,7 @@ SangTacReader/
 ├── dist/index.html              # 仅占位（server.url 模式下 webDir 不被使用）
 ├── plugins/
 │   ├── http/                    # 原生 URLSession 版 Http（含 WKWebView cookie 桥接）
-│   ├── app/                     # App 插件 + 站点补丁注入 + 原生 TTS + 安全区/设置备份
+│   ├── app/                     # App 插件 + 站点补丁注入 + 原生 TTS + 安全区/设置备份 + 评论翻译
 │   └── webnativeview/           # 安卓反射桥的 iOS 占位（仅漫画模块，尚未实现）
 ├── data/site-i18n.json          # 站点文案中译字典（唯一真源）
 ├── scripts/                     # 三条本地/CI 守护（见下）
@@ -51,7 +52,7 @@ SangTacReader/
 
 ## 站点补丁（`plugins/app/.../SitePatch.swift`）
 
-站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 16 个块，
+站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 17 个块，
 每块独立守卫、互不依赖：
 
 | 块 | 作用 |
@@ -71,6 +72,7 @@ SangTacReader/
 | `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
 | `readerTts` | 正文朗读：句子来源取当前章、失败原因上报、测试语句改中文、退出正文自动停止 |
 | `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载对话框「起始章→结束章 + 来源选择」；下载循环自持（无 3s 批间睡眠、失败退避重试、完成后归入已下载并给已下载行加删除按钮） |
+| `commentTranslate` | 评论翻译：标题栏「译全部」、每条评论单独「译／原文」、发帖输入框「译成X」；引擎按「系统离线 → 免密钥微软通道 → 自备 Key」降级，设置面板在 设置 → 翻译 |
 | `bootShell` | 首屏外壳：站点 CSS 到位前先把底部标签栏画出来（主题背景 + 载入提示），并记录启动时间线 |
 | `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（中文原名来自 `oridata`，含阅读器 iframe 兜底） |
 
@@ -119,7 +121,8 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 遮挡、底栏穿透用）、`SETTINGS` 设置备份/恢复（逐键写出、保留、不可用的数量）、
 `BOOKMARK` 取消书签探测、`BOOKINFO` 评论/详情页缺数据时的补取与缓存预热、
 `COMMENT` 评论按钮拦截、`TITLE` 章节中文原名的获取结果、`DOWNLOAD` 下载限速与任务
-按钮、`BOOT` 启动时间线（外壳释放时刻 + app/config/标签栏就绪时刻）、`ERR` 错误。
+按钮、`TRANSLATE` 评论翻译（引擎探测、逐条/整页结果、设置保存）、`BOOT` 启动时间线
+（外壳释放时刻 + app/config/标签栏就绪时刻）、`ERR` 错误。
 
 ## 许可证
 

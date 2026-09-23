@@ -43,7 +43,10 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getVoices", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getSafeArea", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "settingsSave", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "settingsRestore", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "settingsRestore", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "translationStatus", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "translationPrepare", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "translationTranslate", returnType: CAPPluginReturnPromise)
     ]
 
     private var observers: [NSObjectProtocol] = []
@@ -334,6 +337,26 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         CAPLog.print("[SangTacApp:settings] \(entries.count) key(s) found in keychain")
         call.resolve(["entries": entries])
+    }
+
+    // MARK: - Offline translation (iOS 18+)
+
+    /**
+     The comment page's translate buttons. Declared on every iOS version on
+     purpose: the JS layer probes for the selectors, and a selector that simply
+     did not exist on iOS 15-17 would surface as an opaque bridge error instead
+     of the definite "unsupported" answer it can act on. See TranslationBridge.
+     */
+    @objc func translationStatus(_ call: CAPPluginCall) {
+        TranslationSupport.handle("status", call, parent: bridge?.viewController)
+    }
+
+    @objc func translationPrepare(_ call: CAPPluginCall) {
+        TranslationSupport.handle("prepare", call, parent: bridge?.viewController)
+    }
+
+    @objc func translationTranslate(_ call: CAPPluginCall) {
+        TranslationSupport.handle("translate", call, parent: bridge?.viewController)
     }
 
     // MARK: - Diagnostics

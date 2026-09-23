@@ -100,6 +100,21 @@ function makeElement(tagName) {
       child.parentNode = null;
       return child;
     },
+    // The comment-translation block builds its own controls and inserts them
+    // ahead of the site's, so the stub has to support both.
+    insertBefore(child, reference) {
+      const index = reference ? this.children.indexOf(reference) : -1;
+      child.parentNode = this;
+      if (index < 0) { this.children.push(child); } else { this.children.splice(index, 0, child); }
+      this.childNodes = this.children;
+      return child;
+    },
+    remove() {
+      if (this.parentNode) { this.parentNode.removeChild(this); }
+    },
+    removeAttribute(name) {
+      delete this.attributes[name];
+    },
     listeners: {},
     addEventListener(type, handler) {
       this.listeners[type] = (this.listeners[type] || []).concat([handler]);
@@ -129,8 +144,17 @@ function makeElement(tagName) {
         .filter(Boolean)
         .map((part) => {
           const attrMatch = /\[([^\]]+)\]/.exec(part);
-          const attr = attrMatch ? attrMatch[1] : null;
-          if (attrMatch) { part = part.replace(/\[[^\]]*\]/, ''); }
+          let attr = null;
+          if (attrMatch) {
+            // Presence (`[hasedit]`) and equality (`[view=commentblock]`) both
+            // appear in the injected blocks.
+            const raw = attrMatch[1];
+            const eq = raw.indexOf('=');
+            attr = eq < 0
+              ? { name: raw, value: null }
+              : { name: raw.slice(0, eq), value: raw.slice(eq + 1).replace(/^["']|["']$/g, '') };
+            part = part.replace(/\[[^\]]*\]/, '');
+          }
           const matcher = { attr: attr, cls: [], id: null, tag: null };
           if (part.charAt(0) === '.') {
             matcher.cls = part.split('.').filter(Boolean);
@@ -152,9 +176,14 @@ function makeElement(tagName) {
               : true;
             if (hit && matcher.id) { hit = child.id === matcher.id; }
             if (hit && matcher.tag) { hit = child.tagName === matcher.tag; }
-            if (hit && matcher.attr
-                && !Object.prototype.hasOwnProperty.call(child.attributes || {}, matcher.attr)) {
-              hit = false;
+            if (hit && matcher.attr) {
+              const attrs = child.attributes || {};
+              if (!Object.prototype.hasOwnProperty.call(attrs, matcher.attr.name)) {
+                hit = false;
+              } else if (matcher.attr.value !== null
+                && String(attrs[matcher.attr.name]) !== matcher.attr.value) {
+                hit = false;
+              }
             }
             if (hit) { found.push(child); break; }
           }
@@ -173,6 +202,41 @@ function makeElement(tagName) {
   Object.defineProperty(element, 'parentElement', {
     get() {
       return element.parentNode;
+    },
+  });
+
+  Object.defineProperty(element, 'firstChild', {
+    get() {
+      return element.children.length ? element.children[0] : null;
+    },
+  });
+
+  // innerText mirrors textContent: the comment-translation block reads a
+  // comment through it first and falls back to textContent.
+  Object.defineProperty(element, 'innerText', {
+    get() {
+      return element.textContent;
+    },
+  });
+
+  // A deliberately shallow innerHTML: setting it replaces the children with a
+  // raw string (which is all the translation block needs for its restore path),
+  // and reading it returns that string, or the serialized children.
+  let rawHtml = null;
+  Object.defineProperty(element, 'innerHTML', {
+    get() {
+      if (rawHtml !== null) { return rawHtml; }
+      let out = '';
+      for (const child of element.children) {
+        out += child.nodeType === 3 ? (child.nodeValue || '') : (child.outerHTML || child.textContent || '');
+      }
+      return out;
+    },
+    set(value) {
+      rawHtml = value === undefined || value === null ? '' : String(value);
+      detached = '';
+      element.children.length = 0;
+      element.childNodes = element.children;
     },
   });
 
@@ -206,6 +270,7 @@ function makeElement(tagName) {
     },
     set(value) {
       detached = value === undefined || value === null ? '' : String(value);
+      rawHtml = null;
       element.children.length = 0;
       element.childNodes = element.children;
       if (detached !== '') { element.appendChild(makeTextNode(detached)); }
@@ -321,6 +386,22 @@ function makeSandbox() {
     for (const handler of listeners[type] || []) { handler(event); }
   };
   sandbox.__listenerCount = (type) => (listeners[type] || []).length;
+  // Minimal MutationObserver: it records the observed node and the callback so a
+  // test can flush it by hand. Only the comment-translation block uses one, and
+  // it is how a comment that arrives after the first render gets decorated.
+  const observers = [];
+  sandbox.MutationObserver = class {
+    constructor(callback) {
+      this.callback = callback;
+      this.nodes = [];
+      observers.push(this);
+    }
+    observe(node) { this.nodes.push(node); }
+    disconnect() {}
+  };
+  sandbox.__flushObservers = () => {
+    for (const observer of observers) { observer.callback(); }
+  };
   return sandbox;
 }
 
@@ -430,6 +511,19 @@ function installFakeApp(sandbox, options) {
     },
     toast(message) {
       stored.toasts = (stored.toasts || []).concat([message]);
+    },
+    // The comment-translation block reads app.language to pick the default
+    // reading target, and wraps pushPage to decorate the pages it opens.
+    language: options.appLanguage || 'vi',
+    pushPage(name) {
+      stored.pushed = (stored.pushed || []).concat([name]);
+      const page = (options.pages || {})[name];
+      if (!page) { return null; }
+      return {
+        root: page,
+        q: (selector) => page.querySelector(selector),
+        qq: (selector) => page.querySelectorAll(selector),
+      };
     },
   };
   app.config.reader.__defineSetter__('display_type', function (value) {
@@ -666,6 +760,34 @@ function installFakeApp(sandbox, options) {
         },
         settingsRestore() {
           return Promise.resolve({ entries: Object.assign({}, keychain) });
+        },
+        // Apple's Translation framework, reached through the always-present
+        // selectors. Defaults model an iOS 18+ device with the pack installed.
+        translationStatus(payload) {
+          (stored.translationStatus || (stored.translationStatus = [])).push(payload);
+          return Promise.resolve(options.appleStatus || { status: 'installed', ready: true });
+        },
+        translationPrepare(payload) {
+          (stored.translationPrepare || (stored.translationPrepare = [])).push(payload);
+          return Promise.resolve(options.appleStatus || { status: 'installed', ready: true });
+        },
+        translationTranslate(payload) {
+          (stored.translationTranslate || (stored.translationTranslate = [])).push(payload);
+          if (options.appleTranslate) { return options.appleTranslate(payload); }
+          return Promise.resolve({
+            translations: payload.texts.map((text) => '【系统】' + text),
+          });
+        },
+      },
+      // Every network engine goes through the native Http plugin, because a
+      // page-level fetch to those hosts is blocked by CORS.
+      Http: {
+        request(payload) {
+          (stored.http || (stored.http = [])).push(payload);
+          if (options.httpResponse) {
+            return Promise.resolve(options.httpResponse(String(payload.url), payload));
+          }
+          return Promise.reject(new Error('no Http stub for ' + payload.url));
         },
       },
     },
@@ -2242,6 +2364,329 @@ async function testBookmarkToggle() {
   check('no removal probe without an active bookmark', add.__posts.length === 0);
 }
 
+// ------------------------------------------------------ comment translation
+
+/**
+ * The comment page (_page_vip.html:914-941): title bar, the rendered comment
+ * list, and the contenteditable the reader types into.
+ */
+function commentPageFixture(texts) {
+  const page = makeContainer('div', 'commentpage');
+  const bar = makeContainer('div', 'titlebar');
+  const ctx = makeContainer('div', 'rctx');
+  ctx.appendChild(makeContainer('button', 'rbtn'));
+  bar.appendChild(ctx);
+  const view = makeContainer('div', 'commentview');
+  for (const text of texts) {
+    const block = makeContainer('div', '');
+    block.setAttribute('view', 'commentblock');
+    const body = makeContainer('div', 'cmtbody');
+    body.appendChild(makeContainer('div', 'cmtcontent content', text));
+    block.appendChild(body);
+    view.appendChild(block);
+  }
+  const bottom = makeContainer('div', 'bottombar');
+  const input = makeContainer('div', 'commentinput shadowinset');
+  bottom.appendChild(input);
+  page.appendChild(bar);
+  page.appendChild(view);
+  page.appendChild(bottom);
+  return { page, bar, ctx, view, input };
+}
+
+function settingsPageFixture() {
+  const page = makeContainer('div', '');
+  page.appendChild(makeContainer('div', 'titlebar'));
+  const content = makeContainer('div', '');
+  content.appendChild(makeContainer('div', 'settingsection', 'interface'));
+  page.appendChild(content);
+  return { page, content };
+}
+
+function click(node) {
+  node.__fire('click', {
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  });
+}
+
+/** The Edge translatetext shape: one object per input string. */
+function edgeAnswer(texts) {
+  return {
+    status: 200,
+    data: texts.map((text) => ({ translations: [{ text: '【微软】' + text }] })),
+  };
+}
+
+async function testCommentTranslate() {
+  console.log('comment translation (system offline engine)');
+  const fixture = commentPageFixture(['Bình luận một', 'Bình luận hai']);
+  const settingsFixture = settingsPageFixture();
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { comment: fixture.page, pagesetting: settingsFixture.page },
+    httpResponse: (url, payload) => (
+      url.indexOf('edge.microsoft.com') >= 0
+        ? edgeAnswer(JSON.parse(payload.data))
+        : { status: 500, data: '' }
+    ),
+  });
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  // The site appends a pushed page to the document; the panel and the input
+  // button label are both found through a document-wide query.
+  sandbox.document.body.appendChild(fixture.page);
+  sandbox.document.body.appendChild(settingsFixture.page);
+  app.pushPage('comment', {});
+  await tick(60);
+
+  check('the comment title bar gets a translate-all button',
+    fixture.bar.querySelectorAll('.stv-translate-all').length === 1);
+  check('the comment title bar gets a settings button',
+    fixture.bar.querySelectorAll('.stv-translate-settings').length === 1);
+  check("the site's own title button survives",
+    fixture.ctx.querySelectorAll('.rbtn').length === 1);
+  check('every comment block gets its own translate button',
+    fixture.view.querySelectorAll('.stv-translate-one').length === 2,
+    String(fixture.view.querySelectorAll('.stv-translate-one').length));
+
+  const inputBar = fixture.input.parentNode.querySelectorAll('.stv-translate-input');
+  check('the comment input gets a translate button', inputBar.length === 1);
+  check('the input button names the configured write target',
+    inputBar.length === 1 && inputBar[0].textContent === '译成越南语',
+    inputBar.length ? inputBar[0].textContent : 'missing');
+
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(150);
+
+  const calls = sandbox.__stored.translationTranslate || [];
+  check('the offline engine is used first', calls.length === 1,
+    'native=' + calls.length + ' http=' + (sandbox.__stored.http || []).length);
+  check('the whole visible comment list goes in one request',
+    calls.length === 1
+      && JSON.stringify(calls[0].texts) === JSON.stringify(['Bình luận một', 'Bình luận hai']),
+    calls.length ? JSON.stringify(calls[0].texts) : 'no call');
+  check('the reading target follows the app language',
+    calls.length === 1 && calls[0].target === 'zh-Hans',
+    calls.length ? String(calls[0].target) : 'no call');
+  check('the comment source language is the configured one',
+    calls.length === 1 && calls[0].source === 'vi',
+    calls.length ? String(calls[0].source) : 'no call');
+
+  const contents = fixture.view.querySelectorAll('.cmtcontent');
+  check('translated text lands in the comment body',
+    contents[0].textContent === '【系统】Bình luận một', contents[0].textContent);
+  check('the original is kept for the toggle',
+    contents[0].getAttribute('stv-orig') === 'Bình luận một',
+    String(contents[0].getAttribute('stv-orig')));
+
+  const one = fixture.view.querySelectorAll('.stv-translate-one');
+  click(one[0]);
+  await tick(40);
+  check('tapping the per-comment button restores the original',
+    contents[0].getAttribute('stv-orig') === undefined
+      && contents[0].innerHTML === 'Bình luận một',
+    String(contents[0].getAttribute('stv-orig')) + ' / ' + contents[0].innerHTML);
+  check('the per-comment button flips back to 译', one[0].textContent === '译',
+    one[0].textContent);
+
+  // A comment that arrives after the first render (the site pushes new ones
+  // over the comment channel) must still get its button.
+  const late = makeContainer('div', '');
+  late.setAttribute('view', 'commentblock');
+  const lateBody = makeContainer('div', 'cmtbody');
+  lateBody.appendChild(makeContainer('div', 'cmtcontent content', 'Bình luận muộn'));
+  late.appendChild(lateBody);
+  fixture.view.appendChild(late);
+  sandbox.__flushObservers();
+  check('a late comment is decorated too',
+    late.querySelectorAll('.stv-translate-one').length === 1);
+
+  fixture.input.textContent = '你好，这是一条测试评论';
+  click(inputBar[0]);
+  await tick(150);
+  const inputCalls = (sandbox.__stored.translationTranslate || []).slice(1);
+  check('translating the draft asks for the write target',
+    inputCalls.length === 1 && inputCalls[0].target === 'vi',
+    JSON.stringify(inputCalls));
+  check('translating the draft auto-detects the source',
+    inputCalls.length === 1 && inputCalls[0].source === undefined,
+    JSON.stringify(inputCalls[0]));
+  check('the translated draft replaces what the reader typed',
+    fixture.input.innerHTML === '【系统】你好，这是一条测试评论',
+    fixture.input.innerHTML);
+
+  app.pushPage('pagesetting', {});
+  await tick(40);
+  const entry = settingsFixture.content.querySelectorAll('.stv-translate-entry');
+  check('a 翻译 entry is added to 设置', entry.length === 1);
+  click(entry[0]);
+  await tick(60);
+
+  const panel = sandbox.document.getElementById('stv-translate-panel');
+  check('the translation panel opens', !!panel);
+  if (!panel) { return; }
+
+  const selects = panel.querySelectorAll('select');
+  const fields = panel.querySelectorAll('input');
+  check('the panel offers every engine', selects.length === 4 && fields.length >= 4,
+    'selects=' + selects.length + ' inputs=' + fields.length);
+
+  selects[0].value = 'free';
+  fields[0].value = 'key-123';
+  const panelButtons = panel.querySelectorAll('button');
+  click(panelButtons[1]);
+  await tick(80);
+  const saved = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
+  check('the panel saves the engine and the key',
+    saved.engine === 'free' && saved.apiKey === 'key-123', JSON.stringify(saved));
+
+  click(panelButtons[2]);
+  await tick(150);
+  const http = sandbox.__stored.http || [];
+  check('the keyless Microsoft channel is used',
+    http.length === 1
+      && String(http[0].url).indexOf('edge.microsoft.com/translate/translatetext') >= 0,
+    JSON.stringify(http.map((call) => call.url)));
+  check('the keyless channel is told the target language',
+    http.length === 1 && String(http[0].url).indexOf('to=zh-Hans') >= 0,
+    http.length ? http[0].url : 'no request');
+  check('the keyless channel posts the texts as a JSON array',
+    http.length === 1
+      && JSON.parse(http[0].data)[0] === 'Xin chào, đây là một bình luận thử nghiệm.',
+    http.length ? http[0].data : 'no request');
+}
+
+async function testCommentTranslateFallback() {
+  console.log('comment translation without the system engine');
+  const fixture = commentPageFixture(['Nhận xét']);
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { comment: fixture.page },
+    // An iOS 15-17 device: the selector exists but reports "unsupported".
+    appleStatus: { status: 'unsupported', ready: false, reason: 'ios-version' },
+    httpResponse: (url, payload) => (
+      url.indexOf('edge.microsoft.com') >= 0
+        ? edgeAnswer(JSON.parse(payload.data))
+        : { status: 500, data: '' }
+    ),
+  });
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.app.pushPage('comment', {});
+  await tick(60);
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(200);
+
+  check('a device without the framework never calls the native translate',
+    (sandbox.__stored.translationTranslate || []).length === 0,
+    JSON.stringify(sandbox.__stored.translationTranslate || []));
+  check('it falls through to the keyless Microsoft channel',
+    (sandbox.__stored.http || []).length === 1,
+    JSON.stringify((sandbox.__stored.http || []).map((call) => call.url)));
+  const contents = fixture.view.querySelectorAll('.cmtcontent');
+  check('the fallback still fills the comment body',
+    contents[0].textContent === '【微软】Nhận xét', contents[0].textContent);
+}
+
+async function testCommentTranslateProviders() {
+  console.log('comment translation provider request shapes');
+  const cases = [
+    {
+      engine: 'azure',
+      extra: { apiKey: 'azure-key', region: 'eastasia' },
+      texts: (payload) => JSON.parse(payload.data).map((item) => item.Text),
+      url: 'https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=zh-Hans&from=vi',
+      headers: (headers) => headers['Ocp-Apim-Subscription-Key'] === 'azure-key'
+        && headers['Ocp-Apim-Subscription-Region'] === 'eastasia',
+      answer: (texts) => ({ status: 200, data: texts.map((text) => ({ translations: [{ text: '【Azure】' + text }] })) }),
+      marker: '【Azure】',
+    },
+    {
+      engine: 'google',
+      extra: { apiKey: 'google-key' },
+      texts: (payload) => JSON.parse(payload.data).q,
+      url: 'https://translation.googleapis.com/language/translate/v2?key=google-key',
+      headers: () => true,
+      answer: (texts) => ({ status: 200, data: { data: { translations: texts.map((text) => ({ translatedText: '【谷歌】' + text })) } } }),
+      marker: '【谷歌】',
+    },
+    {
+      engine: 'deepl',
+      extra: { apiKey: 'deepl-key' },
+      texts: (payload) => String(payload.data).split('&')
+        .filter((part) => part.indexOf('text=') === 0)
+        .map((part) => decodeURIComponent(part.slice(5))),
+      url: 'https://api-free.deepl.com/v2/translate',
+      headers: (headers) => headers.Authorization === 'DeepL-Auth-Key deepl-key',
+      answer: (texts) => ({ status: 200, data: { translations: texts.map((text) => ({ text: '【DeepL】' + text })) } }),
+      marker: '【DeepL】',
+    },
+    {
+      engine: 'openai',
+      extra: { apiKey: 'openai-key', endpoint: 'https://ai.example.com/v1', model: 'gpt-4o-mini' },
+      texts: (payload) => JSON.parse(JSON.parse(payload.data).messages[1].content),
+      url: 'https://ai.example.com/v1/chat/completions',
+      headers: (headers) => headers.Authorization === 'Bearer openai-key',
+      answer: (texts) => ({
+        status: 200,
+        data: { choices: [{ message: { content: JSON.stringify(texts.map((text) => '【AI】' + text)) } }] },
+      }),
+      marker: '【AI】',
+    },
+  ];
+
+  for (const item of cases) {
+    const fixture = commentPageFixture(['Một bình luận']);
+    const sandbox = makeSandbox();
+    const seeded = Object.assign({
+      engine: item.engine,
+      apiKey: '',
+      region: '',
+      endpoint: '',
+      model: '',
+      readSource: 'vi',
+      readTarget: 'zh-Hans',
+      writeTarget: 'vi',
+      auto: false,
+    }, item.extra);
+    sandbox.localStorage.setItem('stv.translate.settings', JSON.stringify(seeded));
+    installFakeApp(sandbox, {
+      appLanguage: 'zh',
+      pages: { comment: fixture.page },
+      httpResponse: (url, payload) => item.answer(item.texts(payload)),
+    });
+
+    vm.runInContext(loadBlocks().join('\n'), sandbox);
+    await tick(250);
+    sandbox.app.pushPage('comment', {});
+    await tick(60);
+    click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+    await tick(200);
+
+    const http = sandbox.__stored.http || [];
+    check(item.engine + ': one request to its own endpoint',
+      http.length === 1 && http[0].url === item.url,
+      JSON.stringify(http.map((call) => call.url)));
+    check(item.engine + ': sends the key in the right header',
+      http.length === 1 && item.headers(http[0].headers),
+      http.length ? JSON.stringify(http[0].headers) : 'no request');
+    check(item.engine + ': posts exactly the comment texts',
+      http.length === 1
+        && JSON.stringify(item.texts(http[0])) === JSON.stringify(['Một bình luận']),
+      http.length ? JSON.stringify(item.texts(http[0])) : 'no request');
+    const contents = fixture.view.querySelectorAll('.cmtcontent');
+    check(item.engine + ': the answer lands in the comment body',
+      contents[0].textContent === item.marker + 'Một bình luận', contents[0].textContent);
+  }
+}
+
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -2268,6 +2713,9 @@ await testBootShell();
   await testKeyboardPopup();
   await testGridLayout();
   await testTabProbe();
+  await testCommentTranslate();
+  await testCommentTranslateFallback();
+  await testCommentTranslateProviders();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

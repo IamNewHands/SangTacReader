@@ -60,6 +60,8 @@
 6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）；`tabProbe` 同批退役，见 §6.11 (4)。
 7. 站点 `filterDownloadingChapters`（`read.js:3445`）参数遮蔽导致跨任务去重失效 —— 低危、未改（改动会牵动 `total` 口径，见 §6.11 (2)）。
 8. ~~储物袋顶部 tab 的错位成因未定~~ —— **已定性**：不是位移错位，是末页「Đang kích hoạt」本来就没有数据（服务端 `act` 为空数组，见 §6.11/§6.12 (6)）。`tabProbe` 探针已补 `panes`/`activate`，若后续发现该有数据再收口。
+9. **系统离线翻译要 iOS 18+ 且语言包已下载**（见 §6.13）。iOS 15-17 上 `App.translationStatus` 如实回 `unsupported`，`commentTranslate` 会自动改用联网引擎（免密钥微软通道，或用户自备 Key），因此该功能在旧系统上不是不可用，只是必须联网。
+10. **自备 API Key 存在站点存储里**（`app.storage` → Capacitor Preferences → UserDefaults），并被 `settingsBackup` 一并镜像进 Keychain（`stv.translate.settings`）。日志只记引擎名，不打印 Key；但它不是独立的加密存储，介意的话请用可随时吊销的 Key。
 
 ## 6. 真机问题档案
 
@@ -1196,3 +1198,72 @@ items=[0+40 40+40 80+40 120+40 160+40 200+54] views=6 lastview=0 child(ren) div=
 `a failing chapter is retried instead of abandoning the job` 5 条、`keyboard vs popup inputs` 8 条、
 `grid tap targets` +4 条、`inventory tab probe` +2 条）、`gen-site-i18n --check`
 （458 labels / 35 fragments）全绿。
+
+### 6.13 评论翻译（2026-09-23 新增功能）
+
+**需求**：正文的评论页要能翻译别人的评论，也要能把「我输入的评论」译成任意语言再发出去；
+优先用 iOS 自带的离线翻译，同时也允许自己填 API Key；实现方式参考 `newsnook-ios` 的
+`AppleTranslationPlugin.swift` 与 `features/translation/freeProviders.ts`。
+
+#### (1) 为什么是两个目标语言，不是一个
+
+评论是越南语、用户要读中文；用户打中文、评论者要看越南语。一个目标语言不可能同时服务
+两个方向，所以设置里是 `readTarget`（评论翻译成）与 `writeTarget`（发评论时译成）两项，
+`readTarget` 的默认值跟随站点界面语言（`app.language === 'zh'` → `zh-Hans`）。
+
+#### (2) 引擎与降级顺序
+
+| 引擎 | 说明 |
+|---|---|
+| `apple` | iOS 18+ Translation 框架：离线、免密钥、复用系统已下语言包。默认首选 |
+| `free` | 微软 Edge 无鉴权端点 `edge.microsoft.com/translate/translatetext`（与 newsnook-ios 同一条通道），按 IP 限速 |
+| `azure` / `google` / `deepl` / `openai` | 用户自备 Key，走原生 Http 插件 —— 页面级 `fetch` 到这些域会被 CORS 拦掉 |
+
+`apple` 不是靠 UA 猜的：`SangTacAppPlugin.translationStatus` 在**所有 iOS 版本上都存在**，
+iOS 15-17 上如实回 `{status:'unsupported'}`，JS 的 `probeApple()` 据此把引擎换成 `free`。
+若把这三个方法写成 `@available(iOS 18.0, *)` 的 extension，旧系统上选择子直接不存在，
+JS 只会拿到一个不透明的桥接错误，没法判断该不该降级。
+
+#### (3) 原生侧：`TranslationBridge.swift`
+
+- 框架只在 SwiftUI `.translationTask` 的闭包里交出 `TranslationSession`，也只有这个 session
+  能申请语言包下载，所以插件挂了一个常驻 1×1 的 `AppleTranslationHostView`（Capacitor
+  视图控制器的子 VC）当宿主，语对不变就复用同一个 session。
+- 换配置前必须先丢掉旧 session（框架里复用会 `fatalError`），并且要「先置 nil、下一轮
+  runloop 再设新值」，否则同一语对的第二次请求拿不到 session。这两点与 newsnook-ios 一致。
+- `translate` 会先跑一次 `prepareTranslation()`：这正是弹出系统语言包下载确认的调用，
+  于是「第一次翻译某个新语对」是自愈的，而不是先报一个错误让用户去猜。
+- **弱链接**：部署目标是 15.0，`Translation` 是 iOS 18 框架，所有使用都在
+  `@available(iOS 18.0, *)` 内，Swift 因此发出 `LC_LOAD_WEAK_DYLIB`。强链接会让 iOS 15-17
+  的 dyld 在任何代码执行前中止启动，而编译期与本机（Windows）都看不出来 —— CI 新增
+  `Verify Translation.framework is weak linked` 步骤查产物的加载命令兜底。
+- 不解析 `TranslationError` 的具体错误码：那套静态成员是 iOS 26 才公开的（newsnook-ios 为此
+  耗过一轮 CI），这里只用 `localizedDescription` 加自有的超时错误文案。
+
+#### (4) 站点侧：`commentTranslate` 块
+
+- 挂钩点是 `app.pushPage`（所有页面的唯一漏斗）：`comment` → 装按钮，`pagesetting` → 加
+  「设置 → 翻译」入口。
+- 评论页（`_page_vip.html:914-941`）加三处 UI：标题栏 `译全部` + `⚙`、每条 `[view=commentblock]`
+  的 `.cmtbody` 里一个 `译／原文` 切换、`.commentinput` 上方一个 `译成X`。
+- 评论是分两批到的：`loadEmbed()` 的首屏渲染，以及之后评论频道推来的新评论。只挂一次
+  `MutationObserver` 才能覆盖第二批。
+- 发帖方向不能只写 `innerHTML` 就完事：站点在 `_page_vip.html:4586` 把
+  `p.q('.commentinput').innerHTML` 交给 `replyContext.set()`，所以写入的是转义后的文本
+  （换行用 `<br>`），否则用户输入里的尖括号会被当成标签。
+- 设置存 `app.storage` 的 `stv.translate.settings`，并加进 `settingsBackup` 的 `KEYS`，
+  于是和阅读设置一样能跨重装恢复（走 Keychain）。
+- 长列表按 3000 字符切块串行发送；单块失败只让那一块保留原文，不会把整页翻译丢掉。
+
+#### 验证
+
+`check-ios-shim`（18 块 / 219102 字节 / 21 markers）、`test-site-patch`（257 条断言，新增
+`comment translation (system offline engine)` 22 条、`comment translation without the system engine`
+3 条、`comment translation provider request shapes` 16 条）、`gen-site-i18n --check`
+（458 labels / 35 fragments）全绿。CI 另加：二进制里必须有
+`translationStatus`/`translationPrepare`/`translationTranslate` 与 `stvCommentTranslateInstalled`，
+且 `Translation.framework` 必须是弱链接。
+
+**未证实项**：`TranslationSession` 跨调用复用是主要运行时假设（与 newsnook-ios 相同）；
+真机若失败，provider 的 `discardSession()` + 重建路径会在下次调用自愈。首次翻译新语对会弹
+系统语言包下载确认，CI 无法覆盖。

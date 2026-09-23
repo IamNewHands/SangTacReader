@@ -1369,7 +1369,7 @@ enum SitePatch {
         window.__stvSettingsBackupInstalled = true;
 
         var KEYS = ['config.reader', 'config.ux', 'config.comicReader', 'tts.setting',
-                    'readthemeset', 'offlineBook'];
+                    'readthemeset', 'offlineBook', 'stv.translate.settings'];
         var PREFIXES = ['reader.style.'];
 
         function note(tag, message) {
@@ -3029,6 +3029,1046 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Comment translation
+
+    /**
+     Comment translation on the reader's comment page (_page_vip.html:914-941):
+
+       * a 译全部 button in the title bar translates every comment currently
+         loaded;
+       * every comment block gets its own 译 that toggles back to the original;
+       * the comment input gets a 译成X button that rewrites what the reader
+         typed into the language the site's commenters actually read, so a
+         Chinese reader can post in Vietnamese;
+       * 设置 -> 翻译 opens a panel for the engine, the API key and the languages.
+
+     Engines, in the order the UI offers them:
+
+       apple  iOS 18+ Translation framework: native, offline, no key. Probed
+              through the always-present App.translationStatus selector, so an
+              iOS 15-17 device falls through to the next engine by itself.
+       free   Microsoft's keyless Edge endpoint
+              (edge.microsoft.com/translate/translatetext) -- the same channel
+              newsnook-ios uses. No key, IP rate limited.
+       azure / google / deepl / openai
+              the reader's own key, sent through the native Http plugin: a
+              page-level fetch to those hosts would be blocked by CORS.
+
+     Settings live in the site's own storage (app.storage) under
+     stv.translate.settings, which is also in settingsBackup's KEYS, so they
+     survive a reinstall exactly like the reader settings do.
+
+     Read vs write target are deliberately separate settings. Comments are
+     Vietnamese and the reader wants Chinese; the reader types Chinese and the
+     commenters want Vietnamese. One target cannot serve both directions.
+     */
+    static let commentTranslate = """
+    (function () {
+        if (window.__stvCommentTranslateInstalled) { return; }
+        window.__stvCommentTranslateInstalled = true;
+
+        var STORE_KEY = 'stv.translate.settings';
+        var PANEL_ID = 'stv-translate-panel';
+        var NL = String.fromCharCode(10);
+
+        var ENGINE_LABELS = [
+            ['apple', 'iOS 系统离线（推荐，免密钥）'],
+            ['free', '免密钥联网（微软 Edge 通道）'],
+            ['azure', 'Azure Translator（自备 Key）'],
+            ['google', 'Google Cloud Translation（自备 Key）'],
+            ['deepl', 'DeepL（自备 Key）'],
+            ['openai', 'OpenAI 兼容接口（自备 Key）']
+        ];
+
+        var LANGUAGES = [
+            ['vi', '越南语'], ['zh-Hans', '简体中文'], ['zh-Hant', '繁体中文'],
+            ['en', '英语'], ['ja', '日语'], ['ko', '韩语'], ['th', '泰语'],
+            ['id', '印尼语'], ['ms', '马来语'], ['fr', '法语'], ['de', '德语'],
+            ['es', '西班牙语'], ['ru', '俄语'], ['pt', '葡萄牙语'],
+            ['ar', '阿拉伯语'], ['hi', '印地语']
+        ];
+
+        var SOURCE_LANGUAGES = [['auto', '自动识别']].concat(LANGUAGES);
+
+        var EDGE_URL = 'https://edge.microsoft.com/translate/translatetext';
+        // Edge's own translation endpoint answers on an Edge UA; this mirrors
+        // what newsnook-ios sends.
+        var EDGE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            + ' (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0';
+
+        var BUTTON_CSS = 'padding:5px 10px;margin-left:6px;border-radius:7px;'
+            + 'border:1px solid rgba(128,128,128,0.45);background:rgba(128,128,128,0.18);'
+            + 'color:inherit;font:13px/1.2 inherit;cursor:pointer;';
+
+        var FIELD_CSS = 'width:100%;box-sizing:border-box;padding:7px 9px;'
+            + 'border-radius:8px;border:1px solid #555;background:#2a2a2a;'
+            + 'color:#eee;font-size:13px;';
+
+        // Some engines cap a single request; a translate-all of fifty comments
+        // is one string well past that.
+        var MAX_CHARS = 3000;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function messageOf(error) {
+            if (error && error.message) { return String(error.message); }
+            return String(error);
+        }
+
+        function stop(event) {
+            if (!event) { return; }
+            if (typeof event.preventDefault === 'function') { event.preventDefault(); }
+            if (typeof event.stopPropagation === 'function') { event.stopPropagation(); }
+            if (typeof event.stopImmediatePropagation === 'function') {
+                event.stopImmediatePropagation();
+            }
+        }
+
+        // The site puts q()/qq() on Element.prototype from /stv.ui.js; fall back
+        // to the standard pair so this block also works before that loads and
+        // under the stub DOM the test suite drives it with.
+        function q(node, selector) {
+            if (!node) { return null; }
+            if (typeof node.q === 'function') { return node.q(selector); }
+            if (typeof node.querySelector === 'function') { return node.querySelector(selector); }
+            return null;
+        }
+
+        function qq(node, selector) {
+            if (!node) { return []; }
+            if (typeof node.qq === 'function') { return node.qq(selector); }
+            if (typeof node.querySelectorAll === 'function') {
+                var list = node.querySelectorAll(selector);
+                return list ? Array.prototype.slice.call(list) : [];
+            }
+            return [];
+        }
+
+        function textOf(node) {
+            if (!node) { return ''; }
+            var text = node.innerText;
+            if (typeof text !== 'string' || !text) { text = node.textContent; }
+            return typeof text === 'string' ? text : '';
+        }
+
+        function escapeHtml(text) {
+            return String(text)
+                .split('&').join('&amp;')
+                .split('<').join('&lt;')
+                .split('>').join('&gt;');
+        }
+
+        function languageName(code) {
+            for (var i = 0; i < LANGUAGES.length; i++) {
+                if (LANGUAGES[i][0] === code) { return LANGUAGES[i][1]; }
+            }
+            return String(code);
+        }
+
+        function engineName(code) {
+            for (var i = 0; i < ENGINE_LABELS.length; i++) {
+                if (ENGINE_LABELS[i][0] === code) { return ENGINE_LABELS[i][1]; }
+            }
+            return String(code);
+        }
+
+        // ---- settings ----------------------------------------------------
+
+        var settings = null;
+
+        function defaults() {
+            var app = window.app;
+            var ui = (app && app.language) || 'vi';
+            var readTarget = 'vi';
+            if (ui === 'zh') { readTarget = 'zh-Hans'; }
+            if (ui === 'en') { readTarget = 'en'; }
+            return {
+                engine: 'apple',
+                apiKey: '',
+                region: '',
+                endpoint: '',
+                model: '',
+                readSource: 'vi',
+                readTarget: readTarget,
+                writeTarget: 'vi',
+                auto: false
+            };
+        }
+
+        function mergeSettings(base, raw) {
+            if (typeof raw !== 'string' || !raw) { return base; }
+            var parsed = null;
+            try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+            if (!parsed || typeof parsed !== 'object') { return base; }
+            for (var key in base) {
+                if (Object.prototype.hasOwnProperty.call(parsed, key)
+                    && typeof parsed[key] === typeof base[key]) {
+                    base[key] = parsed[key];
+                }
+            }
+            return base;
+        }
+
+        function loadSettings() {
+            if (settings) { return Promise.resolve(settings); }
+            var base = defaults();
+            var app = window.app;
+            var storage = app && app.storage;
+            if (!storage || typeof storage.get !== 'function') {
+                settings = base;
+                return Promise.resolve(settings);
+            }
+            return Promise.resolve(storage.get(STORE_KEY)).then(function (raw) {
+                settings = mergeSettings(base, raw);
+                return settings;
+            }, function (error) {
+                note('ERR', 'translate settings read failed: ' + messageOf(error));
+                settings = base;
+                return settings;
+            });
+        }
+
+        function saveSettings(next) {
+            settings = next;
+            var app = window.app;
+            var storage = app && app.storage;
+            if (!storage || typeof storage.set !== 'function') {
+                return Promise.resolve();
+            }
+            return Promise.resolve(storage.set(STORE_KEY, JSON.stringify(next)))
+                .then(function () {
+                    note('TRANSLATE', 'settings saved (engine=' + next.engine + ')');
+                }, function (error) {
+                    note('ERR', 'translate settings save failed: ' + messageOf(error));
+                });
+        }
+
+        // ---- engines -----------------------------------------------------
+
+        function appPlugin() {
+            return (window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App) || null;
+        }
+
+        function httpPlugin() {
+            return (window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.Http) || null;
+        }
+
+        function httpRequest(method, url, headers, data) {
+            var plugin = httpPlugin();
+            if (!plugin || typeof plugin.request !== 'function') {
+                return Promise.reject(new Error('原生 Http 插件不可用'));
+            }
+            var options = { url: url, method: method, headers: headers || {} };
+            if (data !== undefined && data !== null) { options.data = data; }
+            return plugin.request(options);
+        }
+
+        function bodyOf(response) {
+            if (!response) { throw new Error('翻译接口没有响应'); }
+            if (response.status < 200 || response.status >= 300) {
+                if (response.status === 429) {
+                    throw new Error('接口限流（429），请稍后再试或换用自备 Key');
+                }
+                throw new Error('接口返回 HTTP ' + response.status);
+            }
+            var data = response.data;
+            if (typeof data === 'string') {
+                var text = data.trim();
+                if (text && (text.charAt(0) === '{' || text.charAt(0) === '[')) {
+                    try { return JSON.parse(text); } catch (e) { return text; }
+                }
+                return text;
+            }
+            return data;
+        }
+
+        function trimSlashes(url) {
+            var out = String(url);
+            while (out.length && out.charAt(out.length - 1) === '/') {
+                out = out.substring(0, out.length - 1);
+            }
+            return out;
+        }
+
+        function pick(list, index, texts, key) {
+            var item = list[index];
+            var piece = item && item[key];
+            if (typeof piece === 'string' && piece) { return piece; }
+            return texts[index];
+        }
+
+        function appleBatch(texts, source, target) {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.translationTranslate !== 'function') {
+                return Promise.reject(new Error('原生翻译桥不可用'));
+            }
+            var payload = { texts: texts, target: target };
+            if (source && source !== 'auto') { payload.source = source; }
+            return Promise.resolve(plugin.translationTranslate(payload)).then(function (result) {
+                var out = result && result.translations;
+                if (!out || out.length !== texts.length) {
+                    throw new Error('系统翻译返回条数不符');
+                }
+                return out;
+            });
+        }
+
+        function freeBatch(texts, source, target) {
+            var url = EDGE_URL + '?to=' + encodeURIComponent(target)
+                + '&isEnterpriseClient=false';
+            if (source && source !== 'auto') {
+                url += '&from=' + encodeURIComponent(source);
+            }
+            return httpRequest('POST', url, {
+                'Content-Type': 'application/json; charset=UTF-8',
+                'User-Agent': EDGE_UA
+            }, JSON.stringify(texts)).then(function (response) {
+                var data = bodyOf(response);
+                if (!data || !data.length) { throw new Error('微软通道没有返回译文'); }
+                var out = [];
+                for (var i = 0; i < texts.length; i++) {
+                    var item = data[i];
+                    var piece = item && item.translations && item.translations[0]
+                        && item.translations[0].text;
+                    out.push(typeof piece === 'string' && piece ? piece : texts[i]);
+                }
+                return out;
+            });
+        }
+
+        function azureBatch(texts, source, target, config) {
+            var url = 'https://api.cognitive.microsofttranslator.com/translate'
+                + '?api-version=3.0&to=' + encodeURIComponent(target);
+            if (source && source !== 'auto') {
+                url += '&from=' + encodeURIComponent(source);
+            }
+            var headers = {
+                'Content-Type': 'application/json; charset=UTF-8',
+                'Ocp-Apim-Subscription-Key': config.apiKey
+            };
+            if (config.region) { headers['Ocp-Apim-Subscription-Region'] = config.region; }
+            var payload = [];
+            for (var i = 0; i < texts.length; i++) { payload.push({ Text: texts[i] }); }
+            return httpRequest('POST', url, headers, JSON.stringify(payload))
+                .then(function (response) {
+                    var data = bodyOf(response);
+                    if (!data || !data.length) { throw new Error('Azure 没有返回译文'); }
+                    var out = [];
+                    for (var j = 0; j < texts.length; j++) {
+                        var item = data[j];
+                        var piece = item && item.translations && item.translations[0]
+                            && item.translations[0].text;
+                        out.push(typeof piece === 'string' && piece ? piece : texts[j]);
+                    }
+                    return out;
+                });
+        }
+
+        function googleBatch(texts, source, target, config) {
+            var url = 'https://translation.googleapis.com/language/translate/v2?key='
+                + encodeURIComponent(config.apiKey);
+            var payload = { q: texts, target: target, format: 'text' };
+            if (source && source !== 'auto') { payload.source = source; }
+            return httpRequest('POST', url,
+                { 'Content-Type': 'application/json; charset=UTF-8' },
+                JSON.stringify(payload)).then(function (response) {
+                    var data = bodyOf(response);
+                    var list = data && data.data && data.data.translations;
+                    if (!list || !list.length) { throw new Error('Google 没有返回译文'); }
+                    var out = [];
+                    for (var i = 0; i < texts.length; i++) {
+                        var piece = list[i] && list[i].translatedText;
+                        out.push(typeof piece === 'string' && piece ? piece : texts[i]);
+                    }
+                    return out;
+                });
+        }
+
+        // DeepL wants ZH / ZH-HANT / EN-US / PT-BR rather than the BCP-47 the
+        // rest of the pipeline speaks.
+        function deeplLanguage(code) {
+            var lower = String(code).toLowerCase();
+            if (lower.indexOf('zh-hant') === 0) { return 'ZH-HANT'; }
+            if (lower.indexOf('zh') === 0) { return 'ZH'; }
+            if (lower.indexOf('en') === 0) { return 'EN-US'; }
+            if (lower.indexOf('pt') === 0) { return 'PT-BR'; }
+            return String(code).toUpperCase();
+        }
+
+        function deeplBatch(texts, source, target, config) {
+            var url = trimSlashes(config.endpoint || 'https://api-free.deepl.com')
+                + '/v2/translate';
+            var parts = [];
+            for (var i = 0; i < texts.length; i++) {
+                parts.push('text=' + encodeURIComponent(texts[i]));
+            }
+            parts.push('target_lang=' + encodeURIComponent(deeplLanguage(target)));
+            if (source && source !== 'auto') {
+                parts.push('source_lang=' + encodeURIComponent(deeplLanguage(source)));
+            }
+            return httpRequest('POST', url, {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Authorization': 'DeepL-Auth-Key ' + config.apiKey
+            }, parts.join('&')).then(function (response) {
+                var data = bodyOf(response);
+                var list = data && data.translations;
+                if (!list || !list.length) { throw new Error('DeepL 没有返回译文'); }
+                var out = [];
+                for (var j = 0; j < texts.length; j++) {
+                    var piece = list[j] && list[j].text;
+                    out.push(typeof piece === 'string' && piece ? piece : texts[j]);
+                }
+                return out;
+            });
+        }
+
+        function parseJsonArray(text) {
+            var trimmed = String(text).trim();
+            var start = trimmed.indexOf('[');
+            var end = trimmed.lastIndexOf(']');
+            if (start < 0 || end <= start) { return null; }
+            try {
+                var parsed = JSON.parse(trimmed.substring(start, end + 1));
+                return parsed && parsed.length ? parsed : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function openaiBatch(texts, source, target, config) {
+            var url = trimSlashes(config.endpoint || 'https://api.openai.com/v1')
+                + '/chat/completions';
+            var system = 'You are a translation engine. Translate every item of the'
+                + ' JSON array the user sends into ' + target
+                + '. Keep the array length and order. Reply with the JSON array only,'
+                + ' no prose, no code fences.';
+            var payload = {
+                model: config.model || 'gpt-4o-mini',
+                temperature: 0,
+                messages: [
+                    { role: 'system', content: system },
+                    { role: 'user', content: JSON.stringify(texts) }
+                ]
+            };
+            return httpRequest('POST', url, {
+                'Content-Type': 'application/json; charset=UTF-8',
+                'Authorization': 'Bearer ' + config.apiKey
+            }, JSON.stringify(payload)).then(function (response) {
+                var data = bodyOf(response);
+                var text = data && data.choices && data.choices[0]
+                    && data.choices[0].message && data.choices[0].message.content;
+                if (typeof text !== 'string') {
+                    throw new Error('OpenAI 兼容接口没有返回内容');
+                }
+                var parsed = parseJsonArray(text);
+                if (!parsed) { throw new Error('OpenAI 兼容接口没有返回 JSON 数组'); }
+                var out = [];
+                for (var i = 0; i < texts.length; i++) {
+                    out.push(typeof parsed[i] === 'string' && parsed[i]
+                        ? parsed[i] : texts[i]);
+                }
+                return out;
+            });
+        }
+
+        function engineBatch(texts, source, target, config) {
+            var engine = config.engine || 'apple';
+            if (engine === 'free') { return freeBatch(texts, source, target); }
+            if (engine === 'azure') { return azureBatch(texts, source, target, config); }
+            if (engine === 'google') { return googleBatch(texts, source, target, config); }
+            if (engine === 'deepl') { return deeplBatch(texts, source, target, config); }
+            if (engine === 'openai') { return openaiBatch(texts, source, target, config); }
+            return appleBatch(texts, source, target);
+        }
+
+        // null until probed; true only when the native framework answered
+        // something other than "unsupported".
+        var appleReady = null;
+
+        function probeApple(target) {
+            if (appleReady !== null) { return Promise.resolve(appleReady); }
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.translationStatus !== 'function') {
+                appleReady = false;
+                return Promise.resolve(false);
+            }
+            return Promise.resolve(plugin.translationStatus({ target: target }))
+                .then(function (result) {
+                    appleReady = !!(result && result.status !== 'unsupported');
+                    note('TRANSLATE', 'system translation: '
+                        + ((result && result.status) || 'unknown'));
+                    return appleReady;
+                }, function (error) {
+                    note('TRANSLATE', 'system translation probe failed: ' + messageOf(error));
+                    appleReady = false;
+                    return false;
+                });
+        }
+
+        function chunkTexts(texts) {
+            var chunks = [];
+            var current = [];
+            var size = 0;
+            for (var i = 0; i < texts.length; i++) {
+                var length = String(texts[i]).length;
+                if (current.length && size + length > MAX_CHARS) {
+                    chunks.push(current);
+                    current = [];
+                    size = 0;
+                }
+                current.push(texts[i]);
+                size += length;
+            }
+            if (current.length) { chunks.push(current); }
+            return chunks;
+        }
+
+        function runChunks(texts, source, target, config) {
+            var chunks = chunkTexts(texts);
+            var out = [];
+            var failed = 0;
+            var lastError = null;
+            var chain = Promise.resolve();
+            chunks.forEach(function (chunk) {
+                chain = chain.then(function () {
+                    return engineBatch(chunk, source, target, config).then(function (part) {
+                        for (var i = 0; i < part.length; i++) { out.push(part[i]); }
+                    }, function (error) {
+                        // One bad chunk must not throw away the rest of a long
+                        // list; the untouched entries keep their original text.
+                        failed++;
+                        lastError = error;
+                        note('ERR', 'translate chunk failed: ' + messageOf(error));
+                        for (var j = 0; j < chunk.length; j++) { out.push(chunk[j]); }
+                    });
+                });
+            });
+            return chain.then(function () {
+                if (failed && failed === chunks.length) { throw lastError; }
+                if (failed) {
+                    note('TRANSLATE', failed + ' of ' + chunks.length
+                        + ' chunk(s) kept the original text');
+                }
+                return out;
+            });
+        }
+
+        function runTranslate(texts, source, target, config) {
+            if ((config.engine || 'apple') !== 'apple') {
+                return runChunks(texts, source, target, config);
+            }
+            return probeApple(target).then(function (ready) {
+                if (ready) { return runChunks(texts, source, target, config); }
+                var fallback = {};
+                for (var key in config) { fallback[key] = config[key]; }
+                fallback.engine = 'free';
+                note('TRANSLATE', 'no system offline translation here;'
+                    + ' using the keyless Microsoft channel');
+                return runChunks(texts, source, target, fallback);
+            });
+        }
+
+        // ---- UI ----------------------------------------------------------
+
+        function makeButton(label, className) {
+            var button = document.createElement('button');
+            button.className = 'stv-translate-btn ' + className;
+            button.textContent = label;
+            button.style.cssText = BUTTON_CSS;
+            return button;
+        }
+
+        function toast(message) {
+            var app = window.app;
+            if (app && typeof app.toast === 'function') { app.toast(message); }
+            note('TRANSLATE', message);
+        }
+
+        function fail(error) {
+            var text = messageOf(error);
+            note('ERR', 'translate failed: ' + text);
+            toast('翻译失败：' + text);
+        }
+
+        function decorateComment(block) {
+            if (!block || !block.getAttribute) { return; }
+            if (block.getAttribute('stv-tr')) { return; }
+            var content = q(block, '.cmtcontent');
+            if (!content) { return; }
+            block.setAttribute('stv-tr', '1');
+            var row = document.createElement('div');
+            row.className = 'stv-translate-row';
+            row.style.cssText = 'margin-top:4px;';
+            var button = makeButton('译', 'stv-translate-one');
+            button.style.fontSize = '12px';
+            button.style.padding = '2px 8px';
+            button.style.marginLeft = '0';
+            button.addEventListener('click', function (event) {
+                stop(event);
+                translateOne(button, content);
+            }, true);
+            row.appendChild(button);
+            var body = q(block, '.cmtbody') || content.parentNode;
+            if (!body) { return; }
+            body.appendChild(row);
+        }
+
+        function originalOf(node) {
+            var stored = node.getAttribute('stv-orig');
+            return (stored === null || stored === undefined) ? null : stored;
+        }
+
+        function restore(node, button) {
+            var stored = originalOf(node);
+            if (stored === null) { return false; }
+            node.innerHTML = stored;
+            if (node.removeAttribute) { node.removeAttribute('stv-orig'); }
+            button.textContent = '译';
+            return true;
+        }
+
+        function translateOne(button, content) {
+            if (restore(content, button)) { return; }
+            var text = textOf(content);
+            if (!text) { return; }
+            loadSettings().then(function (config) {
+                button.textContent = '…';
+                return runTranslate([text], config.readSource, config.readTarget, config)
+                    .then(function (out) {
+                        if (typeof out[0] !== 'string' || !out[0]) {
+                            button.textContent = '译';
+                            return;
+                        }
+                        content.setAttribute('stv-orig', content.innerHTML);
+                        content.textContent = out[0];
+                        button.textContent = '原文';
+                        note('TRANSLATE', 'one comment translated with ' + config.engine);
+                    }, function (error) {
+                        button.textContent = '译';
+                        fail(error);
+                    });
+            });
+        }
+
+        function commentTargets(view) {
+            var blocks = qq(view, '[view=commentblock]');
+            var targets = [];
+            for (var i = 0; i < blocks.length; i++) {
+                var content = q(blocks[i], '.cmtcontent');
+                if (!content) { continue; }
+                var text = textOf(content);
+                if (!text) { continue; }
+                targets.push({ node: content, text: text });
+            }
+            return targets;
+        }
+
+        function translateComments(page) {
+            var view = q(page, '.commentview');
+            if (!view) { return; }
+            var targets = commentTargets(view);
+            if (!targets.length) {
+                toast('还没有可翻译的评论');
+                return;
+            }
+            loadSettings().then(function (config) {
+                var texts = [];
+                for (var i = 0; i < targets.length; i++) { texts.push(targets[i].text); }
+                toast('正在翻译 ' + texts.length + ' 条评论…');
+                return runTranslate(texts, config.readSource, config.readTarget, config)
+                    .then(function (out) {
+                        var done = 0;
+                        for (var j = 0; j < targets.length; j++) {
+                            var piece = out[j];
+                            if (typeof piece !== 'string' || !piece
+                                || piece === targets[j].text) { continue; }
+                            targets[j].node.setAttribute('stv-orig',
+                                targets[j].node.innerHTML);
+                            targets[j].node.textContent = piece;
+                            done++;
+                        }
+                        note('TRANSLATE', 'translated ' + done + ' of ' + targets.length
+                            + ' comment(s) with ' + config.engine);
+                        toast('已翻译 ' + done + ' 条（单条点「原文」可还原）');
+                    }, function (error) { fail(error); });
+            });
+        }
+
+        function setInputText(input, text) {
+            // The site reads innerHTML off this contenteditable
+            // (_page_vip.html:4586 hands it to replyContext.set()), so write
+            // escaped text with <br> for the line breaks the editable would
+            // otherwise have produced itself.
+            var lines = String(text).split(NL);
+            var html = '';
+            for (var i = 0; i < lines.length; i++) {
+                if (i > 0) { html += '<br>'; }
+                html += escapeHtml(lines[i]);
+            }
+            input.innerHTML = html;
+            input.value = text;
+        }
+
+        function translateInput(button, input) {
+            var text = textOf(input);
+            if (!text) {
+                toast('请先输入评论内容');
+                return;
+            }
+            loadSettings().then(function (config) {
+                var previous = button.textContent;
+                button.textContent = '翻译中…';
+                return runTranslate([text], 'auto', config.writeTarget, config)
+                    .then(function (out) {
+                        if (typeof out[0] === 'string' && out[0]) {
+                            setInputText(input, out[0]);
+                            note('TRANSLATE', 'comment input translated into '
+                                + config.writeTarget);
+                            toast('已译成' + languageName(config.writeTarget)
+                                + '，可以直接发送');
+                        }
+                        button.textContent = previous;
+                        refreshLabels();
+                    }, function (error) {
+                        button.textContent = previous;
+                        refreshLabels();
+                        fail(error);
+                    });
+            });
+        }
+
+        function decorateInput(input) {
+            if (!input || !input.getAttribute) { return; }
+            if (input.getAttribute('stv-tr-input')) { return; }
+            var host = input.parentNode;
+            if (!host) { return; }
+            input.setAttribute('stv-tr-input', '1');
+            var bar = document.createElement('div');
+            bar.className = 'stv-translate-inputbar';
+            // `.lock-bot` is a flex row (replyinfo | input | send), so the button
+            // goes between the input and the paper plane rather than onto a line
+            // of its own -- that row is already absolute-positioned above the
+            // safe area and must not grow.
+            bar.style.cssText = 'display:flex;align-items:center;padding:0 2px;';
+            var button = makeButton('译', 'stv-translate-input');
+            button.style.fontSize = '12px';
+            button.style.padding = '4px 8px';
+            button.addEventListener('click', function (event) {
+                stop(event);
+                translateInput(button, input);
+            }, true);
+            bar.appendChild(button);
+            var send = q(host, '.sendcmt');
+            if (send && send.parentNode === host) { host.insertBefore(bar, send); }
+            else { host.insertBefore(bar, null); }
+        }
+
+        function refreshLabels() {
+            var config = settings || defaults();
+            var label = '译成' + languageName(config.writeTarget);
+            var nodes = document.querySelectorAll('.stv-translate-input');
+            for (var i = 0; i < nodes.length; i++) { nodes[i].textContent = label; }
+        }
+
+        function observeComments(view) {
+            if (!view || view.__stvTranslateObserved) { return; }
+            view.__stvTranslateObserved = true;
+            var sweep = function () {
+                var blocks = qq(view, '[view=commentblock]');
+                for (var i = 0; i < blocks.length; i++) { decorateComment(blocks[i]); }
+            };
+            sweep();
+            // Comments arrive twice: the initial loadEmbed() render, and later
+            // pushes over the comment channel. Only a mutation observer catches
+            // the second one.
+            if (typeof MutationObserver === 'function') {
+                var observer = new MutationObserver(sweep);
+                observer.observe(view, { childList: true, subtree: true });
+                view.__stvTranslateObserver = observer;
+                note('TRANSLATE', 'watching the comment list for late arrivals');
+            }
+        }
+
+        function addTitleButtons(bar, page) {
+            if (q(bar, '.stv-translate-all')) { return; }
+            var host = q(bar, '.rctx') || bar;
+            var group = document.createElement('div');
+            group.style.cssText = 'display:flex;align-items:center;';
+            var translate = makeButton('译全部', 'stv-translate-all');
+            translate.addEventListener('click', function (event) {
+                stop(event);
+                translateComments(page);
+            }, true);
+            var gear = makeButton('⚙', 'stv-translate-settings');
+            gear.addEventListener('click', function (event) {
+                stop(event);
+                openPanel();
+            }, true);
+            group.appendChild(translate);
+            group.appendChild(gear);
+            host.insertBefore(group, host.firstChild);
+        }
+
+        function onCommentPage(page) {
+            var bar = q(page, '.titlebar');
+            if (bar) { addTitleButtons(bar, page); }
+            var view = q(page, '.commentview');
+            if (view) { observeComments(view); }
+            var input = q(page, '.commentinput');
+            if (input) { decorateInput(input); }
+            loadSettings().then(function (config) {
+                refreshLabels();
+                if (config.auto && view) { translateComments(page); }
+            });
+        }
+
+        function onSettingsPage(page) {
+            if (!page || !page.q) { return; }
+            if (q(page, '.stv-translate-entry')) { return; }
+            var section = q(page, '.settingsection');
+            var host = section && section.parentNode;
+            if (!host) { return; }
+            var header = document.createElement('div');
+            header.className = 'settingsection mt-3';
+            header.textContent = '翻译';
+            var item = document.createElement('div');
+            item.className = 'settingitem stv-translate-entry';
+            item.innerHTML = '<div class="settingitemtitle">评论翻译与发帖语言</div>'
+                + '<div class=""><i class="fas fa-chevron-right"></i></div>';
+            item.addEventListener('click', function (event) {
+                stop(event);
+                openPanel();
+            }, true);
+            host.appendChild(header);
+            host.appendChild(item);
+            note('TRANSLATE', 'settings entry added');
+        }
+
+        // ---- settings panel ---------------------------------------------
+
+        function openPanel() {
+            var existing = document.getElementById(PANEL_ID);
+            if (existing && existing.parentNode) {
+                existing.parentNode.removeChild(existing);
+            }
+            loadSettings().then(buildPanel);
+        }
+
+        function buildPanel(config) {
+            var host = document.body || document.documentElement;
+            if (!host) { return; }
+
+            var root = document.createElement('div');
+            root.id = PANEL_ID;
+            root.setAttribute('data-stvtranslate', 'panel');
+            // Top-anchored on purpose: the panel has text fields, and a centred
+            // card would put the focused field behind the keyboard. Every field
+            // that matters (engine, API Key) is in the first two rows.
+            root.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;'
+                + 'z-index:2147483644;background:rgba(0,0,0,0.55);display:flex;'
+                + 'align-items:flex-start;justify-content:center;padding:12px;'
+                + 'padding-top:5vh;overflow:auto;';
+
+            var card = document.createElement('div');
+            card.style.cssText = 'width:100%;max-width:430px;max-height:74vh;'
+                + 'overflow:auto;background:#1e1e1e;color:#eee;border-radius:12px;'
+                + 'padding:14px;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;'
+                + 'box-shadow:0 10px 34px rgba(0,0,0,0.55);';
+            root.appendChild(card);
+
+            var head = document.createElement('div');
+            head.style.cssText = 'display:flex;align-items:center;margin-bottom:4px;';
+            var title = document.createElement('div');
+            title.style.cssText = 'flex:1;font-size:16px;font-weight:600;';
+            title.textContent = '评论翻译';
+            var close = makeButton('关闭', 'stv-translate-close');
+            close.style.fontSize = '13px';
+            close.addEventListener('click', function (event) {
+                stop(event);
+                if (root.parentNode) { root.parentNode.removeChild(root); }
+            }, true);
+            head.appendChild(title);
+            head.appendChild(close);
+            card.appendChild(head);
+
+            function row(label, control) {
+                var wrap = document.createElement('div');
+                wrap.style.cssText = 'margin:9px 0;';
+                var caption = document.createElement('div');
+                caption.style.cssText = 'font-size:12px;opacity:0.75;margin-bottom:3px;';
+                caption.textContent = label;
+                wrap.appendChild(caption);
+                wrap.appendChild(control);
+                card.appendChild(wrap);
+                return control;
+            }
+
+            function textInput(value, placeholder) {
+                var el = document.createElement('input');
+                el.type = 'text';
+                el.value = value || '';
+                el.placeholder = placeholder || '';
+                el.style.cssText = FIELD_CSS;
+                return el;
+            }
+
+            function selectInput(pairs, value) {
+                var el = document.createElement('select');
+                el.style.cssText = FIELD_CSS;
+                for (var i = 0; i < pairs.length; i++) {
+                    var option = document.createElement('option');
+                    option.value = pairs[i][0];
+                    option.textContent = pairs[i][1];
+                    if (pairs[i][0] === value) { option.selected = true; }
+                    el.appendChild(option);
+                }
+                el.value = value || pairs[0][0];
+                return el;
+            }
+
+            var engineSelect = row('翻译引擎', selectInput(ENGINE_LABELS, config.engine));
+            var keyInput = row('API Key（系统离线与免密钥通道不用填）',
+                textInput(config.apiKey, 'Azure / Google / DeepL / OpenAI 的 Key'));
+            var regionInput = row('区域 Region（Azure 需要，可选）',
+                textInput(config.region, '例如 eastasia'));
+            var endpointInput = row('自定义接口地址（可选）',
+                textInput(config.endpoint, 'DeepL 或 OpenAI 兼容接口的地址'));
+            var modelInput = row('模型名（OpenAI 兼容接口用）',
+                textInput(config.model, '例如 gpt-4o-mini'));
+            var readSourceSelect = row('评论原文语言',
+                selectInput(SOURCE_LANGUAGES, config.readSource));
+            var readTargetSelect = row('评论翻译成',
+                selectInput(LANGUAGES, config.readTarget));
+            var writeTargetSelect = row('发评论时译成',
+                selectInput(LANGUAGES, config.writeTarget));
+
+            var autoWrap = document.createElement('label');
+            autoWrap.style.cssText = 'display:flex;align-items:center;margin:9px 0;'
+                + 'font-size:13px;';
+            var autoBox = document.createElement('input');
+            autoBox.type = 'checkbox';
+            autoBox.checked = !!config.auto;
+            autoBox.style.cssText = 'margin-right:7px;';
+            autoWrap.appendChild(autoBox);
+            var autoText = document.createElement('span');
+            autoText.textContent = '打开评论页自动翻译';
+            autoWrap.appendChild(autoText);
+            card.appendChild(autoWrap);
+
+            var status = document.createElement('div');
+            status.style.cssText = 'font-size:12px;opacity:0.85;margin-top:10px;'
+                + 'min-height:18px;word-break:break-word;';
+            card.appendChild(status);
+
+            var actions = document.createElement('div');
+            actions.style.cssText = 'margin-top:4px;display:flex;flex-wrap:wrap;';
+            card.appendChild(actions);
+
+            function collect() {
+                return {
+                    engine: engineSelect.value || 'apple',
+                    apiKey: keyInput.value || '',
+                    region: regionInput.value || '',
+                    endpoint: endpointInput.value || '',
+                    model: modelInput.value || '',
+                    readSource: readSourceSelect.value || 'vi',
+                    readTarget: readTargetSelect.value || 'zh-Hans',
+                    writeTarget: writeTargetSelect.value || 'vi',
+                    auto: !!autoBox.checked
+                };
+            }
+
+            var saveButton = makeButton('保存', 'stv-translate-save');
+            saveButton.style.cssText = BUTTON_CSS
+                + 'background:#2563eb;border-color:#3b82f6;color:#fff;';
+            saveButton.addEventListener('click', function (event) {
+                stop(event);
+                var next = collect();
+                saveSettings(next).then(function () {
+                    status.textContent = '已保存：' + engineName(next.engine);
+                    refreshLabels();
+                });
+            }, true);
+            actions.appendChild(saveButton);
+
+            var testButton = makeButton('测试', 'stv-translate-test');
+            testButton.addEventListener('click', function (event) {
+                stop(event);
+                var next = collect();
+                status.textContent = '正在测试…';
+                runTranslate(['Xin chào, đây là một bình luận thử nghiệm.'],
+                    next.readSource, next.readTarget, next).then(function (out) {
+                        status.textContent = '测试成功（' + engineName(next.engine)
+                            + '）：' + out[0];
+                    }, function (error) {
+                        status.textContent = '测试失败：' + messageOf(error);
+                    });
+            }, true);
+            actions.appendChild(testButton);
+
+            var packButton = makeButton('下载系统语言包', 'stv-translate-pack');
+            packButton.addEventListener('click', function (event) {
+                stop(event);
+                var next = collect();
+                var plugin = appPlugin();
+                if (!plugin || typeof plugin.translationPrepare !== 'function') {
+                    status.textContent = '原生翻译桥不可用';
+                    return;
+                }
+                var payload = { target: next.readTarget };
+                if (next.readSource && next.readSource !== 'auto') {
+                    payload.source = next.readSource;
+                }
+                status.textContent = '正在申请语言包…（系统会弹出下载确认）';
+                Promise.resolve(plugin.translationPrepare(payload)).then(function (result) {
+                    status.textContent = '语言包状态：'
+                        + ((result && result.status) || 'unknown');
+                }, function (error) {
+                    status.textContent = '语言包申请失败：' + messageOf(error);
+                });
+            }, true);
+            actions.appendChild(packButton);
+
+            host.appendChild(root);
+        }
+
+        // ---- wiring ------------------------------------------------------
+
+        // pushPage is the single funnel for every page the app opens, so
+        // decorating here covers both the comment page (pushed by
+        // app.fun.showComment) and the settings page.
+        function hookPushPage() {
+            var app = window.app;
+            if (!app || typeof app.pushPage !== 'function') { return false; }
+            if (app.__stvTranslateHooked) { return true; }
+            app.__stvTranslateHooked = true;
+            var original = app.pushPage;
+            app.pushPage = function (name) {
+                var page = original.apply(this, arguments);
+                try {
+                    if (name === 'comment') { onCommentPage(page); }
+                    if (name === 'pagesetting') { onSettingsPage(page); }
+                } catch (error) {
+                    note('ERR', 'translate page hook: ' + messageOf(error));
+                }
+                return page;
+            };
+            note('TRANSLATE', 'comment translation ready');
+            return true;
+        }
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            if (hookPushPage() || attempts > 2500) { clearInterval(timer); }
+        }, 20);
+    })();
+    """
+
     // MARK: - Inventory tab probe
 
     /**
@@ -3277,5 +4317,6 @@ enum SitePatch {
                                 readerDefaults, ttsProvider, followFallback,
                                 safeArea, keyboardPopup, gridLayout, settingsBackup,
                                 domainFailover, bookmarkToggle, readerTts,
-                                pageRepair, bootShell, SiteI18nData.script]
+                                pageRepair, commentTranslate, bootShell,
+                                SiteI18nData.script]
 }
