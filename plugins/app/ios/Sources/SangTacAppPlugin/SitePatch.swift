@@ -2893,13 +2893,33 @@ enum SitePatch {
                     var self = this;
                     var args = arguments;
                     var round = 0;
+                    // Tagged so the loop can tell "the reader paused" from "the
+                    // server gave up" and hand the chapter back to the resume.
+                    function paused() {
+                        var stop = new Error('tam dung');
+                        stop.stvPaused = true;
+                        return stop;
+                    }
                     function once() {
+                        // A pause has to bite before the next request goes out,
+                        // not after the whole batch has been retried: the backoff
+                        // below can hold a batch for 10s, and the reader sees the
+                        // download keep going after tapping 暂停下载.
+                        if (self.isPaused) { return Promise.reject(paused()); }
                         return downloadGate().then(function () {
                             return originalChapter.apply(self, args);
                         }).then(function (result) {
                             relaxGate();
                             return result;
                         }, function (error) {
+                            if (self.isPaused) {
+                                // The site's downloadChapter has already written
+                                // "Lỗi: Không thể đọc dữ liệu" into the row status
+                                // by now; that is the "报错" the reader sees after
+                                // pausing. Put "Đã dừng" back and stop retrying.
+                                if (self.setStatus) { self.setStatus('Đã dừng'); }
+                                return Promise.reject(paused());
+                            }
                             if (round >= CHAPTER_BACKOFF.length) { throw error; }
                             var wait = CHAPTER_BACKOFF[round];
                             round++;
@@ -2924,7 +2944,19 @@ enum SitePatch {
                     // plain repeat start() is a no-op, otherwise the replay would
                     // spawn the second loop this guard exists to prevent.
                     if (self.__stvStartRunning) {
-                        if (self.isPaused) { self.__stvStartAgain = true; }
+                        if (self.isPaused) {
+                            // 继续下载 tapped while the paused loop is still
+                            // finishing its batch: unpause in place so the retry
+                            // backoff stops aborting, and arm the replay in case
+                            // the loop was already past its last isPaused check
+                            // and is about to exit.
+                            self.isPaused = false;
+                            self.__stvStartAgain = true;
+                            if (self.setStatus) { self.setStatus('Đang tải...'); }
+                            note('DOWNLOAD', 'resumed in place for '
+                                + self.host + '/' + self.id);
+                            return Promise.resolve();
+                        }
                         note('DOWNLOAD', 'start() ignored while a loop is running for '
                             + self.host + '/' + self.id);
                         return Promise.resolve();
@@ -3005,9 +3037,34 @@ enum SitePatch {
                 };
                 note('BOOKINFO', 'downloaded-list bookinfo warm-up installed');
             }
+            var store = app.offlineBook.store;
+            if (store && typeof store.remove === 'function' && !store.__stvRemovePatched) {
+                store.__stvRemovePatched = true;
+                var originalRemove = store.remove;
+                // OfflineBook.delete() (app.v2.read.js:3314) hands store.remove()
+                // the wrapper, but store.data holds the plain record it wraps
+                // (store.prepend(this.baseObject), :3309), so indexOf() never
+                // matches, nothing is spliced, and the "deleted" book is back the
+                // next time the app starts. Unwrap before looking it up.
+                store.remove = function (item) {
+                    if (item && item.baseObject) { item = item.baseObject; }
+                    return originalRemove.call(this, item);
+                };
+                note('DOWNLOAD', 'store.remove unwraps OfflineBook records');
+            }
+            if (manager && manager.prototype && !manager.prototype.__stvPauseNoted) {
+                manager.prototype.__stvPauseNoted = true;
+                var originalPause = manager.prototype.pause;
+                manager.prototype.pause = function () {
+                    originalPause.apply(this, arguments);
+                    note('DOWNLOAD', 'paused ' + this.host + '/' + this.id + ' at '
+                        + this.downloaded + '/' + this.total);
+                };
+            }
             return !!(manager && manager.prototype && manager.prototype.__stvWarmed
                     && manager.prototype.__stvThrottled)
-                && !!app.offlineBook.__stvWarmedList;
+                && !!app.offlineBook.__stvWarmedList
+                && !!(store && store.__stvRemovePatched);
         }
 
         // The site's loop (app.v2.read.js:3488-3532) runs three chapters at a time,
@@ -3028,6 +3085,7 @@ enum SitePatch {
             function step() {
                 if (self.isPaused || !queue.length) { return Promise.resolve(); }
                 var batch = queue.splice(0, MAX_PARALLEL);
+                var requeue = [];
                 return Promise.all(batch.map(function (cid) {
                     return self.downloadChapter(cid).then(function () {
                         self.downloaded++;
@@ -3036,11 +3094,20 @@ enum SitePatch {
                         if (index >= 0) { self.chapters.splice(index, 1); }
                         console.log(self.downloaded + '/' + self.total);
                     }, function (error) {
+                        if (error && error.stvPaused) {
+                            // Paused mid-batch: the chapter was never fetched, so
+                            // keep it for the resume instead of counting it as a
+                            // give-up (a give-up leaves the job paused and drops
+                            // the chapter for good).
+                            requeue.push(cid);
+                            return;
+                        }
                         failed.push(cid);
                         note('DOWNLOAD', 'chapter ' + cid + ' of ' + self.host + '/'
                             + self.id + ' gave up: ' + (error && error.message));
                     });
                 })).then(function () {
+                    if (requeue.length) { queue = requeue.concat(queue); }
                     if (self.isPaused) { return null; }
                     return step();
                 });
@@ -3054,7 +3121,11 @@ enum SitePatch {
                     note('DOWNLOAD', 'finished with ' + failed.length + ' chapter(s)'
                         + ' missing for ' + self.host + '/' + self.id);
                 }
-                if (self.status && self.status.textContent === 'Đang tải...') {
+                // A resume that is already waiting to be replayed owns the status
+                // text now; flipping it back to "Đã dừng" here would make a job
+                // that is about to carry on look stopped.
+                if (!self.__stvStartAgain && self.status
+                    && self.status.textContent === 'Đang tải...') {
                     if (self.setStatus) { self.setStatus('Đã dừng'); }
                 }
                 if (self.onProgress) { self.onProgress(); }
@@ -3068,6 +3139,11 @@ enum SitePatch {
         // once when the view loads (page-vip:4038-4076, its pull-to-refresh is
         // commented out) -- never learns about the new book.
         function moveJobToDownloaded(manager) {
+            // A resume replays the loop once it has exited, so this can be
+            // reached twice for the same job; the second pass would append a
+            // duplicate row for a book the list already shows.
+            if (manager.__stvMoved) { return; }
+            manager.__stvMoved = true;
             var app = window.app;
             var list = app.bookDownloaderList || [];
             var index = list.indexOf(manager);
@@ -3158,13 +3234,44 @@ enum SitePatch {
                 };
                 if (!target) { finish(); return; }
                 note('DOWNLOAD', 'deleting downloaded book ' + book.host + '/' + book.id);
-                Promise.resolve(target.deleteAll())
+                // OfflineBook.deleteAll() (app.v2.read.js:3368) walks the chapter
+                // list while deleteChapter() splices that very array, so it drops
+                // every second chapter body and leaves the rest behind. Walk a
+                // copy instead.
+                var wiped = 0;
+                Promise.resolve(target.getChapterDownloaded())
+                    .then(function (chapters) {
+                        var list = (chapters || []).slice();
+                        var chain = Promise.resolve();
+                        for (var i = 0; i < list.length; i++) {
+                            chain = chain.then(function (chapter) {
+                                return function () {
+                                    wiped++;
+                                    return target.deleteChapter(chapter);
+                                };
+                            }(list[i]));
+                        }
+                        return chain;
+                    })
                     .then(function () { return target.delete(); })
                     .then(function () {
+                        // The book object is cached per host/id and never
+                        // invalidated (app.v2.read.js:3248). Re-downloading a book
+                        // in the same session would hand back this stale wrapper,
+                        // whose baseObject is no longer in store.data, so save()
+                        // would skip the prepend and the book would never come
+                        // back. Drop it and let the next download rebuild it.
+                        var singletons = app.offlineBook.offlineBookSingletons;
+                        var key = book.host + '_' + book.id;
+                        if (singletons && singletons[key]) { delete singletons[key]; }
                         return app.offlineBook.store && app.offlineBook.store.save
                             ? app.offlineBook.store.save() : null;
                     })
-                    .then(finish, function (error) {
+                    .then(function () {
+                        note('DOWNLOAD', 'wiped ' + wiped + ' chapter file(s) for '
+                            + book.host + '/' + book.id);
+                        finish();
+                    }, function (error) {
                         note('ERR', 'delete failed for ' + book.host + '/' + book.id
                             + ': ' + error);
                     });

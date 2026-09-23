@@ -64,6 +64,7 @@
 10. **自备 API Key 存在站点存储里**（`app.storage` → Capacitor Preferences → UserDefaults），并被 `settingsBackup` 一并镜像进 Keychain（`stv.translate.settings`）。日志只记引擎名，不打印 Key；但它不是独立的加密存储，介意的话请用可随时吊销的 Key。
 11. **社区里的 Cbox 板块翻译不了**：`page-pagecbox`（`_page_vip.html:982`）是一个跨域 iframe（`www6.cbox.ws`），父页面拿不到里面的 DOM；Facebook 的两个按钮是外部浏览器。其余板块（Kênh truyện / Kênh linh tinh / 势力 / 单帖 / 用户主页评论 / 广播）都已覆盖，见 §6.14 (7)。
 12. **标签栏切换的正式 API 未知**：`ui.smtab()` 来自 `/stv.ui.js`，该文件不在仓库里也拉不下来（本机 TLS 取不到），所以「跳转到下载页」是靠**在 tabitem 上派发 click**（和手指一样）+ 事后用 `tab.current()` 校验；校验不过才去探测 `select/go/switchTo/setIndex/activate/to` 这一组 setter 名字。走哪条路、`current()` 是否存在于 `#tabtusach`，都会写进 `[DOWNLOAD]` 日志，下一份真机日志即可定案，见 §6.15 (2)。
+13. 站点自身还有两处缺陷，已用包装绕过（站点代码仍未改，见 §6.16）：`store.remove()` 按**引用**找记录而 `OfflineBook.delete()` 递进去的是包装对象（`app.v2.js:661` / `read.js:3314`），所以删除恒不落盘、重启就复活；`OfflineBook.deleteAll()`（`read.js:3368`）边遍历边 `splice`，每隔一章漏删一个章节文件。
 
 ## 6. 真机问题档案
 
@@ -1455,3 +1456,77 @@ iframe，父页面取不到内部文字，**不支持**；两个 Facebook 按钮
 **未证实项**：`ui.smtab()` 的 setter 名字、`#tabtusach.current()` 在真机上是否存在、以及
 真机点 tabitem 是否真的能触发框架切换（三者都由本轮日志自证）；「关闭日志后 tap 日志也停」
 这一点只在测试里断言了（真机上表现为「面板里不再出现新行」）。
+
+### 6.16 第十四轮反馈（`日志.txt`，225 行）：删除不落盘、暂停无效
+
+上一轮的两件事都成了（日志第 146 行 `download tab selected by click`、第 138-148 行
+`[NAV]`/`[TAB]` 记录、悬浮窗正常开关），本轮是两个新问题。
+
+#### 1. 已删除的已下载内容，重进应用又回来了
+
+日志第 38-52 行：5 本书 `deleting downloaded book ...` → `removed downloaded book ...`，
+全程没有 `[ERR]`，看上去删成功了；重启后 5 本全回来。
+
+根因是站点的 `store.remove()` 用**引用相等**找记录（`app.v2.js:661`
+`this.data.indexOf(item)`），而 `OfflineBook.delete()`（`app.v2.read.js:3314`）递进去的是
+**OfflineBook 包装对象**，`store.data` 里存的却是它包着的那条记录（`store.prepend(this.baseObject)`，
+`:3309`）。`indexOf` 恒为 -1 → 什么都没 splice → 我们的按钮只是把 DOM 行删了，
+`store.save()` 又把没变的数组原样写回文件。站点自己的 `save()` 递的是 `baseObject`
+（`:3309`），`delete()` 递的是 `this`，两处不一致，所以这个坑只在删除路径上。
+
+修法（两层）：
+
+- `patchReaders()` 里包一层 `app.offlineBook.store.remove`：参数带 `baseObject` 就先拆包，
+  再走站点原本的 `indexOf`。这样站点自己的 `delete()` 也一起修好了。
+- 删除链里顺手清掉 `app.offlineBook.offlineBookSingletons[host_id]`。这个单例缓存
+  （`:3248-3255`）从不失效，而 `OfflineBook.save()` 在 `isWithBaseObject` 时只 `store.save()`
+  不 `prepend`（`:3304-3312`）——不清单例的话，**同一次会话里删掉再重下这本书会永远回不来**。
+
+顺带修掉 `deleteAll()`（`:3368`）的边遍历边 splice：它 `for` 走 `chapters` 的同时
+`deleteChapter()` 又在 splice 同一个数组，**每隔一章漏一个**章节文件。改成先 `.slice()`
+快照再逐个删（站点自己从不调用 `deleteAll()`，这个坑只被我们的按钮踩到）。
+
+#### 2. 点暂停还在下，点继续报错，过一会儿又自己继续
+
+日志第 162-205 行是完整的现场：
+
+- `14:00:49` 暂停 → `isPaused = true`；
+- `14:00:50-56` 第 13/14/15 章的批还在飞，14/15 撞上 429，退避重试
+  （`retry 1/3` / `retry 2/3`，1500/3000/6000ms）**一路重试不看 `isPaused`**，所以「暂停了还在下」；
+  站点自己的 `downloadChapter` 失败时已经把行状态写成 `Lỗi: Không thể đọc dữ liệu`（`:3566`），
+  这就是用户看到的「报错」；
+- `14:00:57/59` 点「继续下载」→ `start()` 被去重守卫吞掉（`start() ignored while a loop is running`，
+  只置 `__stvStartAgain` 等循环退出后重放）；
+- 批终于落定 → 重放的 `runJob()` 开头 `self.isPaused = false` → **又自己接着下到 20/20**。
+
+三个修法：
+
+- 退避重试里加暂停检查（`downloadChapter` 包装）：进请求前 `isPaused` 就直接 reject，失败后
+  若 `isPaused` 则把行状态写回 `Đã dừng` 再 reject，不再重试。暂停从「等整批结束」变成
+  「立刻生效」。
+- 这个 reject 带 `stvPaused` 标记，`runJob()` 据此把章节**退回队列**而不是记成
+  `gave up`（记成放弃的话，章节已被 `queue.splice` 拿走，续传就永久少章）。
+- `start()` 在「循环还在跑 + 已暂停」时**就地解暂停**（`isPaused = false` + 状态回
+  `Đang tải...` + 仍然置 `__stvStartAgain` 兜住「循环刚好已经过了最后一次检查、正要退出」的窗口），
+  日志写 `resumed in place for ...`，不再有「点了没反应」。
+- `moveJobToDownloaded()` 加 `__stvMoved` 幂等：重放的循环会再走一次完成分支，
+  否则「已下载」列表会出现两行同一本书。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 19 块 / 266966 字节 / **27** markers（新增
+  `store.remove unwraps OfflineBook records`、`resumed in place for `、`stvPaused`）
+- `node scripts/test-site-patch.js` → **367 条断言**全过。新增/改写：
+  - 删除：桩里的 `existedBook.delete()` 逐字照抄站点（`store.remove(this)`），`store.remove()`
+    也照抄站点的 `indexOf`；断言 4 个章节文件**全删**（不是隔一个）、记录真的不在 `store.data` 里、
+    落盘内容里已无该书、单例缓存被清、`wiped 4 chapter file(s)` 上报；
+  - 暂停/继续：批在飞时暂停 → 该批失败后**不记 gave up、章节退回队列、状态是 `Đã dừng`**、
+    循环不再开新批；继续 → 整段补齐到 6/6；另一路断言「批还在飞时点继续」走就地解暂停
+    （`resumed in place for qidian/8`，且**没有** `start() ignored`）；
+  - 重放一个已完成的 job 不会在「已下载」里插第二行。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
+
+**未证实项**：真机上「删完重启不再出现」要看下一份日志（`[DOWNLOAD] wiped N chapter file(s)`
++ 重启后列表）；暂停的即时性在真机上的表现是「点暂停后不再有新请求」，`[DOWNLOAD] paused ... at
+d/ t` 与 `resumed in place for ...` 会写在日志里；「删除任务」按钮走的也是 `pause()`，
+现在同样会真的停下。

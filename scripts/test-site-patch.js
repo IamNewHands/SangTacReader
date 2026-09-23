@@ -631,8 +631,18 @@ function installFakeApp(sandbox, options) {
   app.offlineBook = {
     store: {
       data: options.offlineBooks || [],
+      // The site's own remove() (app.v2.js:661) is an identity lookup, which is
+      // exactly why OfflineBook.delete() (app.v2.read.js:3314) removes nothing:
+      // it hands over the wrapper while data holds the record inside it.
+      remove(item) {
+        stored.removals = (stored.removals || []).concat([item]);
+        const index = this.data.indexOf(item);
+        if (index > -1) { this.data.splice(index, 1); }
+        return Promise.resolve(index > -1);
+      },
       save() {
         stored.storeSaves = (stored.storeSaves || 0) + 1;
+        stored.savedData = JSON.stringify(this.data);
         return Promise.resolve();
       },
     },
@@ -644,6 +654,9 @@ function installFakeApp(sandbox, options) {
       stored.existedLookups = (stored.existedLookups || []).concat([obj.host + '/' + obj.id]);
       return options.existedBook || null;
     },
+    // The real book objects are cached here and never invalidated
+    // (app.v2.read.js:3248).
+    offlineBookSingletons: {},
     getDownloadBooks(from, to) {
       stored.listReads = (stored.listReads || []).concat([from + ':' + to]);
       // Stands in for populateBookInfo(), which answers from the bookinfo cache
@@ -720,11 +733,14 @@ function installFakeApp(sandbox, options) {
       // The download loop lives in the shim now, so a test that needs the loop to
       // stay in flight holds the chapter requests open instead of the old start().
       if (options.slowChapter && !autoRelease) {
-        return new Promise((resolve) => { pendingChapters.push(resolve); });
+        return new Promise((resolve, reject) => { pendingChapters.push({ resolve, reject }); });
       }
       return Promise.resolve(chapter);
     }
     pause() { this.isPaused = true; }
+    setStatus(text) {
+      if (this.status) { this.status.textContent = text; }
+    }
     start() {
       this.isPaused = false;
       stored.resumes = (stored.resumes || 0) + 1;
@@ -732,9 +748,13 @@ function installFakeApp(sandbox, options) {
     }
   }
   app.BookDownloadManager = FakeDownloadManager;
-  stored.releaseChapters = (all) => {
+  stored.releaseChapters = (all, fail) => {
     if (all) { autoRelease = true; }
-    while (pendingChapters.length) { pendingChapters.shift()(); }
+    while (pendingChapters.length) {
+      const pending = pendingChapters.shift();
+      if (fail) { pending.reject(new Error('Không thể đọc dữ liệu')); }
+      else { pending.resolve(); }
+    }
   };
 
   // The site's mirror picker (app.v2.js:890). Only installed when a test asks
@@ -2289,6 +2309,103 @@ async function testDownloadLifecycle() {
   check('deleting a task refreshes the list counter', updates === 1, String(updates));
 }
 
+async function testDownloadPauseResume() {
+  console.log('pausing a download stops it and resuming carries on');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    slowChapter: true,
+    bookInfoResponses: {
+      '/mobile/bookinfo.php?hid=7&host=qidian': {
+        book: { host: 'qidian', id: '7', chaptercount: '6' },
+      },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  const text = () => String(sandbox.window.__stvDiag.text() || '');
+  const job = new app.BookDownloadManager('qidian', '7',
+    ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']);
+  job.status = makeElement('div');
+  const run = job.start();
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) === 3);
+
+  // 暂停下载 while the batch is in flight. On the device those three were 429s
+  // held open by the retry backoff, which is what made the download look
+  // unstoppable: nothing consulted isPaused until the whole batch had settled.
+  job.pause();
+  check('the pause is reported', text().indexOf('paused qidian/7 at 0/6') >= 0,
+    text().slice(-220));
+  sandbox.__stored.releaseChapters(false, true);
+  await run;
+  await tick(80);
+  check('a paused loop starts no further batch',
+    (sandbox.__stored.chapterCalls || 0) === 3, String(sandbox.__stored.chapterCalls));
+  check('the chapters the pause caught are kept for the resume',
+    job.chapters.join(',') === 'p1,p2,p3,p4,p5,p6', job.chapters.join(','));
+  check('a paused chapter is not counted as a give-up',
+    text().indexOf('gave up') < 0, text().slice(-260));
+  check('the row says stopped instead of the 429 read error',
+    job.status.textContent === 'Đã dừng', JSON.stringify(job.status.textContent));
+  check('the job stays paused', job.isPaused === true);
+
+  // 继续下载: the range has to be picked back up and finished.
+  const again = job.start();
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) === 6);
+  sandbox.__stored.releaseChapters(true);
+  await again;
+  await tick(80);
+  check('the resume fetches the whole range and finishes',
+    job.downloaded === 6 && job.chapters.length === 0,
+    job.downloaded + '/' + job.total + ' left=' + job.chapters.join(','));
+  check('no chapter of the range is skipped',
+    ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']
+      .every((chapter) => (sandbox.__stored.chapters || []).indexOf(chapter) >= 0),
+    JSON.stringify(sandbox.__stored.chapters));
+  check('the finished job says so', job.status.textContent === 'Hoàn thành',
+    JSON.stringify(job.status.textContent));
+
+  // 继续下载 tapped while the paused loop is still finishing its batch: the tap
+  // used to be swallowed ("start() ignored while a loop is running"), the reader
+  // saw the 429 error, and the download carried on by itself later.
+  const second = makeSandbox();
+  const secondApp = installFakeApp(second, {
+    displayType: 'auto',
+    slowChapter: true,
+    bookInfoResponses: {
+      '/mobile/bookinfo.php?hid=8&host=qidian': {
+        book: { host: 'qidian', id: '8', chaptercount: '5' },
+      },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), second);
+  await tick(300);
+  const secondText = () => String(second.window.__stvDiag.text() || '');
+  const job2 = new secondApp.BookDownloadManager('qidian', '8',
+    ['q1', 'q2', 'q3', 'q4', 'q5']);
+  job2.status = makeElement('div');
+  const run2 = job2.start();
+  await waitFor(() => (second.__stored.chapterCalls || 0) === 3);
+  job2.pause();
+  const resumed = job2.start();
+  check('a resume during the paused batch is taken in place, not swallowed',
+    job2.isPaused === false
+      && secondText().indexOf('resumed in place for qidian/8') >= 0,
+    secondText().slice(-220));
+  check('the in-place resume is not logged as an ignored start',
+    secondText().indexOf('start() ignored while a loop is running for qidian/8') < 0,
+    secondText().slice(-220));
+  second.__stored.releaseChapters();
+  await waitFor(() => (second.__stored.chapterCalls || 0) === 5);
+  second.__stored.releaseChapters(true);
+  await Promise.all([run2, resumed]);
+  await tick(80);
+  check('the loop carries on through the rest of the range',
+    job2.downloaded === 5 && job2.chapters.length === 0,
+    job2.downloaded + '/' + job2.total + ' left=' + job2.chapters.join(','));
+}
+
 async function testGridLayout() {
   console.log('grid tap targets');
   const sandbox = makeSandbox();
@@ -2464,15 +2581,28 @@ async function testDownloadCompletion() {
   const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
   const sandbox = makeSandbox();
   const deleted = [];
+  const record = { host: 'qidian', id: '1034915599', key: 'offlineBook_qidian_1034915599' };
+  const book = {
+    baseObject: record,
+    chapters: ['1', '2', '3', '4'],
+    getChapterDownloaded() { return Promise.resolve(this.chapters); },
+    deleteChapter(chapter) {
+      deleted.push('chapter:' + chapter);
+      const index = this.chapters.indexOf(chapter);
+      if (index >= 0) { this.chapters.splice(index, 1); }
+      return Promise.resolve();
+    },
+    // Verbatim from the site: the wrapper goes in, store.data holds the record,
+    // and the identity lookup misses -- so the book came back on the next launch.
+    delete() { deleted.push('delete'); return app.offlineBook.store.remove(this); },
+  };
   const app = installFakeApp(sandbox, {
     displayType: 'auto',
+    offlineBooks: [record],
     bookInfoResponses: {
       [url]: { book: { host: 'qidian', id: '1034915599', lid: '3972206', chaptercount: '310' } },
     },
-    existedBook: {
-      deleteAll() { deleted.push('deleteAll'); return Promise.resolve(); },
-      delete() { deleted.push('delete'); return Promise.resolve(); },
-    },
+    existedBook: book,
   });
   // The DOWNLOADED area is #download-manager's parent (page-vip:4041-4075).
   const page = makeContainer('div', 'bookdownloaded');
@@ -2523,17 +2653,40 @@ async function testDownloadCompletion() {
   check('the downloaded row gets a delete button',
     buttons.length === 1 && buttons[0].textContent === '删除',
     JSON.stringify(buttons.map((button) => button.textContent)));
+  app.offlineBook.offlineBookSingletons['qidian_1034915599'] = book;
   buttons[0].__fire('click', { stopPropagation() {}, preventDefault() {} });
   await waitFor(() => deleted.indexOf('delete') >= 0, 3000);
-  check('deleting removes the chapter bodies and then the record',
-    deleted.join(',') === 'deleteAll,delete', deleted.join(','));
+  await tick(60);
+  check('every chapter body is deleted, not every other one',
+    deleted.join(',') === 'chapter:1,chapter:2,chapter:3,chapter:4,delete',
+    deleted.join(','));
+  check('the record is really out of the store, so a restart cannot revive it',
+    app.offlineBook.store.data.indexOf(record) < 0,
+    JSON.stringify(app.offlineBook.store.data));
+  check('the cached book object is dropped so a re-download rebuilds it',
+    app.offlineBook.offlineBookSingletons['qidian_1034915599'] === undefined,
+    String(typeof app.offlineBook.offlineBookSingletons['qidian_1034915599']));
   check('the record list is saved', (sandbox.__stored.storeSaves || 0) >= 1,
     String(sandbox.__stored.storeSaves));
+  check('the saved list no longer holds the book',
+    String(sandbox.__stored.savedData || '').indexOf('1034915599') < 0,
+    String(sandbox.__stored.savedData));
   check('the row is removed from the page', row.parentElement === null);
+  check('the wipe is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('wiped 4 chapter file(s) for qidian/1034915599') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
   check('the delete is reported',
     String(sandbox.window.__stvDiag.text() || '')
       .indexOf('removed downloaded book qidian/1034915599') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // A resume replays the loop once it has exited, so the completion hand-off can
+  // run twice for the same job; the second pass must not append a second row.
+  await job.start();
+  await tick(80);
+  check('replaying a finished job adds no second DOWNLOADED row',
+    rendered.length === 1, String(rendered.length));
 }
 
 async function testDownloadRenderRace() {
@@ -3542,6 +3695,7 @@ await testBootShell();
   await testDownloadRange();
   await testDownloadStartedDialog();
   await testDownloadLifecycle();
+  await testDownloadPauseResume();
   await testDownloadSources();
   await testDownloadCompletion();
   await testDownloadRenderRace();

@@ -36,6 +36,12 @@ const REQUIRED_MARKERS = [
   // of the download-started dialog.
   'stv.diag.settings',
   'action=stvqueue',
+  // The delete button has to reach the persistent store (store.remove unwraps
+  // the book wrapper) and a pause has to reach the retry backoff, or the reader
+  // sees a deleted book come back and a paused download keep going.
+  'store.remove unwraps OfflineBook records',
+  'resumed in place for ',
+  'stvPaused',
   'window.__stvActivityLogInstalled',
   'window.__stvTabProbeInstalled',
   'window.__stvStorageAccessorInstalled',
