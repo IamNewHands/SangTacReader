@@ -71,7 +71,7 @@
 17. **导出的章节名只有越南语机翻可用，除非去问章节列表**（见 §6.18 (3)）：`readchapter` 不带原名，`oridata` 只在 `getChapterListOnline`（`app.v2.js:270`）出现。导出已改为复用阅读器那套映射；EPUB 的 `dc:language` / `xml:lang` 已在第十七轮改成 `zh`（正文与标题都是中文），见 §6.19 (1)。
 18. **「书本的取消点赞」很可能在站点侧根本不存在**（见 §6.19 (3)）：`app.api.unlike` 全站只有一个调用方，而且是社区帖子（`app.v2.js:5239`）；书籍这条路上站点自己只会 `like`。真机日志显示服务端收下 `ajax=unlike`（`code 100`）却一行都没删，而同一本书的 like 记录有两行。我们的包装已改成阶梯（对象 id → 逐行 id，每条复查），若行 id 也删不动，就只能如实提示失败——或者干脆不让赞加上去（按钮只读），这属于产品取舍，需要用户定。
 19. **每章正文末尾的存档声明是服务端加的**（见 §6.19 (2)）：`Bạn đang đọc bản lưu trong hệ thống` 不在客户端任何文件里，只能在消费正文处剥掉（阅读器 iframe + 导出，共用 `__stvI18n.stripNotice`）。匹配按用户给出的句子做，别的写法会漏。
-20. **冷启动的剩余时间在站点自己的串行链上**（见 §6.19 (4)）：外壳 HTML 的 TTFB ~1.2s，`app.v2.js`（59KB）在它后面，实测站点 UI 到 +2.9s、首页数据到 +10s 才齐。本轮修掉的是我们自己的两处浪费（资源 URL 每天换一次、设置页一次点错连发 25 个 403 的 `/mobile/lang/<域名>.json`）；要再往下压只有把静态资源搬进本地 origin（`docs/optimization-plan-2026-09-23.md` §3/P2），工作量大且回归面广，尚未做。
+20. **冷启动的剩余时间在站点自己的串行链上**（见 §6.19 (4)）：外壳 HTML 的 TTFB ~1.2s，`app.v2.js`（59KB）在它后面，实测站点 UI 到 +2.9s、首页数据到 +10s 才齐。本轮修掉的是我们自己的两处浪费（资源 URL 每天换一次、设置页一次点错连发 25 个 403 的 `/mobile/lang/<域名>.json`）；要再往下压只有把静态资源搬进应用（`docs/optimization-plan-2026-09-23.md` §3/P2）。**§6.22 已做掉可达的那 8 个文件（906296 字节 源文件随包 + 后台 `If-Modified-Since` 校验）**，解析器自建的那 13 个仍需接管文档加载，见 §6.22 未证实项。
 
 ## 6. 真机问题档案
 
@@ -2158,5 +2158,152 @@ app.api.queryLike = async function(list){          // app.v2.js:4865
 - 滚动式显示器本轮仍只按「视口顶端」取起点；若阅读器在 frame 内还有自己的悬浮工具栏，起点会落在
   它下面一行左右——真机若是这个形状，把日志给我，按工具栏的 rect 再收一次。
 - 第 1 项（取消点赞）与上一轮同：已经拆掉阶梯、只试站点契约那一种键，仍未定案，用户说「不行就算了」。
+
+### 6.22 第二十轮（用户要求：把站点资源镜像到本地）：可达的 8 个文件进包 + `[ASSET]` 时间线
+
+#### 证据（`日志2.txt`，905 行，20:07:30–20:11:28）
+
+先说这份日志**不能**回答什么，因为这决定了本轮的做法：
+
+- tag 分布：`TTS` 359 / `LOG` 349 / `ERR` 37 / `TAP` 23 / `Http` 14 / `RECT` 12 / `MSG` 2 /
+  `PAGE` 2 / `SAFE` 1 / `BOOT` **1**。这是一份**阅读器会话**日志（20:07:30 起，用户开着日志开关
+  在正文里操作），不是启动日志——`[BOOT]` 行只有一条 `+20001ms stylesheet: app=yes config=yes navbar=85px`。
+- 那 14 条 `[Http]` 是**唯一**有耗时证据的网络行，全部是 API：
+  `searchBooks 74047b in 1013ms`、`readchapter 7828b in 710ms`、`bookinfo 1556b in 710ms`、
+  `updateOldLink 39b in 667/711/916/2782ms`、`ngmar=onl2 1b in 818/1116ms`，两条命中章节缓存
+  `in 0ms (cache)`（P0-5 的 `ResponseCache` 在工作）。
+- **站点自己的静态资源一次都没出现**——它们由 WKWebView 直接抓，不走原生 Http 插件，
+  所以这份日志里没有任何一条能说明它们花了多少时间。这正是本轮的第二个产物（`[ASSET]` 时间线）
+  存在的原因。
+
+动手前用本机探测把三件事定死（这决定了实现方式，不是猜测）：
+
+| 探测 | 结果 |
+|---|---|
+| 外壳 HTML 里被 `Math.random()` 破缓存的 URL | 4 处：`app.v2.css`（:3066，`setAttribute('href')`）、`app.v2.js`（:5207）、`bookdisplay`（:5208）、`config`（:5211） |
+| 由 HTML 解析器直接建 `<script src>` 的静态文件 | 13 个（`_page_vip.html` :96–:130：`jqr.js?v=10`、`bootstrap.min.css?origin=`、`font/font.css?v=4`、`asset/all.min.css`、`main.css?v=44`、`theme.default.css?v=0`、`bootstrap.min.js`、`stv.ui.js?v=1.360`、`stv.host.js`、`iro.js`、`materialize.icon.css`、`crypto-js.min.js`、`html2canvas.min.js`、`gsap.min.js`、`materialize.min.css`、`materialize.min.js`） |
+| 这 8 个可达文件的响应头与体积 | 全部 `Cache-Control: max-age=86400` + **`Last-Modified`**、**没有 ETag**；`app.v2.js` 259387 字节（LM 2026-06-28）、`app.v2.css` 52744（2025-05-09）、`bookdisplay` 27155（2025-07-12）、`config` 4095（2025-11-12）、`read` 145097（2026-02-14）、`chapterdisplay` 157668（2026-02-15）、`stv.tts.js?v=7` 46220（2025-12-19）、`hanviet.js` 176419（2020-11-09） |
+| 站点是否发 CSP | **没有** `Content-Security-Policy` 头（node fetch 实测）→ 内联脚本、`eval`、`blob:` 三种做法都合法 |
+
+`Last-Modified` 是关键：它让「每次启动后台校验一次」变成一次 **304、无 body** 的往返，
+这也是站点自己给 WebKit 的缓存时长（`max-age=86400`）——所以镜像的陈旧窗口不会比现状更差。
+
+#### 根因与可达性（为什么只做 8 个）
+
+- WKWebView **无法拦截/重定向 `https://`**（`WKURLSchemeHandler` 只吃自定义 scheme，
+  `WKContentRuleList` 只有 block / block-cookies / css-display-none / make-https，没有重定向）。
+  所以：**JS 钩子能改的只有 `script.src` / `link.href` 的 setter 与 `setAttribute`**，
+  也就是那 4 个被随机化的 + 4 个由 `scriptmanager.load` 拉的；解析器自建的那 13 个注入层永远碰不到。
+- 要连那 13 个一起拿掉，只有一条路：**原生侧取外壳 HTML、把 `<script src>` 换成内联/`data:` URL、
+  再用 `loadHTMLString(html, baseURL: 真实 URL)` 载入**（origin 仍是 `https://sangtacviet.com`，
+  所以 Cookie/Referer/Turnstile 都不动）。那条路要接管 `webView.navigationDelegate`（Capacitor
+  自己占着），本机无法编译、无法真机验证，**本轮没做**，见下面「未证实项」。
+
+#### 改了什么
+
+1. **`scripts/gen-site-assets.js`**（新）：从站点原样下载那 8 个文件到
+   `plugins/app/ios/Sources/SangTacAppPlugin/site-assets/`，写 `manifest.json`（name / path /
+   bytes / sha256 / lastModified）。`--check` 只读盘、重算哈希，CI 跑它。**生成时就验**：`.js`
+   必须能被 `new Function` 解析、文件开头不能是 HTML（Cloudflare 拦截页存成 `.js` 是这类镜像最
+   典型的死法，这里在构建期抓住而不是在真机上）。
+2. **`plugins/app/Package.swift`**：`resources: [.copy("site-assets")]`，随 IPA 发布。
+3. **`SiteAssets.swift`**（新）：读快照 + 读 `Library/Application Support/stv-site-assets/` 里
+   被刷新过的副本（**后者优先**），用 `JSONSerialization` 拼出 `window.__stvSiteAssets` /
+   `window.__stvSiteStamps` 两个表。两个刻意的选择：
+   - **不用 `Bundle.module`**：SwiftPM 生成的访问器在资源包不在预期位置时是 `fatalError`，
+     等于把一个打包失误变成启动崩溃；这里改成自己找、找不到返回 nil（镜像静默失效，页面照旧全网络）。
+   - **不用 Swift 字符串字面量装站点代码**：那 900KB 里全是反斜杠、两种引号和越南文，
+     手写转义正是第 6.1 节那次「shim 是语法错误、整层静默死掉」的同类错误。让 Foundation 转义。
+     `SiteAssets.swift` 里因此**一个 `\"\"\"` 块都没有**（`check-ios-shim.js` 扫的是那种块）。
+4. **`assetMirror` 块**（`SitePatch.swift`，注入顺序第 4，紧跟 `assetCache` 之后——它包住
+   `assetCache` 刚装的那两个钩子，所以必须在它后面）：
+   - **脚本走 `blob:` URL**，通过站点自己用的那个 `HTMLScriptElement.src` 属性赋进去：
+     元素仍然是普通 `<script>`，站点 loader 的 `onload` 与按 URL 去重的 `stack` 原样工作。
+     换成「新建一个内联 `<script>`」会把这两样都破坏掉。
+   - **样式走 `<style>` 节点**：pageflip 的模板用
+     `document.querySelectorAll("link[rel=stylesheet],style")` 重建每个 frame 的 `<head>`，
+     `<style>` 取 `css.textContent`（`_dl_app.v2.js` @199996），所以这个形状能**确定**把站点
+     样式带进 frame；blob 的 `href` 要在 `about:srcdoc` 文档里解析，不可靠。
+     `bootShell.siteCssReady()` 相应增加按 `data-stv-mirror` 认表（`<style>` 没有 `href`）。
+   - **两条自愈**（这是「盲改也得能装」的前提）：镜像脚本 `error`（元素上的 `error` 事件，
+     或 `window.onerror` 的 filename 是 `blob:`）→ 写 `stv.mirror.off` 并 reload 一次；
+     `app.v2.js` 载入 8 秒后 `window.STV_SERVER`（该文件第一行就声明的全局）仍未定义 → 同样处理。
+     第二次加载完全走网络，与没有这个功能时**逐字节相同**。刻意**不用**「N 秒后 `window.app`
+     还没出现就放弃」：真机 `[BOOT]` 有 20s 的样本，那会把正常但慢的启动误判成镜像坏了，
+     然后 `stv.mirror.off` 一写，功能就永久静默失效了。`STV_SERVER` 是「文件到底跑没跑」的
+     直接证据，不是时间猜测。
+   - **频率**：revalidate 有 6 小时 TTL（`stv.mirror.checked`），不是每次导航一次；
+     设置页新增「本地资源镜像」（开关，写/清 `stv.mirror.off`）与「丢弃已刷新的资源副本」，
+     后者与既有的「强制刷新站点资源」互相挂钩（那一行现在也会 `forget()`，否则只修了 WebKit
+     缓存的那一半）。
+5. **`[ASSET]` 资源时间线**（同一块，`load` 后 500ms 打印，**与镜像是否开启无关**）：
+   `performance.getEntriesByType('resource')` 里按扩展名筛出静态资源（把 XHR API 排除），
+   报一条汇总（还有几条在网络、wire/解码字节、几条 `transferSize===0` 即命中缓存、
+   最后一个字节在 +Nms）+ 最慢 5 条（名字、wire 大小、耗时、`cache`/`network`、`@+startTime`）。
+   **这是唯一能看见那 13 个解析器自建文件成本的地方**——镜像覆盖不到它们，只能先量。
+6. **原生 `siteAssetRefresh` / `siteAssetForget`**（`SangTacAppPlugin`）：按 `If-Modified-Since`
+   做条件 GET，304 跳过、200 且通过 `plausible()`（>512 字节、不以 `<` 开头、有花括号配对）
+   才写盘，写失败就不写——**宁可保留好快照，也不让一次截断的下载永久毁掉镜像**。
+   `origin` 必须是 https 且调用方是站点自己的主 frame：否则被 XSS 的页面可以把镜像指向任意主机、
+   把随包资源换成任意 JavaScript，而这份 JavaScript 会在**每次启动**的 document start 执行，
+   等于一个持久的、自己给自己装的 XSS。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → **23 块 / 399339 字节 / 56 markers**（新增
+  `window.__stvAssetMirror`、`stv.mirror.off`、`data-stv-mirror`、`STV_SERVER`、
+  `siteAssetRefresh`、`static request(s) still over the network`）
+- `node scripts/test-site-patch.js` → **569 条断言**全过（上一轮 531，新增 38）。新增覆盖：
+  - 桩里给 `HTMLScriptElement` / `HTMLLinkElement` / `Element` 建**同一棵原型链**（真 DOM 的形状），
+    `Element.prototype.setAttribute` 才既是 `assetCache` 又是 `assetMirror` 的拦截点；
+  - 脚本：`/asset/app.v2.js?0.4242` → 元素 `src` 是 `blob:`、打了 `data-stv-mirror`、日志有
+    `[MIRROR] app.v2.js`；`/stv.tts.js?v=7` 也命中（**查询串不是身份**）；`/jqr.js?v=10` 不被接管；
+  - 样式：`setAttribute('href')` 之后 head 里出现带 `data-stv-mirror="app.v2.css"` 的 `<style>`，
+    `textContent` 是整份 CSS，而 `<link>` 上**没有留下 `href`**（= 不发请求）；
+  - `bootShell`：把「`href` 为 null、`ownerNode` 带标记」的 sheet 推进 `document.styleSheets`，
+    断言外壳以 `app.v2.css (local)` 释放（在**删掉 `app.config.reader`** 的沙箱里跑，
+    否则那条信号会抢先把外壳摘掉、测不到这条路径）；
+  - 自愈两条路径各 4 条断言：元素 `error` → 写标记 + reload；`STV_SERVER` 已定义时 `probe()` **不动作**
+    （慢启动不误判）；`STV_SERVER` 未定义时 → 写标记 + reload；带标记的下一次加载 `hooks === undefined`、
+    文件确实回到网络；
+  - 时间线：喂 3 条 resource entry（2 静态 + 1 XHR），断言只数 2 条、`30KB wire / 267KB decoded`、
+    `1 from cache`、最慢两条各按 `network`/`cache` 具名；
+  - revalidate：断言发的条数、`If-Modified-Since` 就是那份 `Last-Modified`、origin 是页面实际读的那个、
+    返回 `updated` 时日志写 `(next launch)`，以及**同一会话内不会重复发**（TTL）；
+  - **三份清单必须一致**：从 `SiteAssets.swift`、`assetMirror` 块里的 `PATHS`、`gen-site-assets.js`
+    的 `ASSETS` 各解析一遍，断言三个列表是同一份（只在一个地方知道的路径会**静默失效**：
+    镜像永远不匹配，文件继续走网络，没有任何报错）。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
+- `node scripts/gen-site-assets.js --check` → 8 files / 906296 bytes / host `https://sangtacviet.com`
+  （哈希与字节数按 CRLF 归一化后计算，`.gitattributes` 另把 `site-assets/**` 钉成 `-text`，
+  免得 `core.autocrlf` 不同的机器让这条断言报假警）
+- `.github/workflows/build-ipa.yml` 新增两步：`gen-site-assets.js --check`；
+  **产物里必须有资源包**（`*SangTacAppPlugin*.bundle/site-assets/` 下逐个文件存在）。
+  资源包缺失时镜像会静默失效（App 仍能启动，只是又变慢），所以这件事必须在构建期红，
+  不能等读者发现。二进制 strings 检查加上 `stvAssetMirror`、`siteAssetRefresh`、`data-stv-mirror`。
+- `README.md`：块表加 `assetMirror` 一行（22 → 23 块）、本地验证四条命令、`ASSET`/`MIRROR` 两个 tag，
+  并在许可一节写明：**`site-assets/` 里是站点自己的前端 bundle（906296 字节），版权归 sangtacviet**，
+  不适用本仓库许可，只随个人自用构建进包，删掉该目录并去掉 `Package.swift` 的 `resources` 一行
+  即可完全退回全网络加载。
+
+#### 未证实项（下一轮的输入）
+
+- **`blob:` 当 `<script src>` 在本机 WKWebView 上没在真机验证过**（同类做法在站点自己那里有：
+  `app.images.downloadAndAssign` 用 `URL.createObjectURL(blob)` 给 `<img>`）。这是本轮唯一
+  「可能装上就没用」的点，所以才有那两条自愈。真机应看到 `[MIRROR] <文件> (<n>KB) from the local copy`
+  与 `[MIRROR] 8 file(s), 907KB bundled, hooks=2`（这里的 KB 是页面内字符数，
+  与 manifest 的 906296 字节记账口径不同：manifest 把 CRLF 归一化后算哈希，
+  否则 `core.autocrlf` 不同的机器会让 `--check` 报假警）；若看到 `[ERR] ... reloading without the local copy`，
+  就是这台 webview 不接受，功能会自己关掉、App 照旧可用，把那一行给我。
+- **本轮不解决 20s 启动**。它把可达的 8 个文件（启动关键路径 78KB wire、阅读器 226KB wire）
+  从网络拿掉，但**那 13 个解析器自建文件仍在网络**，而日志里的 14 条 API 是 498–2782ms/条。
+  所以下一轮的输入是 `[ASSET] N static request(s) still over the network: …KB wire / …KB decoded,
+  N from cache, last byte at +Nms` 这一行：如果静态资源本来就是 cache 命中、字节很少，
+  那 8 秒闸门就不在资源上，要往 API 与域名探测方向走；如果 `wire` 还是几百 KB，才值得做
+  「原生取外壳 + `loadHTMLString(html, baseURL:)`」那条路（1–2 天，风险面是接管导航代理）。
+- 镜像的新鲜度：快照与构建同龄，之后每次启动后台校验一次、**下一次启动生效**，所以陈旧窗口
+  ≤ 一次启动，与站点自己给的 `max-age=86400` 同阶。若站点在两次启动之间改名/改内容而读者只启动一次，
+  那次仍是旧文件——「丢弃已刷新的资源副本」+「强制刷新站点资源」是手动出口。
+- 包体：`site-assets/` 906296 字节 源文件（zip 后约 150KB，IPA 现 952372 字节）。
 
 

@@ -61,6 +61,9 @@ jobs:
       - name: Verify generated i18n block is in sync
         run: node scripts/gen-site-i18n.js --check
 
+      - name: Verify the bundled site-asset mirror is in sync
+        run: node scripts/gen-site-assets.js --check
+
       - name: List detected plugins
         run: npx cap ls || true
 
@@ -176,7 +179,8 @@ jobs:
                         stvKeyboardPopupInstalled \
                         stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled \
                         stvAssetCache stvReaderPrefetchInstalled \
-                        stvCommentTranslateInstalled; do
+                        stvCommentTranslateInstalled stvAssetMirror \
+                        siteAssetRefresh data-stv-mirror; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
@@ -224,6 +228,34 @@ jobs:
               echo "✓ $marker 已编入产物"
             else
               echo "::error::$marker 缺失"
+              exit 1
+            fi
+          done
+
+      - name: Verify the bundled asset mirror is inside the app
+        run: |
+          set -euo pipefail
+          app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
+          echo "app: $app"
+          # SwiftPM copies the target's resources into <Package>_<Target>.bundle.
+          # A missing bundle leaves the mirror silently inert on device -- the app
+          # still boots, it is just slow again -- so the build has to fail here
+          # rather than the reader finding out.
+          bundle="$(find "$app" -maxdepth 2 -name '*SangTacAppPlugin*.bundle' -type d | head -1)"
+          if [ -z "$bundle" ]; then
+            echo "::error::未找到 SangTacAppPlugin 资源包；本地资源镜像不会生效"
+            find "$app" -maxdepth 2 -name '*.bundle' -type d || true
+            exit 1
+          fi
+          echo "资源包: $bundle"
+          for name in app.v2.js app.v2.css app.v2.bookdisplay.js app.v2.config.js \
+                      app.v2.read.js app.v2.chapterdisplay.js stv.tts.js hanviet.js \
+                      manifest.json; do
+            if [ -f "$bundle/site-assets/$name" ]; then
+              echo "✓ site-assets/$name $(wc -c < "$bundle/site-assets/$name") bytes"
+            else
+              echo "::error::资源包里缺少 site-assets/$name"
+              ls -la "$bundle" || true
               exit 1
             fi
           done

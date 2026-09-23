@@ -1,0 +1,62 @@
+{
+  "host": "https://sangtacviet.com",
+  "generated": "2026-09-23T13:29:58.264Z",
+  "files": [
+    {
+      "name": "app.v2.js",
+      "path": "/asset/app.v2.js",
+      "bytes": 252334,
+      "sha256": "90a93036110b81377ae6ed5362f43edc69f4389faf9d6a9d3c3abaae9d186aa1",
+      "lastModified": "Sun, 28 Jun 2026 19:08:22 GMT"
+    },
+    {
+      "name": "app.v2.css",
+      "path": "/asset/app.v2.css",
+      "bytes": 50001,
+      "sha256": "7858c5dd8dbd1e59ce0388a2a66f81c21ed4312e46d4240e08bb3f44633cf47c",
+      "lastModified": "Fri, 09 May 2025 19:32:19 GMT"
+    },
+    {
+      "name": "app.v2.bookdisplay.js",
+      "path": "/asset/app.v2.bookdisplay.js",
+      "bytes": 26313,
+      "sha256": "88e8ee10285769b6e8cf66beffee8773ba133253260b64df4d0911a0826e03d1",
+      "lastModified": "Sat, 12 Jul 2025 04:14:24 GMT"
+    },
+    {
+      "name": "app.v2.config.js",
+      "path": "/asset/app.v2.config.js",
+      "bytes": 3980,
+      "sha256": "6d76726093421f6aba852335508c22bddf267ee135018ed64204461cdc16bd57",
+      "lastModified": "Wed, 12 Nov 2025 13:16:20 GMT"
+    },
+    {
+      "name": "app.v2.read.js",
+      "path": "/asset/app.v2.read.js",
+      "bytes": 140969,
+      "sha256": "9f945090b7fe1d96c95207f555ca473673a146146009d13736d4613f156eaa3a",
+      "lastModified": "Sat, 14 Feb 2026 14:37:08 GMT"
+    },
+    {
+      "name": "app.v2.chapterdisplay.js",
+      "path": "/asset/app.v2.chapterdisplay.js",
+      "bytes": 153712,
+      "sha256": "e98555084647dfec2125b3d659e7237a02cc7af743026a57b5432c491a27c9ae",
+      "lastModified": "Sun, 15 Feb 2026 10:05:03 GMT"
+    },
+    {
+      "name": "stv.tts.js",
+      "path": "/stv.tts.js",
+      "bytes": 45458,
+      "sha256": "a0ddd485817b4c08857bba2b0151d02fbca9617feb4c18989cb1b863d218bfe7",
+      "lastModified": "Fri, 19 Dec 2025 18:25:21 GMT"
+    },
+    {
+      "name": "hanviet.js",
+      "path": "/hanviet.js",
+      "bytes": 233529,
+      "sha256": "39c2c400cbdfea6ce183c3b1fb6bdfdb7a5e0d3ec5e17a7474cb57bb4ead3638",
+      "lastModified": "Mon, 09 Nov 2020 00:30:21 GMT"
+    }
+  ]
+}

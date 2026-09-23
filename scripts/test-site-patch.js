@@ -5278,6 +5278,347 @@ async function testAssetCacheStabiliser() {
  * Nothing else in the build would notice a block being dropped from the list,
  * listed twice, or moved back to the end.
  */
+/**
+ * The local asset mirror: eight of the site's bundles are shipped inside the app
+ * and served from the document-start shim, because the shell asks for them with
+ * a `Math.random()` cache-buster (so WebKit's disk cache can never hit) over a
+ * link whose every round trip is 300-900ms.
+ *
+ * The three lists that have to agree -- the Swift table, the JavaScript PATHS
+ * table and the generator's ASSETS -- are checked here, because a path that only
+ * one of them knows about fails silently: the mirror simply never matches and the
+ * file keeps going over the wire.
+ */
+async function testAssetMirror() {
+  console.log('local asset mirror');
+
+  const SCRIPT = 'var STV_SERVER = "https://sangtacviet.app";var app = {};';
+  const CSS = '.chaptertopinfo{height:14px}';
+
+  /**
+   * The stub has no HTMLScriptElement/HTMLLinkElement/Element at all, so both
+   * `assetCache` and `assetMirror` skip their hooks unless a test supplies them
+   * (testAssetCacheStabiliser does the same). Here the link and script prototypes
+   * inherit from one Element prototype, which is what the real DOM does and what
+   * makes the setAttribute hook apply to a `<link>`.
+   */
+  function mirrorSandbox(options) {
+    const opts = options || {};
+    const sandbox = makeSandbox();
+    installFakeApp(sandbox, { appLanguage: 'zh' });
+    const view = sandbox.window;
+    view.__stvSiteAssets = opts.table || {
+      'app.v2.js': SCRIPT,
+      'app.v2.css': CSS,
+      'stv.tts.js': 'var TTS = {};',
+    };
+    view.__stvSiteStamps = { 'app.v2.js': 'Sun, 28 Jun 2026 19:08:22 GMT' };
+    if (opts.off) { sandbox.localStorage.setItem('stv.mirror.off', '1'); }
+
+    const accessor = (store) => ({
+      configurable: true,
+      enumerable: true,
+      get() { return store.value || ''; },
+      set(value) { store.value = String(value); },
+    });
+
+    const elementPrototype = {
+      tagName: 'DIV',
+      setAttribute(name, value) {
+        this.attributes = this.attributes || {};
+        this.attributes[name] = String(value);
+      },
+      getAttribute(name) { return (this.attributes || {})[name]; },
+      addEventListener(type, handler) {
+        this.listeners = this.listeners || {};
+        this.listeners[type] = (this.listeners[type] || []).concat([handler]);
+      },
+      __fire(type, event) {
+        for (const handler of ((this.listeners || {})[type] || [])) { handler(event); }
+      },
+    };
+    view.Element = function () {};
+    view.Element.prototype = elementPrototype;
+
+    const scriptPrototype = Object.create(elementPrototype);
+    scriptPrototype.tagName = 'SCRIPT';
+    Object.defineProperty(scriptPrototype, 'src', accessor({}));
+    view.HTMLScriptElement = function () {};
+    view.HTMLScriptElement.prototype = scriptPrototype;
+
+    const linkPrototype = Object.create(elementPrototype);
+    linkPrototype.tagName = 'LINK';
+    Object.defineProperty(linkPrototype, 'href', accessor({}));
+    view.HTMLLinkElement = function () {};
+    view.HTMLLinkElement.prototype = linkPrototype;
+
+    return { sandbox, view };
+  }
+
+  const first = mirrorSandbox();
+  const view = first.view;
+  const sandbox = first.sandbox;
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  const mirror = view.__stvAssetMirror;
+  check('the mirror publishes its API', !!mirror);
+  if (!mirror) { return; }
+
+  check('the bundled table is what it reports',
+    JSON.stringify(mirror.names.slice().sort()) === JSON.stringify(['app.v2.css', 'app.v2.js', 'stv.tts.js']),
+    JSON.stringify(mirror.names));
+  check('both URL hooks are installed', mirror.hooks === 2, String(mirror.hooks));
+
+  // A plain <script src> assignment, which is how stv.ui.js loads every bundle
+  // (it appends the element first and only then assigns `.src`, so the property
+  // setter is the only hook that can do the work).
+  const script = new view.HTMLScriptElement();
+  script.src = '/asset/app.v2.js?0.4242';
+  check('a bundled script is served from a blob URL, not the network',
+    String(script.src).indexOf('blob:') === 0, String(script.src));
+  check('the element is stamped with the file it is carrying',
+    script.getAttribute('data-stv-mirror') === 'app.v2.js',
+    String(script.getAttribute('data-stv-mirror')));
+  check('the mirror says what it served',
+    String(view.__stvDiag.text()).indexOf('[MIRROR] app.v2.js') >= 0,
+    String(view.__stvDiag.text()).slice(-200));
+
+  // The query string is a cache-buster, not part of the identity: the same file
+  // is asked for as `?0.42` on one load and `?stv1` after assetCache stabilises
+  // it, and the version-number form has to match too.
+  const tts = new view.HTMLScriptElement();
+  tts.src = '/stv.tts.js?v=7';
+  check('the site\'s own version number still matches the mirror',
+    String(tts.src).indexOf('blob:') === 0, String(tts.src));
+
+  const other = new view.HTMLScriptElement();
+  other.src = '/jqr.js?v=10';
+  check('a file that is not mirrored is left to the network',
+    other.src === '/jqr.js?v=10', other.src);
+
+  // The stylesheet: the shell builds it with setAttribute('href', ...) after
+  // setting rel=stylesheet, so the attribute hook is the one that runs.
+  const link = new view.HTMLLinkElement();
+  link.setAttribute('rel', 'stylesheet');
+  link.setAttribute('href', '/asset/app.v2.css?r=0.5');
+  const styleNode = sandbox.document.head.children.find(
+    (node) => node.getAttribute && node.getAttribute('data-stv-mirror') === 'app.v2.css');
+  check('the stylesheet becomes a style node', !!styleNode);
+  check('the style node carries the whole stylesheet',
+    !!styleNode && styleNode.textContent === CSS,
+    styleNode ? String(styleNode.textContent).slice(0, 60) : 'none');
+  // A style node, not a blob <link>: the page-flip templates rebuild each
+  // frame's <head> from document.querySelectorAll('link[rel=stylesheet],style')
+  // and use css.textContent for style nodes (_dl_app.v2.js @199996), so this is
+  // the shape that carries the site's CSS into the frames.
+  check('no href is left behind, so nothing is fetched for the stylesheet',
+    link.attributes.href === undefined, String(link.attributes.href));
+
+  // bootShell has to recognise a sheet that has no href to match on. Run in its
+  // own sandbox with `app.config.reader` removed before install, because that
+  // alone is a release signal and would otherwise name itself as the reason.
+  const shellSandbox = mirrorSandbox();
+  delete shellSandbox.view.app.config.reader;
+  vm.runInContext(loadBlocks().join('\n'), shellSandbox.sandbox);
+  await tick(60);
+  const shellLink = new shellSandbox.view.HTMLLinkElement();
+  shellLink.setAttribute('rel', 'stylesheet');
+  shellLink.setAttribute('href', '/asset/app.v2.css?r=0.5');
+  const shellStyle = shellSandbox.sandbox.document.head.children.find(
+    (node) => node.getAttribute && node.getAttribute('data-stv-mirror') === 'app.v2.css');
+  shellSandbox.sandbox.document.styleSheets.push({ href: null, ownerNode: shellStyle });
+  await tick(1200);
+  check('the mirrored stylesheet releases the first-paint shell',
+    String(shellSandbox.view.__stvDiag.text()).indexOf('app.v2.css (local)') >= 0,
+    String(shellSandbox.view.__stvDiag.text()).slice(-260));
+
+  // --- the resource timeline -------------------------------------------------
+  const profile = mirrorSandbox();
+  const profileView = profile.view;
+  profileView.location = {
+    origin: 'https://sangtacviet.app',
+    reload() { profile.sandbox.__reloaded = true; },
+  };
+  profileView.performance = {
+    getEntriesByType: () => ([
+      { name: 'https://sangtacviet.app/jqr.js?v=10', initiatorType: 'script',
+        transferSize: 30720, decodedBodySize: 120000, duration: 963, startTime: 400, responseEnd: 1363 },
+      { name: 'https://sangtacviet.app/stv.ui.js?v=1.360', initiatorType: 'script',
+        transferSize: 0, decodedBodySize: 153474, duration: 4, startTime: 1400, responseEnd: 1404 },
+      { name: 'https://sangtacviet.app/mobile/bookinfo.php?hid=1', initiatorType: 'xmlhttprequest',
+        transferSize: 1556, decodedBodySize: 4000, duration: 710, startTime: 2000, responseEnd: 2710 },
+      // A cross-origin cover: it reports transferSize 0 for lack of
+      // Timing-Allow-Origin, so counting it would look like a cache hit and hide
+      // real bytes. Nothing cross-origin can be mirrored by path either.
+      { name: 'https://static.sangtacvietcdn.xyz/img/bookcover256.jpg', initiatorType: 'img',
+        transferSize: 0, decodedBodySize: 26000, duration: 512, startTime: 100, responseEnd: 612 },
+    ]),
+  };
+  vm.runInContext(loadBlocks().join('\n'), profile.sandbox);
+  await tick(60);
+  profileView.__stvAssetMirror.timeline();
+  const profileText = String(profileView.__stvDiag.text());
+  check('the timeline counts only same-origin static resources, not API calls or the CDN',
+    profileText.indexOf('2 static request(s) still over the network') >= 0,
+    profileText.slice(-300));
+  check('it separates wire bytes from decoded bytes and names the cache hits',
+    profileText.indexOf('30KB wire / 267KB decoded') >= 0
+      && profileText.indexOf('1 from cache') >= 0,
+    profileText.slice(-300));
+  check('the slowest resources are named with their size and duration',
+    profileText.indexOf('jqr.js 30KB 963ms network @+400ms') >= 0,
+    profileText.slice(-300));
+  check('a resource served from cache is reported as such',
+    profileText.indexOf('stv.ui.js 0KB 4ms cache @+1400ms') >= 0,
+    profileText.slice(-300));
+
+  // --- revalidation ---------------------------------------------------------
+  const calls = [];
+  profileView.Capacitor = {
+    Plugins: {
+      App: {
+        siteAssetRefresh(options) {
+          calls.push(options);
+          return Promise.resolve({ checked: options.items.length, updated: ['app.v2.js'] });
+        },
+      },
+    },
+  };
+  profileView.location = { origin: 'https://sangtacviet.app', reload() { profile.sandbox.__reloaded = true; } };
+  profileView.__stvAssetMirror.revalidate();
+  await tick(40);
+  const call = calls[0] || { items: [] };
+  check('revalidation asks the site for the files the app is serving',
+    call.items.length === 3, JSON.stringify(call.items));
+  check('it sends the Last-Modified the stored copy came with',
+    call.items.filter((item) => item.name === 'app.v2.js')[0].stamp
+      === 'Sun, 28 Jun 2026 19:08:22 GMT',
+    JSON.stringify(call.items));
+  check('it uses the origin the page is actually reading from',
+    call.origin === 'https://sangtacviet.app', String(call.origin));
+  check('an updated file is reported as taking effect on the next launch',
+    String(profileView.__stvDiag.text()).indexOf('updated app.v2.js (next launch)') >= 0,
+    String(profileView.__stvDiag.text()).slice(-200));
+
+  // A refresh must not run once per navigation on a long session.
+  const before = calls.length;
+  profileView.__stvAssetMirror.revalidate();
+  await tick(40);
+  check('revalidation is rate-limited to the TTL, not run every load',
+    calls.length === before, JSON.stringify(calls.map((entry) => entry.items.length)));
+
+  // --- the two safety nets ---------------------------------------------------
+  // 1. A mirrored file that fails to load or to parse. This is the failure that
+  //    would otherwise leave a white screen with no way back.
+  const broken = mirrorSandbox();
+  vm.runInContext(loadBlocks().join('\n'), broken.sandbox);
+  await tick(60);
+  broken.view.location = { reload() { broken.sandbox.__reloaded = true; } };
+  const brokenScript = new broken.view.HTMLScriptElement();
+  brokenScript.src = '/asset/app.v2.js?0.1';
+  brokenScript.__fire('error', {});
+  check('a mirrored file that fails to load disables the mirror', broken.sandbox.localStorage.getItem('stv.mirror.off') === '1',
+    String(broken.sandbox.localStorage.getItem('stv.mirror.off')));
+  check('and reloads once, so the next load is the version without it',
+    broken.sandbox.__reloaded === true);
+
+  // 2. The probe for a blob the web view accepted but never executed.
+  //    `STV_SERVER` is the first global app.v2.js declares, so a boot that is
+  //    merely slow must not trip it -- only a file that never ran.
+  const slow = mirrorSandbox();
+  vm.runInContext(loadBlocks().join('\n'), slow.sandbox);
+  await tick(60);
+  slow.view.location = { reload() { slow.sandbox.__reloaded = true; } };
+  const slowScript = new slow.view.HTMLScriptElement();
+  slowScript.src = '/asset/app.v2.js?0.2';
+  slow.view.STV_SERVER = 'https://sangtacviet.app';
+  slow.view.__stvAssetMirror.probe();
+  check('a slow boot is not mistaken for a broken mirror',
+    slow.sandbox.__reloaded === undefined, String(slow.sandbox.__reloaded));
+
+  const never = mirrorSandbox();
+  vm.runInContext(loadBlocks().join('\n'), never.sandbox);
+  await tick(60);
+  never.view.location = { reload() { never.sandbox.__reloaded = true; } };
+  const neverScript = new never.view.HTMLScriptElement();
+  neverScript.src = '/asset/app.v2.js?0.3';
+  never.view.__stvAssetMirror.probe();
+  check('a mirrored app.v2.js that never executed disables the mirror',
+    never.sandbox.localStorage.getItem('stv.mirror.off') === '1',
+    String(never.sandbox.localStorage.getItem('stv.mirror.off')));
+  check('and that path reloads too', never.sandbox.__reloaded === true);
+
+  // The flag has to survive into the next load, or the reload would loop.
+  const off = mirrorSandbox({ off: true });
+  const offScript = new off.view.HTMLScriptElement();
+  offScript.src = '/asset/app.v2.js?0.4';
+  vm.runInContext(loadBlocks().join('\n'), off.sandbox);
+  await tick(60);
+  check('with the flag set the mirror is inert',
+    off.view.__stvAssetMirror.enabled() === false
+      && off.view.__stvAssetMirror.hooks === undefined,
+    String(off.view.__stvAssetMirror.hooks));
+  check('and the page fetches the file itself again',
+    offScript.src === undefined || String(offScript.src).indexOf('blob:') !== 0,
+    String(offScript.src));
+  const offAgain = new off.view.HTMLScriptElement();
+  offAgain.src = '/asset/app.v2.js?0.5';
+  check('the next load keeps the file on the network',
+    String(offAgain.src).indexOf('blob:') !== 0, String(offAgain.src));
+  const offLines = off.view.__stvDiag.lines().filter(
+    (line) => String(line).indexOf('[MIRROR]') >= 0);
+  check('and says so in the log',
+    offLines.join('|').indexOf('off after a failure') >= 0,
+    offLines.join(' | ') || 'no [MIRROR] line at all');
+
+  // --- the settings rows -----------------------------------------------------
+  const rowsSandbox = mirrorSandbox();
+  vm.runInContext(loadBlocks().join('\n'), rowsSandbox.sandbox);
+  await tick(60);
+  const host = makeContainer('div', '');
+  rowsSandbox.view.__stvAssetMirror.rows(host);
+  const toggle = host.children.filter(
+    (node) => String(node.className).indexOf('stv-assetmirror-entry') >= 0)[0];
+  const clear = host.children.filter(
+    (node) => String(node.className).indexOf('stv-assetmirror-clear') >= 0)[0];
+  check('the settings page gets a mirror toggle and a drop-copies row',
+    !!toggle && !!clear);
+  rowsSandbox.view.location = { reload() { rowsSandbox.sandbox.__reloaded = true; } };
+  click(toggle);
+  check('turning the mirror off persists the flag',
+    rowsSandbox.sandbox.localStorage.getItem('stv.mirror.off') === '1',
+    String(rowsSandbox.sandbox.localStorage.getItem('stv.mirror.off')));
+  check('and reloads so the change takes effect', rowsSandbox.sandbox.__reloaded === true);
+  click(toggle);
+  check('turning it back on clears the flag',
+    rowsSandbox.sandbox.localStorage.getItem('stv.mirror.off') === '',
+    String(rowsSandbox.sandbox.localStorage.getItem('stv.mirror.off')));
+
+  // --- the three lists have to agree ----------------------------------------
+  const swift = fs.readFileSync(path.join(TARGET_DIR, 'SiteAssets.swift'), 'utf8');
+  const swiftNames = [...swift.matchAll(/Asset\(name: "([^"]+)", path: "([^"]+)"\)/g)]
+    .map((match) => match[1] + ' ' + match[2]);
+  const patch = fs.readFileSync(path.join(TARGET_DIR, 'SitePatch.swift'), 'utf8');
+  const mirrorBlock = /static let assetMirror = """([\s\S]*?)"""/.exec(patch);
+  check('the assetMirror block is in SitePatch', !!mirrorBlock);
+  const jsPairs = mirrorBlock
+    ? [...mirrorBlock[1].matchAll(/\['([^']+)', '([^']+)'\]/g)].map((m) => m[2] + ' ' + m[1])
+    : [];
+  const generator = fs.readFileSync(path.join(__dirname, 'gen-site-assets.js'), 'utf8');
+  const generatorPairs = [...generator.matchAll(/name: '([^']+)', path: '([^']+)'/g)]
+    .map((m) => m[1] + ' ' + m[2]);
+  check('the Swift table, the JavaScript table and the generator list the same files',
+    swiftNames.length === 8
+      && JSON.stringify(swiftNames.slice().sort()) === JSON.stringify(jsPairs.slice().sort())
+      && JSON.stringify(swiftNames.slice().sort()) === JSON.stringify(generatorPairs.slice().sort()),
+    `swift=${swiftNames.length} js=${jsPairs.length} gen=${generatorPairs.length}`);
+  check('every mirrored path is one the site actually asks for',
+    swiftNames.every((entry) => entry.split(' ')[1].indexOf('/') === 0),
+    swiftNames.join(' | '));
+}
+
 function testInjectionOrder() {
   console.log('injection order');
 
@@ -5307,8 +5648,10 @@ function testInjectionOrder() {
     listed[1] === 'assetCache', listed[1]);
   check('diag runs before every block that logs through it',
     listed[2] === 'diag', listed[2]);
+  check('the mirror wraps the asset hooks, so it has to come after them',
+    listed[3] === 'assetMirror', listed[3]);
 
-  const bootCritical = ['compat', 'assetCache', 'diag', 'storageAccessor',
+  const bootCritical = ['compat', 'assetCache', 'diag', 'assetMirror', 'storageAccessor',
     'readerDefaults', 'safeArea', 'domainFailover', 'bootShell'];
   check('the boot-critical blocks are a prefix of the injection list',
     bootCritical.every((name, index) => listed[index] === name),
@@ -5477,6 +5820,7 @@ await testBootShell();
   await testCommunityBoardTranslate();
   await testTranslateKeyStorage();
   await testAssetCacheStabiliser();
+  await testAssetMirror();
   testInjectionOrder();
   await testReaderPrefetch();
   await testNativeDiagnosticsBridge();

@@ -117,6 +117,19 @@ const REQUIRED_MARKERS = [
   // The reader modules the site only asks for once the reader opens.
   'window.__stvReaderPrefetchInstalled',
   'pageflip',
+  // The local asset mirror: the site's own boot bundles are shipped inside the
+  // app and handed to the page from document start, because the shell asks for
+  // them with a Math.random() cache-buster over a 300-900ms link. The flag is
+  // the escape hatch a failed mirror sets before reloading without itself.
+  'window.__stvAssetMirror',
+  'stv.mirror.off',
+  'data-stv-mirror',
+  "STV_SERVER",
+  'siteAssetRefresh',
+  // The resource timeline is the measurement half: it reports what the mirror
+  // does *not* cover (the parser-created files) so the remaining cost is known
+  // rather than assumed.
+  'static request(s) still over the network',
 ];
 
 function fail(message) {

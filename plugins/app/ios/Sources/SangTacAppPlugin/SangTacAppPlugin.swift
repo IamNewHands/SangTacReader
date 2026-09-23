@@ -49,7 +49,9 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "translationStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationPrepare", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationTranslate", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "exportFile", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "exportFile", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "siteAssetRefresh", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "siteAssetForget", returnType: CAPPluginReturnPromise)
     ]
 
     private var observers: [NSObjectProtocol] = []
@@ -89,11 +91,34 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
      throws and the book never opens.
      */
     private func installDocumentStartScripts() {
-        let scripts = SitePatch.all.map { source in
+        var scripts: [WKUserScript] = []
+
+        // The mirrored site assets go in before every site patch, because both
+        // `assetCache` (which installs the URL hooks) and `assetMirror` (which
+        // wraps them) read `window.__stvSiteAssets`, and the parser starts
+        // creating elements as soon as the shell HTML arrives.
+        //
+        // Built at runtime rather than shipped as a Swift literal: the site's
+        // bundles contain backslashes, both quote styles and Vietnamese text, so
+        // Foundation does the escaping (see SiteAssets.swift). A missing resource
+        // bundle leaves `scripts` without a table and the mirror block inert --
+        // the page then fetches everything itself, exactly as before.
+        if let mirror = SiteAssets.script() {
+            scripts.append(WKUserScript(source: mirror,
+                                        injectionTime: .atDocumentStart,
+                                        forMainFrameOnly: true))
+            let refreshed = SiteAssets.refreshedNames()
+            CAPLog.print("[SangTacApp] asset mirror: \(SiteAssets.tableNames().count) file(s)"
+                + ", refreshed: \(refreshed.isEmpty ? "none" : refreshed.joined(separator: ","))")
+        } else {
+            CAPLog.print("[SangTacApp] asset mirror: no bundled assets; the page fetches everything")
+        }
+
+        scripts.append(contentsOf: SitePatch.all.map { source in
             WKUserScript(source: source,
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true)
-        }
+        })
 
         // The web view exists before plugins load (CAPBridgeViewController
         // .loadView() -> prepareWebView() -> CapacitorBridge.init() -> plugins)
@@ -636,6 +661,94 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.resolve(["value": true, "name": name, "bytes": payload.count])
             }
         }
+    }
+
+    // MARK: - Site asset mirror
+
+    /**
+     Revalidates the mirrored site assets against the mirror the page is reading
+     from.
+
+     Called by the `assetMirror` site patch once the page has loaded, with the
+     Last-Modified stamp of every file currently being served from disk. The
+     conditional GET answers 304 for the (overwhelmingly common) unchanged case,
+     which costs one round trip and no body; a 200 is written into Application
+     Support and takes over from the next launch on. A stale snapshot therefore
+     costs at most one launch, which is the same bound the site's own
+     `Cache-Control: max-age=86400` puts on WebKit's copy.
+
+     The origin check is the load-bearing part, and it is why this is not simply
+     open: without it a compromised page could point the mirror at any host and
+     overwrite the stored assets with arbitrary JavaScript that this app then
+     executes at document start, on every launch, forever. That is a persistent
+     self-inflicted XSS, so the caller has to be the site's own top frame.
+     */
+    @objc func siteAssetRefresh(_ call: CAPPluginCall) {
+        guard isTrustedCaller("siteAssetRefresh"),
+              let origin = call.getString("origin"),
+              let base = URL(string: origin),
+              base.scheme == "https" else {
+            call.reject("refresh needs an https origin on a trusted host")
+            return
+        }
+        let items = (call.getArray("items") ?? []).compactMap { $0 as? [String: Any] }
+        guard !items.isEmpty else {
+            call.resolve(["checked": 0, "updated": [String]()])
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            var checked = 0
+            var updated: [String] = []
+            for item in items {
+                guard let name = item["name"] as? String,
+                      let asset = SiteAssets.supported.first(where: { $0.name == name }),
+                      let url = URL(string: asset.path, relativeTo: base) else { continue }
+                let stamp = (item["stamp"] as? String) ?? ""
+                var request = URLRequest(url: url)
+                // The point of this request is to ask the server; a URLSession
+                // cache hit would answer it locally and hide the answer.
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+                request.timeoutInterval = 20
+                request.setValue(SiteAssets.userAgent, forHTTPHeaderField: "User-Agent")
+                if !stamp.isEmpty {
+                    request.setValue(stamp, forHTTPHeaderField: "If-Modified-Since")
+                }
+                checked += 1
+                guard let (data, response) = SiteAssetFetcher.get(request),
+                      let http = response as? HTTPURLResponse else { continue }
+                if http.statusCode == 304 { continue }
+                guard http.statusCode == 200,
+                      let text = String(data: data, encoding: .utf8) else { continue }
+                let next = http.value(forHTTPHeaderField: "Last-Modified") ?? ""
+                if SiteAssets.store(name: name, text: text, stamp: next) {
+                    updated.append(name)
+                }
+            }
+            let summary = updated.isEmpty
+                ? "\(checked) checked, all current"
+                : "\(checked) checked, updated: " + updated.joined(separator: ",")
+            CAPLog.print("[SangTacApp:assetmirror] \(summary)")
+            self.report("MIRROR", summary + " (next launch)")
+            call.resolve(["checked": checked, "updated": updated])
+        }
+    }
+
+    /**
+     Drops every revalidated copy so the snapshot shipped in the IPA takes over
+     again. Wired to the same settings row as the cache-buster refresh: if a
+     refresh ever leaves the mirror holding something the site has since moved
+     past, one tap has to be able to undo it without a reinstall.
+     */
+    @objc func siteAssetForget(_ call: CAPPluginCall) {
+        guard isTrustedCaller("siteAssetForget") else {
+            call.reject("untrusted origin")
+            return
+        }
+        let dropped = SiteAssets.refreshedNames()
+        SiteAssets.forgetAll()
+        CAPLog.print("[SangTacApp:assetmirror] dropped \(dropped.count) refreshed file(s)")
+        call.resolve(["dropped": dropped])
     }
 
     // MARK: - Diagnostics

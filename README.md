@@ -53,13 +53,14 @@ SangTacReader/
 
 ## 站点补丁（`plugins/app/.../SitePatch.swift`）
 
-站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 22 个块，
+站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 23 个块，
 每块独立守卫、互不依赖：
 
 | 块 | 作用 |
 |---|---|
 | `compat` | `nativeclick` 空实现 + `window.TTS` 门面（站点不调则整条点击链抛错） |
 | `assetCache` | 站点给 `/asset/*.js|css` 发 `max-age=86400`，却在 URL 上拼 `Math.random()`，于是每次冷启动都是全新 URL、磁盘缓存永不命中。这里把随机串换成稳定 token（`stv<代>`，**不含日期**：带日期等于每天第一次启动强制重下启动关键路径上的 74KB），拦截 `script.src` / `link.href` / `img.src` 的 setter 与 `setAttribute`；`?v=1.360` 这类真版本号一律不动。设置页「强制刷新站点资源」换一代并 reload |
+| `assetMirror` | **站点自己的启动包放进 IPA**：`app.v2.js`/`app.v2.css`/`bookdisplay`/`config`/`read`/`chapterdisplay`/`stv.tts.js`/`hanviet.js` 共 906296 字节 随包发布（`plugins/app/.../site-assets/`，`scripts/gen-site-assets.js` 生成、CI `--check`），document start 由原生侧用 `JSONSerialization` 拼成一张表交给页面，取用时**脚本走 `blob:` URL、样式走 `<style>` 节点**——前者保住站点 loader 的 `onload` 与按 URL 去重的 `stack`，后者保住 pageflip 把样式带进 frame 的 `css.textContent` 路径（`_dl_app.v2.js` @199996），`bootShell` 靠 `data-stv-mirror` 认这张无 `href` 的样式表。每次启动后用 `If-Modified-Since` 后台校验一次（6 小时 TTL、304 无 body），有变化就写进 Application Support，**下次启动生效**；设置页有开关与「丢弃已刷新的资源副本」。两条自愈：镜像脚本报错（blob 的 `error` / `window.onerror` 带 blob 文件名）或 `app.v2.js` 载入 8 秒后 `STV_SERVER` 仍未定义，就写 `stv.mirror.off` 并 reload 一次，下一次完全走网络。同一块还打印 `[ASSET]` 资源时间线：还剩多少静态请求在网络、wire/解码字节、几条命中缓存、最慢的 5 个（传 `transferSize===0` 判缓存），**这是唯一能看见 HTML 解析器自建的那 13 个文件成本的地方**——注入层永远碰不到它们，只能先量 |
 | `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台）。**默认关闭**：关着时不存在任何悬浮窗、不缓冲、不接管 console；在「设置 → 诊断」打开后徽标常显、面板立即弹出，开关镜像进 Keychain，重装后仍然有效 |
 | `activityLog` | 常见流程的日志：`PAGE` 每个 `pushPage`/`popPage`、`NAV` 每次标签栏点击（含序号与文案）、`MSG` 每次 `app.toast` / `app.context.info`、`BOOT` app 对象就绪时刻 |
 | `tabProbe` | 临时：点 tab 时上报 tabbar 项宽、指针 transform/width、`tabdiv` transform、末页子节点数 |
@@ -106,12 +107,13 @@ data/site-i18n.json            ← 手工维护（唯一真源，可编辑）
 ## 本地能验证什么
 
 本机（Windows）无法编译 Swift，**Swift 改动只能等 CI 结果**。注入的 JavaScript
-可以本地全量验证，CI 每次构建也会跑这三条：
+可以本地全量验证，CI 每次构建也会跑这四条：
 
 ```bash
 node scripts/check-ios-shim.js      # 注入块能解析、无转义陷阱、必需标记齐全
 node scripts/test-site-patch.js     # 在 stub DOM 里验证每个补丁的行为
 node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
+node scripts/gen-site-assets.js --check # 随包的站点资源镜像与 manifest 同步
 ```
 
 ## 诊断面板（日志开关）
@@ -131,7 +133,9 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 `BOOKMARK` 取消书签探测、`LIKE` 点赞状态来源与 like/unlike 结果及复查结论（取消只试站点契约那一种键）、
 `BOOKINFO` 评论/详情页缺数据时的补取与缓存预热、
 `COMMENT` 评论按钮拦截、`TITLE` 章节中文原名的获取结果（阅读器与导出各一条）、
-`ASSET` 站点资源 URL 稳定化（token 与拦截到的钩子数）、
+`ASSET` 站点资源 URL 稳定化（token 与拦截到的钩子数）与**资源时间线**（还剩多少静态
+请求在网络、wire/解码字节、命中缓存条数、最慢 5 个的耗时与是否命中缓存）、
+`MIRROR` 本地资源镜像（装了几个文件、取了哪几个、revalidate 结果、被自愈关掉的时刻）、
 `PATCH` 站点文案中译层自己的动作（存档声明剥掉、非语言值被拒），
 `DOWNLOAD` 下载限速与任务
 按钮（并发去重、已下载章节跳过、已下载列表过滤、同一本书的重复行/记录清理、开始提示窗与跳转下载页、删除落盘、
@@ -155,6 +159,14 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 
 本许可只覆盖本仓库中由本项目作者编写的代码与文档。站点自身的内容、接口、
 素材与商标不在授权范围内，其权利归 sangtacviet 所有。
+
+**关于随包的站点资源**：`plugins/app/ios/Sources/SangTacAppPlugin/site-assets/` 里是
+站点自己发布的 8 个前端 bundle（`app.v2.js`、`app.v2.css`、`app.v2.read.js` 等，共
+906296 字节），由 `scripts/gen-site-assets.js` 从站点原样下载，仅为让 App 不必每次启动重下
+它们（见上表 `assetMirror`）。这些文件**不是**本项目作者的作品，不适用上面的许可，
+版权归 sangtacviet；它们只随个人自用构建进入 IPA，运行期还会用 `Last-Modified` 与站点
+核对并在有变化时用站点的新版本覆盖，不需要的人删掉该目录并去掉 `Package.swift` 里的
+`resources` 一行即可（App 会自动退回全网络加载）。
 
 ## 说明 / 免责
 

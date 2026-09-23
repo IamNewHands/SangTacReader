@@ -276,6 +276,505 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Local asset mirror
+
+    /**
+     Serves the site's own boot bundles from a copy inside the app.
+
+     The problem this solves, in one line: the reader waits for roughly a
+     megabyte of JavaScript that the site asks for over a link whose every
+     round trip is 300-900ms, and the four largest files are requested with a
+     `Math.random()` cache-buster that makes WebKit's disk cache useless
+     (`_page_vip.html:3066,5207,5208,5211`). The other thirteen load from the
+     HTML parser before any injected script can see them.
+
+     This block covers the eight files it *can* reach. It cannot reach the
+     parser-created ones -- those need the document itself to be served
+     differently -- and `[ASSET]` below reports exactly what is still going over
+     the network so that the remaining cost is measurable instead of assumed.
+
+     Mechanism, and why:
+
+       - JavaScript goes out as a `blob:` URL assigned through the same
+         `HTMLScriptElement.src` property the site's own loader uses. The element
+         stays an ordinary script, so `stv.ui.js`'s `onload` handler and its
+         `stack` de-duplication map (keyed on the URL *it* passed) keep working
+         untouched. Inlining the source into a new `<script>` would have broken
+         both.
+       - CSS becomes a `<style>` node instead of a blob `<link>`. The page-flip
+         templates rebuild each frame's `<head>` from
+         `document.querySelectorAll("link[rel=stylesheet],style")` and use
+         `css.textContent` for style nodes (`_dl_app.v2.js` @199996), so a style
+         node carries the site's stylesheet into the frames and a blob href would
+         have to be resolved across an `about:srcdoc` document instead.
+       - `bootShell.siteCssReady()` recognises the mirrored sheet by its
+         `data-stv-mirror` attribute, because a `<style>` has no `href` to match
+         on.
+
+     Two escape hatches, because this is the one patch that can stop the app from
+     booting at all and it is installed at document start:
+
+       1. `window.error` with a `blob:` filename, or an `error` event on an
+          element we served, or `STV_SERVER` -- the very first global `app.v2.js`
+          declares -- still being undefined 8s after we served it. Any of those
+          sets `stv.mirror.off` and reloads once; the next load skips the mirror
+          entirely and behaves exactly like the version without it.
+       2. 设置 -> 本地资源镜像 turns it off by hand, and clears any refreshed copy.
+
+     Everything the block reports goes out under `[MIRROR]`, and the resource
+     timeline it prints at `load` under `[ASSET]`.
+     */
+    static let assetMirror = """
+    (function () {
+        if (window.__stvAssetMirror) { return; }
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        var OFF_KEY = 'stv.mirror.off';
+        var CHECK_KEY = 'stv.mirror.checked';
+        var CHECK_TTL = 6 * 60 * 60 * 1000;
+        var PROBE_DELAY = 8000;
+
+        var TABLE = window.__stvSiteAssets || null;
+        var STAMPS = window.__stvSiteStamps || {};
+        var off = false;
+
+        function readLocal(key) {
+            try {
+                return window.localStorage ? (window.localStorage.getItem(key) || '') : '';
+            } catch (e) { return ''; }
+        }
+
+        function writeLocal(key, value) {
+            try {
+                if (window.localStorage) { window.localStorage.setItem(key, value); }
+            } catch (e) {}
+        }
+
+        off = readLocal(OFF_KEY) === '1';
+
+        // The same eight files as SiteAssets.supported in SiteAssets.swift and
+        // ASSETS in scripts/gen-site-assets.js. The tests assert all three lists
+        // agree, because a path that only one of them knows about fails silently:
+        // the mirror simply never matches and the file keeps going over the wire.
+        var PATHS = [
+            ['/asset/app.v2.js', 'app.v2.js'],
+            ['/asset/app.v2.css', 'app.v2.css'],
+            ['/asset/app.v2.bookdisplay.js', 'app.v2.bookdisplay.js'],
+            ['/asset/app.v2.config.js', 'app.v2.config.js'],
+            ['/asset/app.v2.read.js', 'app.v2.read.js'],
+            ['/asset/app.v2.chapterdisplay.js', 'app.v2.chapterdisplay.js'],
+            ['/stv.tts.js', 'stv.tts.js'],
+            ['/hanviet.js', 'hanviet.js']
+        ];
+
+        function pathOf(url) {
+            var text = String(url || '');
+            var cut = text.indexOf('?');
+            if (cut >= 0) { text = text.slice(0, cut); }
+            cut = text.indexOf('#');
+            if (cut >= 0) { text = text.slice(0, cut); }
+            if (text.indexOf('://') >= 0) {
+                var after = text.indexOf('/', text.indexOf('://') + 3);
+                text = after < 0 ? '' : text.slice(after);
+            }
+            return text;
+        }
+
+        function nameOf(url) {
+            var path = pathOf(url);
+            for (var i = 0; i < PATHS.length; i++) {
+                if (PATHS[i][0] === path) { return PATHS[i][1]; }
+            }
+            return '';
+        }
+
+        function textOf(name) {
+            var text = TABLE ? TABLE[name] : '';
+            return (typeof text === 'string' && text.length > 0) ? text : '';
+        }
+
+        function isScript(element) {
+            return String((element && element.tagName) || '').toUpperCase() === 'SCRIPT';
+        }
+
+        function isStylesheet(element) {
+            if (String((element && element.tagName) || '').toUpperCase() !== 'LINK') { return false; }
+            var rel = '';
+            try { rel = String(element.getAttribute('rel') || element.rel || ''); } catch (e) { rel = ''; }
+            return rel.toLowerCase() === 'stylesheet';
+        }
+
+        function giveUp(reason) {
+            if (off) { return; }
+            off = true;
+            writeLocal(OFF_KEY, '1');
+            note('ERR', reason + '; reloading without the local copy');
+            try { window.location.reload(); } catch (e) {}
+        }
+
+        // A blob script that fails to load fires `error` on the element, and one
+        // that fails to parse reports a blob: URL through window.onerror. Both are
+        // unambiguous, so neither costs a false positive on a slow boot.
+        window.addEventListener('error', function (event) {
+            var file = String((event && event.filename) || '');
+            if (file.indexOf('blob:') !== 0) { return; }
+            giveUp('a mirrored script failed (' + file + ')');
+        }, true);
+
+        var probeArmed = false;
+
+        /**
+         `app.v2.js` opens with `var STV_SERVER`, so that global is proof the file
+         ran. Checking for it rather than for `window.app` is what keeps this from
+         firing on a boot that is merely slow: a mirrored file either executes
+         within milliseconds of being handed to the element, or it never will.
+         */
+        function probe() {
+            if (!probeArmed) { return; }
+            if (typeof window.STV_SERVER !== 'undefined') { return; }
+            giveUp('the mirrored app.v2.js never executed');
+        }
+
+        function armProbe(name, text) {
+            if (name !== 'app.v2.js' || text.indexOf('STV_SERVER') < 0) { return; }
+            if (probeArmed) { return; }
+            probeArmed = true;
+            setTimeout(probe, PROBE_DELAY);
+        }
+
+        var served = 0;
+        var servedNames = [];
+        var blobUrls = {};
+        var styleNodes = {};
+
+        function blobFor(name) {
+            if (blobUrls[name] !== undefined) { return blobUrls[name]; }
+            var url = '';
+            var text = textOf(name);
+            if (text) {
+                try {
+                    url = URL.createObjectURL(new Blob([text], { type: 'application/javascript' }));
+                } catch (e) { url = ''; }
+            }
+            blobUrls[name] = url;
+            return url;
+        }
+
+        function styleFor(name) {
+            if (styleNodes[name]) { return; }
+            var text = textOf(name);
+            if (!text) { return; }
+            var node = document.createElement('style');
+            node.setAttribute('data-stv-mirror', name);
+            node.textContent = text;
+            (document.head || document.documentElement).appendChild(node);
+            styleNodes[name] = node;
+        }
+
+        function adopt(element, name) {
+            served++;
+            servedNames.push(name);
+            try { element.setAttribute('data-stv-mirror', name); } catch (e) {}
+            if (typeof element.addEventListener === 'function') {
+                element.addEventListener('error', function () {
+                    giveUp('the mirrored ' + name + ' did not load');
+                });
+            }
+            note('MIRROR', name + ' (' + Math.round(textOf(name).length / 1024)
+                + 'KB) from the local copy');
+        }
+
+        function wrapScriptSrc() {
+            var proto = window.HTMLScriptElement && window.HTMLScriptElement.prototype;
+            if (!proto) { return false; }
+            var descriptor = null;
+            try { descriptor = Object.getOwnPropertyDescriptor(proto, 'src'); } catch (e) {
+                return false;
+            }
+            if (!descriptor || typeof descriptor.set !== 'function') { return false; }
+            var setter = descriptor.set;
+            try {
+                Object.defineProperty(proto, 'src', {
+                    configurable: true,
+                    enumerable: descriptor.enumerable,
+                    get: descriptor.get,
+                    set: function (value) {
+                        if (!this.__stvMirrorDone && !off) {
+                            var name = nameOf(value);
+                            var url = name ? blobFor(name) : '';
+                            if (url) {
+                                this.__stvMirrorDone = name;
+                                adopt(this, name);
+                                armProbe(name, textOf(name));
+                                return setter.call(this, url);
+                            }
+                        }
+                        return setter.call(this, value);
+                    }
+                });
+                return true;
+            } catch (e) { return false; }
+        }
+
+        function maybeMirrored(value) {
+            return typeof value === 'string'
+                && (value.indexOf('/asset/') >= 0
+                    || value.indexOf('/stv.tts.js') >= 0
+                    || value.indexOf('/hanviet.js') >= 0);
+        }
+
+        /**
+         The site builds its stylesheet link with setAttribute (line 3066 of the
+         shell), and `stv.ui.js` appends the <script> before assigning `.src`, so
+         both the property hook above and this attribute hook below are needed.
+         */
+        function wrapSetAttribute() {
+            var proto = window.Element && window.Element.prototype;
+            if (!proto || typeof proto.setAttribute !== 'function') { return false; }
+            var original = proto.setAttribute;
+            proto.setAttribute = function (name, value) {
+                if (off || this.__stvMirrorDone || !maybeMirrored(value)) {
+                    return original.call(this, name, value);
+                }
+                var key = String(name).toLowerCase();
+                var mirror = (key === 'src' || key === 'href') ? nameOf(value) : '';
+                if (mirror && key === 'src' && isScript(this)) {
+                    var url = blobFor(mirror);
+                    if (url) {
+                        this.__stvMirrorDone = mirror;
+                        adopt(this, mirror);
+                        armProbe(mirror, textOf(mirror));
+                        return original.call(this, name, url);
+                    }
+                } else if (mirror && key === 'href' && isStylesheet(this) && textOf(mirror)) {
+                    this.__stvMirrorDone = mirror;
+                    adopt(this, mirror);
+                    styleFor(mirror);
+                    return;
+                }
+                return original.call(this, name, value);
+            };
+            return proto.setAttribute !== original;
+        }
+
+        // --- resource timeline ---
+
+        var STATIC_EXT = ['.js', '.css', '.woff2', '.woff', '.ttf', '.otf', '.png',
+            '.jpg', '.jpeg', '.webp', '.svg', '.gif'];
+
+        function isStatic(entry) {
+            var name = String((entry && entry.name) || '');
+            // Same-origin only. A cross-origin response (the cover CDN, the
+            // font CDN) reports transferSize 0 for lack of Timing-Allow-Origin,
+            // which would be counted as a cache hit and would understate the
+            // bytes -- and nothing cross-origin can be mirrored by path anyway.
+            var origin = (window.location && window.location.origin)
+                ? String(window.location.origin) : '';
+            if (origin && name.indexOf(origin) !== 0) { return false; }
+            var path = pathOf(name);
+            if (!path) { return false; }
+            var lower = path.toLowerCase();
+            for (var i = 0; i < STATIC_EXT.length; i++) {
+                if (lower.slice(-STATIC_EXT[i].length) === STATIC_EXT[i]) { return true; }
+            }
+            return false;
+        }
+
+        function shorten(name) {
+            var path = pathOf(name);
+            var parts = path.split('/');
+            return parts[parts.length - 1] || path;
+        }
+
+        /**
+         What is still going over the network after the mirror took its eight
+         files. This is deliberately independent of the mirror being enabled: it
+         is the measurement that says whether the remaining static resources
+         matter at all, and it counts the parser-created files the mirror cannot
+         reach.
+         */
+        function timeline() {
+            var perf = window.performance;
+            if (!perf || typeof perf.getEntriesByType !== 'function') { return; }
+            var entries = perf.getEntriesByType('resource') || [];
+            var count = 0;
+            var wire = 0;
+            var decoded = 0;
+            var cached = 0;
+            var last = 0;
+            var rows = [];
+            for (var i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                if (!isStatic(entry)) { continue; }
+                count++;
+                wire += entry.transferSize || 0;
+                decoded += entry.decodedBodySize || 0;
+                if (!entry.transferSize) { cached++; }
+                if (entry.responseEnd > last) { last = entry.responseEnd; }
+                rows.push(entry);
+            }
+            if (!count) { return; }
+            rows.sort(function (a, b) { return (b.duration || 0) - (a.duration || 0); });
+            note('ASSET', count + ' static request(s) still over the network: '
+                + Math.round(wire / 1024) + 'KB wire / ' + Math.round(decoded / 1024)
+                + 'KB decoded, ' + cached + ' from cache, last byte at +'
+                + Math.round(last) + 'ms' + (served ? '; ' + served + ' served locally ('
+                + servedNames.join(',') + ')' : '; none served locally'));
+            for (var j = 0; j < rows.length && j < 5; j++) {
+                var row = rows[j];
+                note('ASSET', shorten(row.name) + ' ' + Math.round((row.transferSize || 0) / 1024)
+                    + 'KB ' + Math.round(row.duration || 0) + 'ms '
+                    + (row.transferSize ? 'network' : 'cache') + ' @+'
+                    + Math.round(row.startTime || 0) + 'ms');
+            }
+        }
+
+        if (document.readyState === 'complete') {
+            setTimeout(timeline, 500);
+        } else {
+            window.addEventListener('load', function () { setTimeout(timeline, 500); });
+        }
+
+        // --- revalidation ---
+
+        function dueForCheck() {
+            var last = parseInt(readLocal(CHECK_KEY), 10);
+            if (!isFinite(last) || last <= 0) { return true; }
+            return (Date.now() - last) > CHECK_TTL;
+        }
+
+        function revalidate() {
+            var plugin = window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App;
+            if (!plugin || typeof plugin.siteAssetRefresh !== 'function') { return; }
+            if (!dueForCheck()) { return; }
+            var items = [];
+            for (var i = 0; i < PATHS.length; i++) {
+                var name = PATHS[i][1];
+                if (textOf(name)) {
+                    items.push({ name: name, stamp: String(STAMPS[name] || '') });
+                }
+            }
+            if (!items.length) { return; }
+            writeLocal(CHECK_KEY, String(Date.now()));
+            plugin.siteAssetRefresh({ origin: window.location.origin, items: items })
+                .then(function (result) {
+                    var updated = (result && result.updated) || [];
+                    note('MIRROR', 'revalidated ' + ((result && result.checked) || 0)
+                        + ' file(s): ' + (updated.length
+                            ? 'updated ' + updated.join(',') + ' (next launch)'
+                            : 'all current'));
+                })
+                .catch(function (error) {
+                    note('ERR', 'revalidate failed: ' + error);
+                });
+        }
+
+        function forget() {
+            writeLocal(CHECK_KEY, '');
+            var plugin = window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App;
+            if (!plugin || typeof plugin.siteAssetForget !== 'function') { return; }
+            plugin.siteAssetForget().then(function (result) {
+                note('MIRROR', 'dropped ' + (((result && result.dropped) || []).length)
+                    + ' refreshed file(s); the copy inside the app takes over');
+            }).catch(function (error) {
+                note('ERR', 'forget failed: ' + error);
+            });
+        }
+
+        // --- settings rows ---
+
+        function rows(host) {
+            var item = document.createElement('div');
+            item.className = 'settingitem stv-assetmirror-entry';
+            var title = document.createElement('div');
+            title.className = 'settingitemtitle';
+            title.textContent = '本地资源镜像';
+            var state = document.createElement('div');
+            state.className = 'stv-assetmirror-state';
+            function paint() {
+                state.textContent = (off ? '已关闭' : '已开启') + ' · 点这里'
+                    + (off ? '开启' : '关闭');
+                state.style.cssText = 'font-size:12px;opacity:0.9;' + (off ? '' : 'color:#7fdc7f;');
+            }
+            paint();
+            item.appendChild(title);
+            item.appendChild(state);
+            item.addEventListener('click', function (event) {
+                if (event && event.stopPropagation) { event.stopPropagation(); }
+                if (event && event.preventDefault) { event.preventDefault(); }
+                off = !off;
+                writeLocal(OFF_KEY, off ? '1' : '');
+                if (!off) { forget(); }
+                paint();
+                note('MIRROR', off ? 'turned off; reloading' : 'turned on; reloading');
+                try { window.location.reload(); } catch (e) {}
+            }, true);
+            host.appendChild(item);
+
+            var clear = document.createElement('div');
+            clear.className = 'settingitem stv-assetmirror-clear';
+            clear.innerHTML = '<div class="settingitemtitle">丢弃已刷新的资源副本</div>'
+                + '<div class=""><i class="fas fa-rotate-left"></i></div>';
+            clear.addEventListener('click', function (event) {
+                if (event && event.stopPropagation) { event.stopPropagation(); }
+                if (event && event.preventDefault) { event.preventDefault(); }
+                forget();
+            }, true);
+            host.appendChild(clear);
+        }
+
+        window.__stvAssetMirror = {
+            enabled: function () { return !off; },
+            served: function () { return servedNames.slice(); },
+            forget: forget,
+            rows: rows,
+            // Exposed so the tests can drive the two safety nets without waiting
+            // out their real delays, and so a device log can be read against the
+            // same entry points the block itself uses.
+            probe: probe,
+            timeline: timeline,
+            revalidate: revalidate
+        };
+
+        if (!TABLE || off) {
+            // Deferred: on a device the switch may still be off at document
+            // start, and the panel is the only place this can be said.
+            setTimeout(function () {
+                note('MIRROR', off
+                    ? 'off after a failure: the page fetches every asset itself'
+                    : 'no local copy bundled: the page fetches every asset itself');
+            }, 0);
+            return;
+        }
+
+        var hooks = 0;
+        if (wrapScriptSrc()) { hooks++; }
+        if (wrapSetAttribute()) { hooks++; }
+
+        window.__stvAssetMirror.hooks = hooks;
+        window.__stvAssetMirror.names = TABLE ? Object.keys(TABLE) : [];
+
+        setTimeout(function () {
+            var total = 0;
+            var names = window.__stvAssetMirror.names;
+            for (var i = 0; i < names.length; i++) { total += textOf(names[i]).length; }
+            note('MIRROR', names.length + ' file(s), ' + Math.round(total / 1024)
+                + 'KB bundled, hooks=' + hooks + ' (blob scripts, style CSS)');
+        }, 0);
+
+        if (document.readyState === 'complete') {
+            setTimeout(revalidate, 3000);
+        } else {
+            window.addEventListener('load', function () { setTimeout(revalidate, 3000); });
+        }
+    })();
+    """
+
     static let diag = """
     (function () {
         if (window.__stvDiagInstalled) { return; }
@@ -6668,9 +7167,23 @@ enum SitePatch {
                     return;
                 }
                 note('ASSET', 'forcing a refresh (generation ' + cache.token + ')');
+                // The mirror's refreshed copies are the other half of "resources
+                // the site has moved past": drop them in the same gesture, or the
+                // row would only fix the half WebKit caches.
+                var mirror = window.__stvAssetMirror;
+                if (mirror && typeof mirror.forget === 'function') { mirror.forget(); }
                 cache.refresh();
             }, true);
             host.appendChild(cacheItem);
+
+            // The asset mirror keeps its own rows: a copy the site has moved past,
+            // and the mirror itself, both have to be undoable without a reinstall.
+            var mirrorBlock = window.__stvAssetMirror;
+            if (mirrorBlock && typeof mirrorBlock.rows === 'function') {
+                mirrorBlock.rows(host);
+            } else {
+                note('MIRROR', 'no settings rows: the mirror block is not installed');
+            }
 
             var logHeader = document.createElement('div');
             logHeader.className = 'settingsection mt-3';
@@ -7289,8 +7802,15 @@ enum SitePatch {
         function siteCssReady() {
             var sheets = document.styleSheets || [];
             for (var i = 0; i < sheets.length; i++) {
-                var href = sheets[i].href || '';
+                var sheet = sheets[i];
+                var href = sheet.href || '';
                 if (href.indexOf('app.v2.css') >= 0) { return 'app.v2.css'; }
+                // The asset mirror serves app.v2.css as a <style> node, which has
+                // no href to match on (see the assetMirror block).
+                var owner = sheet.ownerNode || null;
+                var mark = (owner && owner.getAttribute)
+                    ? String(owner.getAttribute('data-stv-mirror') || '') : '';
+                if (mark === 'app.v2.css') { return 'app.v2.css (local)'; }
             }
             if (window.app && window.app.config && window.app.config.reader) { return 'app.config'; }
             return '';
@@ -7503,7 +8023,10 @@ enum SitePatch {
           shell HTML starts creating <script> and <link> elements.
        3. `diag` -- so every later block's `note()` lands somewhere, and early
           errors are captured.
-       4. the rest of the boot-critical set, ending with `bootShell` and the
+       4. `assetMirror` -- it wraps the two hooks `assetCache` just installed, so
+          it has to run *after* them, and it must be in place before the parser
+          reaches the shell's own `<script src>` lines.
+       5. the rest of the boot-critical set, ending with `bootShell` and the
           Vietnamese->Chinese overlay.
 
      The heavy, page-specific blocks (`pageRepair` 57KB, `commentTranslate`
@@ -7515,7 +8038,7 @@ enum SitePatch {
      `SiteI18nData` is generated from data/site-i18n.json by
      scripts/gen-site-i18n.js.
      */
-    static let all: [String] = [compat, assetCache, diag,
+    static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
                                 activityLog, tabProbe, ttsProvider, followFallback,

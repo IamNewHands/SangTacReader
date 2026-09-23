@@ -1,0 +1,4 @@
+# 随包的站点资源镜像必须逐字节保持站点原样：它要在运行期按 Last-Modified 与站点
+# 核对，还要与 manifest.json 里的 sha256 对上。Git 的换行转换（core.autocrlf）会
+# 在检出时改写这些字节，所以这里显式关掉 —— 别处仍按仓库默认走。
+plugins/app/ios/Sources/SangTacAppPlugin/site-assets/** -text

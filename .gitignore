@@ -46,3 +46,10 @@ jdk17_dir/
 # 抓取/调试产物
 online_*.js
 app_v2_local.js
+
+# 随包的站点资源镜像（plugins/app/.../site-assets/）是**故意入库**的：它就是站点那 8 个
+# 前端 bundle，随 IPA 发布，运行时还会按 Last-Modified 与站点核对。上面的 `app.v2*.js`
+# 是为了挡掉反编/调试时下载的临时副本，却会把镜像里的 6 个文件一起吃掉，所以这里显式放行
+# （后面的规则优先，且这些文件的父目录没有被排除，所以否定规则有效）。
+!plugins/app/ios/Sources/SangTacAppPlugin/site-assets/
+!plugins/app/ios/Sources/SangTacAppPlugin/site-assets/**
