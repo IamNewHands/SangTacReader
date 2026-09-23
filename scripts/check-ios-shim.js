@@ -147,6 +147,7 @@ const REQUIRED_MARKERS = [
   'function patchNet(',
   'function wrappedNet(',
   'function failed(',
+  'function reachFailure(',
   'transport failover installed',
   'app_domain=',
   // 关注/书签的结果上报：站点把回调传给了 `app.net.get` 的 `force` 参数（不是回调），

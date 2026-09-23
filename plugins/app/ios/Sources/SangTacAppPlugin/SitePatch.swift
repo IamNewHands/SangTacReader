@@ -2956,6 +2956,20 @@ enum SitePatch {
             return origin(url);
         }
 
+        function message(error) {
+            return error && error.message ? String(error.message) : String(error);
+        }
+
+        // A mirror that answered with an HTTP status is not the problem: the
+        // request reached it and the *site* returned an error --
+        // `mobile/booklist.php?method=following` answers 500 in the 2026-09-23
+        // log, and `getCapacitor` turns any non-2xx into a rejection
+        // (app.v2.js:1175-1177). Only a failure to reach or to finish counts,
+        // which is what "Network error" / "Request timed out" / no payload means.
+        function reachFailure(error) {
+            return message(error).indexOf('HTTP error:') < 0;
+        }
+
         // A mirror that cannot deliver a payload is not a mirror. Until now the
         // only way one lost was answering code 7, and a stalled mirror answers
         // nothing: the 2026-09-23 log is four 10s timeouts in a row on the same
@@ -2998,8 +3012,9 @@ enum SitePatch {
                     }
                     return data;
                 }, function (error) {
-                    failed(blame, name + ' failed: '
-                        + (error && error.message ? error.message : String(error)));
+                    if (reachFailure(error)) {
+                        failed(blame, name + ' failed: ' + message(error));
+                    }
                     throw error;
                 });
             };
@@ -3121,8 +3136,9 @@ enum SitePatch {
                         if (code !== '7') { rememberGood(used); }
                         return data;
                     }, function (error) {
-                        failed(used, 'readchapter failed: '
-                            + (error && error.message ? error.message : String(error)));
+                        if (reachFailure(error)) {
+                            failed(used, 'readchapter failed: ' + message(error));
+                        }
                         throw error;
                     });
                 }

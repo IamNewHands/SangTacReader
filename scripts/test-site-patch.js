@@ -2621,6 +2621,23 @@ async function testDomainFailover() {
     externalApp.net.networkManager.bestDomain() === slow,
     externalApp.net.networkManager.bestDomain());
 
+  // A non-2xx means the mirror answered and the *site* failed:
+  // `mobile/booklist.php?method=following` answers 500 in the same log, and
+  // banning a reachable mirror over it would make the app worse, not better.
+  const site500 = makeSandbox();
+  site500.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: slow, at: Date.now() }));
+  const site500App = installFakeApp(site500, twoMirrors());
+  site500App.net.get = () => Promise.reject(new Error('HTTP error: 500'));
+  vm.runInContext(loadBlocks().join('\n'), site500);
+  await tick(300);
+  await site500App.net
+    .get('/mobile/booklist.php?method=following&p=0')
+    .catch(() => null);
+  check('an HTTP status from the site does not ban the mirror',
+    site500App.net.networkManager.bestDomain() === slow,
+    site500App.net.networkManager.bestDomain());
+
   // Two bad mirrors in front of a good one: the retry walks past both in a
   // single read instead of handing the first code 7 back to the site.
   const third = 'https://sangtacviet.app';

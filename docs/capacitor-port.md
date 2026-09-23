@@ -2691,6 +2691,10 @@ name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它�
    - **失败的那个请求不重放**：有副作用的 POST 绝不能跑第二遍，重试是站点自己的事。
    - **只有指向站点自己镜像的请求才有资格拉黑**（`stvRequest()`：相对 URL 算，绝对 URL 问
      `isStvDomain()`），否则翻译/封面这类外站请求失败会误伤镜像。
+   - **站点回了 HTTP 状态码就不算镜像的错**（`reachFailure()`：错误文案里带 `HTTP error:`
+     的一律不拉黑）。`getCapacitor` 把任何非 2xx 都变成 rejection（`app.v2.js:1175-1177`），
+     而这份日志里 `mobile/booklist.php?method=following` 就是 **500**——那是站点自己的 bug，
+     为一个能连通的镜像背锅会让情况更糟。
    - 拉黑不再和 `code 7` 共用重试预算：新增 `code7Seen`，`banCount` 删掉。
 2. **站点刚探测过、记忆镜像没应答**（`domains` 里有它且 `status !== 'alive'`）就丢掉。
    探测还没回来（`checkDomains()` 会先清空再逐条 push，`app.v2.js:1060-1091`）算「暂无消息」，
@@ -2722,16 +2726,16 @@ name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它�
 
 | 守卫 | 结果 |
 |---|---|
-| `scripts/check-ios-shim.js` | 23 块 / **423826 字节** / **66 个标记**（新增 `function patchNet(`、`function wrappedNet(`、`function failed(`、`transport failover installed`、`app_domain=`） |
-| `scripts/test-site-patch.js` | **598 条断言**（上一轮 587，新增 11 条） |
+| `scripts/check-ios-shim.js` | 23 块 / **424540 字节** / **67 个标记**（新增 `function patchNet(`、`function wrappedNet(`、`function failed(`、`function reachFailure(`、`transport failover installed`、`app_domain=`） |
+| `scripts/test-site-patch.js` | **599 条断言**（上一轮 587，新增 12 条） |
 | `scripts/gen-site-i18n.js --check` | 458 labels / 35 fragments |
 | `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
 
-新增断言覆盖：`app.net.get` 确实被包上（函数级标记，不是对象级——站点是
-`app.net = app.net \|\| {}` 之后**下一句**才加 `get`，对象级标记会把一个什么都没包的包装
-锁死）、卡住的镜像被拉黑且从记忆里删掉、面板写出 `banned: get failed:`、站点重试落到另一台、
-探测判死的记忆镜像被丢、手选线路赢过记忆镜像、`route`/`ranked` 两行出现、
-**外站请求失败不拉黑镜像**。
+新增断言覆盖：`app.net.get` 与 `app.net.post` 两个槽位确实被包上（函数级标记，不是对象级
+——站点是 `app.net = app.net \|\| {}` 之后**下一句**才加 `get`，对象级标记会把一个什么都没包的
+包装锁死）、卡住的镜像被拉黑且从记忆里删掉、面板写出 `banned: get failed:`、站点重试落到
+另一台、探测判死的记忆镜像被丢、手选线路赢过记忆镜像、`route`/`ranked` 两行出现、
+**外站请求失败不拉黑镜像**、**站点回 500 不拉黑镜像**。
 
 #### 未证实项
 
