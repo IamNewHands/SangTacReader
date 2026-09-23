@@ -1,0 +1,8 @@
+name: "CodeQL config"
+
+# site-assets/ is a byte-for-byte mirror of the site's own frontend bundles
+# (scripts/gen-site-assets.js, pinned by manifest sha256 + CI --check).
+# CodeQL findings there belong to the upstream site's code, not ours, and any
+# local edit would break the byte-level mirror. Excluded from analysis.
+paths-ignore:
+  - "plugins/app/ios/Sources/SangTacAppPlugin/site-assets/**"
