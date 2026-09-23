@@ -458,7 +458,15 @@ function makeFakeFrame(contentElements) {
     visit(html);
     return found;
   };
-  const doc = { documentElement: html, body: frameBody, getElementById: byId };
+  const doc = {
+    documentElement: html,
+    body: frameBody,
+    getElementById: byId,
+    // The injected frame scan looks for frames inside frames, and
+    // querySelectorAll is what it delegates to; a real frame document answers
+    // this, so the stub has to as well.
+    querySelectorAll: (selector) => html.querySelectorAll(selector),
+  };
   frame.contentDocument = doc;
   frame.contentWindow = {
     document: doc,
@@ -1422,6 +1430,37 @@ async function testI18nOverlay() {
   check('a re-navigated iframe document is picked up again',
     repinned.textContent === '第12章 Nhập môn', JSON.stringify(repinned.textContent));
 
+  // The reader builds its frame when a chapter is opened -- minutes into the
+  // session, long after the fixed delay list has run out -- and assigning srcdoc
+  // swaps the document inside an iframe that is already attached, which the
+  // outer document sees no mutation for. The 2026-09-24 device log has no PATCH
+  // line for a whole session while the notice stayed on screen, so the frame
+  // scan has to keep running and every frame has to look inside itself.
+  const lateNotice = makeContainer('p', '', '@Bạn đang đọc bản lưu trong hệ thống');
+  const lateNovel = makeContainer('p', '', '这一句要留下。');
+  const lateFrame = makeFakeFrame([lateNotice, lateNovel]);
+  sandbox.document.body.appendChild(lateFrame);
+  await tick(1200);
+  check('a chapter frame built after document start still loses the notice',
+    lateNotice.textContent === '' && lateNotice.parentNode === null,
+    JSON.stringify(lateNotice.textContent) + ' parent='
+      + String(lateNotice.parentNode && lateNotice.parentNode.tagName));
+  check('the novel text in that frame survives',
+    lateNovel.textContent === '这一句要留下。', JSON.stringify(lateNovel.textContent));
+
+  // The chapter can be a frame inside the reader's own frame, and
+  // querySelectorAll does not cross that boundary: every frame has to look
+  // inside itself for the next one, or the innermost chapter is never reached.
+  const nestedNotice = makeContainer('p', '', '@Bạn đang đọc bản lưu trong hệ thống');
+  const nestedInner = makeFakeFrame([nestedNotice]);
+  const nestedOuter = makeFakeFrame([nestedInner]);
+  sandbox.document.body.appendChild(nestedOuter);
+  sandbox.window.__stvI18n.sweepFrames();
+  check('a chapter frame nested inside the reader frame is reached',
+    nestedNotice.textContent === '' && nestedNotice.parentNode === null,
+    JSON.stringify(nestedNotice.textContent) + ' parent='
+      + String(nestedNotice.parentNode && nestedNotice.parentNode.tagName));
+
   // Translating the title element alone makes the site's own
   // `oldName != name` guard in updateFixedChapterName() true forever, which
   // re-runs its recycle + updateHistory2 branch on every scroll tick. The name
@@ -1611,6 +1650,71 @@ async function testReaderTts() {
   check('the sentence source is the current chapter, not the whole iframe',
     scopedOut.length === 2 && scopedOut[0].toText().slice(4) === '当前章节第一句。',
     JSON.stringify(scopedOut.map((s) => s.toText())));
+
+  // The page-flip display renders the chapter into an off-screen element and
+  // moves the pages it split out into the frames it shows (chapterdisplay.js
+  // setContent 1641-1646, pushPageToScreen 1706-1719). That element and the
+  // body are therefore leftovers, and the 2026-09-24 device log caught the shim
+  // reading exactly one of them: "fallback source [document body]: 111 chars",
+  // the same 111 characters on every attempt, from a page nobody was looking
+  // at. The display knows the page it is on: currentPageId indexes
+  // currentChapter.pageElements.
+  const pageOne = makeContainer('div', 'pageparent', '第一页的内容。');
+  const pageTwo = makeContainer('div', 'pageparent', '第二页第一句。第二页第二句。');
+  const pageThree = makeContainer('div', 'pageparent', '第三页第一句。');
+  const leftover = makeContainer('div', 'maincontent', '上一章残留下来的字。');
+  leftover.id = 'maincontent';
+  const flipFrame = makeFakeFrame([leftover]);
+  const flipChapter = { cid: '927797006', pageElements: [pageOne, pageTwo, pageThree] };
+  const flipDisplay = {
+    innerWindow: flipFrame.contentWindow,
+    getCurrentWindow() { return flipFrame.contentWindow; },
+    getCurrentChapter() { return flipChapter; },
+    currentPageId: 1,
+    tokenizeSentence() { return []; },
+  };
+  const flipSandbox = makeSandbox();
+  const flipApp = installFakeApp(flipSandbox, { displayType: 'pageflip', display: flipDisplay });
+  flipSandbox.document.body.appendChild(flipFrame);
+  // The site's own start() rebuilds the queue only when the CHAPTER changed
+  // (app.v2.read.js app.tts.start -> player.isViewChanged()), so this stands in
+  // for the player and the shim's wrapper is what has to notice the page.
+  const flipPlayer = {
+    sentences: [],
+    currentId: 0,
+    reset() { this.sentences = []; this.currentId = 0; },
+    generateSentences() { this.sentences = flipDisplay.tokenizeSentence(); this.currentId = 0; },
+  };
+  flipApp.tts.player = flipPlayer;
+  flipApp.tts.start = function () { flipApp.tts.player = flipPlayer; };
+  vm.runInContext(loadBlocks().join('\n'), flipSandbox);
+  await tick(250);
+
+  flipApp.tts.start();
+  await tick(20);
+  check('the reader reads the page on screen, not the leftover renderer',
+    flipPlayer.sentences.length === 3
+      && flipPlayer.sentences[0].toText().slice(4) === '第二页第一句。',
+    JSON.stringify(flipPlayer.sentences.map((s) => s.toText())));
+  check('the page it read and its place in the chapter are reported',
+    String(flipSandbox.window.__stvDiag.text() || '').indexOf('pageflip page 2 of 3') >= 0,
+    String(flipSandbox.window.__stvDiag.text() || '').slice(-260));
+
+  flipDisplay.currentPageId = 2;
+  flipApp.tts.start();
+  await tick(20);
+  check('turning the page rebuilds the queue instead of replaying the old page',
+    flipPlayer.sentences.length === 1
+      && flipPlayer.sentences[0].toText().slice(4) === '第三页第一句。',
+    JSON.stringify(flipPlayer.sentences.map((s) => s.toText())));
+
+  flipPlayer.currentId = flipPlayer.sentences.length;
+  flipApp.tts.start();
+  await tick(20);
+  check('a spent list is rebuilt rather than handed to the site to skip a chapter',
+    flipPlayer.currentId === 0 && flipPlayer.sentences.length === 1,
+    'currentId=' + String(flipPlayer.currentId)
+      + ' sentences=' + String(flipPlayer.sentences.length));
 
   // app.tts.test() hardcodes "Xin chào, đây là chuyển văn bản thành giọng nói"
   // (app.v2.read.js:3174).
@@ -3530,43 +3634,43 @@ async function testLikeToggle() {
       && String(stuck.window.__stvDiag.text() || '').indexOf('liked=true') >= 0,
     JSON.stringify(stuck.__stored.toasts));
 
-  // The 2026-09-23 log, replayed: unlike answers code 100, and one second later
-  // querylikestatus still lists two rows for the same book -- identical before
-  // and after. Each row carries the row's own id, which is the other key the
-  // endpoint could be deleting by, so the ladder tries those next. Only rows
-  // that are about this book may be used: a row id is a delete key.
-  const ladder = makeSandbox();
-  const ladderApp = installFakeApp(ladder, { displayType: 'auto' });
-  const attempts = [];
-  let rows = [{ type: 'qidian', objectid: '1034915599', id: '2541666' },
-    { type: 'qidian', objectid: '1034915599', id: '2541667' },
-    { type: 'qidian', objectid: '9999999999', id: '424242' }];
-  ladderApp.api.queryLike = () => Promise.resolve(rows.slice());
-  ladderApp.api.unlike = function (host, id) {
-    attempts.push(host + '/' + id);
-    // Only the row-id form deletes anything here, one row per call.
-    rows = rows.filter((row) => String(row.id) !== String(id));
-    return Promise.resolve({ code: 100 });
+  // The 2026-09-23 logs, replayed. The object id is the form the site itself
+  // uses -- app.api.unlike posts ajax=unlike&type=&id= (app.v2.js:4917-4931) --
+  // and the server accepts it (code 100) without deleting anything, while a row
+  // id comes back as {"text":"Không tìm thấy lịch sử.","code":101}: the endpoint
+  // looks its id up in the reading history, not in the like table, and the site
+  // only ever calls unlike for community topics. There is no book-unlike
+  // contract to find, so the ladder is gone: one attempt, one verification, and
+  // the honest answer.
+  const oneShot = makeSandbox();
+  const oneShotApp = installFakeApp(oneShot, { displayType: 'auto' });
+  const shotAttempts = [];
+  const shotRows = [{ type: 'qidian', objectid: '1034915599', id: '2541666' },
+    { type: 'qidian', objectid: '1034915599', id: '2541667' }];
+  oneShotApp.api.queryLike = () => Promise.resolve(shotRows.slice());
+  oneShotApp.api.unlike = function (host, id) {
+    shotAttempts.push(host + '/' + id);
+    return Promise.resolve({ code: id === '1034915599' ? 100 : 0 });
   };
-  ladderApp.api.likeBook = () => Promise.resolve({ code: 100 });
-  vm.runInContext(loadBlocks().join('\n'), ladder);
+  oneShotApp.api.likeBook = () => Promise.resolve({ code: 100 });
+  vm.runInContext(loadBlocks().join('\n'), oneShot);
   await tick(250);
-  await ladderApp.api.likeBook(book);
+  await oneShotApp.api.likeBook(book);
   await tick(150);
-  check('the unlike ladder tries the object id first, as the site itself does',
-    attempts[0] === 'qidian/1034915599', attempts.join('|'));
-  check('then every row id the account holds for this book',
-    attempts.join('|') === 'qidian/1034915599|qidian/2541666|qidian/2541667',
-    attempts.join('|'));
-  check('a row that belongs to another object is never used as a delete key',
-    attempts.indexOf('qidian/424242') < 0, attempts.join('|'));
-  check('each attempt is reported with the key it used',
-    String(ladder.window.__stvDiag.text() || '')
-      .indexOf('after unlike(row 2541666)') >= 0,
-    String(ladder.window.__stvDiag.text() || '').slice(-360));
-  check('the cancellation is claimed as soon as a row delete sticks',
-    (ladder.__stored.toasts || []).join('|').indexOf('已取消点赞') >= 0,
-    JSON.stringify(ladder.__stored.toasts));
+  check('the unlike is sent once, in the only form the site documents',
+    shotAttempts.join('|') === 'qidian/1034915599', shotAttempts.join('|'));
+  check('no row id is ever used as a delete key',
+    shotAttempts.indexOf('qidian/2541666') < 0
+      && shotAttempts.indexOf('qidian/2541667') < 0,
+    shotAttempts.join('|'));
+  check('the button says the site does not support it instead of claiming success',
+    (oneShot.__stored.toasts || []).join('|').indexOf('已取消点赞') < 0
+      && (oneShot.__stored.toasts || []).join('|').indexOf('站点不支持取消这个赞') >= 0,
+    JSON.stringify(oneShot.__stored.toasts));
+  check('the button stays lit when the site kept the like',
+    String(oneShot.window.__stvDiag.text() || '')
+      .indexOf('the button stays as the site has it') >= 0,
+    String(oneShot.window.__stvDiag.text() || '').slice(-300));
 
   // The endpoint can be missing (an older mirror build): fall back to the site's
   // own extended status rather than deciding nothing.

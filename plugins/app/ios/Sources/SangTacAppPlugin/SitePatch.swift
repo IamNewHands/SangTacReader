@@ -2689,22 +2689,29 @@ enum SitePatch {
 
                 /**
                  The site's own unlike takes the *object* id (app.v2.js:5239,
-                 socialpost.likeBtnEvent) -- and that is what the sixteenth round
-                 sent. The 2026-09-23 log answers it with code 100 and then shows
-                 the same two rows for the same book still in place, on the
-                 query one second later: accepted, applied to nothing.
+                 socialpost.likeBtnEvent), and that is the form the sixteenth
+                 round sent: app.api.unlike(type, id) posts
+                 ajax=unlike&type=&id= (app.v2.js:4917-4931).
 
-                 Every row querylikestatus returns carries the row's own `id`,
-                 which is the other key this endpoint could be deleting by. So
-                 the ladder tries the object id first -- the documented contract,
-                 and the only form that is certainly scoped to this book -- and
-                 then each row the account holds *for this book*, verifying after
-                 every attempt and only claiming the cancellation once the site
-                 agrees. A row id that is not mine can only be a no-op; a delete
-                 that hits a row of mine is exactly what the tap asked for.
+                 The 2026-09-23 logs answer both candidate keys, so there is
+                 nothing left to guess at. The object id is accepted
+                 ({"status":"success","code":100}) and deletes nothing -- the
+                 same two rows come back a second later, byte for byte. Each
+                 row id is refused outright: {"text":"Không tìm thấy lịch sử.",
+                 "code":101}, "no history found", which says this endpoint looks
+                 its id up in the reading history, not in the like table. The
+                 site itself only ever unlikes community topics (app.v2.js:5239
+                 is unlike's only caller), so a book unlike has no working
+                 contract to follow.
+
+                 The row-id ladder is therefore gone: it cost two extra
+                 asynchronous requests and about two seconds before the same
+                 answer. One attempt in the documented form, one verification,
+                 and the honest result -- a failure leaves the button lit and
+                 says so instead of pretending.
                  */
-                function attempt(id, label) {
-                    return Promise.resolve(api.unlike(book.host, String(id)))
+                function attempt(label) {
+                    return Promise.resolve(api.unlike(book.host, String(book.id)))
                         .then(function (down) {
                             note('LIKE', 'unlike(' + label + ') ' + key + ' -> code '
                                 + (down && down.code) + ' raw='
@@ -2721,30 +2728,13 @@ enum SitePatch {
                     });
                 }
 
-                function rowIds(state) {
-                    var ids = [];
-                    var rows = (state && state.rows) || [];
-                    for (var i = 0; i < rows.length && ids.length < 3; i++) {
-                        var row = rows[i] || {};
-                        var id = row.id === undefined ? '' : String(row.id);
-                        var objectid = row.objectid === undefined
-                            ? '' : String(row.objectid);
-                        // Only a row that is about this book: a row id is a
-                        // delete key, and borrowing one from another object's row
-                        // is not something this button may do.
-                        if (!id || id === String(book.id)) { continue; }
-                        if (objectid && objectid !== String(book.id)
-                            && objectid !== key) { continue; }
-                        ids.push(id);
-                    }
-                    return ids;
-                }
-
                 function report(state) {
                     if (state.liked) {
                         likedState[key] = true;
                         applyLiked(true);
-                        if (app.toast) { app.toast('取消失败：站点没有删除这个赞（见日志）'); }
+                        note('LIKE', 'the site did not delete the like for ' + key
+                            + '; the button stays as the site has it');
+                        if (app.toast) { app.toast('站点不支持取消这个赞'); }
                         return false;
                     }
                     likedState[key] = false;
@@ -2757,28 +2747,15 @@ enum SitePatch {
 
                 function remove(book) {
                     note('LIKE', key + ' is liked; unliking');
-                    return attempt(book.id, 'object').then(function (down) {
+                    return attempt('unlike(object)').then(function (down) {
                         if (!(down && down.code == 100)) {
                             note('LIKE', 'the server refused the unlike for ' + key
                                 + '; the button is left as the site drew it');
                             return down;
                         }
                         return verify('unlike(object)').then(function (state) {
-                            if (!state.liked) { report(state); return down; }
-                            var ids = rowIds(state);
-                            var at = 0;
-                            function next() {
-                                if (at >= ids.length) { report(state); return down; }
-                                var rowId = ids[at++];
-                                return attempt(rowId, 'row ' + rowId).then(function () {
-                                    return verify('unlike(row ' + rowId + ')');
-                                }).then(function (again) {
-                                    if (again.liked) { return next(); }
-                                    report(again);
-                                    return down;
-                                });
-                            }
-                            return next();
+                            report(state);
+                            return down;
                         });
                     }, function (error) {
                         note('ERR', 'unlike failed for ' + book.host + '/' + book.id
@@ -2827,6 +2804,13 @@ enum SitePatch {
      This block does not guess: it reports what actually happened, and when the
      sentence source is missing it supplies one built from the chapter text so
      the site's own queue, provider and audio element still do the playing.
+
+     Which text, though, is the whole of the eighteenth round: the page-flip
+     display keeps the chapter in an off-screen renderer and moves the pages it
+     split out into the frames it shows, so the renderer, the body and the
+     chapter list all answer with text that is not on screen. The sentence
+     source is the page the reader is looking at, and the queue still walks the
+     rest of the chapter and then the next one.
      */
     static let readerTts = """
     (function () {
@@ -2890,6 +2874,16 @@ enum SitePatch {
             return out;
         }
 
+        // The archive notice is the i18n block's business, and that block owns
+        // the one definition of what it is (SiteI18nData.script), used by the
+        // reader DOM and by the exporter alike. Asked for rather than copied:
+        // two definitions would drift.
+        function stripNoticeText(value) {
+            var api = window.__stvI18n;
+            if (!api || typeof api.stripNotice !== 'function') { return value; }
+            try { return api.stripNotice(value); } catch (e) { return value; }
+        }
+
         function toTextFor(value) {
             return function () { return value; };
         }
@@ -2921,13 +2915,51 @@ enum SitePatch {
             return w;
         }
 
-        // The reader iframe has no #maincontent: the pageflip template only
-        // builds .chaptertopinfo, #mainscroller and #dragbar, and the scroller
-        // holds the previous, current and next chapter side by side. Reading
-        // body text therefore reads whichever chapters happen to be mounted --
-        // which is why the device played text that was not the chapter on
-        // screen. The current chapter owns exactly one .contentcontainer
-        // (chapterdisplay.js:3615), so read that.
+        function chapterOf(display) {
+            var chapter = null;
+            try {
+                chapter = display.getCurrentChapter
+                    ? display.getCurrentChapter() : display.currentChapter;
+            } catch (e) { chapter = null; }
+            if (!chapter && display.currentChapter) { chapter = display.currentChapter; }
+            return chapter || null;
+        }
+
+        // The page-flip display keeps the whole chapter in an off-screen
+        // renderer and moves the pages it split out into the frames it shows
+        // (chapterdisplay.js setContent 1641-1646, pushPageToScreen 1706-1719),
+        // so that renderer and the document body both hold leftovers rather
+        // than what is on screen. The 2026-09-23 log caught exactly that:
+        // "fallback source [document body]: 111 chars", the same 111 characters
+        // on every attempt, from a page nobody was looking at. The display
+        // already knows which page is on screen -- currentPageId indexes
+        // currentChapter.pageElements -- so read from there to the end of the
+        // chapter; the site's own queue carries on by itself (app.v2.read.js
+        // play() -> nextChapter(true) once the list runs out).
+        function pageModelText(display) {
+            var chapter = chapterOf(display);
+            var pages = chapter && chapter.pageElements;
+            if (!pages || !pages.length) { return null; }
+            var at = display.currentPageId;
+            if (typeof at !== 'number' || at < 0 || at >= pages.length) { at = 0; }
+            var parts = [];
+            for (var i = at; i < pages.length; i++) {
+                var piece = textOf(pages[i]);
+                if (piece) { parts.push(piece); }
+            }
+            if (!parts.length) { return null; }
+            return {
+                text: parts.join(String.fromCharCode(10)),
+                source: 'pageflip page ' + (at + 1) + ' of ' + pages.length
+            };
+        }
+
+        // The page-flip display answers getCurrentChapter() with a chapter
+        // object; the scrolling display answers with an element that owns the
+        // chapter's .contentcontainer. Only the second one has a q(), which is
+        // why this used to return null on the device and hand the body over to
+        // TTS. When there is no .contentcontainer the chapter element itself is
+        // still the right text.
         function chapterHolder(display) {
             var view = null;
             try {
@@ -2937,7 +2969,7 @@ enum SitePatch {
             if (!view || typeof view.q !== 'function') { return null; }
             var holder = null;
             try { holder = view.q('.contentcontainer'); } catch (e) { holder = null; }
-            return holder || null;
+            return holder || view;
         }
 
         function textOf(node) {
@@ -2949,15 +2981,21 @@ enum SitePatch {
             var w = readerWindow(display);
             if (!w || !w.document) { return []; }
             var doc = w.document;
-            var holder = chapterHolder(display);
-            var text = textOf(holder);
-            var source = 'current chapter';
+            var text = '';
+            var source = '';
+            var model = pageModelText(display);
+            if (model) { text = model.text; source = model.source; }
+            if (!text) {
+                text = textOf(chapterHolder(display));
+                source = 'current chapter';
+            }
             if (!text) {
                 // Transient: the display is being rebuilt. Fall back to whatever
                 // the document has rather than reporting nothing to play.
                 source = 'document body';
                 text = textOf(doc.getElementById('maincontent')) || textOf(doc.body);
             }
+            text = stripNoticeText(text);
             var pieces = splitSentences(text);
             var list = [];
             for (var i = 0; i < pieces.length; i++) {
@@ -2998,6 +3036,18 @@ enum SitePatch {
             var app = window.app;
             if (!app || !app.reader || typeof app.reader.getDisplay !== 'function') { return null; }
             try { return app.reader.getDisplay(); } catch (e) { return null; }
+        }
+
+        // What the queue is built from: the chapter, and the page of it that is
+        // on screen. The site's own isViewChanged() compares chapter ids only,
+        // so the page has to be part of the key here or a replay reads the page
+        // the reader has already left.
+        function pageKey(display) {
+            if (!display) { return 'none'; }
+            var chapter = chapterOf(display);
+            var cid = (chapter && chapter.cid) ? String(chapter.cid) : '?';
+            var at = (typeof display.currentPageId === 'number') ? display.currentPageId : '?';
+            return cid + '#' + at;
         }
 
         // app.tts.test() hardcodes a Vietnamese sample sentence
@@ -3111,18 +3161,40 @@ enum SitePatch {
                 var display = currentDisplay();
                 patchDisplay(display);
                 ensureSpeaker(display);
+                var player = this.player;
+                var key = pageKey(display);
+                // The site rebuilds the queue only when the CHAPTER changed
+                // (app.v2.read.js app.tts.start -> player.isViewChanged()), so a
+                // play after the list ran out -- or after the reader turned the
+                // page -- replayed the page the reader had already left; and an
+                // exhausted list makes the site's own play() jump to the next
+                // chapter outright. Rebuild when the page moved and when the
+                // list is spent.
+                var stale = !!player && (!player.sentences || !player.sentences.length
+                    || player.__stvPageKey !== key
+                    || (typeof player.currentId === 'number'
+                        && player.currentId >= player.sentences.length));
+                if (stale && typeof player.generateSentences === 'function') {
+                    try {
+                        if (typeof player.reset === 'function') { player.reset(); }
+                        player.generateSentences();
+                    } catch (e) {
+                        note('ERR', 'rebuilding the reader sentence list failed: ' + e);
+                    }
+                }
+                if (player) { player.__stvPageKey = key; }
                 var failure = '';
                 try {
                     originalStart.apply(this, arguments);
                 } catch (e) {
                     failure = ' threw: ' + e;
                 }
-                var player = this.player;
+                player = this.player;
                 var count = (player && player.sentences) ? player.sentences.length : -1;
                 var first = (player && player.sentences && player.sentences[0])
                     ? (player.sentences[0].text || '') : '';
                 note(failure ? 'ERR' : 'TTS', 'reader TTS start: sentences=' + count
-                    + ' first=' + first.length + ' chars provider='
+                    + ' first=' + first.length + ' chars page=' + key + ' provider='
                     + ((this.setting || {}).provider || '?') + failure);
             };
 

@@ -1939,13 +1939,138 @@ app.api.queryLike = async function(list){          // app.v2.js:4865
   若出现某一行 `unlike(row NNNN) ... code 100` 之后 `liked=false`，就是行 id 生效；若三次之后
   仍是 `liked=true`，则站点对「书籍」这一类对象根本没有取消路径（按源码看，站点自己也只在
   社区帖子上调 `unlike`），届时要么接受「如实提示失败」，要么把点赞按钮改成只读。
+  → **第十八轮已定案**：行 id 被服务端直接拒（`code 101`，见 §6.20 (1)），阶梯已按用户要求拆掉。
 - 第 4 项：**(a)** 的收益需要跨天的两次冷启动对比才能量化（本机看不到 WebKit 的网络层日志，
   只能看 `[BOOT] shell released at +Nms` 前移多少）；**(b)** 只是把这一次 403 风暴的成因修掉，
   风暴本身由站点设置页的 onchange 串行引发，若真机日志里出现别的 `refused a language` 行，
   说明还有别的入口，但代价已被限成一行日志。
+  → **(b) 第十八轮已被真机证实**：489 行日志里一次 403 风暴都没有（§6.20 (3) 的时间线）。
 - 「正文里的存档声明」只按用户给的句子做匹配（`bản lưu trong hệ thống`，前缀引导语与 `@`
   一并吃掉）。若那句话还有别的写法（例如后面跟域名），会留在正文里——`[PATCH] dropped the
   site archive notice from the chapter body` 这行只代表**至少删掉一条**，看到日志却还残留就
   把原文发我，按实际写法补。
+  → **第十八轮查明不是写法问题，是那段代码根本扫不到正文所在的 frame**（§6.20 (2)）：整场
+  会话一条 `[PATCH] dropped` 都没有，用户却仍然看到那句话。
+
+### 6.20 第十八轮反馈（`日志.txt`，489 行）：取消点赞收尾、存档声明还在、TTS 读错页
+
+本轮日志 489 行（19:21:54–19:31:21），把上一轮留下的三个尾巴一次性钉住了。
+
+#### 1. 取消点赞：站点确实没有这条路（用户「不行就算了」）
+
+时间线（同一本书 `qidian/1034915599`，19:22:06–19:22:11）：
+
+```
+19:22:06  querylikestatus → {"list":[{"objectid":"1034915599","id":"2541666"},
+                                    {"objectid":"1034915599","id":"2541667"}],"code":100}
+19:22:07  unlike(对象 id) → {"status":"success","code":100}       [LIKE] unlike(object) -> code 100
+19:22:08  querylikestatus → 与上面**逐字节相同**的两行            [LIKE] ... after unlike(object): liked=true
+19:22:09  unlike(行 id 2541666) → {"text":"Không tìm thấy lịch sử.","code":101}
+                                                                  [LIKE] unlike(row 2541666) -> code 0
+19:22:11  unlike(行 id 2541667) → 同上                            [LIKE] ... after unlike(row 2541667): liked=true
+19:22:11  取消失败：站点没有删除这个赞（见日志）
+```
+
+- **对象 id**：被接受（`code 100`）却一行都没删。
+- **行 id**：服务端直接拒，`{"text":"Không tìm thấy lịch sử.","code":101}`——「找不到历史」，
+  说明这个端点是在**阅读历史**里找这个 id，而不是在点赞表里。`app.api.unlike` 会把
+  `code != 100` 统一成 `{code:0}`（`app.v2.js:4924-4930`），所以日志里看到的是 `code 0`。
+- 站点自己 `unlike` 的**唯一**调用者是社区帖子（`app.v2.js:5239`，`unlike(type, topic.id)`），
+  书籍这条路上站点内没有契约。
+
+修法（按用户「不行就算了」——不再花力气找键）：**拆掉阶梯**。只发一次
+`unlike(host, bookId)`（站点自己的契约形式），复查一次，失败就照实提示
+`站点不支持取消这个赞`，按钮维持站点当前的点亮状态、`.liked` 计数不动。相比上一轮少 2 个
+请求、少约 2 秒等待，结论一样。`[LIKE]` 日志保留（`unlike(object) ... -> code N raw=` 与
+`after unlike(object): <来源> liked=<bool> raw=`），下一份日志若出现 `liked=false` 就是站点改了口。
+
+#### 2. 正文里的存档声明还在——不是匹配问题，是根本扫不到
+
+- 事实：整份 489 行日志里**一条 `[PATCH] dropped the site archive notice from the chapter body`
+  都没有**，而用户在正文里仍然看到 `@ Bạn đang đọc bản lưu trong hệ thống`。
+- 先排除匹配问题：日志里的原文与生成物里的字面值**逐码点相同**（都取出来比对过：
+  `0062 1EA3 006E 0020 006C 01B0 0075 ...`，同一套 NFC）。所以是那段代码没有跑到那个节点。
+- 根因（四条叠加，缺一条都不足以全解释）：
+  1. 所有注入块都是 `forMainFrameOnly: true`（`SangTacAppPlugin.swift:95`），**frame 里不注入**，
+     正文只能靠主文档里的代码伸手进去；
+  2. 主文档的 MutationObserver 只在「新增节点本身就是 `<iframe>`」时才 `attachFrame`，
+     而阅读器是把整页（含 iframe）当**一个子树**插进来的；
+  3. 更关键的是 **`srcdoc` 赋值不产生 mutation**：iframe 元素没变，变的是它内部的 document，
+     所以即便 frame 早就被 attach 过，换文档后也再没人管；
+  4. `attachFrames()` 只在 `FRAME_DELAYS = [0,300,1000,2000,4000,8000] ms` 跑 6 次，而这份日志里
+     用户 19:23 与 19:30 才打开阅读器——**8 秒后建立的 frame 再也没人看**。
+     另有 `querySelectorAll` **不跨文档**：pageflip 模板是一层 srcdoc frame，章节正文可能又是
+     里面的一层，只扫主文档找不到最里面那层。
+- 修法（`scripts/gen-site-i18n.js` 模板 + 重新生成的 `SiteI18nData.swift`）：
+  1. `attachFrame()` 里递归扫**这一层自己的** iframe（新函数 `attachFramesIn(root)`，
+     document 与 element 都能传），frame 套 frame 也能到最里面；
+  2. 主文档 observer 对每个新增节点做 `stripNotices(node)`，并在**子树**里找 iframe
+     （不再要求新增节点本身是 iframe）；`characterData` 变化也直接剥；
+  3. 新增 **1 秒周期的 frame + 存档声明扫描**（上限 1 小时自动停），兜住「iframe 已存在、
+     srcdoc 换了文档」这条没有 mutation 的路。
+- 验证：桩里在**文档启动之后**才追加一个含存档声明的 frame，等 1.2 s 断言声明被删掉、
+  同一 frame 的正文留下；再加一个 frame 套 frame 的用例，断言最里层的声明也被删。
+
+#### 3. TTS 读的不是在看的那一页
+
+日志给出的指纹（19:30:35 与 19:31:01 两次**完全一样**，中间用户还翻过页）：
+
+```
+19:30:35  [TTS] fallback source [document body]: 111 chars -> 7 sentence(s), first=就在此时，
+19:30:35  [TTS] site tokenizeSentence empty, using the chapter-text fallback -> 7 sentence(s)
+19:30:35  [TTS] reader TTS start: sentences=7 first=9 chars provider=ios
+19:31:01  [TTS] fallback source [document body]: 111 chars -> 7 sentence(s), first=就在此时，
+```
+
+- `source` 落在 **document body** 这条最后的兜底分支，字符数与首句两次一致。
+- 根因：pageflip 显示器的结构是「先把整章渲染进一个**离屏**的 `#maincontent`，再把切好的页
+  搬进真正显示的 frame」（`chapterdisplay.js` `setContent` 1641-1646、`pushPageToScreen`
+  1706-1719；`currentPageId` 就是当前页在 `currentChapter.pageElements` 里的下标）。而 shim 的
+  取文顺序是「`getCurrentChapter().q('.contentcontainer')` → 空就 `#maincontent`/`body`」：
+  pageflip 的 `getCurrentChapter()` 返回的是**章节对象**（`PageClipChapter`，没有 `q`），
+  于是 `chapterHolder()` 永远返回 null，句子就从**离屏渲染器的残留**里切——111 个字符正是
+  分页把节点搬走之后留在那里的一小段，所以「不在看的这一页、翻页也不变、不知道是哪里的内容」。
+- 修法（`readerTts` 块）：
+  1. 新增 `pageModelText(display)`：用 `currentChapter.pageElements[currentPageId..]` 拼出
+     「当前页 → 本章结尾」，这就是「从我在看的这页开始读」；读完本章后站点自己的 `player.play()`
+     会 `app.reader.nextChapter(true)` 自动接下一章（`app.v2.read.js:2585-2594`），连续性不动。
+  2. `chapterHolder()` 兼容两种形状（只有元素才有 `q`），继续服务滚动式显示器的
+     `.contentcontainer`。
+  3. 拼好的文本再过一次 `window.__stvI18n.stripNotice`——存档声明一份定义两处用。
+  4. `app.tts.start` 的包装里加**页键**（`cid + '#' + currentPageId`）与「列表已读完」判定：
+     站点只在**章节**变化时重建队列（`app.v2.read.js app.tts.start` 的 `isViewChanged()`），
+     所以翻页后或读完后按播放原本会重播旧页的句子（读完时更糟：站点自己的 `play()` 会直接跳章）。
+  5. 日志行加 `page=<cid>#<页码>`，下一份日志能直接看出读的是哪一页。
+- 验证：桩里造一个 pageflip 形状的显示器（`currentPageId: 1` + 三页 `pageElements` + 一个离屏残留
+  `#maincontent`），断言句子从第 2 页开始且出现 `pageflip page 2 of 3`；把 `currentPageId` 改成 2
+  再按播放 → 队列重建为第 3 页；把 `currentId` 推到最后再按播放 → 重建而不是交给站点跳章。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 22 块 / 367873 字节 / **46** markers（`rowIds` 换成
+  `站点不支持取消这个赞`，新增 `pageModelText`、`pageflip page `、`__stvPageKey`、`attachFramesIn`）
+- `node scripts/test-site-patch.js` → **522 条断言**全过（上一轮 516）。新增/改写：
+  - 取消点赞：只发一次、用的是对象 id、**任何行 id 都不再作为删除键**、提示是
+    `站点不支持取消这个赞` 且绝不出现 `已取消点赞`、按钮保持点亮（诊断里有
+    `the button stays as the site has it`）；
+  - 存档声明：**文档启动之后**才出现的 frame 里的声明照样被删、该 frame 的正文留下、
+    frame 套 frame 的最里层也被删；
+  - 朗读来源：句子从 `currentPageId` 那一页开始、日志出现 `pageflip page 2 of 3`、
+    翻页后队列重建、读完后再按播放是重建而不是跳章。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments（模板与生成物同步）
+
+**未证实项**：
+
+- 第 2 项：真机这一份日志里应出现 `[PATCH] dropped the site archive notice from the chapter body`
+  至少一行。匹配仍只认用户给的那句原文（`bản lưu trong hệ thống`）；若还有别的写法（例如后面
+  跟域名）会留在正文里，把原文发我按实际写法补。
+- 第 3 项：`pageElements` / `currentPageId` 是**站点自己的字段名**（未压缩的
+  `app.v2.chapterdisplay.js`）。真机应出现 `fallback source [pageflip page N of M]`；若仍出现
+  `fallback source [document body]`，说明取值链在真机上被站点改过，按新结构再对一次。
+  滚动式显示器（没有「页」的概念）仍是「从本章开头读」——真机若是那个模式，日志会显示
+  `fallback source [current chapter]`。
+- 第 1 项：站点对书籍**是否真的完全没有取消路径**没有定案（`Không tìm thấy lịch sử` 提示这个
+  端点找的是**历史记录 id**，例如书详情里的 `lid`）。用户说「不行就算了」，本轮不再试；
+  若哪天想再试一次，最小实验是把 `lid` 传进去试一个请求，代价一行日志。
 
 

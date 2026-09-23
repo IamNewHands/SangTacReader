@@ -410,11 +410,27 @@ ${data.patterns
             }
         }
         sweepFrame(frame);
+        // The reader nests. The page-flip template is one srcdoc frame and a
+        // chapter can be another frame inside it, and querySelectorAll does not
+        // cross a document boundary -- so the frame that actually holds the
+        // chapter text was never reached, and the archive notice stayed in the
+        // body the reader was looking at (2026-09-23 device log, no PATCH line
+        // for a whole session). Every frame now looks for its own children.
+        attachFramesIn(doc);
+    }
+
+    // Works for a document and for an element: both answer querySelectorAll,
+    // and a chapter frame is normally inserted as part of a subtree rather than
+    // on its own, which is why the observer hands the added node straight in.
+    function attachFramesIn(root) {
+        if (!root || typeof root.querySelectorAll !== 'function') { return; }
+        var frames = null;
+        try { frames = root.querySelectorAll('iframe'); } catch (e) { frames = null; }
+        for (var i = 0; frames && i < frames.length; i++) { attachFrame(frames[i]); }
     }
 
     function attachFrames() {
-        var list = document.querySelectorAll('iframe');
-        for (var i = 0; i < list.length; i++) { attachFrame(list[i]); }
+        attachFramesIn(document);
     }
 
     // Translating the title element in place is not enough on its own: the site
@@ -739,12 +755,20 @@ ${data.patterns
                 var record = records[i];
                 if (record.type === 'characterData') {
                     walk(record.target);
+                    stripNoticeNode(record.target);
                 } else {
                     var added = record.addedNodes || [];
                     for (var j = 0; j < added.length; j++) {
                         var node = added[j];
                         walk(node);
-                        if (node.nodeType === 1 && node.tagName === 'IFRAME') { attachFrame(node); }
+                        // The archive notice arrives with the chapter text, and
+                        // the reader mounts that minutes into the session --
+                        // long after the delay list below has run out. Strip on
+                        // the mutation and look for frames inside what arrived,
+                        // not only on a timer and not only when the added node
+                        // is itself an iframe.
+                        stripNotices(node);
+                        if (node.nodeType === 1) { attachFramesIn(node); }
                     }
                 }
                 // The reader rewrites .chaptername.textContent on every chapter
@@ -770,6 +794,20 @@ ${data.patterns
             sweep(); attachFrames(); attachContent(); installLanguageGuard();
         }, FRAME_DELAYS[f]);
     }
+
+    // ...and keep looking. The reader frame is built when a chapter is opened,
+    // which can be any time in the session, and assigning srcdoc swaps the
+    // document inside an iframe that is already attached and produces no
+    // mutation this document can see. Attaching is what arms the notice pass
+    // for the chapter text the frame is about to hold. An hour is longer than
+    // any reading session and keeps the timer from outliving the page.
+    var frameAttempts = 0;
+    var frameTimer = setInterval(function () {
+        frameAttempts++;
+        attachFrames();
+        stripNotices(document.documentElement);
+        if (frameAttempts > 3600) { clearInterval(frameTimer); }
+    }, 1000);
 
     var contentAttempts = 0;
     var contentTimer = setInterval(function () {

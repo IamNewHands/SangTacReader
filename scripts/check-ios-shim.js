@@ -53,13 +53,25 @@ const REQUIRED_MARKERS = [
   // aggregate reply re-lights the button and made "已取消点赞" a lie.
   'querylikestatus',
   "'unlike(' + label",
-  // The unlike ladder: one key is not enough, so the object id is tried first
-  // and then the row ids querylikestatus hands back, verified after each.
-  'rowIds',
+  // The unlike ladder is gone: both candidate keys are answered by the device
+  // logs (the object id is accepted and deletes nothing, a row id comes back as
+  // "no history found"), so the button keeps a single attempt and reports the
+  // outcome instead of spending two more requests on the same answer.
+  '站点不支持取消这个赞',
   // The site's own archive notice is stripped where the chapter text is
   // consumed -- reader and exporter share the one definition of it.
   'stripNotice',
   'bản lưu trong hệ thống',
+  // The reader reads the page that is on screen. The page-flip display renders
+  // the chapter into an off-screen element and moves the split pages into the
+  // frames it shows, so that element and the body are leftovers -- which is
+  // what the device was reading aloud.
+  'pageModelText',
+  'pageflip page ',
+  '__stvPageKey',
+  // A frame inside a frame: the page-flip template is one srcdoc frame and the
+  // chapter can be another, and querySelectorAll does not cross that boundary.
+  'attachFramesIn',
   // The settings page can hand changeLanguage a domain instead of a language,
   // which costs a 403 per call; a value that is not a language is refused.
   'refused a language that is not one',
