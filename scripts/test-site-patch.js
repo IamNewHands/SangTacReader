@@ -1839,6 +1839,10 @@ async function testReaderTts() {
   spillWrapTwo.appendChild(spillClone);
   const pageThreeBody = makeElement('div');
   pageThreeBody.className = 'page';
+  // Every page carries its own header (createPage sets the page's innerHTML to
+  // it first), so the spill is the first block that carries TEXT, not the first
+  // child -- which is the shape the skip rule has to survive.
+  pageThreeBody.appendChild(makeContainer('div', 'chaptertopinfo', '第三章 休伤吾主20:08'));
   pageThreeBody.appendChild(spillWrapTwo);
   pageThreeBody.appendChild(makeContainer('p', '', '第三页第一句。'));
   const pageOneBody = makeContainer('div', 'page', '第一页的内容。');

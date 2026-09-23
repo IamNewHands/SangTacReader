@@ -3094,17 +3094,24 @@ enum SitePatch {
         function blocksText(root, options) {
             var parts = [];
             var started = !options.from;
+            var emitted = 0;
             var blocks = (root.children && root.children.length) ? root.children : [root];
             for (var i = 0; i < blocks.length; i++) {
                 var block = blocks[i];
                 if (options.skipChrome && isChromeNode(block)) { continue; }
                 // The second half of a split paragraph repeats what the page
                 // before it already handed over. Only the page on screen needs
-                // that half, and it takes it from the caret.
-                if (i === 0 && options.skipSpill && isSpillBlock(block)) { continue; }
+                // that half, and it takes it from the caret. The display stamps
+                // its page header ahead of it (createPage sets the page's
+                // innerHTML first), so this is the first block that carried
+                // text, not the first child.
+                if (options.skipSpill && !emitted && isSpillBlock(block)) { continue; }
                 var part = nodeText(block, options, started);
                 started = part.started;
-                if (part.text) { parts.push(part.text); }
+                if (part.text) {
+                    parts.push(part.text);
+                    emitted++;
+                }
             }
             return parts.join(String.fromCharCode(10));
         }
