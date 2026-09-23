@@ -99,10 +99,11 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             || text.contains("bookmanage.php")
     }
 
-    /// Only chapter bodies are worth caching past the site's own rules: they are
-    /// the expensive response (`mustRevalidate` forces a network fetch) and they
-    /// are immutable published text. The site keeps its own offline copy of the
-    /// same content, so a cached answer cannot go stale in a way that matters.
+    /// Chapter bodies are the expensive response (`mustRevalidate` forces a
+    /// network fetch) and immutable published text. The site keeps its own offline
+    /// copy of the same content, so a cached answer cannot go stale in a way that
+    /// matters. The other reusable answer -- a book's chapter list -- is decided
+    /// in `cachePolicy` below.
     private static func isChapterRequest(_ url: URL) -> Bool {
         return url.absoluteString.contains("sajax=readchapter")
     }
@@ -154,16 +155,85 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         return text != "7" && text != "10002"
     }
 
-    /// Session-scoped LRU for chapter bodies. Bounded by both entry count and
+    /// Which answers may be reused, and for how long, decided from the request
+    /// alone. One function so the lookup and the store can never disagree.
+    ///
+    ///   * a chapter body -- immutable published text, kept for the whole session;
+    ///   * a book's chapter list -- 115 KB of JSON that the 2026-09-23 device log
+    ///     shows fetched three times in one launch (entering the list, opening the
+    ///     reader, walking back out: 1484 + 1162 + 828 ms), while it only changes
+    ///     when the author publishes.
+    ///
+    /// Nothing else. The user-state endpoints (`userinfo.php`, the
+    /// `booklist.php?method=*` tabs) are deliberately left alone: their answers
+    /// carry unread counts and follow state, and a stale one is a wrong screen
+    /// rather than a saved round trip.
+    private struct CachePolicy {
+        /// `nil` keeps the entry for the session, which is what an immutable
+        /// chapter body wants. A list can go stale, so it carries a clock.
+        let ttl: TimeInterval?
+        let accepts: (Data) -> Bool
+    }
+
+    /// Longer than the 60 s the device log shows between the first and last copy
+    /// of the same list, and short enough that a chapter published while the
+    /// reader is open cannot hide behind it for a session.
+    private static let chapterListTTL: TimeInterval = 300
+
+    /// `GET` only: the cache key carries the method and the URL but no request
+    /// body, so a POST must never be answered from here.
+    private static func isChapterListRequest(_ method: String, _ url: URL) -> Bool {
+        guard method.caseInsensitiveCompare("GET") == .orderedSame else { return false }
+        return url.absoluteString.contains("sajax=getchapterlist")
+    }
+
+    /**
+     The chapter list's own signature: `{"code":1,"data":"1-/-<id>-/-<name>-/-/-…"}`.
+
+     `code == 1` *and* a string `data` carrying the site's own `-/-` separator must
+     both hold. That is what keeps an error page, a Cloudflare interstitial or the
+     site's own `{"code":400}` out of the cache -- and the failure direction is the
+     one that matters, because a cached failure would persist for the whole TTL.
+     */
+    private static func isCacheableChapterList(_ body: Data) -> Bool {
+        var data = body
+        if data.count >= 3, data[data.startIndex] == 0xEF,
+           data[data.startIndex + 1] == 0xBB, data[data.startIndex + 2] == 0xBF {
+            data = Data(data.dropFirst(3))
+        }
+        guard let parsed = try? JSONSerialization.jsonObject(with: data,
+                                                             options: [.fragmentsAllowed]),
+              let object = parsed as? [String: Any],
+              let code = object["code"] as? NSNumber, code.intValue == 1,
+              let list = object["data"] as? String,
+              list.contains("-/-") else {
+            return false
+        }
+        return true
+    }
+
+    private static func cachePolicy(method: String, url: URL) -> CachePolicy? {
+        if isChapterRequest(url) {
+            return CachePolicy(ttl: nil, accepts: isCacheableChapter)
+        }
+        if isChapterListRequest(method, url) {
+            return CachePolicy(ttl: chapterListTTL, accepts: isCacheableChapterList)
+        }
+        return nil
+    }
+
+    /// Session-scoped LRU for reusable answers. Bounded by both entry count and
     /// total bytes, evicting least-recently-used first. Deliberately in memory:
     /// an app restart starts clean, which bounds the memory and removes any
-    /// question about serving a chapter from a previous version of the app.
+    /// question about serving an answer from a previous version of the app.
     private final class ResponseCache {
         struct Entry {
             let status: Int
             let contentType: String
             let headers: [String: String]
             let body: Data
+            /// `nil` = valid until the app exits.
+            let expiresAt: Date?
         }
 
         private let lock = NSLock()
@@ -182,6 +252,14 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             lock.lock()
             defer { lock.unlock() }
             guard let entry = entries[key] else { return nil }
+            if let expiresAt = entry.expiresAt, expiresAt <= Date() {
+                // Dropped here rather than on the next sweep, so the byte budget
+                // is freed the moment the answer stops being useful.
+                entries.removeValue(forKey: key)
+                if let index = order.firstIndex(of: key) { order.remove(at: index) }
+                bytes -= entry.body.count
+                return nil
+            }
             if let index = order.firstIndex(of: key) {
                 order.remove(at: index)
                 order.append(key)
@@ -208,12 +286,12 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         }
     }
 
-    /// Chapter bodies are tens of KB each; 300 of them is far more than a reading
-    /// session touches, and the byte cap is what actually bounds the footprint
-    /// (kept well under the 64MB URLCache so the two budgets together stay
-    /// modest on a 3GB device).
-    private let chapterCache = ResponseCache(maxEntries: 300,
-                                             maxBytes: 64 * 1024 * 1024)
+    /// Chapter bodies are tens of KB each and a chapter list is ~115 KB; 300
+    /// entries is far more than a reading session touches, and the byte cap is
+    /// what actually bounds the footprint (kept well under the 64MB URLCache so
+    /// the two budgets together stay modest on a 3GB device).
+    private let responseCache = ResponseCache(maxEntries: 300,
+                                              maxBytes: 64 * 1024 * 1024)
 
     // MARK: - Request policy
 
@@ -600,8 +678,8 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 headers["User-Agent"] = SangTacHttpPlugin.defaultUserAgent
             }
 
-            // Chapter bodies are served from the session cache when we have one,
-            // so a re-read costs no network at all.
+            // Answers we already have are served from the session cache, so a
+            // re-read costs no network at all.
             //
             // The key is built HERE, from the Cookie header that is *about to be
             // sent*, not from that header's two sources separately. They can
@@ -611,7 +689,8 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             // would describe a request that was never sent, then serve a chapter
             // in the language the reader had already moved away from.
             var cacheKey: String?
-            if SangTacHttpPlugin.isChapterRequest(url) {
+            var responsePolicy: CachePolicy?
+            if let policy = SangTacHttpPlugin.cachePolicy(method: method, url: url) {
                 // The method is part of the identity too: a GET and a POST to the
                 // same URL are not the same answer. Not reachable today (the
                 // downloader uses `&download=true`, a different URL), but it costs
@@ -619,7 +698,8 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 let key = method + "|" + url.absoluteString + "|"
                     + SangTacHttpPlugin.chapterVariant(headers["Cookie"])
                 cacheKey = key
-                if let cached = self.chapterCache.get(key) {
+                responsePolicy = policy
+                if let cached = self.responseCache.get(key) {
                     self.serveCached(cached, url: url, call: call, method: method,
                                      elapsedMs: elapsedMs())
                     return
@@ -683,16 +763,25 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                     result["error"] = true
                 }
 
-                // Keep the chapter body for the next time the reader opens the
-                // same chapter. `isCacheableChapter` is what decides: 2xx, big
-                // enough, and actually the site's JSON answer rather than a
-                // challenge page that happens to be large.
-                if let key = cacheKey, http.statusCode >= 200, http.statusCode < 300,
-                   SangTacHttpPlugin.isCacheableChapter(body) {
-                    self.chapterCache.set(key, ResponseCache.Entry(status: http.statusCode,
-                                                                  contentType: contentType,
-                                                                  headers: headerMap,
-                                                                  body: body))
+                // Keep the answer for the next time it is asked for. The policy's
+                // own `accepts` is what decides -- a chapter has to be 2xx, big
+                // enough and actually the site's JSON rather than a challenge page
+                // that happens to be large; a chapter list additionally has to
+                // carry `code:1` and the site's own `-/-` record separator.
+                if let key = cacheKey, let policy = responsePolicy,
+                   http.statusCode >= 200, http.statusCode < 300, policy.accepts(body) {
+                    let expiresAt = policy.ttl.map { Date().addingTimeInterval($0) }
+                    let lifetime = policy.ttl.map { "\(Int($0))s" } ?? "the session"
+                    self.responseCache.set(key, ResponseCache.Entry(status: http.statusCode,
+                                                                    contentType: contentType,
+                                                                    headers: headerMap,
+                                                                    body: body,
+                                                                    expiresAt: expiresAt))
+                    // Kept out of the panel (it fires on every cached answer) but
+                    // written to the native call log, which is the only place that
+                    // shows what the session cache actually decided to hold.
+                    self.callLog("ok", "\(method) \(url.absoluteString) cached-for "
+                        + lifetime + " (\(body.count)b)")
                 }
 
                 self.callLog(http.statusCode >= 400 ? "err" : "ok",
@@ -977,7 +1066,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         return ordered.joined(separator: ";") + "|" + (signedIn ? "in" : "out")
     }
 
-    /// Answers from a cached chapter body, rebuilt through the same
+    /// Answers from the session cache, rebuilt through the same
     /// `responsePayload` the network path uses: its typing is load-bearing (the
     /// reader calls `r.data.replace(...)` on a text/html body), so the cached
     /// bytes have to go through the identical branch.

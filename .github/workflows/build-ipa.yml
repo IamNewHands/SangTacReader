@@ -221,6 +221,17 @@ jobs:
             echo "::error::setDiagnostics 缺失（原生诊断门无法开关）"
             exit 1
           fi
+          # 会话响应缓存里的章节列表那条规则。它没有 UI：一旦编译期丢掉
+          # （比如把 URL 判断写错或整段删掉），表现只是「章节列表又发了三次」，
+          # 面板上看不出来，所以必须让产物自己证明它在。
+          for marker in 'sajax=getchapterlist' 'cached-for '; do
+            if grep -q -F "$marker" "$syms.strings"; then
+              echo "✓ $marker 已编入产物"
+            else
+              echo "::error::$marker 缺失（章节列表缓存没有编入）"
+              exit 1
+            fi
+          done
           # 系统离线翻译的三个桥接方法名。iOS 15-17 上它们也必须在（返回
           # "unsupported" 让 JS 换联网引擎），缺了会变成不透明的桥接错误。
           for marker in translationStatus translationPrepare translationTranslate; do

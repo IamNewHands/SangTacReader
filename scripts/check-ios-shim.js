@@ -130,6 +130,12 @@ const REQUIRED_MARKERS = [
   // does *not* cover (the parser-created files) so the remaining cost is known
   // rather than assumed.
   'static request(s) still over the network',
+  // The mirror choice has to exist before the site's first request, not shortly
+  // after it: `fullUrl()`/`bestDomain()` resolve the host of every app.net call
+  // in the same turn the managers are created, so the install is driven by
+  // accessors instead of a poll.
+  'function watchProperty(',
+  'function watchNet(',
 ];
 
 function fail(message) {

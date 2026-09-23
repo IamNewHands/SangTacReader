@@ -2534,6 +2534,89 @@ async function testDomainFailover() {
   const stuck = await deadApp.reader.getContent('qidian', '1', 'c1');
   check('a code 7 with no alternative mirror is passed through untouched',
     !!stuck && String(stuck.code) === '7', JSON.stringify(stuck));
+
+  // The install has to land in the turn each object is created, not on the next
+  // poll. `fullUrl()`/`bestDomain()` (app.v2.js:110-129, :1136-1191) resolve the
+  // host of every app.net call, and the 2026-09-23 device log shows a launch's
+  // first data requests going to the canonical host because the patch was not in
+  // place yet. Nothing between the assignments and these checks yields, so only
+  // the accessors can have done the wiring.
+  const late = makeSandbox();
+  const remembered = 'https://sangtacviet.app';
+  // Written before the block runs, the way a previous launch leaves it: the entry
+  // is read at document start now instead of on the first bestDomain() call.
+  late.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: remembered, at: Date.now() }));
+  const lateApp = installFakeApp(late, {});
+  vm.runInContext(loadBlocks().join('\n'), late);
+  await tick(300);
+
+  const mirror = () => ({
+    domains: [{ name: good, status: 'alive', ping: 10 }],
+    defaultDomains: [good, remembered],
+    bestDomain() { return this.defaultDomains[0]; },
+  });
+
+  const lateNet = {};
+  lateApp.net = lateNet;
+  lateNet.networkManager = mirror();
+  lateNet.networkManagerXHR = mirror();
+  check('a manager assigned after the block is wrapped in the same turn',
+    lateNet.networkManager.__stvFailoverInstalled === true
+      && lateNet.networkManagerXHR.__stvFailoverInstalled === true,
+    JSON.stringify([lateNet.networkManager.__stvFailoverInstalled,
+      lateNet.networkManagerXHR.__stvFailoverInstalled]));
+  check('and it answers with the remembered mirror before any timer runs',
+    lateNet.networkManagerXHR.bestDomain() === remembered,
+    lateNet.networkManagerXHR.bestDomain());
+
+  // `window.app` is the outermost trap: the shell creates it with `var app = {`
+  // in its own inline script, long after document start.
+  const shellApp = { net: {} };
+  late.window.app = shellApp;
+  shellApp.net.networkManager = mirror();
+  check('an app created after the block is wrapped in the same turn',
+    shellApp.net.networkManager.__stvFailoverInstalled === true,
+    JSON.stringify(shellApp.net.networkManager.__stvFailoverInstalled));
+  check('a manager whose probes have not answered yet still uses the remembered mirror',
+    shellApp.net.networkManager.bestDomain() === remembered,
+    shellApp.net.networkManager.bestDomain());
+
+  // The fallback: once the trap has been given up (flag written by the watchdog
+  // below), the timer still wires the managers -- just not in the same turn. The
+  // optimization degrades, the app keeps working.
+  const off = makeSandbox();
+  off.localStorage.setItem('stv.domain.trap.off', '1');
+  off.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: remembered, at: Date.now() }));
+  const offApp = installFakeApp(off, {});
+  vm.runInContext(loadBlocks().join('\n'), off);
+  const offNet = {};
+  offApp.net = offNet;
+  offNet.networkManager = mirror();
+  check('with the trap given up the manager is not wrapped in the same turn',
+    offNet.networkManager.__stvFailoverInstalled === undefined,
+    JSON.stringify(offNet.networkManager.__stvFailoverInstalled));
+  await tick(300);
+  check('but the fallback timer still wraps it',
+    offNet.networkManager.__stvFailoverInstalled === true,
+    JSON.stringify(offNet.networkManager.__stvFailoverInstalled));
+
+  // The watchdog: a document that reached `complete` without ever creating `app`
+  // means the declaration was refused, not that the page is slow. Give the trap up
+  // for good and reload once -- the flag is what stops that from looping.
+  const noApp = makeSandbox();
+  installFakeApp(noApp, {});
+  noApp.document.readyState = 'complete';
+  noApp.location = { reload() { noApp.__reloaded = true; } };
+  vm.runInContext(loadBlocks().join('\n'), noApp);
+  delete noApp.window.app;
+  await waitFor(() => noApp.localStorage.getItem('stv.domain.trap.off') === '1', 8000);
+  check('an app that never appears drops the trap for good',
+    noApp.localStorage.getItem('stv.domain.trap.off') === '1',
+    String(noApp.localStorage.getItem('stv.domain.trap.off')));
+  check('and reloads once so the next launch works without it',
+    noApp.__reloaded === true, String(noApp.__reloaded));
 }
 
 async function testDownloadRowControls() {

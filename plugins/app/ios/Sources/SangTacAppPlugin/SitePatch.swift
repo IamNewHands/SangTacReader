@@ -2687,6 +2687,13 @@ enum SitePatch {
           chapter is fetched again.
 
      The alert only survives if every mirror refuses.
+
+     Both repairs have to be in place **before the site's first request**, not
+     merely early: the host of every `app.net` call is resolved by
+     `fullUrl()`/`bestDomain()` (`app.v2.js:110-129`, `:1136-1191`), and those run
+     in the same turn the managers are created. The install is therefore driven by
+     accessors on `window.app`, `app.net` and the two managers -- see the note at
+     the bottom of this block for why a poll lost that race on the device.
      */
     static let domainFailover = """
     (function () {
@@ -2705,6 +2712,11 @@ enum SitePatch {
         function manager() {
             var app = window.app;
             return (app && app.net && app.net.networkManager) || null;
+        }
+
+        function xhrManager() {
+            var app = window.app;
+            return (app && app.net && app.net.networkManagerXHR) || null;
         }
 
         function origin(url) {
@@ -2891,16 +2903,130 @@ enum SitePatch {
             return true;
         }
 
+        // ---- installed in the turn the site creates them ---------------------
+        //
+        // A poll cannot win this race, and the device log shows it losing. The
+        // site builds both managers and can spend one in the same synchronous
+        // turn (`app.v2.js:990-991` and `:1124-1125`), so with a 50ms interval the
+        // first requests of a launch resolve their host through the *unpatched*
+        // `bestDomain()`: `this.domains` is empty while `checkDomains()` is still
+        // in flight, so it answers `defaultDomains[0]` -- and `fullUrl()`
+        // (`app.v2.js:110-129`) plus `networkManager.bestDomain()` in
+        // `getCapacitor`/`postCapacitor` (`:1136-1191`) both route through it. In
+        // the 2026-09-23 device log that is the launch's first data requests
+        // going to the canonical host (`booklist.php?method=history`, 4034ms)
+        // while the first call that saw the remembered mirror came two seconds
+        // later and used the fast one for the rest of the session.
+        //
+        // `window.app` is created by `var app = {` in the shell's own inline
+        // script, and `app.net` by `app.v2.js:695` -- both are plain property
+        // assignments, so an accessor installed at document start sees each
+        // object in the turn it is made and hands it to the same idempotent
+        // wrapper the timer used to install. Nothing here reads a site object
+        // before the site creates it.
+        function install() {
+            var a = patchBestDomain(manager(), 'networkManager');
+            var b = patchBestDomain(xhrManager(), 'networkManagerXHR');
+            var c = patchContent();
+            return a && b && c;
+        }
+
+        function watchProperty(host, name, onSet) {
+            if (!host || (typeof host !== 'object' && typeof host !== 'function')) {
+                return false;
+            }
+            var current;
+            try { current = host[name]; } catch (e) { current = undefined; }
+            try {
+                Object.defineProperty(host, name, {
+                    configurable: true,
+                    enumerable: true,
+                    get: function () { return current; },
+                    set: function (next) { current = next; onSet(next); }
+                });
+            } catch (e) {
+                return false;
+            }
+            if (current !== undefined && current !== null) { onSet(current); }
+            return true;
+        }
+
+        function watchManagers(net) {
+            if (!net) { return; }
+            watchProperty(net, 'networkManager', function (value) {
+                patchBestDomain(value, 'networkManager');
+            });
+            watchProperty(net, 'networkManagerXHR', function (value) {
+                patchBestDomain(value, 'networkManagerXHR');
+            });
+        }
+
+        function watchNet(app) {
+            if (!app) { return; }
+            watchProperty(app, 'net', watchManagers);
+        }
+
+        // Read the remembered mirror now rather than on the first `bestDomain()`:
+        // that call is on the request path, and the parse belongs at document
+        // start. This runs even when the trap is given up below, because the
+        // manager wrapper needs the entry either way.
+        readGood();
+
+        // The accessor is given up rather than the site. `var app = {` is a plain
+        // assignment, which is exactly what lets a document-start accessor see it
+        // (`HasOwnProperty` is true, so the declaration is a no-op and the
+        // assignment goes through `[[Set]]`) -- but if an engine refused that
+        // declaration, the shell's own inline script would stop right there and the
+        // site would never boot, with nothing in the log to say why. So: if the
+        // document has finished loading and `app` still does not exist, the trap is
+        // dropped for good and the page is reloaded once. The next launch falls back
+        // to the timer alone, which is the pre-2026-09-23 behaviour.
+        var TRAP_OFF_KEY = 'stv.domain.trap.off';
+        var trapOff = false;
+        try {
+            trapOff = window.localStorage.getItem(TRAP_OFF_KEY) === '1';
+        } catch (e) { trapOff = false; }
+
+        var trapArmed = false;
+        if (!trapOff) {
+            trapArmed = watchProperty(window, 'app', watchNet);
+            watchNet(window.app);
+            if (trapArmed) {
+                var checks = 0;
+                var trapWatchdog = setInterval(function () {
+                    checks++;
+                    if (window.app || checks > 60) { clearInterval(trapWatchdog); return; }
+                    // A slow load is not a broken one: only a document that got all
+                    // the way to `complete` without ever creating `app` counts.
+                    if (!document || document.readyState !== 'complete') { return; }
+                    clearInterval(trapWatchdog);
+                    var wrote = false;
+                    try {
+                        window.localStorage.setItem(TRAP_OFF_KEY, '1');
+                        wrote = true;
+                    } catch (e) { wrote = false; }
+                    // Without a persisted flag the reload would just loop.
+                    if (!wrote) { return; }
+                    note('DOMAIN', 'app never appeared: dropping the document-start trap and reloading');
+                    if (typeof location !== 'undefined' && location
+                        && typeof location.reload === 'function') {
+                        location.reload();
+                    }
+                }, 2000);
+            }
+        }
+
+        // Belt and braces for an assignment the accessors cannot see -- a manager
+        // replaced with `Object.defineProperty`, or one created on an object the
+        // site builds some other way. `patchContent` has no property of its own to
+        // hang off (`app.reader.getContent` is one method on another object the
+        // site assembles), so it stays a poll.
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
-            var app = window.app;
-            var xhr = app && app.net && app.net.networkManagerXHR;
-            var a = patchBestDomain(manager(), 'networkManager');
-            var b = patchBestDomain(xhr, 'networkManagerXHR');
-            var c = patchContent();
-            if ((a && b && c) || attempts > 600) { clearInterval(timer); }
-        }, 50);
+            install();
+            if (attempts > 40) { clearInterval(timer); }
+        }, 250);
     })();
     """
 

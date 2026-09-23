@@ -71,7 +71,7 @@
 17. **导出的章节名只有越南语机翻可用，除非去问章节列表**（见 §6.18 (3)）：`readchapter` 不带原名，`oridata` 只在 `getChapterListOnline`（`app.v2.js:270`）出现。导出已改为复用阅读器那套映射；EPUB 的 `dc:language` / `xml:lang` 已在第十七轮改成 `zh`（正文与标题都是中文），见 §6.19 (1)。
 18. **「书本的取消点赞」很可能在站点侧根本不存在**（见 §6.19 (3)）：`app.api.unlike` 全站只有一个调用方，而且是社区帖子（`app.v2.js:5239`）；书籍这条路上站点自己只会 `like`。真机日志显示服务端收下 `ajax=unlike`（`code 100`）却一行都没删，而同一本书的 like 记录有两行。我们的包装已改成阶梯（对象 id → 逐行 id，每条复查），若行 id 也删不动，就只能如实提示失败——或者干脆不让赞加上去（按钮只读），这属于产品取舍，需要用户定。
 19. **每章正文末尾的存档声明是服务端加的**（见 §6.19 (2)）：`Bạn đang đọc bản lưu trong hệ thống` 不在客户端任何文件里，只能在消费正文处剥掉（阅读器 iframe + 导出，共用 `__stvI18n.stripNotice`）。匹配按用户给出的句子做，别的写法会漏。
-20. **冷启动的剩余时间在站点自己的串行链上**（见 §6.19 (4)）：外壳 HTML 的 TTFB ~1.2s，`app.v2.js`（59KB）在它后面，实测站点 UI 到 +2.9s、首页数据到 +10s 才齐。本轮修掉的是我们自己的两处浪费（资源 URL 每天换一次、设置页一次点错连发 25 个 403 的 `/mobile/lang/<域名>.json`）；要再往下压只有把静态资源搬进应用（`docs/optimization-plan-2026-09-23.md` §3/P2）。**§6.22 已做掉可达的那 8 个文件（906296 字节 源文件随包 + 后台 `If-Modified-Since` 校验）**，解析器自建的那 13 个仍需接管文档加载，见 §6.22 未证实项。
+20. **冷启动的剩余时间在站点自己的串行链上**（见 §6.19 (4)）：外壳 HTML 的 TTFB ~1.2s，`app.v2.js`（59KB）在它后面，实测站点 UI 到 +2.9s、首页数据到 +10s 才齐。本轮修掉的是我们自己的两处浪费（资源 URL 每天换一次、设置页一次点错连发 25 个 403 的 `/mobile/lang/<域名>.json`）；要再往下压只有把静态资源搬进应用（`docs/optimization-plan-2026-09-23.md` §3/P2）。**§6.22 已做掉可达的那 8 个文件（906296 字节 源文件随包 + 后台 `If-Modified-Since` 校验）**，解析器自建的那 13 个仍需接管文档加载；**§6.23 用真机日志 + 冷缓存实测（16 个引用合计 1232KB、`max-age=86400` 且无 ETag，一天最多付一次，而首屏在 +1225ms 已释放）把这条路否掉了**。
 
 ## 6. 真机问题档案
 
@@ -2305,5 +2305,208 @@ app.api.queryLike = async function(list){          // app.v2.js:4865
   ≤ 一次启动，与站点自己给的 `max-age=86400` 同阶。若站点在两次启动之间改名/改内容而读者只启动一次，
   那次仍是旧文件——「丢弃已刷新的资源副本」+「强制刷新站点资源」是手动出口。
 - 包体：`site-assets/` 906296 字节 源文件（zip 后约 150KB，IPA 现 952372 字节）。
+
+
+### 6.23 第二十一轮（`日志.txt` 560 行，21:39:18–21:41:02）：镜像生效确认 + 首请求主机 + 章节列表缓存
+
+这一轮的输入是用户在 §6.22 之后交回的真机日志。它同时回答了两个问题：镜像在设备上到底
+成不成，以及「要不要做壳接管」。
+
+#### ① 先纠正一个被误读了三轮的读数：`[BOOT] +20000ms` 不是「启动 20 秒」
+
+`bootShell` 的采样点是 0/1/3/6/10/20 秒六个，**无条件全打**（`releaseNow()` 在已释放后
+只返回 false，`note()` 照打），所以 `+20000ms` 那一行只是最后一个采样点，不是首屏耗时。
+本份日志里：
+
+| 证据 | 值 |
+|---|---|
+| `[BOOT] shell released` | **+1225ms**（原因 `app.v2.css (local) at +1225ms (stylesheet inserted)`） |
+| `[BOOT] +3001ms` | **`app=yes config=yes navbar=85px`** —— 站点自己的 JS 已经跑完 |
+| `[BOOT] +6019 / +10002 / +20000ms` | 同样 `app=yes config=yes`，只是继续在打点 |
+
+也就是说本次启动 1.2 秒撤掉假外壳、3 秒站点就绪。之前几轮把采样行当成耗时，方向偏了。
+
+#### ② 镜像在真机确认成立
+
+| 证据 | 值 |
+|---|---|
+| 装载 | `[MIRROR] 8 file(s), 848KB bundled, hooks=2 (blob scripts, style CSS)` |
+| 逐个取用 | 8 个文件全部 `from the local copy`（含 `app.v2.js (253KB)`、`hanviet.js (172KB)`） |
+| 首屏释放 | `shell released at +1225ms (app.v2.css (local) …)` —— 走的就是 §6.22 加的 `data-stv-mirror` 分支 |
+| 新鲜度 | `[MIRROR] 8 checked, all current (next launch)` + `revalidated 8 file(s): all current` |
+| 自愈 | **一次都没触发**，日志里没有 `[ERR] … reloading without the local copy` |
+| blob 的 origin | `[LOG] printStackTrace@blob:https://sangtacviet.com/76e71285-…` —— blob 继承的是真 origin，站点的同源判断没被打断 |
+
+TTS 起点（§6.21）同样在真机确认：`pageflip page 1 of 15 / 2 of 15 / 3 of 15` 三条都是
+`from the visible line`，起点分别是 `宝、` / `睡，` / `墨拿出布条，`，即屏幕上那一行的第一个字。
+
+#### ③ 结论：壳接管**不做**
+
+`[ASSET]` 那一行是决定性的：
+
+```
+[ASSET] 21 static request(s) still over the network: 1KB wire / 0KB decoded,
+        17 from cache, last byte at +6318ms; 7 served locally (app.v2.css,app.v2.js,…)
+```
+
+剩下 21 个静态请求总共只花了 **1KB 上网**，17 个直接命中 WKWebView 的磁盘缓存，最后 1 字节
+落在 +6318ms —— 而首屏在 +1225ms 就释放了，静态资源根本不在关键路径上。为了给「接管文档加载」
+定价，本轮实测了那 16 个解析器自建的引用在**冷缓存**下的全量：
+
+| 文件 | 字节 |
+|---|---|
+| `html2canvas.min.js` | 198689 |
+| `materialize.min.js` | 181109 |
+| `bootstrap.min.css?origin=` | 155758 |
+| `stv.ui.js?v=1.360` | 153833 |
+| `materialize.min.css` | 141841 |
+| `jqr.js?v=10` | 88207 |
+| `asset/all.min.css` | 83405 |
+| `gsap.min.js` | 74069 |
+| `bootstrap.min.js` | 58078 |
+| `crypto-js.min.js` | 48316 |
+| `main.css?v=44` | 37026 |
+| `iro.js` | 28249 |
+| `stv.host.js` | 9612 |
+| `font/font.css?v=4` | 1226 |
+| `asset/theme.default.css?v=0` | 1541 |
+| `asset/materialize.icon.css` | 619 |
+| **合计** | **1261578（1232KB）** |
+
+全部带 `max-age=86400` + `Last-Modified`、**无 ETag**，所以这 1232KB 一天最多付一次；
+`loadHTMLString` 那条路要 1–2 天、接管导航代理、包里再 +1.2MB，换的却是这个数。
+**不做**，理由是量出来的，不是估出来的。
+
+#### ④ 于是把力气放到日志里真正花钱的地方
+
+同一份日志按耗时排序（`[Http]` 行，含原生侧 `in <ms>ms`）：
+
+| 请求 | 耗时 | 备注 |
+|---|---|---|
+| `POST sangtacviet.com/mobile/booklist.php?method=history` | **4034ms** | 启动后第一个数据请求，历史是默认 tab |
+| `GET /index.php?ngmar=chapterlist…&sajax=getchapterlist` | 1484 + 1162 + 828 = **3474ms** | **同一 URL、同一内容取了 3 次**，每次 114771 字节 |
+| `POST /io/novel/updateOldLink` ×3 | 836 + 561 + 873 = 2270ms | 响应只有 19 字节 |
+| `GET /io/grantcontext/context` | 2011ms | 844297 字节 |
+| `GET dns1.stv-appdomain-00000001.org/warp.php` | 2105ms | 回的是 `no`（死镜像） |
+| `POST userinfo.php` ×2 | 484 + 711ms | 背靠背同一个请求打了两次 |
+
+而 `.com` 上那三个请求（`warp.php` 1043ms、`lang/zh.json` 1635ms、`history` 4034ms）之后的
+15 个请求全部落在 `.app`（473–765ms 那一档）。注意：**`.app` 也不是全都快**（`getinv` 31 字节
+花了 1195ms、`searchBooks` 1221ms、`grantcontext` 2011ms），所以「换主机能省 3 秒」这件事
+本轮**没有证明**，可证明的是「第一个请求用错了主机，而修正它的代价很小」。
+
+#### ⑤ 改动 A：记住的镜像在 document start 就生效（`domainFailover`）
+
+**机制**（全部有行号）：
+
+1. `fullUrl(url)`（`app.v2.js:110-129`）对每个 `app.net` 请求决定主机：先取
+   `window.location.origin`，若 `networkManagerXHR.isDomainAlive(origin)` 为假才问
+   `bestDomain()`，最后 `baseDomain + url`。
+2. `bestDomain()` 在 `this.domains.length == 0` 时直接返回 `defaultDomains[0]`
+   （`networkManager` 是 `https://sangtacviet.com`，`app.v2.js:932/934-936`；
+   `networkManagerXHR` 是 `https://dns1…`，`:1035/1037-1039`）。
+3. `checkDomains()` 在 `:990` / `:1124` 被调用，`networkManagerXHR` 那一个还会先
+   `this.domains = []`（`:1063`），于是**探测期间 `bestDomain()` 只能给 `defaultDomains[0]`**。
+4. manager 在本文件里被建立后**同一轮**就可能被用掉（`:990-991`、`:1124-1125`），
+   而原来的实现是 50ms 轮询 —— 这场竞争是结构性输掉的。
+5. 而且 `app.v2.js` 并不是 `_page_vip.html` 里的头脚本，它由外壳在第 **5207** 行
+   `ui.scriptmanager.load("/asset/app.v2.js?" + Math.random(), …)` **动态注入**；`app` 本身
+   由外壳自己一个内联 `<script>`（抓下来的 `app.v2.php` 第 3054 行起）用 **`var app = {`**
+   （第 3073 行，顶层、前后括号平衡）建立 —— 两处都是**普通赋值**。
+
+**实现**：在 `window.app`、`app.net`、`net.networkManager`、`net.networkManagerXHR` 四处各装
+一个访问器（`watchProperty`），对象一出现就在**同一轮**交给原来那套幂等包装
+（`patchBestDomain` 的 `__stvFailoverInstalled` 守卫不变），50ms 轮询降级为 250ms×40 次的兜底
+（`patchContent` 没有可挂的属性，仍靠它）。`Object.defineProperty` 包在 try/catch 里，
+装不上就退回旧行为，不会让整块失效。同时把 `readGood()` 从「第一次 `bestDomain()` 时惰性读」
+改成「document start 就读」，请求路径上不再有 `JSON.parse`。
+
+**安全属性保持不变**：记住的镜像仍然必须出现在站点自己的 `domains`/`defaultDomains` 里，
+所以伪造 localStorage 仍然指不到别的 origin（`test-site-patch` 里那条用例照旧通过）。
+
+**自愈（这条改动是拿站点换来的，所以必须留退路）**：给全局 `app` 装访问器是唯一能让
+「站点建立对象」和「我们包装它」之间不留时间窗的做法，但它有一个**只能推断、无法本地验证**的
+前提 —— 引擎允许在已存在（且 `configurable`）的属性上执行 `var app = {`。按规范这是安全的
+（`CanDeclareGlobalVar` 只看 `HasOwnProperty`，为真就不声明，随后赋值走 `[[Set]]` 命中访问器），
+但若某个引擎不这么做，外壳那段内联脚本会**停在这一行**，后面的 `app.v2.js` 都不会被请求，
+站点直接起不来，而且日志里没有任何线索。所以加了一条看门狗：文档 `readyState === 'complete'`
+且 `app` 仍不存在时，写 `stv.domain.trap.off` 并 `location.reload()` 一次；下一次启动读到该标记
+就完全不装访问器，退回 250ms 轮询（即本轮之前的行为）。写标记失败时不 reload（否则会无限循环）。
+「页面只是慢」不会误触：`readyState` 到 `complete` 时外壳那段内联脚本早就执行完了。
+
+**顺带核对过的风险点**：外壳/stv.ui.js/app.v2.js 里没有 `hasOwnProperty("app")`、
+`"app" in window`、`delete window.app`、`Object.keys(window)`、`typeof app` 这些会被访问器
+影响的写法；唯一的 `Object.defineProperty(window.localStorage, 'length', …)` 是站点自己的。
+外壳第 77 行的 `if (app && app.debug && app.debug.report)` 在外壳建立 `app` 之前就引用了它 ——
+装了访问器之后 `app` 是「已定义但 undefined」，那里从可能抛 ReferenceError 变成安静跳过，
+方向是安全的。
+
+#### ⑥ 改动 B：原生会话缓存加 TTL，并把 `sajax=getchapterlist` 收进去
+
+原来的 `ResponseCache`（进程内 LRU，300 条 / 64MB）只认 `url.contains("sajax=readchapter")`，
+键是 `方法|URL|Cookie 变体`，**没有过期概念**（正文是不可变文本，可以这么干）。本轮：
+
+- `Entry` 加 `expiresAt: Date?`（`nil` = 整个会话有效），`get()` 命中过期项时**当场删掉并退还
+  字节预算**。
+- 判定集中成一个 `cachePolicy(method:url:)`，查表（lookup）与写入（store）用的是同一个策略
+  对象，不可能互相不一致。
+- 新增 `isChapterListRequest`：**必须 `GET`**（键里没有请求体，POST 永远不进缓存），且
+  URL 含 `sajax=getchapterlist`。
+- 新增 `isCacheableChapterList`：必须 `code == 1` **且** `data` 是含站点自己 `-/-` 分隔符的
+  字符串 —— 错误页、Cloudflare 拦截页、站点自己的 `{"code":400}` 都进不来。失败方向是安全的
+  那一侧（不认识就重新取），因为一次错误的缓存会钉住整个 TTL。
+- TTL 取 **300 秒**：比日志里同一份列表首末两次相隔的 60 秒长，又短到「读者在读期间作者
+  更新了章节」不会一直被挡。
+- 存入时多写一行原生调用日志（`… cached-for 300s (114771b)`），面板不加新行（每个缓存响应
+  都刷一行会把面板淹掉）；命中仍然沿用现成的 `[Http] … (cache)`。
+
+**故意没做**：`userinfo.php`（背靠背两次）与 `booklist.php?method=*`（未读数/关注状态）不进缓存
+—— 它们的过期是「显示错」而不是「省一次往返」。
+
+#### ⑦ 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **405254 字节** / **58 个标记**（新增 `function watchProperty(`、`function watchNet(`） |
+| `scripts/test-site-patch.js` | **577 条断言**（上一轮 569，新增 8 条：manager 在建后同一轮被包上、同一轮就用记住的镜像、`app` 在块之后建立也被接住、探测未回来的 manager 仍给记住的镜像、退路标记下同一轮不包、退路标记下兜底轮询仍包、`app` 始终不出现时写标记、写标记后 reload 一次） |
+| `scripts/gen-site-i18n.js --check` | 458 标签 / 35 片段 |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 / host `https://sangtacviet.com` |
+
+CI 的二进制 strings 检查新增 `'sajax=getchapterlist'` 与 `'cached-for '`（章节列表缓存没有 UI，
+一旦编译期丢掉，表现只是「列表又发了三次」，面板上看不出来，必须让产物自己证明它在）。
+
+新加的断言里，前四条**全部发生在不 `await` 的同步段**：装完块并 `tick(300)` 之后才做赋值，
+赋值与检查之间没有任何 yield，所以只有访问器可能完成接线 —— 这正是本轮修的那个竞争；
+后四条分别验证退路（标记生效后同一轮不接线、兜底轮询仍接线）与看门狗（始终不出现 `app`
+→ 写标记 + reload 一次）。
+
+#### 未证实项（下一轮的输入）
+
+- **访问器在 Safari 里与 `var app` 的相互作用没有真机验证过**。规范的读法是：
+  `GlobalDeclarationInstantiation` 对已存在的属性只做 `HasOwnProperty` 检查（为真就跳过），
+  随后的赋值走 `[[Set]]`，命中访问器；属性是 `configurable: true`，所以即便站点改用
+  `let app` 也不会抛。**但这依赖 Safari 的实现**。真机上的判据有三条：
+  `[DOMAIN] networkManager mirror failover installed` 应出现得比原来更早（理想情况下在
+  第一条 `[Http]` 之前）、`[BOOT]` 三个采样点应照常 `app=yes`、以及**不应**出现
+  `[DOMAIN] app never appeared: dropping the document-start trap and reloading`。
+  若看到最后那条（面板开着才会有，且开关持久化），说明看门狗生效、下一次启动已经退回轮询，
+  功能只是没优化而不是坏了，把那一行给我即可。
+- **「第一个请求改用记住的镜像」能省多少，这份日志证明不了**（`.com` 与 `.app` 都有 1–4 秒的
+  调用）。要看的下一份日志是：`history` 与 `lang/zh.json` 这两条是否落在 `.app`、耗时是否降到
+  500ms 一档；以及 `[DOMAIN] networkManagerXHR using remembered mirror` 是否出现在
+  **第一条 `[Http]` 之前**。
+- **章节列表缓存的收益要看命中**：期望在第二次/第三次 `getchapterlist` 上看到
+  `[Http] GET … (cache)`，且 `[ASSET]`-式的重复消失；`cached-for 300s (114771b)` 只写在原生调用
+  日志里，面板看不到。若 5 分钟内作者更新了章节而读者正好退回列表，那一次会看到旧列表 ——
+  这是选定的取舍，不是缺陷。
+- **`userinfo.php` 背靠背两次**、**`updateOldLink` 三次共 2270ms**、**`dns1` 探测 2105ms 回 `no`
+  而 `.com`/`.app` 都已回 `yes`** 都还没动：前两个是下一轮的低风险目标，第三个要改站点自己的
+  `verifyDomain()` 排名，风险更高。
+- 日志里还有个**独立**的观察待确认：`jsonify.php?ajax=followbook` 回 `{"status":"success","code":400}`
+  （本站 `code 100` 才算成功），随后的状态查询是 `"follow":false` —— 「关注」这条动作没生效；
+  同一份日志里 `[SAFE] safe area top=0` 出现过两次（`css status-bar-height=62px` 未变，
+  viewport 874→768，同一时刻 navbar 从 `[789..874]` 跳到 `[683..768]`），顶栏会有一次视觉跳动。
+  这两条与本轮的两处改动静默无关，留给下一轮。
+
 
 
