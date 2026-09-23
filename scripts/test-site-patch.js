@@ -2523,10 +2523,13 @@ async function testDomainFailover() {
   vm.runInContext(loadBlocks().join('\n'), stall);
   await tick(300);
 
-  check('the transport failover wraps app.net.get',
+  check('the transport failover wraps app.net.get and app.net.post',
     typeof stallApp.net.get === 'function'
-      && stallApp.net.get.__stvFailoverWrapped === true,
-    String(stallApp.net.get && stallApp.net.get.__stvFailoverWrapped));
+      && stallApp.net.get.__stvFailoverWrapped === true
+      && typeof stallApp.net.post === 'function'
+      && stallApp.net.post.__stvFailoverWrapped === true,
+    JSON.stringify([String(stallApp.net.get && stallApp.net.get.__stvFailoverWrapped),
+      String(stallApp.net.post && stallApp.net.post.__stvFailoverWrapped)]));
 
   const stallFirst = await stallApp.net
     .get('/index.php?ngmar=chapterlist&h=qidian&bookid=1&sajax=getchapterlist')

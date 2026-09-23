@@ -145,6 +145,7 @@ const REQUIRED_MARKERS = [
   // back with no payload bans it, the site's own retries land elsewhere, an
   // explicit 线路 choice wins, and the fresh probe ranking is logged.
   'function patchNet(',
+  'function wrappedNet(',
   'function failed(',
   'transport failover installed',
   'app_domain=',

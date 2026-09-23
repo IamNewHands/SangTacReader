@@ -3019,7 +3019,14 @@ enum SitePatch {
             var a = patchOne(app.net, 'get');
             var b = patchOne(app.net, 'post');
             if (a || b) { note('DOMAIN', 'transport failover installed'); }
-            return a && b;
+            // Asked of the slots, not of this pass: after the first wrap both
+            // `patchOne` calls report false every time, and `install()`'s `&&`
+            // chain would then read "not wired" forever.
+            return wrappedNet(app.net, 'get') && wrappedNet(app.net, 'post');
+        }
+
+        function wrappedNet(net, name) {
+            return typeof net[name] === 'function' && net[name].__stvFailoverWrapped === true;
         }
 
         function patchBestDomain(mgr, label) {

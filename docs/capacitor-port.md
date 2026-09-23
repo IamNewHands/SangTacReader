@@ -2662,8 +2662,13 @@ name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它�
 的 `code 7`。**慢、超时、无载荷都不算失败**，于是 `.app` 一旦卡住就被钉到 6 小时 TTL
 到期为止。同一份日志还有两处佐证：
 
-- 站点自己刚测出 `.com` 比 `.app` 快 4.6 倍，`bestDomain()` 的原实现会选 `.com`
-  （`app.v2.js:947-952`），被这一行 `return` 吃掉了。
+- 站点自己刚测出 `.com` 比 `.app` 快 4.6 倍，而 `bestDomain()` 的原实现是「`app_domain` 指定的
+  镜像活着就返回它，否则返回 ping 最低的活镜像」（`app.v2.js:933-956`）——所以在**未打补丁**
+  且 `app.config.ux.app_domain` 不是 `.app` 的前提下它会选 `.com`。这一句是推论，不是本份日志
+  能证的事：日志里没有 `app_domain` 的取值（只能看到 23:14:14 那次点选给了
+  `https://sangtacviet.com`），所以「原实现会选 `.com`」**留待新的 `route` 行确认**。
+  能确定的是**这个分支只有一条出口**：只要记忆分支被走到，`bestDomain()` 回的就是 `.app`，
+  与 `original` 说了什么无关——`app.v2.read.js:564` 的主机正是它的返回值。
 - 23:14:14 / 23:14:16 两次点「线路」菜单（`[LOG] app.config.ux.app_domain`），此后每个
   请求仍在 `.app`——站点自己在 `app.v2.js:937-943`／`:1040-1046` 是**认**这个偏好的
   （镜像 `alive` 时直接返回它），也被吃掉了。
@@ -2717,7 +2722,7 @@ name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它�
 
 | 守卫 | 结果 |
 |---|---|
-| `scripts/check-ios-shim.js` | 23 块 / **423411 字节** / **65 个标记**（新增 `function patchNet(`、`function failed(`、`transport failover installed`、`app_domain=`） |
+| `scripts/check-ios-shim.js` | 23 块 / **423826 字节** / **66 个标记**（新增 `function patchNet(`、`function wrappedNet(`、`function failed(`、`transport failover installed`、`app_domain=`） |
 | `scripts/test-site-patch.js` | **598 条断言**（上一轮 587，新增 11 条） |
 | `scripts/gen-site-i18n.js --check` | 458 labels / 35 fragments |
 | `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
