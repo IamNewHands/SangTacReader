@@ -1375,16 +1375,16 @@ async function testDownloadRowControls() {
   const title = row.querySelector('.tname');
   const bar = row.__stvBar;
 
+  check('the control bar clears the 77px the absolute row occupies',
+    !!bar && String(bar.getAttribute('style')).indexOf('margin-top:77px') >= 0,
+    bar ? String(bar.getAttribute('style')) : 'no bar');
   check('the control bar is lifted above the absolutely positioned .bookrow',
     !!bar && String(bar.getAttribute('style')).indexOf('position:relative') >= 0
       && String(bar.getAttribute('style')).indexOf('z-index:5') >= 0,
     bar ? String(bar.getAttribute('style')) : 'no bar');
   check('the fixed-height row container grows to fit the controls',
-    row.style.height === 'auto' && row.style.minHeight === '77px'
-      && row.style.paddingBottom === '46px',
-    JSON.stringify({
-      h: row.style.height, min: row.style.minHeight, pad: row.style.paddingBottom,
-    }));
+    row.style.height === 'auto' && row.style.minHeight === '77px',
+    JSON.stringify({ h: row.style.height, min: row.style.minHeight }));
   check('the row carries the book it belongs to',
     row.getAttribute('data-stv-host') === 'qidian'
       && row.getAttribute('data-stv-id') === '1034915599',

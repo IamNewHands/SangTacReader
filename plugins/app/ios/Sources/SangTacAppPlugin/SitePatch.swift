@@ -2072,11 +2072,12 @@ enum SitePatch {
         // `<div class="bookrowcont"><div class="bookrow">...` and app.v2.css
         // gives `.bookrowcont` a fixed `height: 77px` with `.bookrow`
         // `position: absolute` inside it, so a control bar appended in normal
-        // flow is painted *under* the absolutely positioned row and every tap
-        // lands on the row instead. The device log is unambiguous: tapping the
-        // pause/delete area produced `openBookWithData called with no book data
-        // (bookid=0)` -- the row's own handler, never ours. Grow the container
-        // and lift the bar above the positioned row.
+        // flow starts at the container's top (the row is out of flow), is painted
+        // *under* the positioned row, and every tap lands on the row instead. The
+        // device log is unambiguous: tapping the pause/delete area produced
+        // `openBookWithData called with no book data (bookid=0)` -- the row's own
+        // handler, never ours. Let the container grow, push the bar below the
+        // 77px the row occupies, and lift it above the positioned row.
         function decorateRow(manager, node, book) {
             if (!node || node.__stvActions) { return; }
             node.__stvActions = true;
@@ -2088,11 +2089,11 @@ enum SitePatch {
             }
             node.style.height = 'auto';
             node.style.minHeight = '77px';
-            node.style.paddingBottom = '46px';
             var bar = document.createElement('div');
             node.__stvBar = bar;
             bar.setAttribute('style',
-                'position:relative;z-index:5;display:flex;gap:6px;padding:0 6px 8px;');
+                'position:relative;z-index:5;margin-top:77px;display:flex;gap:6px;'
+                + 'padding:0 6px 8px;');
             var toggle = document.createElement('button');
             var drop = document.createElement('button');
             toggle.setAttribute('style',

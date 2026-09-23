@@ -881,8 +881,8 @@ JS（`app.v2.js` 261KB、`chapterdisplay` 158KB、`read` 145KB、`comicprovider`
 
 修法两条：
 
-1. **让控制条真的可点**：把 `.bookrowcont` 放开（`height:auto; min-height:77px;
-   padding-bottom:46px`），控制条本身 `position:relative; z-index:5`，画在定位行之上；
+1. **让控制条真的可点**：`.bookrowcont` 放开（`height:auto; min-height:77px`），控制条本身
+   `margin-top:77px` 让出定位行占的 77px，再 `position:relative; z-index:5` 画在定位行之上；
 2. **让行本体点了也有用**：`render()` 捕获的 `bi` 在缓存未命中时是 `undefined`
    （`populateBookInfo()` 只读缓存、静默返回 `[]`，app.v2.read.js:3258 → :3609），而那个
    匿名监听器无法解绑。于是在 `document` 捕获阶段接管：行的 `.tname` 为空即说明站点没拿到
@@ -926,6 +926,6 @@ JS（`app.v2.js` 261KB、`chapterdisplay` 158KB、`read` 145KB、`comicprovider`
 
 #### 验证
 
-`check-ios-shim`（13 块 / 137982 字节 / 16 markers）、`test-site-patch`（141 条断言，新增
-`readchapter mirror failover` 10 条、`download row controls and missing book info` 9 条、
+`check-ios-shim`（13 块 / 138075 字节 / 16 markers）、`test-site-patch`（142 条断言，新增
+`readchapter mirror failover` 10 条、`download row controls and missing book info` 10 条、
 设置镜像与可判读性 4 条）、`gen-site-i18n --check`（456 labels / 35 fragments）全绿。
