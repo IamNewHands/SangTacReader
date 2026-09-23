@@ -2421,12 +2421,15 @@ enum SitePatch {
      if one exists -- is identified from the device instead of guessed. The
      first action answering code 100 wins.
 
-     Like: the state is read from `queryBookExtStatus` (the same call the site's
-     own `updateBookPage` uses) and the matching endpoint is chosen from it, so
-     the toggle never guesses. The count next to the button is nudged here
-     because `updateBookPage` only rewrites the `.active` class; bookinfo.php
-     re-sends the real number when the page is reopened, so a drift cannot
-     survive a reload.
+     Like: the toggle asks `querylikestatus` -- the endpoint whose key is the
+     same `type:id` pair that `like()` and `unlike()` take -- and verifies the
+     answer after the call instead of trusting it. Reading `queryBookExtStatus`
+     first (the previous revision) was the bug: it answers with the book's own
+     record, so `status.like` stays true after a successful unlike and every tap
+     took the removal path. The count next to the button is nudged here because
+     `updateBookPage` only rewrites the `.active` class; bookinfo.php re-sends
+     the real number when the page is reopened, so a drift cannot survive a
+     reload.
      */
     static let bookmarkToggle = """
     (function () {
@@ -2547,6 +2550,47 @@ enum SitePatch {
             return true;
         }
 
+        // Did *I* like this book? `querylikestatus` is the only endpoint whose
+        // key space matches like()/unlike() -- `${type}:${id}`, the same pair
+        // app.socialpost.queryLikeStatus builds for a post (app.v2.js:5258) -- so
+        // the read and the write finally speak about the same object. `liked:
+        // null` means "the site would not say" (signed out, or the call failed)
+        // and is never turned into a guess.
+        var likedState = {};
+
+        function readLiked(book) {
+            var api = window.app.api;
+            var key = book.host + ':' + book.id;
+            if (typeof api.queryLike === 'function') {
+                return Promise.resolve(api.queryLike([key])).then(function (list) {
+                    var entries = list && list.length ? list : [];
+                    var liked = false;
+                    for (var i = 0; i < entries.length; i++) {
+                        var objectid = entries[i] && entries[i].objectid !== undefined
+                            ? String(entries[i].objectid) : '';
+                        if (!objectid || objectid === String(book.id)
+                            || objectid === key) { liked = true; break; }
+                    }
+                    return { liked: liked, source: 'querylikestatus',
+                             raw: String(JSON.stringify(entries)).slice(0, 200) };
+                }, function (error) {
+                    return { liked: null, source: 'querylikestatus',
+                             raw: 'rejected: ' + error };
+                });
+            }
+            if (typeof api.queryBookExtStatus !== 'function') {
+                return Promise.resolve({ liked: null, source: 'none', raw: '' });
+            }
+            return Promise.resolve(api.queryBookExtStatus(book)).then(function (status) {
+                return { liked: status ? !!status.like : null,
+                         source: 'querybookmarkstatus',
+                         raw: String(JSON.stringify(status)).slice(0, 200) };
+            }, function (error) {
+                return { liked: null, source: 'querybookmarkstatus',
+                         raw: 'rejected: ' + error };
+            });
+        }
+
         function attachLike() {
             var app = window.app;
             if (!app || !app.api || typeof app.api.likeBook !== 'function'
@@ -2556,53 +2600,115 @@ enum SitePatch {
             var api = app.api;
             var originalLike = api.likeBook;
 
+            // The `.active` class has exactly one writer, app.api.updateBookPage
+            // (app.v2.js:4932), and it asks the very call this block just proved
+            // is not the reader's state: left alone it re-lights the thumbs-up a
+            // moment after every verified unlike, which looks exactly like "the
+            // cancellation did nothing". Hand it the verified answer instead of
+            // arguing with it over the class list -- patched for the duration of
+            // one call, restored the moment updateBookPage has taken the reply.
+            if (typeof api.updateBookPage === 'function' && !api.__stvPageWrapped) {
+                api.__stvPageWrapped = true;
+                var originalPage = api.updateBookPage;
+                api.updateBookPage = function (p, bookinfo) {
+                    var info = bookinfo;
+                    if (!info && p) {
+                        info = p.data || (p.q && p.q('div') ? p.q('div').data : null);
+                    }
+                    var key = info && info.host && info.id
+                        ? info.host + '/' + info.id : null;
+                    if (!key || likedState[key] === undefined
+                        || typeof api.queryBookExtStatus !== 'function') {
+                        return originalPage.apply(this, arguments);
+                    }
+                    var verified = likedState[key];
+                    var originalStatus = api.queryBookExtStatus;
+                    var restored = false;
+                    api.queryBookExtStatus = function () {
+                        return Promise.resolve(originalStatus.apply(api, arguments))
+                            .then(function (status) {
+                                if (status) { status.like = verified; }
+                                return status;
+                            });
+                    };
+                    try {
+                        return originalPage.apply(this, arguments);
+                    } finally {
+                        setTimeout(function () {
+                            if (!restored) {
+                                restored = true;
+                                api.queryBookExtStatus = originalStatus;
+                            }
+                        }, 0);
+                    }
+                };
+            }
+
             api.likeBook = function (bookdata) {
                 var book = target(bookdata);
                 if (!book) {
                     note('LIKE', 'the tapped book could not be resolved; falling back to like');
                     return originalLike.apply(this, arguments);
                 }
-                // Authoritative state, the site's own pre-check for the same
-                // result (`app.api.updateBookPage` asks the identical question).
-                var state = typeof api.queryBookExtStatus === 'function'
-                    ? api.queryBookExtStatus(book) : Promise.resolve(null);
-                return Promise.resolve(state).then(function (status) {
-                    // Logged on both paths on purpose: the fifteenth device log
-                    // held no like tap at all, so the next one has to say
-                    // whether this handler ran (and what the server reported)
-                    // even when the answer is "add the like".
-                    note('LIKE', book.host + '/' + book.id + ' status like='
-                        + (status ? String(status.like) : 'unknown'));
-                    if (!(status && status.like)) {
-                        return Promise.resolve(originalLike.call(api, book))
-                            .then(function (down) {
-                                note('LIKE', 'liked ' + book.host + '/' + book.id
-                                    + ' -> code ' + (down && down.code));
-                                if (down && down.code == 100) {
-                                    applyLiked(true);
-                                    bumpLikedCount(1);
-                                }
-                                return down;
-                            });
-                    }
-                    note('LIKE', book.host + '/' + book.id + ' is liked; unliking');
-                    return api.unlike(book.host, book.id).then(function (down) {
+                var key = book.host + '/' + book.id;
+                // Logged on both paths on purpose: the fifteenth device log held
+                // no like tap at all, so this one has to say which question was
+                // asked, what the server answered, and what the button did next.
+                return readLiked(book).then(function (state) {
+                    note('LIKE', key + ' status ' + state.source + ' liked='
+                        + state.liked + ' raw=' + state.raw);
+                    if (state.liked) { return remove(book); }
+                    return add(book);
+                });
+
+                function add(book) {
+                    return Promise.resolve(originalLike.call(api, book)).then(function (down) {
+                        note('LIKE', 'liked ' + key + ' -> code ' + (down && down.code));
                         if (down && down.code == 100) {
-                            applyLiked(false);
-                            bumpLikedCount(-1);
-                            note('LIKE', 'unliked ' + book.host + '/' + book.id);
-                            if (app.toast) { app.toast('已取消点赞'); }
-                        } else {
-                            note('LIKE', 'unlike refused for ' + book.host + '/' + book.id
-                                + ': ' + String(JSON.stringify(down)).slice(0, 200));
+                            likedState[key] = true;
+                            applyLiked(true);
+                            bumpLikedCount(1);
                         }
                         return down;
+                    });
+                }
+
+                function remove(book) {
+                    note('LIKE', key + ' is liked; unliking');
+                    return Promise.resolve(api.unlike(book.host, book.id)).then(function (down) {
+                        note('LIKE', 'unlike ' + key + ' -> code ' + (down && down.code)
+                            + ' raw=' + String(JSON.stringify(down)).slice(0, 200));
+                        if (!(down && down.code == 100)) {
+                            note('LIKE', 'the server refused the unlike for ' + key
+                                + '; the button is left as the site drew it');
+                            return down;
+                        }
+                        // Accepted is not the same as done. Ask again, and only
+                        // claim the cancellation once the site agrees -- the
+                        // unconditional toast is what made the reader report
+                        // "提示取消，但是实际没有取消".
+                        return readLiked(book).then(function (state) {
+                            note('LIKE', key + ' after unlike: ' + state.source + ' liked='
+                                + state.liked + ' raw=' + state.raw);
+                            if (state.liked) {
+                                likedState[key] = true;
+                                applyLiked(true);
+                                if (app.toast) { app.toast('取消失败，详见日志'); }
+                                return down;
+                            }
+                            likedState[key] = false;
+                            applyLiked(false);
+                            bumpLikedCount(-1);
+                            note('LIKE', 'unliked ' + key);
+                            if (app.toast) { app.toast('已取消点赞'); }
+                            return down;
+                        });
                     }, function (error) {
                         note('ERR', 'unlike failed for ' + book.host + '/' + book.id
                             + ': ' + error);
                         return null;
                     });
-                });
+                }
             };
             note('LIKE', 'like toggle installed');
             return true;
@@ -3461,10 +3567,32 @@ enum SitePatch {
                             var store = app.offlineBook.store;
                             var all = (store && store.data) || [];
                             var visible = [];
+                            var seen = {};
+                            var collapsed = 0;
                             for (var i = 0; i < all.length; i++) {
-                                if (!liveJob(all[i].host, all[i].id)) {
-                                    visible.push(all[i]);
+                                var record = all[i];
+                                if (liveJob(record.host, record.id)) { continue; }
+                                var bookKey = record.host + '/' + record.id;
+                                if (seen[bookKey]) {
+                                    // One row per novel whatever the store holds:
+                                    // the chapter file is keyed by host/id, so every
+                                    // duplicate record renders the same content and
+                                    // the newest counts are the true ones.
+                                    var held = seen[bookKey];
+                                    if ((record.lastDownload || 0)
+                                        > (held.record.lastDownload || 0)) {
+                                        visible[held.index] = record;
+                                        held.record = record;
+                                    }
+                                    collapsed++;
+                                    continue;
                                 }
+                                seen[bookKey] = { index: visible.length, record: record };
+                                visible.push(record);
+                            }
+                            if (collapsed) {
+                                note('BOOKINFO', 'collapsed ' + collapsed
+                                    + ' duplicate download record(s)');
                             }
                             if (visible.length === all.length) {
                                 return originalList.apply(self, args);
@@ -3613,6 +3741,26 @@ enum SitePatch {
                         + '; the DOWNLOADED list is not open');
                     return;
                 }
+                // The site renders the DOWNLOADED list from store.data, one
+                // record per book (getNewBook, app.v2.read.js:3218), so a book
+                // that is already in the store is already on screen. Appending
+                // the finished job's row unconditionally is what put the same
+                // novel in the list once per download ("多次下载同一本书...会有多
+                // 条记录"): drop the copy this row replaces.
+                var bookKey = String(host) + '/' + String(id);
+                var rows = area.children || [];
+                var dropped = 0;
+                for (var r = rows.length - 1; r >= 0; r--) {
+                    var stale = rows[r];
+                    if (stale && stale.getAttribute
+                        && stale.getAttribute('data-stvbook') === bookKey) {
+                        area.removeChild(stale);
+                        dropped++;
+                    }
+                }
+                if (dropped) {
+                    note('DOWNLOAD', 'dropped ' + dropped + ' earlier row(s) for ' + bookKey);
+                }
                 var data = {};
                 var key;
                 for (key in book) { data[key] = book[key]; }
@@ -3658,6 +3806,12 @@ enum SitePatch {
             if (!node || node.__stvDelete) { return; }
             node.__stvDelete = true;
             var book = data || {};
+            // One row per novel: the row carries its own key so
+            // moveJobToDownloaded can drop the copy it is about to duplicate.
+            if (book.host && book.id) {
+                node.setAttribute('data-stvbook',
+                    String(book.host) + '/' + String(book.id));
+            }
             // Same trap as the job row: `.bookrowcont` is a fixed 77px box with an
             // absolutely positioned `.bookrow` inside, so anything appended in
             // normal flow is painted underneath and cannot be tapped.
@@ -3704,6 +3858,29 @@ enum SitePatch {
                     })
                     .then(function () { return target.delete(); })
                     .then(function () {
+                        // One row now stands for one book, so the delete has to
+                        // take every record carrying that host/id: a store that
+                        // already held several (one per past download) would
+                        // otherwise leave siblings behind and the book would be
+                        // back on the next reload. OfflineBook.delete() only
+                        // removes the one record its wrapper holds, which is why
+                        // the leftovers are swept here rather than instead.
+                        var store = app.offlineBook.store;
+                        var records = (store && store.data) || [];
+                        var dropped = 0;
+                        for (var r = records.length - 1; r >= 0; r--) {
+                            var record = records[r];
+                            if (record && record.host === book.host
+                                && String(record.id) === String(book.id)) {
+                                records.splice(r, 1);
+                                dropped++;
+                            }
+                        }
+                        if (dropped) {
+                            note('DOWNLOAD', 'removed ' + dropped
+                                + ' leftover record(s) for ' + book.host + '/'
+                                + book.id);
+                        }
                         // The book object is cached per host/id and never
                         // invalidated (app.v2.read.js:3248). Re-downloading a book
                         // in the same session would hand back this stale wrapper,
@@ -4338,7 +4515,7 @@ enum SitePatch {
             return out;
         }
 
-        function parseChapter(raw) {
+        function parseChapter(raw, cid) {
             if (raw === null || raw === undefined || raw === '') { return null; }
             var text = String(raw);
             var json = null;
@@ -4349,6 +4526,9 @@ enum SitePatch {
             var paragraphs = chapterParagraphs(body);
             if (!paragraphs.length) { return null; }
             return {
+                // readchapter carries no original title, so the cid is kept: it is
+                // the only handle back to the Chinese name in the chapter list.
+                cid: String(cid === undefined || cid === null ? '' : cid),
                 title: String(json.chaptername || json.chapterName || '').trim(),
                 paragraphs: paragraphs
             };
@@ -4376,7 +4556,9 @@ enum SitePatch {
                     }
                     return Promise.all(group.map(function (position) {
                         return Promise.resolve(target.getChapter(list[position]))
-                            .then(function (raw) { results[position] = parseChapter(raw); },
+                            .then(function (raw) {
+                                results[position] = parseChapter(raw, list[position]);
+                            },
                                   function (error) {
                                       results[position] = null;
                                       note('EXPORT', 'chapter ' + list[position]
@@ -4540,9 +4722,58 @@ enum SitePatch {
             return book.name || (book.host + ' / ' + book.id);
         }
 
+        function arrayIndex(list, value) {
+            for (var i = 0; i < list.length; i++) {
+                if (String(list[i]) === String(value)) { return i; }
+            }
+            return -1;
+        }
+
+        // Every heading has to read "第N章 <中文名>" or the file opens as one long
+        // blob: a reader that splits a book into chapters looks for 第N章, and
+        // readchapter answers with the site's Vietnamese machine translation
+        // ("Chương 15: ..."). The Chinese original exists only in the chapter
+        // list (`oridata`, app.v2.js:270) -- the same source the in-app reader
+        // already uses for its own chapter titles -- so it is fetched once per
+        // export and reused for every heading.
+        //
+        // The fallback number is the chapter's own place in the book, never the
+        // export's index: a download of chapters 15-30 must not be relabelled
+        // 1-16.
+        function labelChapters(book, chapters) {
+            var i18n = window.__stvI18n;
+            if (!i18n || typeof i18n.chapterNames !== 'function') {
+                return Promise.resolve(0);
+            }
+            return Promise.resolve(i18n.chapterNames(book.host, book.id))
+                .then(function (found) {
+                    var names = (found && found.names) || null;
+                    var order = (found && found.order) || [];
+                    var renamed = 0;
+                    for (var i = 0; i < chapters.length; i++) {
+                        var chapter = chapters[i];
+                        var vietnamese = chapter.title || '';
+                        var original = names && chapter.cid ? names[chapter.cid] : null;
+                        var label = original
+                            ? i18n.chineseChapterName(vietnamese, original) : null;
+                        if (!label) { label = i18n.fixChapterTitle(vietnamese); }
+                        label = String(label === undefined || label === null ? '' : label)
+                            .replace(TRIM_RE, '');
+                        if (label.indexOf('章') < 0) {
+                            var position = arrayIndex(order, chapter.cid) + 1;
+                            if (!position) { position = i + 1; }
+                            label = '第' + position + '章' + (label ? ' ' + label : '');
+                        }
+                        chapter.label = label;
+                        if (original) { renamed++; }
+                    }
+                    return renamed;
+                }, function () { return 0; });
+        }
+
         function chapterLabel(chapter, index) {
-            var label = String(chapter.title || '').replace(TRIM_RE, '');
-            return label || ('第 ' + (index + 1) + ' 章');
+            var label = String(chapter.label || chapter.title || '').replace(TRIM_RE, '');
+            return label || ('第' + (index + 1) + '章');
         }
 
         function buildTxt(book, chapters) {
@@ -4820,10 +5051,16 @@ enum SitePatch {
                     note('EXPORT', 'read ' + read.chapters.length + ' of ' + read.total
                         + ' chapter(s) for ' + book.host + '/' + book.id
                         + (read.unreadable ? ', ' + read.unreadable + ' unreadable' : ''));
-                    node.textContent = '打包中';
-                    if (format !== 'epub') { return buildTxt(meta, read.chapters); }
-                    return fetchCover(meta).then(function (cover) {
-                        return buildEpub(meta, read.chapters, cover);
+                    node.textContent = '整理章节名';
+                    return labelChapters(meta, read.chapters).then(function (renamed) {
+                        note('EXPORT', 'chapter headings: ' + renamed + ' of '
+                            + read.chapters.length + ' carry a Chinese name, first='
+                            + chapterLabel(read.chapters[0], 0));
+                        node.textContent = '打包中';
+                        if (format !== 'epub') { return buildTxt(meta, read.chapters); }
+                        return fetchCover(meta).then(function (cover) {
+                            return buildEpub(meta, read.chapters, cover);
+                        });
                     });
                 });
             }).then(function (payload) {

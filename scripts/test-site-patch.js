@@ -2848,6 +2848,22 @@ async function testDownloadCompletion() {
     String(sandbox.window.__stvDiag.text() || '').indexOf('moved qidian/1034915599') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-260));
 
+  // Downloading the same book again is a NEW job, so `manager.__stvMoved` does
+  // not guard it and the row it appends used to sit next to the one already on
+  // screen: "多次下载同一本书...会有多条记录", every copy exporting the same
+  // chapter file. The row carries its own key, so the older one is dropped.
+  const again = new app.BookDownloadManager('qidian', '1034915599', ['c3']);
+  await again.start();
+  await waitFor(() => rendered.length === 2, 5000);
+  const sameBook = manager.children.filter((child) => child.getAttribute
+    && child.getAttribute('data-stvbook') === 'qidian/1034915599');
+  check('a second download of the same book leaves one DOWNLOADED row',
+    sameBook.length === 1, String(sameBook.length));
+  check('the dropped duplicate is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('dropped 1 earlier row(s) for qidian/1034915599') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-300));
+
   // The row is appended to #download-manager's parent, i.e. after the
   // "DOWNLOADED" header inside the manager wrapper (page-vip:2292-2298).
   const row = manager.children[manager.children.length - 1];
@@ -2886,10 +2902,11 @@ async function testDownloadCompletion() {
 
   // A resume replays the loop once it has exited, so the completion hand-off can
   // run twice for the same job; the second pass must not append a second row.
+  // (Two rows exist by now: the first job's and the re-download's.)
   await job.start();
   await tick(80);
   check('replaying a finished job adds no second DOWNLOADED row',
-    rendered.length === 1, String(rendered.length));
+    rendered.length === 2, String(rendered.length));
 }
 
 async function testDownloadRenderRace() {
@@ -3305,6 +3322,14 @@ async function testBookmarkToggle() {
  * already exists (`app.api.unlike`); the wrapper picks between the two from the
  * same status call the site's own `updateBookPage` uses.
  */
+/**
+ * "取消点赞后会提示取消，但是实际没有取消" -- the toggle read its state from
+ * queryBookExtStatus, which answers with the BOOK's own record, so `like`
+ * remained true after a successful unlike and all four taps in the device log
+ * took the removal path, twenty seconds apart, on a freshly opened page. The
+ * state now comes from querylikestatus (`type:id`, the same key like()/unlike()
+ * take) and nothing is claimed until the site agrees.
+ */
 async function testLikeToggle() {
   console.log('like toggles back off');
   const sandbox = makeSandbox();
@@ -3319,21 +3344,40 @@ async function testLikeToggle() {
   const actionCell = makeContainer('div', 'blk-item likebook');
   sandbox.document.body.appendChild(actionCell);
 
-  let liked = true;
+  let myLikes = ['1034915599'];
   const likes = [];
   const unlikes = [];
-  app.api.queryBookExtStatus = () => Promise.resolve({
-    like: liked, bookmark: false, follow: false,
-  });
+  const statusCalls = [];
+  // The aggregate that made the previous revision lie: always true.
+  app.api.queryBookExtStatus = () => {
+    statusCalls.push('status');
+    return Promise.resolve({ like: true, bookmark: false, follow: false });
+  };
+  app.api.queryLike = (list) => {
+    statusCalls.push('querylikestatus:' + list.join(','));
+    return Promise.resolve(myLikes.map((objectid) => ({ objectid })));
+  };
   app.api.likeBook = function (bookinfo) {
     likes.push(bookinfo.host + '/' + bookinfo.id);
-    liked = true;
+    myLikes = [String(bookinfo.id)];
     return Promise.resolve({ code: 100 });
   };
   app.api.unlike = function (host, id) {
     unlikes.push(host + '/' + id);
-    liked = false;
+    myLikes = [];
     return Promise.resolve({ code: 100 });
+  };
+  // The button's only writer (app.v2.js:4932). It re-asks the aggregate, so
+  // without the wrapper it re-lights the thumbs-up right after a verified
+  // unlike -- indistinguishable from "the cancellation did nothing".
+  app.api.updateBookPage = function (p, bookinfo) {
+    return app.api.queryBookExtStatus(bookinfo).then((status) => {
+      const nodes = sandbox.document.querySelectorAll('.likebook');
+      for (let i = 0; i < nodes.length; i += 1) {
+        if (status.like) { nodes[i].classList.add('active'); }
+        else { nodes[i].classList.remove('active'); }
+      }
+    });
   };
 
   vm.runInContext(loadBlocks().join('\n'), sandbox);
@@ -3343,6 +3387,8 @@ async function testLikeToggle() {
   const book = { host: 'qidian', id: '1034915599', name: '这些仙子全都不正常！' };
   await app.api.likeBook(book);
   await tick(40);
+  check('the state comes from the endpoint that shares the like key space',
+    String(statusCalls[0] || '').indexOf('querylikestatus') === 0, statusCalls.join('|'));
   check('an already liked book is unliked instead of liked again',
     unlikes.join(',') === 'qidian/1034915599' && likes.length === 0,
     'likes=' + likes.join(',') + ' unlikes=' + unlikes.join(','));
@@ -3351,12 +3397,22 @@ async function testLikeToggle() {
     stat.className + ' | ' + actionCell.className);
   check('the counter next to the button drops by one', counter.textContent === '24',
     String(counter.textContent));
-  check('the cancellation is reported',
-    String(sandbox.window.__stvDiag.text() || '').indexOf('is liked; unliking') >= 0,
-    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+  check('the cancellation is claimed only after the site agrees',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('after unlike: querylikestatus liked=false') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-300));
 
-  // Tapping again: the server now says "not liked", so the add path has to run
-  // and the counter goes back up.
+  // The site's own render pass still asks the aggregate, which says "liked".
+  await app.api.updateBookPage(null, book);
+  await tick(40);
+  check('the site own render pass cannot re-light the button',
+    !stat.classList.contains('active') && !actionCell.classList.contains('active'),
+    stat.className + ' | ' + actionCell.className);
+  check('the aggregate really was the disagreeing answer',
+    statusCalls.indexOf('status') >= 0, statusCalls.join('|'));
+
+  // Tapping again: querylikestatus now says "not liked", so the add path has to
+  // run and the counter goes back up.
   await app.api.likeBook(book);
   await tick(40);
   check('an unliked book is liked through the site endpoint',
@@ -3366,13 +3422,45 @@ async function testLikeToggle() {
   check('the counter goes back up', counter.textContent === '25',
     String(counter.textContent));
 
-  // A reader who is not logged in: the status call answers null, the site's own
-  // like() raises the login prompt, and the wrapper must not fire unlike at a
-  // session that does not exist.
+  // A removal the server accepts and does not apply: the previous revision
+  // toasted "已取消点赞" regardless. It has to report the disagreement instead.
+  const stuck = makeSandbox();
+  const stuckApp = installFakeApp(stuck, { displayType: 'auto' });
+  stuckApp.api.queryLike = () => Promise.resolve([{ objectid: '1034915599' }]);
+  stuckApp.api.unlike = () => Promise.resolve({ code: 100 });
+  stuckApp.api.likeBook = () => Promise.resolve({ code: 100 });
+  vm.runInContext(loadBlocks().join('\n'), stuck);
+  await tick(250);
+  await stuckApp.api.likeBook(book);
+  await tick(40);
+  check('an unlike that does not stick is not reported as a cancellation',
+    (stuck.__stored.toasts || []).join('|').indexOf('已取消点赞') < 0
+      && String(stuck.window.__stvDiag.text() || '').indexOf('liked=true') >= 0,
+    JSON.stringify(stuck.__stored.toasts));
+
+  // The endpoint can be missing (an older mirror build): fall back to the site's
+  // own extended status rather than deciding nothing.
+  const legacy = makeSandbox();
+  const legacyApp = installFakeApp(legacy, { displayType: 'auto' });
+  let legacyLiked = true;
+  legacyApp.api.queryBookExtStatus = () => Promise.resolve({ like: legacyLiked });
+  legacyApp.api.likeBook = () => { legacyLiked = true; return Promise.resolve({ code: 100 }); };
+  legacyApp.api.unlike = () => { legacyLiked = false; return Promise.resolve({ code: 100 }); };
+  vm.runInContext(loadBlocks().join('\n'), legacy);
+  await tick(250);
+  await legacyApp.api.likeBook(book);
+  await tick(40);
+  check('without querylikestatus the site status is still used',
+    String(legacy.window.__stvDiag.text() || '')
+      .indexOf('querybookmarkstatus liked=true') >= 0,
+    String(legacy.window.__stvDiag.text() || '').slice(-260));
+
+  // A reader who is not logged in: querylikestatus answers an empty list and the
+  // site's own like() raises the login prompt.
   const anon = makeSandbox();
   const anonApp = installFakeApp(anon, { displayType: 'auto' });
   const anonLikened = [];
-  anonApp.api.queryBookExtStatus = () => Promise.resolve(null);
+  anonApp.api.queryLike = () => Promise.resolve([]);
   anonApp.api.likeBook = () => { anonLikened.push('like'); return Promise.resolve({ code: 0 }); };
   anonApp.api.unlike = () => { anonLikened.push('unlike'); return Promise.resolve({ code: 0 }); };
   vm.runInContext(loadBlocks().join('\n'), anon);
@@ -3538,12 +3626,16 @@ function crcOf(buffer) {
 async function testExportDownloadedBook() {
   console.log('export a downloaded book');
   const prefix = 'offlineBook_qidian_1034915599_';
-  const ids = ['7001', '7002'];
+  const ids = ['7001', '7002', '7003'];
   const files = {};
   ids.forEach((cid, index) => {
     files[prefix + cid] = JSON.stringify({
       code: '0',
-      chaptername: 'Chương ' + (index + 1) + ': <mở đầu>',
+      // readchapter answers with the site's Vietnamese machine translation. The
+      // third chapter carries no number at all, which is the case the chapter
+      // list's own order has to cover.
+      chaptername: index === 2 ? 'Không có số hiệu'
+        : 'Chương ' + (index + 1) + ': <mở đầu>',
       data: '<p>第一段 &amp; 第二段</p><p>第三段</p>',
     });
   });
@@ -3552,6 +3644,8 @@ async function testExportDownloadedBook() {
   const app = installFakeApp(sandbox, {
     displayType: 'auto',
     chapterFiles: files,
+    // The only place the original chapter names exist (app.v2.js:270).
+    oridata: '1-/-7001-/-交锋-/-vip-//-2-/-7002-/-入门-/-vip-//-3-/-7003-/-决战-/-vip',
     existedBook: {
       host: 'qidian',
       id: '1034915599',
@@ -3611,15 +3705,25 @@ async function testExportDownloadedBook() {
       && txtBody.indexOf('作者：叁司') >= 0
       && txtBody.indexOf('来源：qidian / 1034915599') >= 0,
     txtBody.slice(0, 120));
-  check('the txt carries the site chapter titles in download order',
-    txtBody.indexOf('Chương 1: <mở đầu>') >= 0
-      && txtBody.indexOf('Chương 2: <mở đầu>') > txtBody.indexOf('Chương 1: <mở đầu>'),
+  check('the txt headings are Chinese, numbered and in download order',
+    txtBody.indexOf('第1章 交锋') >= 0
+      && txtBody.indexOf('第2章 入门') > txtBody.indexOf('第1章 交锋')
+      && txtBody.indexOf('Chương') < 0,
     txtBody.slice(0, 300));
+  // The third chapter has no number in the site's own title, so the heading has
+  // to take its place from the book's chapter list -- the export's own index
+  // would number a 15-30 download from 1.
+  check('a heading the source left unnumbered takes the book chapter number',
+    txtBody.indexOf('第3章 决战') >= 0, txtBody.slice(-200));
+  check('the heading relabelling is reported to the panel',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('chapter headings: 3 of 3 carry a Chinese name, first=第1章 交锋') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-320));
   check('the chapter markup is reduced to text',
     txtBody.indexOf('第一段 & 第二段') >= 0 && txtBody.indexOf('<p>') < 0,
     txtBody.slice(0, 300));
   check('the export is reported to the panel',
-    String(sandbox.window.__stvDiag.text() || '').indexOf('read 2 of 2 chapter(s)') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').indexOf('read 3 of 3 chapter(s)') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-260));
   check('the button is usable again after the export',
     exportButton.textContent === '导出' && exportButton.__stvExportBusy === false,
@@ -3672,8 +3776,12 @@ async function testExportDownloadedBook() {
     byName['OEBPS/content.opf'].slice(0, 600));
   check('the chapters are well-formed XHTML with escaped text',
     byName['OEBPS/chapter-0001.xhtml'].indexOf('第一段 &amp; 第二段') >= 0
-      && byName['OEBPS/chapter-0001.xhtml'].indexOf('Chương 1: &lt;mở đầu&gt;') >= 0,
+      && byName['OEBPS/chapter-0001.xhtml'].indexOf('<h2>第1章 交锋</h2>') >= 0,
     byName['OEBPS/chapter-0001.xhtml'].slice(0, 400));
+  check('both navigation files carry the Chinese headings',
+    byName['OEBPS/nav.xhtml'].indexOf('第1章 交锋') >= 0
+      && byName['OEBPS/toc.ncx'].indexOf('第3章 决战') >= 0,
+    byName['OEBPS/nav.xhtml'].slice(0, 300));
   check('the navigation lists every chapter',
     byName['OEBPS/nav.xhtml'].indexOf('chapter-0002.xhtml') >= 0
       && byName['OEBPS/toc.ncx'].indexOf('chapter-0002.xhtml') >= 0);

@@ -381,6 +381,8 @@ ${data.patterns
     // cid the reader already knows.
     var titleMaps = {};
     var titleTried = {};
+    var titleOrders = {};
+    var titleRequests = {};
 
     function note(tag, message) {
         if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
@@ -404,17 +406,23 @@ ${data.patterns
         return n;
     }
 
+    // The list is "index-/-cid-/-title-/-vip" entries joined by "-//-". The
+    // order is the book's own reading order, which the exporter needs so a
+    // downloaded slice keeps the book's chapter numbers.
     function parseChapterList(text) {
-        var out = {};
+        var names = {};
+        var order = [];
         var list = String(text).split('-//-');
         for (var i = 0; i < list.length; i++) {
             var parts = list[i].split('-/-');
             if (parts.length < 3) { continue; }
             var cid = trimText(parts[1]);
             var title = trimText(parts[2]);
-            if (cid && title) { out[cid] = title; }
+            if (!cid) { continue; }
+            order.push(cid);
+            if (title) { names[cid] = title; }
         }
-        return out;
+        return { names: names, order: order };
     }
 
     function firstChinese(map) {
@@ -486,10 +494,12 @@ ${data.patterns
         var url = '/index.php?ngmar=chapterlist&h=' + host + '&bookid=' + id
             + '&sajax=getchapterlist';
         app.net.get(url).then(function (down) {
-            var map = null;
+            var parsed = null;
             if (down && typeof down.oridata === 'string' && down.oridata) {
-                map = parseChapterList(down.oridata);
+                parsed = parseChapterList(down.oridata);
             }
+            var map = parsed ? parsed.names : null;
+            if (parsed) { titleOrders[key] = parsed.order; }
             var usable = 0;
             for (var cid in map) { if (cjkCount(map[cid])) { usable++; } }
             if (!usable) {
@@ -505,6 +515,67 @@ ${data.patterns
             note('ERR', 'chapter name lookup failed for ' + key + ': ' + error);
         });
         return null;
+    }
+
+    // The export path can wait for the list, and it has to: a chapter's Chinese
+    // name comes from this response and nowhere else (readchapter never carries
+    // the original). Resolves with whatever is known -- names may be null while
+    // order is usable, which still numbers the headings correctly -- and a
+    // lookup that found nothing is not cached, so a later export retries instead
+    // of exporting Vietnamese titles forever.
+    function chapterNames(host, id) {
+        var key = host + '/' + id;
+        if (titleRequests[key]) { return titleRequests[key]; }
+        var pending;
+        if (titleMaps[key]) {
+            pending = Promise.resolve({ names: titleMaps[key],
+                                        order: titleOrders[key] || [] });
+        } else {
+            pending = new Promise(function (resolve) {
+                var app = window.app;
+                if (!app || !app.net || typeof app.net.get !== 'function') {
+                    resolve({ names: null, order: [] });
+                    return;
+                }
+                var url = '/index.php?ngmar=chapterlist&h=' + host + '&bookid=' + id
+                    + '&sajax=getchapterlist';
+                app.net.get(url).then(function (down) {
+                    var parsed = null;
+                    if (down && typeof down.oridata === 'string' && down.oridata) {
+                        parsed = parseChapterList(down.oridata);
+                    }
+                    if (!parsed) {
+                        note('TITLE', 'export: no chapter list for ' + key);
+                        resolve({ names: null, order: [] });
+                        return;
+                    }
+                    titleOrders[key] = parsed.order;
+                    var usable = 0;
+                    for (var cid in parsed.names) {
+                        if (cjkCount(parsed.names[cid])) { usable++; }
+                    }
+                    if (!usable) {
+                        note('TITLE', 'export: chapter names for ' + key
+                            + ' have no Chinese original');
+                        resolve({ names: null, order: parsed.order });
+                        return;
+                    }
+                    titleMaps[key] = parsed.names;
+                    note('TITLE', 'export: ' + usable + ' of '
+                        + Object.keys(parsed.names).length + ' chapter names for '
+                        + key + ', sample=' + firstChinese(parsed.names));
+                    resolve({ names: parsed.names, order: parsed.order });
+                }, function (error) {
+                    note('ERR', 'chapter name lookup failed for ' + key + ': ' + error);
+                    resolve({ names: null, order: [] });
+                });
+            });
+        }
+        titleRequests[key] = pending.then(function (found) {
+            if (!found || !found.names) { delete titleRequests[key]; }
+            return found;
+        });
+        return titleRequests[key];
     }
 
     function attachContent() {
@@ -537,6 +608,8 @@ ${data.patterns
         sweep: sweep,
         sweepFrames: attachFrames,
         fixChapterTitle: fixChapterTitle,
+        chineseChapterName: chineseChapterName,
+        chapterNames: chapterNames,
         size: EXACT.length,
         rewritten: function () { return rewritten; }
     };

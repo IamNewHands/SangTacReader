@@ -66,6 +66,9 @@
 12. **标签栏切换的正式 API 未知**：`ui.smtab()` 来自 `/stv.ui.js`，该文件不在仓库里也拉不下来（本机 TLS 取不到），所以「跳转到下载页」是靠**在 tabitem 上派发 click**（和手指一样）+ 事后用 `tab.current()` 校验；校验不过才去探测 `select/go/switchTo/setIndex/activate/to` 这一组 setter 名字。走哪条路、`current()` 是否存在于 `#tabtusach`，都会写进 `[DOWNLOAD]` 日志，下一份真机日志即可定案，见 §6.15 (2)。
 13. 站点自身还有两处缺陷，已用包装绕过（站点代码仍未改，见 §6.16）：`store.remove()` 按**引用**找记录而 `OfflineBook.delete()` 递进去的是包装对象（`app.v2.js:661` / `read.js:3314`），所以删除恒不落盘、重启就复活；`OfflineBook.deleteAll()`（`read.js:3368`）边遍历边 `splice`，每隔一章漏删一个章节文件。
 14. 站点还有两处「只实现一半」的地方，同样只在我们的包装里补（见 §6.17）：详情页的点赞按钮只发 `ajax=like`（`_page_vip.html:4220` / `app.v2.js:4914`），而取消用的 `app.api.unlike`（`:4917`）没有任何调用方；站点的 `app.v2.css` 只写了无前缀的 `user-select: none`（`body:28` / `.booksquare:89` / `.bookrow:156`），没有 `-webkit-user-select` 也没有 `-webkit-touch-callout`，所以长按弹菜单时 iOS 的选中/放大镜手势仍然生效。范围下载也从不检查磁盘上已有的章节（`clist.slice(start-1, end)` 直接交新任务），重复下一个区间会整段重下并把限速节奏打坏。
+15. **「我赞过这本书吗」这个问题，站点自己也问错了接口**（见 §6.18 (1)）：`updateBookPage`（`app.v2.js:4932`）用 `queryBookExtStatus`（`ajax=querybookmarkstatus`，带 `bookname`/`author`，返回的是**书自己的记录**，同一回复还喂书签和关注）的 `like` 字段当「我的状态」，于是 unlike 成功后它仍会重新点亮按钮。真正对口的接口是 `querylikestatus`（`app.v2.js:4865`，键是 `type:id`，与 `like`/`unlike` 同一套）。我们的包装已改用它并在调用后复查，`updateBookPage` 的判定也换成复查值——站点自身没改。
+16. **「已下载」列表的重复行是我们自己造成的**（见 §6.18 (2)）：任务完成后 `moveJobToDownloaded` 无条件往列表里 `appendChild`，而站点渲染列表用的是按 `(host,id)` 去重的 `store.data`，所以同一本书下第二次就会多一行。已改成按 `data-stvbook` 键先摘旧行、读列表时再折叠一次。
+17. **导出的章节名只有越南语机翻可用，除非去问章节列表**（见 §6.18 (3)）：`readchapter` 不带原名，`oridata` 只在 `getChapterListOnline`（`app.v2.js:270`）出现。导出已改为复用阅读器那套映射；EPUB 的 `dc:language` 仍是 `vi`，未动。
 
 ## 6. 真机问题档案
 
@@ -1663,4 +1666,131 @@ iOS 的选中/放大镜手势正好落在新节点上，于是「弹选项的同
 `[EXPORT] read N of M chapter(s)` 与系统分享面板弹出；长按是否还选中文字只能眼看（手势事件
 不进日志）。Swift 侧本机无法编译验证：开发机是 Windows，`exportFile`
 只有 CI 的 `macos-26` 会编（workflow 里加了 `exportFile` 的符号校验）。
+
+### 6.18 第十六轮反馈（`日志.txt`，302 行）：点赞取消仍是假的、已下载重复行、导出章节名
+
+第十五轮的四项里，长按不选中文字的真机反馈是「已修复」，其余三项都还有问题。
+
+#### 1. 取消点赞「提示取消，但实际没取消」——状态读错了接口
+
+日志里四次点击全都走同一条路：
+
+```
+17:07:40 [LIKE] qidian/1034915599 status like=true
+17:07:40 [LIKE] qidian/1034915599 is liked; unliking
+17:07:41 [LIKE] unliked qidian/1034915599          <- 服务端答 code 100
+17:07:41 [MSG] toast: 已取消点赞
+...
+17:07:47 [LIKE] qidian/1034915599 status like=true  <- 6 秒后又是 true
+```
+
+而 17:07:19 已经对同一本书 unlike 过一次（同样 code 100），17:07:37 重新打开详情页、17:07:40
+再点仍然读到 `like=true`。`app.net.post` 不缓存（`app.v2.js:756`），所以这不是读到了旧响应。
+整份日志里**没有一条 `liked ... -> code 100`**：四次点击全部进了删除分支。
+
+根因在第十五轮选的状态接口。`queryBookExtStatus` 打的是 `ajax=querybookmarkstatus`，带
+`bookid` + `host` + `bookname` + `author`（`app.v2.js:4879`），返回的是**这本书自己的记录**，
+同一个回复还喂着书签和关注按钮——所以 `status.like` 不等于「我赞过没有」，unlike 成功后它
+依然是 `true`。判断「我赞过没有」的接口是 `querylikestatus`：
+
+```js
+app.api.queryLike = async function(list){          // app.v2.js:4865
+    var params = `ajax=querylikestatus&list=${list.join(",")}`;
+```
+
+它的键是 `type:id`（`app.v2.js:5258` 用 `topic:<id>` 构造），**与 `like(type,id)` /
+`unlike(type,id)`（`app.v2.js:4905/4923`）同一套**——读和写第一次说的是同一个对象。
+
+修法（`bookmarkToggle` 块的 `attachLike`）：
+
+1. 新增 `readLiked(book)`：先问 `queryLike([host + ':' + id])`，返回 `{liked, source, raw}`；
+   接口不存在时（老镜像构建）才退回 `queryBookExtStatus`，并把这个来源记进日志；未登录
+   （`queryLike` 返回 `[]`）时 `liked=false`，仍走站点自己的 like 路径弹登录提示；
+2. 删/增都要**复查**：`unlike` 返回 code 100 之后再问一次 `readLiked`，只有服务端改口才
+   `applyLiked(false)` + 计数 -1 + `已取消点赞`；仍然 `liked=true` 就提示「取消失败，详见日志」，
+   把两个字面量（`unlike` 原始响应、复查结果）都写进面板。**这是上一轮最大的错**：无条件弹
+   「已取消点赞」正是「提示取消但实际没取消」的来源；
+3. `updateBookPage` 的 `active` 判定换成复查过的值。它只按 `queryBookExtStatus` 的答案改
+   `.likebook` 的 class（`app.v2.js:4936-4945`，全站唯一的写入方），unlike 一成功它就把按钮
+   重新点亮。做法是包一层 `updateBookPage`：调用期间把 `queryBookExtStatus` 临时换成
+   「原样返回、只把 `like` 覆盖成已复查值」的版本，`updateBookPage` 取完回复后
+   （`setTimeout(...,0)`）恢复。不猜时间、不和 class 列表抢。
+
+#### 2. 多次下载同一本书 →「已下载」出现多行
+
+站点侧「已下载」是按 `store.data` 渲染的，而 `getNewBook`（`app.v2.read.js:3218`）按
+`(host,id)` 找已存在的记录、有就不 `prepend`——**一个 book 只有一条记录**。多出来的行是我们
+自己造的：`moveJobToDownloaded` 在任务完成后无条件 `area.appendChild(row)`
+（`app.celoader.bookdownloadedrow`，`_page_vip.html:4014`），守卫只有 `manager.__stvMoved`，
+那是**每个 job 实例**的标记；再下一次同一本书是一个新 job，于是又插一行。因为记录只有一条、
+章节文件键也只有一份（`offlineBook_<host>_<id>_chapters`），每行导出出来的都是同一份内容——
+正是「导出时好像又是导出的同一份数据」。
+
+修法都在 `pageRepair`，三处：
+
+1. `decorateDownloadedRow` 给行盖 `data-stvbook="host/id"`（两个渲染入口——站点列表与我们的
+   追加——都经过 `bookdownloadedrow`，所以每行都有键）；
+2. `moveJobToDownloaded` 追加前先摘掉同键的旧行（倒序遍历 `area.children`，按
+   `getAttribute('data-stvbook')` 比对；测试桩不支持属性选择器，也不用后代选择器）；
+3. 读列表时（`getDownloadBooks` 包装里）再按 `host/id` 折叠一次记录，保留 `lastDownload`
+   最新的那条 —— 视口层面兜底，不改持久化数据。删除时把同一本书的**所有**记录一起清掉
+   （先照旧 `target.delete()`，再扫残留），否则留下的兄弟记录下次启动又会长出一行。
+
+#### 3. 导出里的章节序号与名称还是越南语
+
+`readchapter` 的 `chaptername` 是站点的越南语机翻（`app.v2.js:210` 一带的正文接口），**只有
+章节列表带中文原名**：`getChapterListOnline` 在 `app.language != "vi"` 时用 `x.oridata`
+（`app.v2.js:270`）。这个源 `SiteI18nData.script` 早就用了（阅读器的章节名就是这么改的），但
+导出块是另一份代码，直接拿 `json.chaptername` 当标题，于是 TXT 的
+`---------- Chương 15: ...` 在别的阅读器里连目录都切不出来。
+
+修法：
+
+- `SiteI18nData.script`（生成物，源在 `scripts/gen-site-i18n.js`）里把
+  `parseChapterList` 改成同时返回 `{names, order}`（`order` 是书本身的章节顺序），并新导出
+  `chapterNames(host, id)`（可等待，成功才缓存，失败不缓存以便重试）与 `chineseChapterName`；
+- 导出块给每章带上 `cid`，`labelChapters()` 用 `chapterNames` 的结果算标题：
+  `chineseChapterName(越南语标题, 中文原名)` 得到「第15章 交锋」；
+- **补号一律用书内位次**（`order.indexOf(cid) + 1`），绝不用导出下标——日志里这本是下 15-30 章，
+  用下标会编成 1-16；
+- `chapterLabel` 优先用算出来的 `label`，兜底从 `'第 N 章'` 改成 `'第N章'`（带空格的形式阅读器
+  的目录正则匹配不到）。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 22 块 / 350862 字节 / **38** markers（新增
+  `querylikestatus`、`after unlike:`、`data-stvbook`、`chapterNames`）
+- `node scripts/test-site-patch.js` → **496 条断言**全过（上一轮 486）。新增/改写：
+  - 点赞：状态必须来自 `querylikestatus`（桩里 `queryBookExtStatus` 恒返回 `like:true`，用它就
+    会重演旧 bug）；unlike 后复查 `liked=false` 才提示；**站点自己的 `updateBookPage` 不能再把
+    按钮点亮**；服务端收下却改不动时不许弹「已取消点赞」；没有 `queryLike` 的构建退回
+    `queryBookExtStatus`；未登录仍走站点 like 路径；
+  - 重复下载：同一本书起第二个 job 后 `[data-stvbook]` 行数仍是 1，并记
+    `dropped 1 earlier row(s) for qidian/1034915599`；
+  - 导出：三章标题必须是 `第1章 交锋` / `第2章 入门` / **`第3章 决战`**（第三章的站点标题没有
+    编号，只能靠章节列表的顺序补），正文里不许再出现 `Chương`，EPUB 的 `<h2>`、`nav.xhtml`、
+    `toc.ncx` 都是中文标题，面板记 `chapter headings: 3 of 3 carry a Chinese name`。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments（本轮改了生成器模板，
+  已重新生成）
+- 产物复核：`STV_EXPORT_DUMP=1` 后用 .NET `ZipFile` 独立打开 `book.epub` —— 11 个条目、
+  `mimetype` 第 0 个且 `CompressedLength == Length`、`chapter-0001.xhtml` 的 `<h2>` 是
+  `第1章 交锋`、`toc.ncx` 的 navLabel 依次是「这些仙子全都不正常！/ 第1章 交锋 / 第2章 入门 /
+  第3章 决战」；TXT 里同样是 `第1章 交锋`。
+
+**未证实项**：
+
+- 第 1 项的**根因归属**仍有两种可能，日志只能证明「客户端发了 unlike、服务端答 code 100、
+  复查时仍是 liked」，不能证明是服务端没删还是 `status.like` 本身不代表「我」。本轮的改法对
+  两种都成立（状态改由 `querylikestatus` 读、且调用后复查），真机日志会给结论：
+  正常应是 `[LIKE] qidian/X status querylikestatus liked=true` → `unlike ... -> code 100`
+  → `after unlike: querylikestatus liked=false`；若出现 `liked=true` 就是服务端没删，
+  下一轮再按日志里的原始响应处理；
+- 第 2 项：`store.data` 本身在真机上是否真有重复记录**未经证实**（按源码推不出来），上面的
+  折叠与「删除清全部」对两种情形都成立，代价是列表被折叠过；
+- 第 3 项：`oridata` 在真机上确实是中文原名这一点，靠「阅读器里的章节名早就是中文」间接成立，
+  本机无法直连站点验证（`sangtacviet.com` 在这台机器上解析到非公网地址）。导出会记
+  `[TITLE] export: N of M chapter names for host/id`，下一份日志直接给出命中率；
+- 导出的 EPUB 仍写 `xml:lang="vi"` / `<dc:language>vi`（正文与标题其实都是中文），本轮没动：
+  超出本轮反馈范围，且改了会影响越南语读者的排版。
+
 

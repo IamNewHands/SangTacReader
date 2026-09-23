@@ -48,6 +48,17 @@ const REQUIRED_MARKERS = [
   // The detail page's like button is one-way in the site's own client; without
   // this wrapper the second tap re-likes the book and looks like a dead button.
   'like toggle installed',
+  // The like state has to come from the endpoint that shares the key space with
+  // like()/unlike() (`querylikestatus`), and the call has to be verified: the
+  // aggregate reply re-lights the button and made "已取消点赞" a lie.
+  'querylikestatus',
+  'after unlike:',
+  // One DOWNLOADED row per novel: the row is stamped and the finished job drops
+  // the row it would otherwise duplicate.
+  'data-stvbook',
+  // Exporting has to relabel every heading from the chapter list's original
+  // names, or the file opens as one blob in another reader.
+  'chapterNames',
   // Re-running a finished range must queue only what is not on disk yet.
   'already downloaded',
   // Long-pressing a book cell has to open the menu without selecting text.
