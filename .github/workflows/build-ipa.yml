@@ -170,7 +170,8 @@ jobs:
           fi
           # 阅读翻页默认值 + 原生 TTS provider 注册同样要在产物里。
           for marker in stvReaderDefaultsInstalled stvTtsProviderInstalled stvI18nInstalled \
-                        stvSafeAreaInstalled stvSettingsBackupInstalled stvBookmarkToggleInstalled \
+                        stvSafeAreaInstalled stvSettingsBackupInstalled stvDomainFailoverInstalled \
+                        stvBookmarkToggleInstalled \
                         stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"

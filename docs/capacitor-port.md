@@ -814,3 +814,118 @@ JS（`app.v2.js` 261KB、`chapterdisplay` 158KB、`read` 145KB、`comicprovider`
 禁止、必须保留许可/版权/署名并标注修改、分发修改版必须以同一许可公开完整源代码。
 只覆盖本仓库作者编写的代码与文档；站点内容与第三方素材不在授权范围内。
 `README.md` 增补许可证一节，四个 `package.json` 加 `license` 字段。
+
+### 6.10 第九轮反馈（`日志2.txt`，408 行）：镜像 code 7、下载行按钮、记录与设置
+
+#### (1) 正文打不开，提示「Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời」
+
+这句是站点自己的兜底文案，不是真因（`app.v2.read.js:747`：`x.err || x.info || "…"`）。
+真因在响应体里：
+
+```
+[Http] GET https://dns1.stv-appdomain-00000001.org/?sajax=readchapter&h=qidian&bookid=…&key=…
+       -> 200 text/html … 24b in 1271ms {"code": 7,"time": 1000}
+```
+
+**每个** `readchapter` 都是 `code 7`，而且换书、换 host（qidian/fanqie）都一样；同一份日志里
+下载路径（`sangtacviet.app/index.php?…&key=stvmobilereader&download=true`）20/20 全部
+`code 0`，上一轮的日志（`日志.txt`）里阅读路径走的是 `sangtacviet.com`，也全部 `code 0`。
+
+差别只有一个：**域名**。`app.net.networkManager.bestDomain()`（app.v2.js:933）只按
+`/warp.php` 的探测延迟排序，而三个镜像并不等价：
+
+| 镜像 | warp.php | readchapter |
+| --- | --- | --- |
+| `sangtacviet.com` | `yes` | 正常 |
+| `dns1.stv-appdomain-00000001.org` | `no` | `code 7` |
+| `sangtacviet.app` | `no` | 未测 |
+
+这台设备上 dns1 最快（1408ms vs 3503ms），于是赢下竞速，阅读全挂；`grantcontext`（章节
+密钥）在同一个域名上照样 200 —— 所以问题不在密钥、不在 Cookie、不在 `x-stv-transport`。
+
+修法不写死域名黑名单，而是**用服务端自己的回答来判定**（新增 `domainFailover` 块）：
+
+1. `bestDomain()` 被包装：已经回过 `code 7` 的镜像不再被选中（按站点自己的存活/延迟排序
+   取下一个，`defaultDomains` 兜底）；
+2. `code 7` 在 `app.reader.getContent` 出口被拦下 —— 那是所有章节的唯一入口
+   （chapterdisplay.js:788 / :1812 / :3680）。拦下后封禁该镜像、清掉 `app.reader.cachekey`
+   （密钥是刚被抛弃的那个镜像签发的，不清掉 `getKey()` 会继续复用）并重新取一次章节。
+
+用户看到的结果：第一次翻章会多一次往返，之后整个会话都走可用镜像；只有所有镜像都拒绝时
+才保留站点原本的报错弹窗。面板上报：
+
+```
+[DOMAIN] mirror https://dns1.stv-appdomain-00000001.org banned: readchapter answered code 7
+[DOMAIN] refetching qidian/1045345742 chapter 847372113 after code 7
+```
+
+#### (2) 下载页的「暂停 / 删除」点不到，一点就提示「书籍信息缺失」
+
+上一轮把两个按钮追加到 `DownloadManager.render()` 返回的节点上，但站点模板
+（`_page_vip.html` 的 `view-bookdownloadjob`）与 CSS 决定了那个位置点不到：
+
+```css
+.bookrowcont { position: relative; height: 77px; }   /* 固定高 */
+.bookrow     { position: absolute; }                 /* 行本体脱离文档流 */
+```
+
+控制条是 `.bookrowcont` 里的普通流子元素，而 `.bookrow` 是定位元素 —— **定位元素画在普通流
+之上**，于是整条控制条被行本体盖住，手指落点始终是行本体，触发的是站点自己的
+`node.addEventListener("click", … openBookWithData(0, bi))`。日志逐条印证：
+
+```
+[TAP] tap div.status / div.pgbarinner / div.right / div.bookrow
+[ERR] openBookWithData called with no book data (bookid=0) -- refusing to push a blank detail page
+[LOG] 书籍信息缺失，请返回后重试
+```
+
+修法两条：
+
+1. **让控制条真的可点**：把 `.bookrowcont` 放开（`height:auto; min-height:77px;
+   padding-bottom:46px`），控制条本身 `position:relative; z-index:5`，画在定位行之上；
+2. **让行本体点了也有用**：`render()` 捕获的 `bi` 在缓存未命中时是 `undefined`
+   （`populateBookInfo()` 只读缓存、静默返回 `[]`，app.v2.read.js:3258 → :3609），而那个
+   匿名监听器无法解绑。于是在 `document` 捕获阶段接管：行的 `.tname` 为空即说明站点没拿到
+   书籍信息，此时自己解析 bookinfo 并打开详情页，而不是让守卫弹「书籍信息缺失」。
+   `.tname` 有内容（站点自己拿到了数据）的行一律放行，控制条自身的点击也不拦。
+
+#### (3) 下载记录与设置「关闭应用重进就没了」
+
+启动日志里 7 个键**全部** `(store was empty)`：
+
+```
+[SETTINGS] restore config.reader -> 497 chars (store was empty)
+…
+[SETTINGS] keychain restore: 7 written, 0 kept [], 0 unusable [], of 7 backed-up key(s)
+```
+
+`app.storage` 在 iOS 上是 `@capacitor/preferences`（UserDefaults，`package.json` 里有这个
+依赖），正常情况下重启不会清空 —— 所以要么容器被换掉（每次侧载新构建都会），要么写入没
+落地。两种情况都指向同一个结论：**Keychain 是这台设备上唯一真正持久的地方**，而上一轮只把
+设置镜像进去，没管下载记录。
+
+于是把镜像面扩大到 `offlineBook`（`app.objectStore("offlineBook")` 的列表，也就是下载记录
+本体，app.v2.read.js:3189；章节正文键 `offlineBook_<host>_<id>_<cid>` 体积大且可由站点在
+线补读，故意不镜像）。同时补上三处可判读性：
+
+- `read()` 区分「存储回空值」和「存储读失败」，摘要行给出
+  `unreadable [key:err …]`；
+- 写回后**回读校验**，后端「接受写入然后忘记」会被记为
+  `not-persisted [key:len …]`（这类后端正是整个块要防的东西）；
+- 实时配置回灌改成等 `app.config.reader` 出现后再做（设备上 `app.v2.config.js` 约 +10s
+  才建好读写器，上一轮把它挂在恢复链尾，日志里因此没有 `live config updated` 行），
+  并且**只回灌本次真正写入的键** —— 存储里本来就有的值比备份新，回灌会把用户后来的修改
+  顶掉。
+
+新的摘要行形态：
+
+```
+[SETTINGS] keychain restore: N written, M kept [key:len …], U unreadable [key:err …],
+           P not-persisted [key:len …], K unusable [key:typeof …], of T backed-up key(s)
+```
+
+#### 验证
+
+`check-ios-shim`（13 块 / 137982 字节 / 16 markers）、`test-site-patch`（141 条断言，新增
+`readchapter mirror failover` 10 条、`download row controls and missing book info` 9 条、
+设置镜像与可判读性 4 条）、`gen-site-i18n --check`（456 labels / 35 fragments）全绿。

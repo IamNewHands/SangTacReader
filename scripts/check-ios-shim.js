@@ -37,6 +37,7 @@ const REQUIRED_MARKERS = [
   'window.__stvFollowFallbackInstalled',
   'window.__stvSafeAreaInstalled',
   'window.__stvSettingsBackupInstalled',
+  'window.__stvDomainFailoverInstalled',
   'window.__stvBookmarkToggleInstalled',
   'window.__stvReaderTtsInstalled',
   'window.__stvPageRepairInstalled',

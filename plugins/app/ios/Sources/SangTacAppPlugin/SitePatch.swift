@@ -1088,7 +1088,7 @@ enum SitePatch {
         window.__stvSettingsBackupInstalled = true;
 
         var KEYS = ['config.reader', 'config.ux', 'config.comicReader', 'tts.setting',
-                    'readthemeset'];
+                    'readthemeset', 'offlineBook'];
         var PREFIXES = ['reader.style.'];
 
         function note(tag, message) {
@@ -1120,13 +1120,21 @@ enum SitePatch {
             return app.storage;
         }
 
+        // `value: ''` means the store answered "nothing"; `failed` records a
+        // backend that threw. The two need different repairs, and the previous
+        // version collapsed them into the same empty string, which is why
+        // "存储是空的" and "存储读不出来" were indistinguishable on device.
         function read(storage, key) {
             return Promise.resolve(storage.get(key)).then(function (value) {
-                return typeof value === 'string' ? value : '';
-            }, function () { return ''; });
+                return { value: typeof value === 'string' ? value : '', failed: '' };
+            }, function (error) {
+                return { value: '', failed: String(error) };
+            });
         }
 
         var restored = false;
+        var lastEntries = null;
+        var restoredKeys = [];
 
         function restore() {
             var plugin = appPlugin();
@@ -1137,11 +1145,14 @@ enum SitePatch {
             restored = true;
             plugin.settingsRestore({}).then(function (result) {
                 var entries = (result && result.entries) || {};
+                lastEntries = entries;
                 var keys = [];
                 for (var key in entries) { if (isBackedUp(key)) { keys.push(key); } }
                 var written = 0;
                 var kept = [];
                 var unusable = [];
+                var unreadable = [];
+                var mismatched = [];
                 var chain = Promise.resolve();
                 keys.forEach(function (key) {
                     chain = chain.then(function () {
@@ -1150,19 +1161,36 @@ enum SitePatch {
                             unusable.push(key + ':' + (value === null ? 'null' : typeof value));
                             return null;
                         }
-                        return read(storage, key).then(function (existing) {
+                        return read(storage, key).then(function (found) {
                             // The store the site reads is authoritative whenever
                             // it has something: after a wipe it is empty and the
                             // backup is the only thing left, which is the case
                             // this whole block exists for.
-                            if (existing) {
-                                kept.push(key + ':' + existing.length);
+                            if (found.failed) {
+                                unreadable.push(key + ':' + found.failed);
+                                return null;
+                            }
+                            if (found.value) {
+                                kept.push(key + ':' + found.value.length);
                                 return null;
                             }
                             return Promise.resolve(storage.set(key, value)).then(function () {
                                 written++;
+                                restoredKeys.push(key);
                                 note('SETTINGS', 'restore ' + key + ' -> ' + value.length
                                     + ' chars (store was empty)');
+                                // Write-through is the point of this block, and a
+                                // backend that accepts a write and forgets it is
+                                // exactly the failure being defended against, so
+                                // read the value back instead of trusting resolve().
+                                return read(storage, key).then(function (back) {
+                                    if (back.value === value) { return null; }
+                                    mismatched.push(key + ':' + back.value.length);
+                                    note('ERR', 'restore readback mismatch for ' + key
+                                        + ' (wrote ' + value.length + ' chars, read back '
+                                        + back.value.length + ')');
+                                    return null;
+                                });
                             }, function (error) {
                                 note('ERR', 'restore write failed for ' + key + ': ' + error);
                             });
@@ -1172,9 +1200,10 @@ enum SitePatch {
                 return chain.then(function () {
                     note('SETTINGS', 'keychain restore: ' + written + ' written, '
                         + kept.length + ' kept [' + kept.join(' ') + '], '
+                        + unreadable.length + ' unreadable [' + unreadable.join(' ') + '], '
+                        + mismatched.length + ' not-persisted [' + mismatched.join(' ') + '], '
                         + unusable.length + ' unusable [' + unusable.join(' ') + '], of '
                         + keys.length + ' backed-up key(s)');
-                    return applyToLiveConfig(entries);
                 });
             }).catch(function (e) {
                 note('ERR', 'settingsRestore failed: ' + e);
@@ -1189,17 +1218,26 @@ enum SitePatch {
         // restored values, so push them into the live config as well. Each key
         // has a setter that writes through to app.config._reader and re-saves,
         // so this also keeps the store and the UI consistent.
+        //
+        // Only the keys this block actually wrote are pushed. A key the store
+        // already held is newer than the backup (that is why it was kept), and
+        // replaying the backup over it would undo whatever the user changed since
+        // the mirror was taken.
         var CONFIG_TARGETS = {
             'config.reader': 'reader',
             'config.ux': 'ux',
             'config.comicReader': 'comicReader'
         };
 
-        function applyToLiveConfig(entries) {
+        function applyToLiveConfig(entries, restoredKeys) {
             var app = window.app;
-            if (!app || !app.config) { return null; }
+            if (!app || !app.config) { return 0; }
+            // app.v2.config.js only builds the getter/setter surface after its
+            // own store round trip; before that there is nothing to assign to.
+            if (!app.config.reader) { return 0; }
             var applied = 0;
             for (var storageKey in CONFIG_TARGETS) {
+                if (restoredKeys && restoredKeys.indexOf(storageKey) < 0) { continue; }
                 var target = app.config[CONFIG_TARGETS[storageKey]];
                 var raw = entries[storageKey];
                 if (!target || typeof raw !== 'string' || !raw) { continue; }
@@ -1245,11 +1283,174 @@ enum SitePatch {
         }
 
         var attempts = 0;
+        var liveApplied = false;
         var timer = setInterval(function () {
             attempts++;
             if (!restored) { restore(); }
-            if ((restored && attach()) || attempts > 400) { clearInterval(timer); }
+            // The live push has to wait for app.v2.config.js, which on device
+            // builds app.config.reader ~10s in; doing it only once inside the
+            // restore chain is what left the running app on the defaults in the
+            // device log (the chain finished long before the config module did).
+            if (restored && !liveApplied && lastEntries && window.app && window.app.config
+                && window.app.config.reader) {
+                liveApplied = true;
+                applyToLiveConfig(lastEntries, restoredKeys);
+            }
+            // Mirroring must not wait on the config module: it is what keeps the
+            // next launch's backup current.
+            var attached = attach();
+            if ((restored && liveApplied && attached) || attempts > 1600) { clearInterval(timer); }
         }, 25);
+    })();
+    """
+
+    // MARK: - Mirror failover for readchapter
+
+    /**
+     readchapter is answered by whichever mirror `networkManager.bestDomain()`
+     picked, and the mirrors are not equivalent. The device log shows every
+     chapter coming back as `{"code": 7,"time": 1000}` on
+     `dns1.stv-appdomain-00000001.org` while the downloader -- which talks to a
+     fixed host -- kept returning chapters throughout, and the same reader
+     request on `sangtacviet.com` worked in the previous round's log.
+     `verifyDomain()` only probes `/warp.php` and ranks the mirrors by ping, so a
+     mirror that cannot serve the app read path still wins the race;
+     `handlingException` then turns code 7 into the dead-end alert
+     "Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời" and the chapter
+     never appears.
+
+     Two repairs, both driven by the server's own answer rather than a hard-coded
+     host list:
+
+       1. `bestDomain()` never returns a mirror that already answered code 7.
+       2. a code 7 answer is intercepted on the way out of
+          `app.reader.getContent` -- the single funnel every chapter goes through
+          (chapterdisplay.js:788 / :1812 / :3680). The mirror that produced it is
+          banned, the cached chapter key is dropped (it was issued by the mirror
+          being left, and `getKey()` would otherwise keep reusing it), and the
+          chapter is fetched again.
+
+     The alert only survives if every mirror refuses.
+     */
+    static let domainFailover = """
+    (function () {
+        if (window.__stvDomainFailoverInstalled) { return; }
+        window.__stvDomainFailoverInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        var banned = {};
+        var banCount = 0;
+        var MAX_BANS = 3;
+        var noted = {};
+
+        function manager() {
+            var app = window.app;
+            return (app && app.net && app.net.networkManager) || null;
+        }
+
+        function origin(url) {
+            if (!url) { return ''; }
+            try { return new URL(String(url)).origin; } catch (e) { return ''; }
+        }
+
+        // Alive mirrors first, cheapest ping first -- the same ranking
+        // bestDomain() uses -- then whatever else the site knows about, so a
+        // banned mirror always has somewhere to fail over to.
+        function candidates(mgr) {
+            var list = [];
+            var known = (mgr.domains || []).slice().sort(function (a, b) {
+                var aAlive = a.status === 'alive' ? 0 : 1;
+                var bAlive = b.status === 'alive' ? 0 : 1;
+                if (aAlive !== bAlive) { return aAlive - bAlive; }
+                return (a.ping || 0) - (b.ping || 0);
+            });
+            var i;
+            for (i = 0; i < known.length; i++) { list.push(known[i].name); }
+            var defaults = mgr.defaultDomains || [];
+            for (i = 0; i < defaults.length; i++) {
+                if (list.indexOf(defaults[i]) < 0) { list.push(defaults[i]); }
+            }
+            return list;
+        }
+
+        function pick(mgr, siteChoice) {
+            var list = candidates(mgr);
+            for (var i = 0; i < list.length; i++) {
+                if (!banned[list[i]]) { return list[i]; }
+            }
+            return siteChoice;
+        }
+
+        function ban(domain, why) {
+            if (!domain || banned[domain]) { return false; }
+            banned[domain] = true;
+            banCount++;
+            note('DOMAIN', 'mirror ' + domain + ' banned: ' + why);
+            return true;
+        }
+
+        function patchBestDomain() {
+            var mgr = manager();
+            if (!mgr || typeof mgr.bestDomain !== 'function') { return false; }
+            if (mgr.__stvFailoverInstalled) { return true; }
+            mgr.__stvFailoverInstalled = true;
+            var original = mgr.bestDomain;
+            mgr.bestDomain = function () {
+                var siteChoice = original.apply(this, arguments);
+                var chosen = pick(this, siteChoice);
+                if (chosen && chosen !== siteChoice && !noted[siteChoice]) {
+                    noted[siteChoice] = true;
+                    note('DOMAIN', 'bestDomain ' + siteChoice + ' -> ' + chosen);
+                }
+                return chosen;
+            };
+            note('DOMAIN', 'mirror failover installed');
+            return true;
+        }
+
+        function patchContent() {
+            var app = window.app;
+            if (!app || !app.reader || typeof app.reader.getContent !== 'function') { return false; }
+            if (app.reader.__stvFailoverInstalled) { return true; }
+            app.reader.__stvFailoverInstalled = true;
+            var original = app.reader.getContent;
+            app.reader.getContent = function (h, i, c, rl) {
+                var self = this;
+                var args = arguments;
+                // Retried through this same wrapper, so more than one bad mirror
+                // can be walked past in a single read. Each round either bans a
+                // new mirror (banCount is bounded) or gives up and hands the
+                // code 7 back to the site.
+                function attempt() {
+                    return Promise.resolve(original.apply(self, args)).then(function (data) {
+                        if (!data || String(data.code) !== '7' || banCount >= MAX_BANS) {
+                            return data;
+                        }
+                        var mgr = manager();
+                        var bad = mgr ? origin(mgr.bestDomain ? mgr.bestDomain() : '') : '';
+                        if (!ban(bad, 'readchapter answered code 7')) { return data; }
+                        if (app.reader) { app.reader.cachekey = null; }
+                        note('DOMAIN', 'refetching ' + h + '/' + i + ' chapter ' + c
+                            + ' after code 7');
+                        return attempt();
+                    });
+                }
+                return attempt();
+            };
+            note('DOMAIN', 'readchapter failover installed');
+            return true;
+        }
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            var a = patchBestDomain();
+            var b = patchContent();
+            if ((a && b) || attempts > 600) { clearInterval(timer); }
+        }, 50);
     })();
     """
 
@@ -1791,6 +1992,9 @@ enum SitePatch {
             });
         }, true);
 
+        // key -> bookinfo.php response. The response is memoised rather than a
+        // boolean so a row that rendered without book data can still resolve the
+        // book on tap without a second request.
         var warmed = {};
 
         // populateBookInfo() (app.v2.read.js:3258) answers from
@@ -1808,14 +2012,18 @@ enum SitePatch {
                 return Promise.resolve(null);
             }
             var key = host + '/' + id;
-            if (warmed[key]) { return Promise.resolve(null); }
+            if (Object.prototype.hasOwnProperty.call(warmed, key)) {
+                return Promise.resolve(warmed[key]);
+            }
             var url = '/mobile/bookinfo.php?hid=' + id + '&host=' + host;
             return app.net.getCacheLater(url).then(function (down) {
-                warmed[key] = true;
+                warmed[key] = down || null;
                 note('BOOKINFO', 'warmed ' + key + ' -> '
                     + ((down && down.book) ? 'book cached' : 'no book in response'));
-                return down;
+                return warmed[key];
             }, function (error) {
+                // A failure is not memoised: the row is still on screen and the
+                // next tap is a perfectly good time to try again.
                 note('ERR', 'bookinfo warm-up failed for ' + key + ': ' + error);
                 return null;
             });
@@ -1859,11 +2067,32 @@ enum SitePatch {
         // The site's download row has no controls at all: pausing and retrying
         // live behind a long-press context menu and there is no way to drop a
         // task. Add both as buttons.
-        function decorateRow(manager, node) {
+        //
+        // Placement is the whole problem. The row is
+        // `<div class="bookrowcont"><div class="bookrow">...` and app.v2.css
+        // gives `.bookrowcont` a fixed `height: 77px` with `.bookrow`
+        // `position: absolute` inside it, so a control bar appended in normal
+        // flow is painted *under* the absolutely positioned row and every tap
+        // lands on the row instead. The device log is unambiguous: tapping the
+        // pause/delete area produced `openBookWithData called with no book data
+        // (bookid=0)` -- the row's own handler, never ours. Grow the container
+        // and lift the bar above the positioned row.
+        function decorateRow(manager, node, book) {
             if (!node || node.__stvActions) { return; }
             node.__stvActions = true;
+            node.__stvManager = manager;
+            node.__stvBook = book || null;
+            if (node.setAttribute) {
+                node.setAttribute('data-stv-host', manager.host);
+                node.setAttribute('data-stv-id', manager.id);
+            }
+            node.style.height = 'auto';
+            node.style.minHeight = '77px';
+            node.style.paddingBottom = '46px';
             var bar = document.createElement('div');
-            bar.setAttribute('style', 'display:flex;gap:6px;padding:0 6px 8px;');
+            node.__stvBar = bar;
+            bar.setAttribute('style',
+                'position:relative;z-index:5;display:flex;gap:6px;padding:0 6px 8px;');
             var toggle = document.createElement('button');
             var drop = document.createElement('button');
             toggle.setAttribute('style',
@@ -1896,6 +2125,65 @@ enum SitePatch {
             node.appendChild(bar);
         }
 
+        function within(ancestor, node) {
+            while (node) {
+                if (node === ancestor) { return true; }
+                node = node.parentNode;
+            }
+            return false;
+        }
+
+        function rowOf(node) {
+            while (node && node.nodeType === 1) {
+                if (node.__stvManager) { return node; }
+                node = node.parentElement;
+            }
+            return null;
+        }
+
+        // Did the site's own render() get book data out of the cache? It writes
+        // the title into `.tname` and nothing at all when populateBookInfo()
+        // returned [].
+        function rowHasBookData(node) {
+            var title = node.querySelector ? node.querySelector('.tname') : null;
+            return !!(title && String(title.textContent || '').length > 0);
+        }
+
+        // render() captures the bookinfo it read (:3609) into the row's click
+        // handler (:3621), so a row that rendered without data can never open its
+        // book -- the listener is anonymous and cannot be rebound. Handle that
+        // tap here instead of letting the openBookWithData guard refuse it with
+        // "书籍信息缺失": resolve the book and open the detail page.
+        document.addEventListener('click', function (event) {
+            var row = rowOf(event.target);
+            if (!row || rowHasBookData(row)) { return; }
+            var bar = row.__stvBar;
+            if (bar && within(bar, event.target)) { return; }
+            var manager = row.__stvManager;
+            if (!manager) { return; }
+            event.stopPropagation();
+            event.preventDefault();
+            note('DOWNLOAD', 'row ' + manager.host + '/' + manager.id
+                + ' rendered without book info; resolving it for the tap');
+            var pending = row.__stvBook
+                ? Promise.resolve(row.__stvBook)
+                : warmOne(manager.host, manager.id).then(function (down) {
+                    var book = down && down.book ? down.book : null;
+                    if (book) { row.__stvBook = book; }
+                    return book;
+                });
+            pending.then(function (resolved) {
+                var app = window.app;
+                if (!resolved) {
+                    if (app && app.toast) { app.toast('书籍信息缺失，请返回后重试'); }
+                    return;
+                }
+                app.fun.openBookWithData(0, resolved);
+            }, function (error) {
+                note('ERR', 'download row bookinfo lookup failed: ' + error);
+            });
+        }, true);
+
         // Two entry points read that cache for a list of books: the download
         // manager's rows (render) and the 储物袋 downloaded list
         // (getDownloadBooks -> populateBookInfo). Warm in front of both.
@@ -1909,11 +2197,12 @@ enum SitePatch {
                 manager.prototype.render = function () {
                     var self = this;
                     var args = arguments;
-                    return warmOne(self.host, self.id).then(function () {
-                        return originalRender.apply(self, args);
-                    }).then(function (node) {
-                        decorateRow(self, node);
-                        return node;
+                    return warmOne(self.host, self.id).then(function (down) {
+                        return Promise.resolve(originalRender.apply(self, args))
+                            .then(function (node) {
+                                decorateRow(self, node, down && down.book ? down.book : null);
+                                return node;
+                            });
                     });
                 };
                 note('BOOKINFO', 'download manager render warmed');
@@ -2140,6 +2429,6 @@ enum SitePatch {
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
     static let all: [String] = [compat, diag, readerDefaults, ttsProvider,
                                 followFallback, safeArea, settingsBackup,
-                                bookmarkToggle, readerTts, pageRepair, bootShell,
-                                SiteI18nData.script]
+                                domainFailover, bookmarkToggle, readerTts,
+                                pageRepair, bootShell, SiteI18nData.script]
 }

@@ -115,8 +115,9 @@ function makeElement(tagName) {
       return { left: 0, top: 0, width: 26, height: 26, right: 26, bottom: 26 };
     },
     select() {},
-    querySelector() {
-      return null;
+    querySelector(selector) {
+      const found = this.querySelectorAll(selector);
+      return found.length ? found[0] : null;
     },
     querySelectorAll(selector) {
       // Supports the shapes the injected blocks actually use: one or more
@@ -290,6 +291,9 @@ function makeSandbox() {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
     Blob: globalThis.Blob,
     Uint8Array,
+    // The mirror-failover block reads the origin of the URL bestDomain()
+    // returned.
+    URL: globalThis.URL,
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -502,7 +506,24 @@ function installFakeApp(sandbox, options) {
     }
     render() {
       stored.renderCache = (stored.cacheLater || []).slice();
-      return Promise.resolve(makeContainer('div', 'bookrowcont'));
+      // The real row is `<div class="bookrowcont"><div class="bookrow">` with
+      // the title in `.tname` (view-bookdownloadjob); the failover/guard code
+      // reads `.tname` to tell a row that got book data from one that did not.
+      const node = makeContainer('div', 'bookrowcont');
+      const row = makeContainer('div', 'bookrow');
+      const right = makeContainer('div', 'right');
+      const title = makeContainer('div', 'tname', options.rowTitle || '');
+      right.appendChild(title);
+      right.appendChild(makeContainer('div', 'status'));
+      const pbar = makeContainer('div', 'pgbar');
+      pbar.appendChild(makeContainer('div', 'pgbarinner'));
+      right.appendChild(pbar);
+      row.appendChild(right);
+      node.appendChild(row);
+      this.node = node;
+      this.status = right.children[1];
+      this.progress = pbar.children[0];
+      return Promise.resolve(node);
     }
     downloadChapter(chapter) {
       stored.downloadStarts = (stored.downloadStarts || []).concat([Date.now()]);
@@ -513,6 +534,22 @@ function installFakeApp(sandbox, options) {
     start() { this.isPaused = false; stored.resumes = (stored.resumes || 0) + 1; }
   }
   app.BookDownloadManager = FakeDownloadManager;
+
+  // The site's mirror picker (app.v2.js:890). Only installed when a test asks
+  // for it, because the failover block wraps bestDomain()/getContent().
+  if (options.networkManager) {
+    const mirrors = options.networkManager;
+    app.net.networkManager = {
+      domains: mirrors.domains.map((entry) => Object.assign({}, entry)),
+      defaultDomains: mirrors.defaultDomains,
+      bestDomain() {
+        stored.bestDomainCalls = (stored.bestDomainCalls || 0) + 1;
+        const alive = this.domains.filter((entry) => entry.status === 'alive');
+        if (!alive.length) { return this.defaultDomains[0]; }
+        return alive.slice().sort((a, b) => (a.ping || 0) - (b.ping || 0))[0].name;
+      },
+    };
+  }
 
   sandbox.app = app;
   sandbox.window.app = app;
@@ -1108,8 +1145,8 @@ async function testOfflineBookDetailPage() {
     JSON.stringify(starts));
 
   const row = await throttled.render();
-  const bar = row.children[0];
-  const buttons = bar ? bar.children.filter((child) => child.tagName === 'BUTTON') : [];
+  const buttons = row.querySelectorAll('button');
+  const bar = buttons.length ? buttons[0].parentNode : null;
   check('the download row gets its own pause and delete buttons',
     buttons.length === 2 && buttons[0].textContent === '暂停下载'
       && buttons[1].textContent === '删除任务',
@@ -1221,6 +1258,182 @@ async function testSafeAreaRespectsSiteValues() {
     root.style.getPropertyValue('--screensafebottom'));
 }
 
+async function testDomainFailover() {
+  console.log('readchapter mirror failover');
+  const bad = 'https://dns1.stv-appdomain-00000001.org';
+  const good = 'https://sangtacviet.com';
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: bad, status: 'alive', ping: 100 },
+        { name: good, status: 'alive', ping: 400 },
+      ],
+      defaultDomains: [good, bad, 'https://sangtacviet.app'],
+    },
+  });
+  // The device log: the mirror that wins the ping race answers every chapter
+  // with {"code":7,"time":1000} while the slower one serves it fine.
+  const served = [];
+  app.reader.cachekey = 'qidian-1';
+  app.reader.getContent = function () {
+    const domain = app.net.networkManager.bestDomain();
+    served.push(domain);
+    return Promise.resolve(domain === bad
+      ? { code: 7, time: 1000 }
+      : { code: 0, data: 'chapter' });
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  check('the site mirror picker is wrapped',
+    app.net.networkManager.__stvFailoverInstalled === true);
+  check('the fastest mirror is the one the site would use',
+    app.net.networkManager.domains.slice().sort((a, b) => a.ping - b.ping)[0].name === bad);
+
+  const data = await app.reader.getContent('qidian', '1', 'c1');
+  check('the chapter is returned instead of the code-7 alert',
+    !!data && String(data.code) === '0', JSON.stringify(data));
+  check('the rejected mirror was retried on the next one',
+    served.length === 2 && served[0] === bad && served[1] === good, JSON.stringify(served));
+  check('the rejected mirror is never picked again',
+    app.net.networkManager.bestDomain() === good, app.net.networkManager.bestDomain());
+  check('the chapter key issued by the rejected mirror is dropped',
+    app.reader.cachekey === null, String(app.reader.cachekey));
+  const diag = sandbox.window.__stvDiag.text();
+  check('the failover is reported in the panel',
+    diag.indexOf('mirror ' + bad + ' banned') >= 0, diag.slice(-300));
+
+  served.length = 0;
+  const second = await app.reader.getContent('qidian', '1', 'c2');
+  check('later chapters go straight to the working mirror',
+    String(second.code) === '0' && served.length === 1 && served[0] === good,
+    JSON.stringify(served));
+
+  // Two bad mirrors in front of a good one: the retry walks past both in a
+  // single read instead of handing the first code 7 back to the site.
+  const third = 'https://sangtacviet.app';
+  const chain = makeSandbox();
+  const chainApp = installFakeApp(chain, {
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: bad, status: 'alive', ping: 10 },
+        { name: third, status: 'alive', ping: 20 },
+        { name: good, status: 'alive', ping: 30 },
+      ],
+      defaultDomains: [good, bad, third],
+    },
+  });
+  const chainServed = [];
+  chainApp.reader.getContent = function () {
+    const domain = chainApp.net.networkManager.bestDomain();
+    chainServed.push(domain);
+    return Promise.resolve(domain === good ? { code: 0, data: 'chapter' } : { code: 7 });
+  };
+  vm.runInContext(loadBlocks().join('\n'), chain);
+  await tick(300);
+  const walked = await chainApp.reader.getContent('qidian', '1', 'c1');
+  check('every rejecting mirror is walked past in one read',
+    String(walked.code) === '0' && chainServed.length === 3
+      && chainServed[2] === good, JSON.stringify(chainServed));
+
+  // Nothing left to fail over to: the site's own alert has to stay possible.
+  const dead = makeSandbox();
+  const deadApp = installFakeApp(dead, {
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [{ name: bad, status: 'alive', ping: 10 }],
+      defaultDomains: [bad],
+    },
+  });
+  deadApp.reader.getContent = () => Promise.resolve({ code: 7 });
+  vm.runInContext(loadBlocks().join('\n'), dead);
+  await tick(300);
+  const stuck = await deadApp.reader.getContent('qidian', '1', 'c1');
+  check('a code 7 with no alternative mirror is passed through untouched',
+    !!stuck && String(stuck.code) === '7', JSON.stringify(stuck));
+}
+
+async function testDownloadRowControls() {
+  console.log('download row controls and missing book info');
+  const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    bookInfoResponses: {
+      [url]: { book: { id: '1034915599', host: 'qidian', name: '这些仙子全都不正常！' } },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  const manager = new app.BookDownloadManager('qidian', '1034915599');
+  const row = await manager.render();
+  const title = row.querySelector('.tname');
+  const bar = row.__stvBar;
+
+  check('the control bar is lifted above the absolutely positioned .bookrow',
+    !!bar && String(bar.getAttribute('style')).indexOf('position:relative') >= 0
+      && String(bar.getAttribute('style')).indexOf('z-index:5') >= 0,
+    bar ? String(bar.getAttribute('style')) : 'no bar');
+  check('the fixed-height row container grows to fit the controls',
+    row.style.height === 'auto' && row.style.minHeight === '77px'
+      && row.style.paddingBottom === '46px',
+    JSON.stringify({
+      h: row.style.height, min: row.style.minHeight, pad: row.style.paddingBottom,
+    }));
+  check('the row carries the book it belongs to',
+    row.getAttribute('data-stv-host') === 'qidian'
+      && row.getAttribute('data-stv-id') === '1034915599',
+    String(row.getAttribute('data-stv-host')) + '/' + String(row.getAttribute('data-stv-id')));
+  check('an empty .tname marks a row the site rendered without book data',
+    title.textContent === '', JSON.stringify(title.textContent));
+
+  const buttons = row.querySelectorAll('button');
+  const event = () => ({ stopPropagation() {}, preventDefault() {} });
+
+  // Tapping the row body used to reach openBookWithData(0, undefined) and be
+  // refused with 书籍信息缺失.
+  sandbox.__dispatch('click', Object.assign({ target: title }, event()));
+  await tick(50);
+  const opened = sandbox.__stored.opened || [];
+  check('tapping a row with no book data still opens the book',
+    opened.length === 1 && !!opened[0].data && opened[0].data.id === '1034915599',
+    JSON.stringify(opened));
+  check('the tap is not turned into the 书籍信息缺失 toast',
+    !(sandbox.__stored.toasts || []).some((t) => t.indexOf('书籍信息缺失') >= 0),
+    JSON.stringify(sandbox.__stored.toasts || []));
+
+  const beforeButtons = (sandbox.__stored.opened || []).length;
+  sandbox.__dispatch('click', Object.assign({ target: buttons[0] }, event()));
+  await tick(20);
+  check('the capture listener leaves the control bar alone',
+    (sandbox.__stored.opened || []).length === beforeButtons,
+    JSON.stringify(sandbox.__stored.opened || []));
+  buttons[0].__fire('click', event());
+  check('the pause button still pauses the task', manager.isPaused === true);
+
+  // A row the site did fill in keeps the site's own behaviour.
+  const filled = makeSandbox();
+  const filledApp = installFakeApp(filled, {
+    displayType: 'pageflip',
+    rowTitle: '这些仙子全都不正常！',
+    bookInfoResponses: { [url]: { book: { id: '1034915599', host: 'qidian' } } },
+  });
+  vm.runInContext(loadBlocks().join('\n'), filled);
+  await tick(300);
+  const filledManager = new filledApp.BookDownloadManager('qidian', '1034915599');
+  const filledRow = await filledManager.render();
+  filled.__dispatch('click', Object.assign({ target: filledRow.querySelector('.tname') }, event()));
+  await tick(30);
+  check('a row the site filled in is left to the site',
+    (filled.__stored.opened || []).length === 0,
+    JSON.stringify(filled.__stored.opened || []));
+}
+
 async function testSettingsBackup() {
   console.log('settings backup across reinstalls');
 
@@ -1278,6 +1491,57 @@ async function testSettingsBackup() {
   await app.storage.set('chaptercache.1', 'x');
   await tick(50);
   check('a cached chapter is not mirrored', write.__keychain['chaptercache.1'] === undefined);
+
+  // The download list lives in the same store under the objectStore key
+  // (app.v2.read.js:3189). Losing it loses every downloaded book's row, so it is
+  // mirrored and restored alongside the settings.
+  const records = '[{"host":"qidian","id":"1034915599","key":"offlineBook_qidian_1034915599"}]';
+  const recordsBackup = makeSandbox();
+  installFakeApp(recordsBackup, { displayType: 'auto', keychain: { offlineBook: records } });
+  vm.runInContext(loadBlocks().join('\n'), recordsBackup);
+  await tick(250);
+  check('the download record list is restored from the keychain',
+    recordsBackup.localStorage.getItem('offlineBook') === records,
+    String(recordsBackup.localStorage.getItem('offlineBook')));
+
+  const recordsWrite = makeSandbox();
+  const recordsApp = installFakeApp(recordsWrite, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), recordsWrite);
+  await tick(250);
+  await recordsApp.storage.set('offlineBook', records);
+  await tick(50);
+  check('download records are mirrored as they change',
+    recordsWrite.__keychain.offlineBook === records,
+    String(recordsWrite.__keychain.offlineBook));
+
+  // "The store is empty" and "the store cannot be read" need different repairs,
+  // so they have to be told apart in the log.
+  const unreadable = makeSandbox();
+  const unreadableApp = installFakeApp(unreadable, {
+    displayType: 'auto',
+    keychain: { 'config.reader': '{"a":1}' },
+  });
+  unreadableApp.storage.get = () => Promise.reject(new Error('Preferences unavailable'));
+  vm.runInContext(loadBlocks().join('\n'), unreadable);
+  await tick(250);
+  const unreadableDiag = String(unreadable.window.__stvDiag.text() || '');
+  check('a store that cannot be read is reported as unreadable, not empty',
+    unreadableDiag.indexOf('1 unreadable') >= 0 && unreadableDiag.indexOf('0 written') >= 0,
+    unreadableDiag.slice(-300));
+
+  // A backend that resolves the write and drops the value is the failure this
+  // whole block exists to survive, so the write is read back.
+  const amnesia = makeSandbox();
+  const amnesiaApp = installFakeApp(amnesia, {
+    displayType: 'auto',
+    keychain: { 'config.reader': '{"a":1}' },
+  });
+  amnesiaApp.storage.set = () => Promise.resolve();
+  vm.runInContext(loadBlocks().join('\n'), amnesia);
+  await tick(250);
+  const amnesiaDiag = String(amnesia.window.__stvDiag.text() || '');
+  check('a write that does not persist is reported',
+    amnesiaDiag.indexOf('readback mismatch') >= 0, amnesiaDiag.slice(-300));
 }
 
 async function testBookmarkToggle() {
@@ -1324,6 +1588,8 @@ await testChapterNamePlace();
 await testBootShell();
   await testCommentButton();
   await testOfflineBookDetailPage();
+  await testDomainFailover();
+  await testDownloadRowControls();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
