@@ -1,0 +1,61 @@
+name: CodeQL
+
+# CodeQL 扫描（advanced setup，替代已禁用的 default setup）。
+#
+# 为什么不用 default setup：site-assets/ 是站点自己前端 bundle 的逐字节镜像
+# （gen-site-assets.js 生成、manifest sha256 + CI --check 钉死），里面的
+# CodeQL 发现（xss-through-dom #5/#6）属于上游站点代码，改镜像会破坏
+# sha256 校验并挂 CI。default setup 在个人账号下挂不了
+# github-codeql-config-file 仓库属性（组织专属），所以用 workflow +
+# config-file 的方式挂同一份 paths-ignore。
+#
+# 覆盖范围与原 default setup 对齐：javascript-typescript + actions，
+# 每周一跑一次 + push 触发。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+  schedule:
+    - cron: '17 3 * * 1'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: actions
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # 排除 site-assets/（逐字节镜像，站点自己的代码）
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
