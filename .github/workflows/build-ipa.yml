@@ -180,7 +180,7 @@ jobs:
                         stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled \
                         stvAssetCache stvReaderPrefetchInstalled \
                         stvCommentTranslateInstalled stvAssetMirror \
-                        siteAssetRefresh data-stv-mirror; do
+                        siteAssetRefresh data-stv-mirror stv.domain.trap.off; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
@@ -221,14 +221,19 @@ jobs:
             echo "::error::setDiagnostics 缺失（原生诊断门无法开关）"
             exit 1
           fi
-          # 会话响应缓存里的章节列表那条规则。它没有 UI：一旦编译期丢掉
-          # （比如把 URL 判断写错或整段删掉），表现只是「章节列表又发了三次」，
-          # 面板上看不出来，所以必须让产物自己证明它在。
-          for marker in 'sajax=getchapterlist' 'cached-for '; do
-            if grep -q -F "$marker" "$syms.strings"; then
-              echo "✓ $marker 已编入产物"
+          # 会话响应缓存里的章节列表那条规则。它没有 UI：一旦丢掉，表现只是
+          # 「章节列表又发了三次」，面板上看不出来。**这一条只能查源码**：
+          # 它唯一的诊断字面量只经过 CAPLog，release 产物里会被优化掉（第一次
+          # 写成二进制 strings 检查时就是这样红的），而 `sajax=getchapterlist`
+          # 又同时出现在 SiteI18nData 的注入块里，放在 strings 检查里会「因为
+          # 别的地方有同样的字符串」而假装通过。源码检查证明的是「规则还在」，
+          # 能不能链进产物由上面的编译与注册步骤负责。
+          for marker in 'cachePolicy(method:' 'sajax=getchapterlist' \
+                        'chapterListTTL' 'isCacheableChapterList'; do
+            if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
+              echo "✓ $marker 还在响应缓存源码里"
             else
-              echo "::error::$marker 缺失（章节列表缓存没有编入）"
+              echo "::error::$marker 缺失（章节列表缓存规则被删改）"
               exit 1
             fi
           done

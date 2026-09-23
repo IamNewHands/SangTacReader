@@ -136,6 +136,9 @@ const REQUIRED_MARKERS = [
   // accessors instead of a poll.
   'function watchProperty(',
   'function watchNet(',
+  // ...and the way back out: if the declaration is ever refused, the trap is
+  // dropped for good and the page reloaded once instead of the site never booting.
+  'stv.domain.trap.off',
 ];
 
 function fail(message) {

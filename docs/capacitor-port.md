@@ -2467,13 +2467,23 @@ TTS 起点（§6.21）同样在真机确认：`pageflip page 1 of 15 / 2 of 15 /
 
 | 守卫 | 结果 |
 |---|---|
-| `scripts/check-ios-shim.js` | 23 块 / **405254 字节** / **58 个标记**（新增 `function watchProperty(`、`function watchNet(`） |
+| `scripts/check-ios-shim.js` | 23 块 / **405254 字节** / **59 个标记**（新增 `function watchProperty(`、`function watchNet(`、`stv.domain.trap.off`） |
 | `scripts/test-site-patch.js` | **577 条断言**（上一轮 569，新增 8 条：manager 在建后同一轮被包上、同一轮就用记住的镜像、`app` 在块之后建立也被接住、探测未回来的 manager 仍给记住的镜像、退路标记下同一轮不包、退路标记下兜底轮询仍包、`app` 始终不出现时写标记、写标记后 reload 一次） |
 | `scripts/gen-site-i18n.js --check` | 458 标签 / 35 片段 |
 | `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 / host `https://sangtacviet.com` |
 
-CI 的二进制 strings 检查新增 `'sajax=getchapterlist'` 与 `'cached-for '`（章节列表缓存没有 UI，
-一旦编译期丢掉，表现只是「列表又发了三次」，面板上看不出来，必须让产物自己证明它在）。
+CI 的二进制 strings 标记新增 `stv.domain.trap.off`（在注入块里，必然进产物）。
+
+**改动 B 不能用二进制 strings 检查 —— 这是第一次 CI 红出来的教训，记在这里**：最初把
+`sajax=getchapterlist` 与 `cached-for ` 加进了 `strings` 检查，结果 `cached-for ` 找不到。
+两个原因都值得记：(1) 那个字面量只作为参数传给 `callLog` → `CAPLog.print`，release 产物里
+这条路径没有可观察效果，字符串被优化掉了；(2) `sajax=getchapterlist` 其实**也不是** http 插件
+贡献的 —— `SiteI18nData.swift` 的注入块里就有同样的文本，所以这条断言是「别的地方碰巧也有这个
+字符串」而通过的，属于会假装通过的检查。现在 B 改成**查源码**（`cachePolicy(method:`、
+`sajax=getchapterlist`、`chapterListTTL`、`isCacheableChapterList` 四个串必须在
+`plugins/http/.../SangTacHttpPlugin.swift` 里），它证明的是「规则还在源码里」，能不能链进产物
+由编译步骤（16）与插件注册校验（14）负责 —— 与其留一条会误报通过的带标记检查，不如把它的
+证明力说清楚。
 
 新加的断言里，前四条**全部发生在不 `await` 的同步段**：装完块并 `tick(300)` 之后才做赋值，
 赋值与检查之间没有任何 yield，所以只有访问器可能完成接线 —— 这正是本轮修的那个竞争；
