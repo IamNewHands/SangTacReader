@@ -51,22 +51,25 @@ SangTacReader/
 
 ## 站点补丁（`plugins/app/.../SitePatch.swift`）
 
-站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 12 个块，
+站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 15 个块，
 每块独立守卫、互不依赖：
 
 | 块 | 作用 |
 |---|---|
 | `compat` | `nativeclick` 空实现 + `window.TTS` 门面（站点不调则整条点击链抛错） |
 | `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台） |
+| `tabProbe` | 临时：点 tab 时上报 tabbar 项宽、指针 transform/width、`tabdiv` transform、末页子节点数 |
+| `storageAccessor` | 替换站点坏掉的 `app.storage.get`（`await prefs.get({key}).value` 恒为 `undefined`），设置/下载记录/历史才读得回来 |
 | `readerDefaults` | iOS 上把阅读器 `display_type` 默认成左右翻页；修「静态章节名称」选过不显示后再也回不来的单程 bug |
 | `ttsProvider` | 注册 `ttsEngine` 的 `ios` provider，走原生 `AVSpeechSynthesizer`；按文本语种挑发音人 |
 | `followFallback` | 「关注」接口服务端 500 时探测站点自己的旧接口 |
 | `safeArea` | 灵动岛 / Home Indicator：安全区补齐、`#overlay` 高度兜底 + 阅读器菜单几何量上报 |
-| `settingsBackup` | 设置与下载记录镜像进 Keychain，重装/容器被换掉后写回站点真正读取的 `app.storage`（含回读校验） |
+| `gridLayout` | 书架网格：格子不再被强制成第一格的高度、标题两行截断（点空白不再命中上一行） |
+| `settingsBackup` | 设置与下载记录镜像进 Keychain；等 `storageAccessor` 修好后才恢复，并把值回灌运行中的 `app.config` / `offlineBook.store.data` |
 | `domainFailover` | 正文镜像故障转移：回过 `code 7` 的域名不再被选中，`getContent` 出口拦截并换镜像重取 |
 | `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
 | `readerTts` | 正文朗读：句子来源取当前章、失败原因上报、测试语句改中文、退出正文自动停止 |
-| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载限速 + 行内暂停/删除按钮（抬高到定位行之上，行本体点了也能打开详情） |
+| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载限速 + 行内暂停/删除按钮；下载对话框改成「起始章→结束章」默认整本；`start()` 重入闩；删任务后刷新计数 |
 | `bootShell` | 首屏外壳：站点 CSS 到位前先把底部标签栏画出来（主题背景 + 载入提示），并记录启动时间线 |
 | `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（中文原名来自 `oridata`，含阅读器 iframe 兜底） |
 

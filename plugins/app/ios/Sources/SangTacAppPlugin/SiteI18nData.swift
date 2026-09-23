@@ -43,6 +43,8 @@ enum SiteI18nData {
             ['Bạn có xác nhận đăng xuất tài khoản?', '确认要注销账号吗？'],
             ['Bật', '开启'],
             ['Bắt đầu từ', '起始章节'],
+            ['Nhập khoảng chương để tải:', '输入要下载的章节范围：'],
+            ['Đến chương', '结束章节'],
             ['Bật dịch chương truyện', '开启章节翻译'],
             ['Biết rồi!', '知道了！'],
             ['Bình luận', '评论'],

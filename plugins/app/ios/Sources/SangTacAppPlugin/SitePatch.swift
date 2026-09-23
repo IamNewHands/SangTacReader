@@ -445,6 +445,89 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Site storage accessor
+
+    /**
+     The site persists everything through `app.storage`, and on iOS it picks the
+     Capacitor Preferences branch (app.v2.js:534):
+
+         app.storage.get = async function (key) {
+             return await prefs.get({ key: key }).value;
+         }
+
+     Member access binds tighter than `await`, so that expression is
+     `await ((prefs.get({ key: key })).value)` -- `.value` of a Promise is
+     `undefined`, so the function returns `undefined` for every key, including
+     keys it wrote a moment earlier. The Android APK never hits this:
+     `@capacitor/preferences` is not a dependency there, so the site takes the
+     localStorage branch and reads work. This build ships the plugin (CI's
+     packageClassList contains `PreferencesPlugin`), so the broken branch is the
+     live one -- the device log says so on every launch:
+
+         [SETTINGS] restore config.reader -> 517 chars (store was empty)
+         [ERR] restore readback mismatch for config.reader (wrote 517 chars, read back 0)
+
+     Everything the site stores is affected: `config.reader` / `config.ux` (every
+     setting), `offlineBook` (the download list), `readhistory`, and the bookinfo
+     cache. Writes land; nothing is readable, so the site always falls back to its
+     defaults and the download list is always empty on start.
+
+     Replacing the accessor -- not wrapping it, because the original discards the
+     value inside its own body -- is the smallest repair at the exact seam.
+     */
+    static let storageAccessor = """
+    (function () {
+        if (window.__stvStorageAccessorInstalled) { return; }
+        window.__stvStorageAccessorInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function unwrap(result) {
+            if (result && typeof result === 'object' && 'value' in result) {
+                return result.value;
+            }
+            return result;
+        }
+
+        function patch() {
+            var app = window.app;
+            var Capacitor = window.Capacitor;
+            if (!app || !app.storage || typeof app.storage.get !== 'function') { return false; }
+            if (app.storage.__stvGetFixed) { return true; }
+            var prefs = Capacitor && Capacitor.Plugins && Capacitor.Plugins.Preferences;
+            if (!prefs) {
+                // No Preferences plugin: the site is on the localStorage branch,
+                // whose reads already work. Nothing to repair -- but the settings
+                // restore waits for this flag, so publish it.
+                window.__stvStorageAccessorPatched = true;
+                return true;
+            }
+            app.storage.__stvGetFixed = true;
+            app.storage.get = function (key) {
+                // Resolve the call inside the chain so a synchronous throw from
+                // the bridge is handled like a rejection.
+                return Promise.resolve().then(function () {
+                    return prefs.get({ key: key });
+                }).then(unwrap, function (error) {
+                    note('ERR', 'app.storage.get failed for ' + key + ': ' + error);
+                    return undefined;
+                });
+            };
+            window.__stvStorageAccessorPatched = true;
+            note('STORAGE', 'app.storage.get reads the Preferences result properly');
+            return true;
+        }
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            if (patch() || attempts > 800) { clearInterval(timer); }
+        }, 25);
+    })();
+    """
+
     // MARK: - Reader display type
 
     /**
@@ -1049,6 +1132,62 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Grid tap targets
+
+    /**
+     The history / followed / bookmarked grids are built by
+     `app.celoader.infbookgrid` (_page_vip.html:3873), which after rendering the
+     cells does:
+
+         var h = addedElements[0].scrollHeight;
+         for (...) { addedElements[i].style.height = h + "px"; }
+
+     Every cell is forced to the height of the *first* book, on top of flexbox
+     already stretching each row's cells to its tallest one. The cell is also the
+     click target (`e.addEventListener("click", ... openBookWithData)`, :3897), so
+     the blank strip under a shorter card still belongs to that card. That is the
+     "第一行和第二行之间空白很大，点空白处实际会变成点第一行的小说" report: the
+     first book's title wraps furthest, its height wins, and every row inherits the
+     leftover space as a tappable blank.
+
+     Let each cell size to its own content and clamp the title to two lines, so the
+     rows stay even without a forced height.
+     */
+    static let gridLayout = """
+    (function () {
+        if (window.__stvGridLayoutInstalled) { return; }
+        window.__stvGridLayoutInstalled = true;
+
+        var CSS = '.f-3-col, .f-sm-4-col, .f-md-6-col { align-items: flex-start; }'
+            + '.booksquarecont { height: auto !important; }'
+            + '.booksquare .tname { display: -webkit-box; -webkit-line-clamp: 2;'
+            + ' -webkit-box-orient: vertical; overflow: hidden; }';
+
+        function inject() {
+            if (document.getElementById('stv-grid-layout')) { return true; }
+            var head = document.head;
+            if (!head) { return false; }
+            var el = document.createElement('style');
+            el.id = 'stv-grid-layout';
+            el.textContent = CSS;
+            head.appendChild(el);
+            if (window.__stvDiag) {
+                window.__stvDiag.log('GRID',
+                    'cells size to their own content, titles clamped to 2 lines');
+            }
+            return true;
+        }
+
+        if (!inject()) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (inject() || attempts > 500) { clearInterval(timer); }
+            }, 20);
+        }
+    })();
+    """
+
     // MARK: - Settings backup across reinstalls
 
     /**
@@ -1141,6 +1280,13 @@ enum SitePatch {
             if (!plugin || typeof plugin.settingsRestore !== 'function') { return false; }
             var storage = siteStorage();
             if (!storage) { return false; }
+            // Wait for the storage accessor repair. Until app.storage.get returns
+            // what was written, an empty read is indistinguishable from a broken
+            // one -- and treating a broken read as "the store is empty" would
+            // write this backup over settings the user has changed since it was
+            // taken. The accessor block publishes the flag; it always does, even
+            // when there is nothing to repair.
+            if (!window.__stvStorageAccessorPatched) { return false; }
             if (restored) { return true; }
             restored = true;
             plugin.settingsRestore({}).then(function (result) {
@@ -1257,6 +1403,40 @@ enum SitePatch {
             return applied;
         }
 
+        // The same race the live-config push solves, for the download list: the
+        // records are restored into the store, but `app.offlineBook.store.load()`
+        // (app.v2.js:624) has usually already run -- and before the storage
+        // accessor was repaired it always read nothing -- so the in-memory list
+        // the download page renders from stays empty. Push the records in.
+        function applyOfflineBookToLiveStore(entries, restoredKeys) {
+            var app = window.app;
+            if (!app || !app.offlineBook || !app.offlineBook.store) { return 0; }
+            if (restoredKeys.indexOf('offlineBook') < 0) { return 0; }
+            var raw = entries['offlineBook'];
+            if (typeof raw !== 'string' || !raw) { return 0; }
+            var parsed = null;
+            try { parsed = JSON.parse(raw); } catch (e) { return 0; }
+            if (!parsed || !parsed.length) { return 0; }
+            var store = app.offlineBook.store;
+            var current = store.data || [];
+            var merged = current.slice();
+            for (var i = 0; i < parsed.length; i++) {
+                var record = parsed[i];
+                if (!record || !record.host || !record.id) { continue; }
+                var known = false;
+                for (var j = 0; j < merged.length; j++) {
+                    if (merged[j] && merged[j].host === record.host
+                        && merged[j].id === record.id) { known = true; break; }
+                }
+                if (!known) { merged.push(record); }
+            }
+            if (merged.length === current.length) { return 0; }
+            store.data = merged;
+            note('SETTINGS', 'download records restored into the live store: '
+                + merged.length + ' book(s)');
+            return merged.length;
+        }
+
         function mirror(key, value) {
             var plugin = appPlugin();
             if (!plugin || typeof plugin.settingsSave !== 'function') { return; }
@@ -1284,6 +1464,7 @@ enum SitePatch {
 
         var attempts = 0;
         var liveApplied = false;
+        var offlineApplied = false;
         var timer = setInterval(function () {
             attempts++;
             if (!restored) { restore(); }
@@ -1296,10 +1477,20 @@ enum SitePatch {
                 liveApplied = true;
                 applyToLiveConfig(lastEntries, restoredKeys);
             }
+            // app.offlineBook is built inside its own async IIFE (read.js:3186),
+            // so it appears even later than the config module.
+            if (restored && !offlineApplied && lastEntries && window.app
+                && window.app.offlineBook && window.app.offlineBook.store) {
+                offlineApplied = true;
+                applyOfflineBookToLiveStore(lastEntries, restoredKeys);
+            }
             // Mirroring must not wait on the config module: it is what keeps the
             // next launch's backup current.
             var attached = attach();
-            if ((restored && liveApplied && attached) || attempts > 1600) { clearInterval(timer); }
+            if ((restored && liveApplied && offlineApplied && attached)
+                || attempts > 1600) {
+                clearInterval(timer);
+            }
         }, 25);
     })();
     """
@@ -2118,6 +2309,10 @@ enum SitePatch {
                 var index = list.indexOf(manager);
                 if (index >= 0) { list.splice(index, 1); }
                 if (node.parentElement) { node.parentElement.removeChild(node); }
+                // The "DOWNLOADING (n)" counter and the list are redrawn by
+                // onUpdate() (page-vip:4044 reads the list length into .total).
+                // Without it the row disappears while the page still says (1).
+                if (typeof list.onUpdate === 'function') { list.onUpdate(); }
                 note('DOWNLOAD', 'task removed from the download list');
             });
             refresh();
@@ -2227,6 +2422,49 @@ enum SitePatch {
                 };
                 note('DOWNLOAD', 'download throttle installed (' + DOWNLOAD_GAP + 'ms gap)');
             }
+            if (manager && manager.prototype && !manager.prototype.__stvStartGuarded) {
+                manager.prototype.__stvStartGuarded = true;
+                var originalStart = manager.prototype.start;
+                manager.prototype.start = function () {
+                    var self = this;
+                    // start() walks this.chapters with three requests in flight
+                    // and splices the list as it goes, so entering it again while
+                    // that loop is still awaiting gives two loops over the same
+                    // chapters. The device log shows the result: the same chapter
+                    // fetched three times and the counter running past the total
+                    // (20/20, 21/20 ... 32/20). A resume request that arrives
+                    // while the loop is winding down is replayed once it exits.
+                    if (self.__stvStartRunning) {
+                        // Only a resume is worth replaying: the site's start() is
+                        // the resume path (pause() sets isPaused, start() clears
+                        // it). A plain repeat start() while the loop is genuinely
+                        // running must stay a no-op, or the replay would spawn the
+                        // second loop this guard exists to prevent.
+                        if (self.isPaused) { self.__stvStartAgain = true; }
+                        note('DOWNLOAD', 'start() ignored while a loop is running for '
+                            + self.host + '/' + self.id);
+                        return Promise.resolve();
+                    }
+                    self.__stvStartRunning = true;
+                    var done = function () {
+                        self.__stvStartRunning = false;
+                        if (self.__stvStartAgain) {
+                            self.__stvStartAgain = false;
+                            // The deferred call was a resume, so run the loop again
+                            // over the chapters that are left. The pause flag is
+                            // deliberately left set until now: it is what makes the
+                            // running loop break instead of carrying on into a
+                            // second one.
+                            return self.start();
+                        }
+                        return null;
+                    };
+                    return Promise.resolve(originalStart.apply(self, arguments))
+                        .then(function (result) { done(); return result; },
+                              function (error) { done(); throw error; });
+                };
+                note('DOWNLOAD', 'download start() made re-entrant-safe');
+            }
             if (typeof app.offlineBook.getDownloadBooks === 'function'
                 && !app.offlineBook.__stvWarmedList) {
                 app.offlineBook.__stvWarmedList = true;
@@ -2243,6 +2481,89 @@ enum SitePatch {
             return !!(manager && manager.prototype && manager.prototype.__stvWarmed
                     && manager.prototype.__stvThrottled)
                 && !!app.offlineBook.__stvWarmedList;
+        }
+
+        // The download dialog asks for a chapter COUNT and hard-codes 20 of them.
+        // `showDownloadBook` (page-vip:4939-4953) fetches the book's
+        // `chaptercount` into `ccount`, never uses it, and sets `total = 20`; the
+        // action then runs `clist.slice(start-1, start-1+count)`
+        // (app.v2.js:2768-2783). Typing 4 and 20 therefore downloads chapters
+        // 4..23, which is exactly the "实际下载的范围会超过这个选定的章节范围"
+        // report. Turn the second field into an end chapter, default the pair to
+        // the whole book, and slice on the end chapter.
+        function patchDownloadRange() {
+            var app = window.app;
+            var menu = app && app.context && app.context.menu
+                && app.context.menu.downloadchapter;
+            if (!menu || !menu.action || typeof menu.action.startdownload !== 'function') {
+                return false;
+            }
+            if (menu.__stvRangePatched) { return true; }
+            menu.__stvRangePatched = true;
+            // Same classes for bookid/bookhost (the popup binds template.data keys
+            // to `.<key>` inputs, app.v2.js:2244-2251); the count field becomes an
+            // end chapter.
+            menu.body = 'Nhập khoảng chương để tải:<br>'
+                + '<input class="bookid" type="hidden"/>'
+                + '<input class="bookhost" type="hidden"/>'
+                + '<input class="numstart" type="text" placeholder="Bắt đầu từ" />'
+                + '<input class="numend" type="text" placeholder="Đến chương" />';
+            var originalStart = menu.action.startdownload;
+            menu.action.startdownload = async function (p) {
+                var host = p.q('.bookhost').value;
+                var bookid = p.q('.bookid').value;
+                var start = parseInt(p.q('.numstart').value, 10);
+                var end = parseInt(p.q('.numend').value, 10);
+                if (!(start > 0)) { start = 1; }
+                this.cancel(p);
+                try {
+                    var book = await app.offlineBook.getNewBook({ id: bookid, host: host });
+                    var clist = await getChapterList(host, bookid);
+                    if (!(end > 0) || end > clist.length) { end = clist.length; }
+                    if (end < start) { end = start; }
+                    var lists = clist.slice(start - 1, end)
+                        .map(function (e) { return e.cid; });
+                    note('DOWNLOAD', 'range ' + start + '-' + end + ' of ' + clist.length
+                        + ' -> ' + lists.length + ' chapter(s)');
+                    var job = new app.BookDownloadManager(host, bookid, lists, book);
+                    job.start();
+                } catch (error) {
+                    // getChapterList() is a top-level function in app.v2.js; if it
+                    // ever stops being reachable, keep the site's own action.
+                    note('ERR', 'range download failed, using the site action: ' + error);
+                    return originalStart.call(this, p);
+                }
+            };
+            if (!app.context.__stvRangePopup) {
+                app.context.__stvRangePopup = true;
+                var originalPopup = app.context.showPopup;
+                app.context.showPopup = function (template, attach) {
+                    var pop = originalPopup.apply(this, arguments);
+                    try {
+                        // Only the download-range dialog carries .numend. The popup
+                        // element exposes the site's `q()` helper; fall back to
+                        // querySelector so a missing helper cannot silently leave
+                        // the old defaults in place.
+                        var body = (template && template.body) || '';
+                        if (body.indexOf('numend') >= 0 && pop) {
+                            var pick = pop.q ? function (s) { return pop.q(s); }
+                                : function (s) {
+                                    return pop.querySelector ? pop.querySelector(s) : null;
+                                };
+                            var startInput = pick('.numstart');
+                            var endInput = pick('.numend');
+                            var latest = attach && attach.chaptercount;
+                            // 1 .. latest, not "where I stopped reading + 20".
+                            if (startInput) { startInput.value = '1'; }
+                            if (endInput && latest) { endInput.value = String(latest); }
+                            note('DOWNLOAD', 'range dialog defaulted to 1-'
+                                + (latest ? latest : '?'));
+                        }
+                    } catch (e) {}
+                    return pop;
+                };
+            }
+            return true;
         }
 
         function attach() {
@@ -2273,13 +2594,101 @@ enum SitePatch {
         var patchAttempts = 0;
         var patchTimer = setInterval(function () {
             patchAttempts++;
-            if (patchReaders() || patchAttempts > 600) { clearInterval(patchTimer); }
+            var readers = patchReaders();
+            var range = patchDownloadRange();
+            if ((readers && range) || patchAttempts > 600) { clearInterval(patchTimer); }
         }, 200);
 
         // Books downloaded after boot enter store.data later, so keep sweeping.
         // Cheap: warmOne() answers immediately for anything already warmed, and
         // the store holds a handful of entries.
         setInterval(warmStore, 3000);
+    })();
+    """
+
+    // MARK: - Inventory tab probe
+
+    /**
+     "储物袋 顶部的tab标签点击有错位，点击最后一个tab页，实际会显示到最后一处空白位置".
+
+     The inventory page (_page_vip.html:1914-1938) has six `tabitem`s over six
+     `tabview`s and is driven by `ui.smtab()` from /stv.ui.js -- a file that is not
+     part of this repo, so the pointer-mark and `tabdiv` translate maths cannot be
+     read here. Two mechanisms fit the symptom and they need different repairs:
+
+       a) geometry -- the pointer mark and the pane offset are computed from a
+          stale or hard-coded width (the template ships
+          `tabpointermark{width:85px}`), so the last pane lands on blank space;
+       b) data -- the last pane ("Đang kích hoạt") is filled from `inv.activate`
+          (app.v2.js:7760, 7828) and stays empty when the server sends no `act`,
+          so it is blank by content.
+
+     Measure both at the tap instead of guessing: item count and per-item
+     offsetLeft/offsetWidth, the mark's width and transform, the tabdiv transform,
+     and the pane child counts -- before and after the framework reacts. Temporary,
+     like the diagnostics panel; retire it with `diag` once this is settled.
+     */
+    static let tabProbe = """
+    (function () {
+        if (window.__stvTabProbeInstalled) { return; }
+        window.__stvTabProbeInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function name(node) {
+            return String((node && node.tagName) || '').toLowerCase();
+        }
+
+        function itemsOf(tabbar) {
+            var out = [];
+            var kids = (tabbar && tabbar.children) || [];
+            for (var i = 0; i < kids.length; i++) {
+                if (name(kids[i]) == 'tabitem') { out.push(kids[i]); }
+            }
+            return out;
+        }
+
+        function describe(item) {
+            var node = item;
+            var tabbar = null;
+            var tab = null;
+            while (node && node.nodeType === 1) {
+                if (!tabbar && name(node) == 'tabbar') { tabbar = node; }
+                if (name(node) == 'tab') { tab = node; break; }
+                node = node.parentElement;
+            }
+            if (!tab) { return 'not inside a tab'; }
+            var items = itemsOf(tabbar);
+            var widths = [];
+            for (var i = 0; i < items.length; i++) {
+                widths.push(items[i].offsetLeft + '+' + items[i].offsetWidth);
+            }
+            var mark = tab.querySelector ? tab.querySelector('tabpointermark') : null;
+            var div = tab.querySelector ? tab.querySelector('tabdiv') : null;
+            var views = (div && div.children) || [];
+            var lastChildren = views.length
+                ? ((views[views.length - 1].children || []).length) : -1;
+            return 'index=' + items.indexOf(item) + '/' + items.length
+                + ' items=[' + widths.join(' ') + ']'
+                + ' mark=' + (mark ? (mark.style.width || '?') + ' '
+                    + (mark.style.transform || '?') : 'none')
+                + ' div=' + (div ? (div.style.transform || '?') : 'none')
+                + ' views=' + views.length + ' lastview=' + lastChildren + ' child(ren)';
+        }
+
+        document.addEventListener('click', function (event) {
+            var node = event.target;
+            var item = null;
+            while (node && node.nodeType === 1) {
+                if (name(node) == 'tabitem') { item = node; break; }
+                node = node.parentElement;
+            }
+            if (!item) { return; }
+            note('TAB', 'before ' + describe(item));
+            setTimeout(function () { note('TAB', 'after  ' + describe(item)); }, 400);
+        }, true);
     })();
     """
 
@@ -2428,8 +2837,9 @@ enum SitePatch {
 
     /// Injected in order; every block is independently guarded. `SiteI18nData`
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
-    static let all: [String] = [compat, diag, readerDefaults, ttsProvider,
-                                followFallback, safeArea, settingsBackup,
+    static let all: [String] = [compat, diag, tabProbe, storageAccessor,
+                                readerDefaults, ttsProvider, followFallback,
+                                safeArea, gridLayout, settingsBackup,
                                 domainFailover, bookmarkToggle, readerTts,
                                 pageRepair, bootShell, SiteI18nData.script]
 }

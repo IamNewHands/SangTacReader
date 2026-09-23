@@ -481,6 +481,10 @@ function installFakeApp(sandbox, options) {
   };
   app.offlineBook = {
     store: { data: options.offlineBooks || [] },
+    getNewBook(bookInfo) {
+      stored.newBooks = (stored.newBooks || []).concat([bookInfo]);
+      return Promise.resolve({ host: bookInfo.host, id: bookInfo.id });
+    },
     getDownloadBooks(from, to) {
       stored.listReads = (stored.listReads || []).concat([from + ':' + to]);
       // Stands in for populateBookInfo(), which answers from the bookinfo cache
@@ -495,13 +499,15 @@ function installFakeApp(sandbox, options) {
   // (app.v2.read.js:3481), and that render is what reads the cache.
   app.bookDownloaderList = [];
   class FakeDownloadManager {
-    constructor(host, id) {
+    constructor(host, id, chapters) {
       this.host = host;
       this.id = id;
       this.isPaused = false;
-      this.chapters = ['c1', 'c2'];
+      // The range the caller asked for, so a test can see what was sliced.
+      this.chapters = chapters || ['c1', 'c2'];
+      this.chaptersOrginal = this.chapters.slice();
       this.downloaded = 0;
-      this.total = 2;
+      this.total = this.chapters.length;
       app.bookDownloaderList.push(this);
     }
     render() {
@@ -531,7 +537,14 @@ function installFakeApp(sandbox, options) {
       return Promise.resolve(chapter);
     }
     pause() { this.isPaused = true; }
-    start() { this.isPaused = false; stored.resumes = (stored.resumes || 0) + 1; }
+    start() {
+      this.isPaused = false;
+      stored.resumes = (stored.resumes || 0) + 1;
+      if (options.slowStart) {
+        return new Promise((resolve) => { stored.finishStart = resolve; });
+      }
+      return undefined;
+    }
   }
   app.BookDownloadManager = FakeDownloadManager;
 
@@ -592,6 +605,37 @@ function installFakeApp(sandbox, options) {
       },
     },
   };
+  // The site's Preferences branch (app.v2.js:534-546). Installed only when a test
+  // asks for it: modelling it replaces app.storage.get with the site's own
+  // (broken) expression, which changes what every other block reads.
+  if (options.preferences) {
+    const prefStore = Object.assign({}, options.preferences.store || {});
+    sandbox.Capacitor.Plugins.Preferences = {
+      get(args) {
+        if (options.preferences.rejectGet) {
+          return Promise.reject(new Error('Preferences unavailable'));
+        }
+        const has = Object.prototype.hasOwnProperty.call(prefStore, args.key);
+        return Promise.resolve({ value: has ? prefStore[args.key] : null });
+      },
+      set(args) {
+        prefStore[args.key] = args.value;
+        return Promise.resolve();
+      },
+      keys() {
+        return Promise.resolve({ keys: Object.keys(prefStore) });
+      },
+    };
+    stored.prefStore = prefStore;
+    // Verbatim from app.v2.js:536-546, including `.value` applied to the Promise
+    // instead of to its result.
+    app.storage.get = async function (key) {
+      return await sandbox.Capacitor.Plugins.Preferences.get({ key: key }).value;
+    };
+    app.storage.set = async function (key, value) {
+      return await sandbox.Capacitor.Plugins.Preferences.set({ key: key, value: value });
+    };
+  }
   sandbox.window.Capacitor = sandbox.Capacitor;
   return app;
 }
@@ -1434,6 +1478,277 @@ async function testDownloadRowControls() {
     JSON.stringify(filled.__stored.opened || []));
 }
 
+async function testStorageAccessor() {
+  console.log('site storage accessor');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    preferences: { store: { 'config.reader': '{"display_type":"pageflip"}' } },
+  });
+  // Before the shim: the site's own accessor, verbatim from app.v2.js:536.
+  const before = await app.storage.get('config.reader');
+  check('the site accessor loses the value (the bug being repaired)',
+    before === undefined, String(before));
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  check('the accessor is replaced', app.storage.__stvGetFixed === true);
+  check('the repair is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('app.storage.get reads') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+  const after = await app.storage.get('config.reader');
+  check('the repaired accessor returns the stored value',
+    after === '{"display_type":"pageflip"}', String(after));
+  const missing = await app.storage.get('never-written');
+  check('an unset key reads as null, not a crash', missing === null, String(missing));
+  await app.storage.set('written', 'yes');
+  check('set keeps working', (await app.storage.get('written')) === 'yes');
+
+  // A backend that rejects must read as "nothing stored", not break the caller.
+  const broken = makeSandbox();
+  const brokenApp = installFakeApp(broken, {
+    displayType: 'auto',
+    preferences: { rejectGet: true },
+  });
+  vm.runInContext(loadBlocks().join('\n'), broken);
+  await tick(250);
+  const rejected = await brokenApp.storage.get('config.reader');
+  check('a rejecting Preferences read resolves to undefined', rejected === undefined,
+    String(rejected));
+
+  // The point of the repair: a store the site can read means the keychain backup
+  // no longer has to overwrite anything.
+  const survivor = makeSandbox();
+  installFakeApp(survivor, {
+    displayType: 'auto',
+    preferences: { store: { 'config.reader': '{"display_type":"pageflip"}' } },
+    keychain: { 'config.reader': '{"display_type":"auto","show_title":true}' },
+  });
+  vm.runInContext(loadBlocks().join('\n'), survivor);
+  await tick(250);
+  const survivorDiag = String(survivor.window.__stvDiag.text() || '');
+  check('a readable store wins over the keychain backup',
+    survivor.__stored.prefStore['config.reader'] === '{"display_type":"pageflip"}',
+    String(survivor.__stored.prefStore['config.reader']));
+  check('the restore reports the value as kept, not written',
+    survivorDiag.indexOf('0 written, 1 kept') >= 0, survivorDiag.slice(-260));
+}
+
+async function testDownloadRange() {
+  console.log('download range dialog');
+  const chapters = [];
+  for (let i = 1; i <= 30; i += 1) { chapters.push({ cid: 'c' + i }); }
+  const sandbox = makeSandbox();
+  sandbox.getChapterList = async () => chapters;
+  const app = installFakeApp(sandbox, { displayType: 'auto' });
+  // The site's dialog: 起始章 + 章数 (count), the count hard-coded to 20 upstream.
+  app.context = {
+    menu: {
+      downloadchapter: {
+        body: 'Nhập số chương để tải:<br>'
+          + '<input class="bookid" type="hidden"/>'
+          + '<input class="bookhost" type="hidden"/>'
+          + '<input class="numstart" type="text" placeholder="Bắt đầu từ" />'
+          + '<input class="total" type="text" placeholder="Số chương" />',
+        action: {
+          startdownload: async function () { sandbox.__stored.siteStart = true; },
+          cancel: function () {},
+        },
+      },
+    },
+    showPopup(template) {
+      sandbox.__stored.popup = template;
+      return makeContainer('div', 'popupedit');
+    },
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  const menu = app.context.menu.downloadchapter;
+  check('the dialog is patched', menu.__stvRangePatched === true);
+  check('the second field is an end chapter, not a count',
+    menu.body.indexOf('numend') >= 0 && menu.body.indexOf('class="total"') < 0,
+    menu.body);
+
+  // The action must slice on the end chapter: 1..10 of 30, not 1..(1+10).
+  const inputs = {
+    '.bookhost': { value: 'qidian' },
+    '.bookid': { value: '1034915599' },
+    '.numstart': { value: '1' },
+    '.numend': { value: '10' },
+  };
+  const popup = { q: (sel) => inputs[sel] || null };
+  await menu.action.startdownload.call({ cancel() {} }, popup);
+  await tick(30);
+  const job = app.bookDownloaderList[app.bookDownloaderList.length - 1];
+  check('the job covers exactly the requested range',
+    job && job.chapters.length === 10
+      && job.chapters[0] === 'c1' && job.chapters[9] === 'c10',
+    JSON.stringify(job && job.chapters));
+  check('the site action is not used', sandbox.__stored.siteStart === undefined);
+  check('the range is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('range 1-10 of 30') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+
+  // An end past the last chapter clamps to the book's length.
+  inputs['.numstart'].value = '25';
+  inputs['.numend'].value = '999';
+  await menu.action.startdownload.call({ cancel() {} }, popup);
+  await tick(30);
+  const tail = app.bookDownloaderList[app.bookDownloaderList.length - 1];
+  check('an end past the last chapter clamps',
+    tail && tail.chapters.length === 6 && tail.chapters[5] === 'c30',
+    JSON.stringify(tail && tail.chapters));
+
+  // The dialog defaults to the whole book, not to "where I stopped + 20".
+  // showPopup() is the seam: it returns the popup element, and the site's
+  // showDownloadBook() sets numstart = reading position + 1 and total = 20 before
+  // calling it. A fresh sandbox keeps this independent of the run above.
+  const popupNode = makeContainer('div', 'popupedit');
+  const startInput = makeElement('input');
+  const endInput = makeElement('input');
+  startInput.className = 'numstart';
+  endInput.className = 'numend';
+  startInput.value = '4';
+  popupNode.appendChild(startInput);
+  popupNode.appendChild(endInput);
+
+  const fresh = makeSandbox();
+  fresh.getChapterList = async () => chapters;
+  const freshApp = installFakeApp(fresh, { displayType: 'auto' });
+  freshApp.context = {
+    menu: {
+      downloadchapter: {
+        body: '<input class="numstart" /><input class="numend" />',
+        action: { startdownload: async function () {}, cancel: function () {} },
+      },
+    },
+    showPopup: (template) => popupNode,
+  };
+  vm.runInContext(loadBlocks().join('\n'), fresh);
+  await tick(400);
+  freshApp.context.showPopup(freshApp.context.menu.downloadchapter, { chaptercount: 30 });
+  check('the dialog defaults to 1 .. the latest chapter',
+    startInput.value === '1' && endInput.value === '30',
+    startInput.value + '..' + endInput.value);
+  check('the defaulting is reported',
+    String(fresh.window.__stvDiag.text() || '').indexOf('defaulted to 1-30') >= 0,
+    String(fresh.window.__stvDiag.text() || '').slice(-200));
+}
+
+async function testDownloadLifecycle() {
+  console.log('download task lifecycle');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'auto', slowStart: true });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  const manager = new app.BookDownloadManager('qidian', '1034915599');
+  const first = manager.start();
+  const again = manager.start();
+  check('a second start() while one is running is ignored',
+    (sandbox.__stored.resumes || 0) === 1, String(sandbox.__stored.resumes));
+  check('the ignored start is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('start() ignored') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+  sandbox.__stored.finishStart();
+  await Promise.all([first, again]);
+  await tick(20);
+  check('a repeat start() is not replayed after the loop exits',
+    (sandbox.__stored.resumes || 0) === 1, String(sandbox.__stored.resumes));
+
+  // A resume that arrives while the paused loop is still winding down is
+  // replayed once the loop exits.
+  const resumed = new app.BookDownloadManager('qidian', '2');
+  const running = resumed.start();
+  resumed.pause();
+  const deferred = resumed.start();
+  check('a resume during the running loop is deferred, not doubled',
+    (sandbox.__stored.resumes || 0) === 2, String(sandbox.__stored.resumes));
+  sandbox.__stored.finishStart();
+  await Promise.all([running, deferred]);
+  await tick(30);
+  check('the deferred resume replays after the loop exits',
+    (sandbox.__stored.resumes || 0) === 3, String(sandbox.__stored.resumes));
+
+  // Deleting a task has to redraw the DOWNLOADING (n) counter.
+  const deleting = new app.BookDownloadManager('qidian', '3');
+  const row = await deleting.render();
+  let updates = 0;
+  app.bookDownloaderList.onUpdate = function () { updates += 1; };
+  const buttons = row.querySelectorAll('button');
+  buttons[1].__fire('click', { stopPropagation() {}, preventDefault() {} });
+  check('deleting a task drops it from the list',
+    app.bookDownloaderList.indexOf(deleting) < 0);
+  check('deleting a task refreshes the list counter', updates === 1, String(updates));
+}
+
+async function testGridLayout() {
+  console.log('grid tap targets');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(120);
+  const style = sandbox.document.getElementById('stv-grid-layout');
+  check('the grid stylesheet is injected', !!style);
+  const css = style ? String(style.textContent || '') : '';
+  check('cells stop stretching to the tallest card',
+    css.indexOf('align-items: flex-start') >= 0, css);
+  check('the forced cell height is overridden',
+    css.indexOf('.booksquarecont { height: auto !important; }') >= 0, css);
+  check('titles are clamped so rows stay even',
+    css.indexOf('-webkit-line-clamp: 2') >= 0, css);
+}
+
+async function testTabProbe() {
+  console.log('inventory tab probe');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(120);
+
+  // <tab><tabbar><tabitem/>…<tabpointermark/><tabdiv><tabview/>…</tabdiv></tab>
+  const tab = makeContainer('tab');
+  const tabbar = makeContainer('tabbar');
+  const first = makeContainer('tabitem', '', 'Đan dược');
+  const last = makeContainer('tabitem', '', 'Đang kích hoạt');
+  first.offsetLeft = 0; first.offsetWidth = 60;
+  last.offsetLeft = 60; last.offsetWidth = 90;
+  tabbar.appendChild(first);
+  tabbar.appendChild(last);
+  const mark = makeContainer('tabpointermark');
+  mark.style.width = '85px';
+  mark.style.transform = 'translateX(0px)';
+  const div = makeContainer('tabdiv');
+  div.style.transform = 'translateX(0px)';
+  const view1 = makeContainer('tabview');
+  view1.appendChild(makeContainer('div'));
+  const view2 = makeContainer('tabview'); // the empty last pane
+  div.appendChild(view1);
+  div.appendChild(view2);
+  tab.appendChild(tabbar);
+  tab.appendChild(mark);
+  tab.appendChild(div);
+  sandbox.document.body.appendChild(tab);
+
+  sandbox.__dispatch('click', { target: last });
+  await tick(500);
+  const lines = String(sandbox.window.__stvDiag.text() || '')
+    .split('\n').filter((line) => line.indexOf('TAB') >= 0);
+  const before = lines.find((line) => line.indexOf('before') >= 0) || '';
+  const after = lines.find((line) => line.indexOf('after') >= 0) || '';
+  check('the tapped tab index and item geometry are reported',
+    before.indexOf('index=1/2') >= 0 && before.indexOf('0+60 60+90') >= 0, before);
+  check('the pointer mark is reported',
+    before.indexOf('mark=85px translateX(0px)') >= 0, before);
+  check('the pane transform is reported', before.indexOf('div=translateX(0px)') >= 0, before);
+  check('the last pane child count is reported (blank-pane check)',
+    before.indexOf('views=2 lastview=0 child(ren)') >= 0, before);
+  check('the state after the framework reacts is reported too',
+    after.indexOf('after') >= 0 && after.indexOf('index=1/2') >= 0, after);
+}
+
 async function testSettingsBackup() {
   console.log('settings backup across reinstalls');
 
@@ -1590,6 +1905,11 @@ await testBootShell();
   await testOfflineBookDetailPage();
   await testDomainFailover();
   await testDownloadRowControls();
+  await testStorageAccessor();
+  await testDownloadRange();
+  await testDownloadLifecycle();
+  await testGridLayout();
+  await testTabProbe();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

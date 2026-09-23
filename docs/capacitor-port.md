@@ -57,7 +57,9 @@
 3. `WebNativeView` 目前是占位实现 → 漫画/图片模块退化（小说正文不受影响）。
 4. `CapacitorSQLite`、`MlKit`/`MainClass`（OCR）、`AdMob` 未接 → 对应功能降级。
 5. ~~旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）~~ —— **已退役**（2026-09-22，新构建多轮真机验证通过后删除，含它打包的 `www/` 资源与 `tests/` 下的一次性探测脚本）。旧实现仍可从 git 历史取回。
-6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）。
+6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）；`tabProbe` 同批退役，见 §6.11 (4)。
+7. 站点 `filterDownloadingChapters`（`read.js:3445`）参数遮蔽导致跨任务去重失效 —— 低危、未改（改动会牵动 `total` 口径，见 §6.11 (2)）。
+8. 储物袋顶部 tab 的错位成因未定（`/stv.ui.js` 不在仓库，几何算式看不到）——已加 `tabProbe` 探针，等一份真机日志，见 §6.11 (4)。
 
 ## 6. 真机问题档案
 
@@ -929,3 +931,132 @@ JS（`app.v2.js` 261KB、`chapterdisplay` 158KB、`read` 145KB、`comicprovider`
 `check-ios-shim`（13 块 / 138075 字节 / 16 markers）、`test-site-patch`（142 条断言，新增
 `readchapter mirror failover` 10 条、`download row controls and missing book info` 10 条、
 设置镜像与可判读性 4 条）、`gen-site-i18n --check`（456 labels / 35 fragments）全绿。
+
+### 6.11 第十轮反馈（`日志.txt`，261 行）：存储读取口、下载范围与计数、历史网格热区、储物袋 tab
+
+上一轮的三条按预期收口：`readchapter` 全部 `code 0`（`[DOMAIN]` 故障转移在位），下载行控制条
+可点，设置靠 Keychain 镜像 + 实时回灌活着。这一轮的四件事，第一件是**真根因**。
+
+#### (1) 站点自己的 `app.storage.get` 永远返回 `undefined`
+
+```
+09:36:25 [SETTINGS] restore config.reader -> 517 chars (store was empty)
+09:36:25 [ERR] restore readback mismatch for config.reader (wrote 517 chars, read back 0)
+…
+[SETTINGS] keychain restore: 7 written, 0 kept [], 0 unreadable [], 7 not-persisted […]
+```
+
+`app.v2.js:536`：
+
+```js
+app.storage.get = async function(key){
+    return await prefs.get({ key: key }).value;
+}
+```
+
+成员访问先于 `await` 求值，所以这是 `await ((prefs.get({key})).value)` —— **Promise 的
+`.value` 是 `undefined`**，函数对任何键都返回 `undefined`，包括它自己刚写进去的键。
+
+为什么安卓版没这个问题：APK 没有 `@capacitor/preferences` 依赖，站点走 `else` 分支用
+localStorage，读写都正常。我们这个包 `package.json` 里装了这个依赖（CI 的
+`packageClassList` 里确实有 `PreferencesPlugin`），于是**跑的是坏的那条分支**。
+
+影响面就是"站点自己写的东西自己读不回来"：`config.reader` / `config.ux`（全部设置）、
+`offlineBook`（下载记录）、`readhistory`、bookinfo 缓存。所以上一轮"设置/下载记录跨重启丢失"
+的真根因不是容器被换掉 —— 写入一直是成功的，读取一直是空的。
+
+修法（新增 `storageAccessor` 块）：**替换**访问器（不能包装，原函数在自己体内就把值丢了），
+按 `@capacitor/preferences` 的契约解包 `{value}`；没有 Preferences 时（localStorage 分支）
+直接放行。同时立一条顺序约束：
+
+- 访问器修好后置 `window.__stvStorageAccessorPatched`；
+- `settingsBackup` 的恢复**必须等这个标志**。否则"读失败"和"存储为空"无法区分，会把
+  Keychain 里的旧备份写到用户后来改过的设置上面。等标志之后，存储里有值就是 `kept`，
+  备份只在真的空时才写。
+
+`offlineBook` 再补一道实时回灌（与 `applyToLiveConfig` 同套路）：站点
+`app.offlineBook.store.load()`（`app.v2.js:624`）通常在恢复之前就跑完了，而且修复前它读到的
+永远是空，所以把恢复出来的记录直接推进 `app.offlineBook.store.data`。
+
+#### (2) 下载：默认 4-20、实际下到 4-23
+
+`_page_vip.html:4939-4953`：
+
+```js
+var ccount = data.chaptercount;                  // 取到了，下面从没用过
+var index = readed ? ((readed.chapterIndex||readed.index)+1) : 1;
+popupTemplate.data.numstart = index;             // 读到第 3 章 → 默认 4
+popupTemplate.data.total = 20;                   // 固定「20 章」
+```
+
+`app.v2.js:2768-2783` 把第二个框当**章数**用：
+
+```js
+var lists = clist.slice(startnum, startnum + total);   // 4..23，不是 4..20
+```
+
+所以"选定的范围"和"实际下载的范围"本来就差一个语义：第二个框是章数、不是结束章，而且写死 20。
+修法（`pageRepair` 内新增 `patchDownloadRange`）：第二个框改成 `numend`（结束章），占位符与
+引导语进词典（`Nhập khoảng chương để tải:`→输入要下载的章节范围：、`Đến chương`→结束章节），
+动作改成 `clist.slice(start-1, end)`，超界收敛到 `clist.length`；默认值在
+`app.context.showPopup` 这个"值落到输入框"的接缝上改成 **1 → chaptercount**（站点在
+`showDownloadBook` 里先塞了"阅读进度+1 / 20"，那里无法从外部改）。
+
+日志里的 `1/20 … 20/20 … 21/20 … 32/20`（同一个 cid 抓 3 次）还有第二个成因，是**我们自己的
+锅**：09:37:34 与 09:37:36 两次 `tap button`（暂停/继续）让 `manager.start()` 在上一轮循环还在
+`await` 时被再进一次，两条循环跑同一份 `this.chapters`。现在 `start()` 加了重入闩：循环在跑时
+再进来的 `start()` 直接忽略；**只有暂停中的那次（真·继续）会被记下来，等旧循环退出后重放一次**。
+暂停标志在重放前一直保持置位，否则旧循环不会 `break`，会直接跑成第二条循环。
+
+删任务后 `DOWNLOADING (n)` 不刷新：计数器由 `app.bookDownloaderList.onUpdate()` 从列表长度
+重画（`_page_vip.html:2294`、`:4044`），我们的删除按钮 splice 完没调用它。现在调用。
+
+站点侧还有一个低危 bug 记录在案、**未改**：`filterDownloadingChapters`（`read.js:3445`）用
+`var i` 遮蔽了 bookid 参数，`bookDownloaderList[j].id != i` 比的是数组下标，跨任务的去重永远
+不成立。改它要连 `total` 的口径一起动（进度条按 `downloaded/total` 算），收益不抵风险，而观测
+到的重复下载已由重入闩消掉。
+
+#### (3) 首页-历史：点空白命中第一行
+
+`app.celoader.infbookgrid`（`_page_vip.html:3873`）渲染完每个格子后：
+
+```js
+var h = addedElements[0].scrollHeight;
+for (...) { addedElements[i].style.height = h + "px"; }
+```
+
+**所有格子被强制成第一个书格的高度**，而 flexbox 本来就已经把一行的格子拉到最高的那个。格子
+同时就是点击热区（`:3897` 的 `openBookWithData`），于是矮卡片下面那条空白仍然属于那张卡片 ——
+第一本书标题换行最多、它撑高了 `h`，每行都继承这段可点的空白。
+
+修法（新增 `gridLayout` 块，纯 CSS）：`.f-3-col/.f-sm-4-col/.f-md-6-col{align-items:flex-start}` +
+`.booksquarecont{height:auto !important}`（压掉内联行高）+ `.booksquare .tname` 两行截断
+（站点本来写了 `-max-height`，被注释掉了）。
+
+#### (4) 储物袋顶部 tab：先测，再修
+
+六个 `tabitem` 对六个 `tabview`（`_page_vip.html:1914-1938`）结构是齐的，切换由 `/stv.ui.js`
+的 `ui.smtab` 负责 —— **这个文件不在仓库里**（`_dl_*` 只有 app.v2.\*/stv.tts.js），指针与
+`tabdiv` 的位移算式看不到。两个候选成因需要不同的修法：
+
+- 几何：指针与位移按过期或写死的宽度算（模板里 `tabpointermark{width:85px}`），末页落到空白；
+- 数据：末页「Đang kích hoạt」由 `inv.activate` 填（`app.v2.js:7760`、`:7828`），服务端不给
+  `act` 时它本来就是空的。
+
+新增 `tabProbe` 块（临时设施，和 `diag` 一起退役）：点任意 `tabitem` 时上报 tabbar 项数与各项
+`offsetLeft+offsetWidth`、指针的 width/transform、`tabdiv` 的 transform、以及末页子节点数，
+点击前与 400ms 后各一行：
+
+```
+[TAB] before index=1/2 items=[0+60 60+90] mark=85px translateX(0px) div=translateX(0px) views=2 lastview=0 child(ren)
+[TAB] after  …
+```
+
+一份日志即可定死是几何还是空面板。
+
+#### 验证
+
+`check-ios-shim`（16 块 / 154877 字节 / 19 markers）、`test-site-patch`（175 条断言，新增
+`site storage accessor` 9 条、`download range dialog` 8 条、`download task lifecycle` 7 条、
+`grid tap targets` 4 条、`inventory tab probe` 5 条）、`gen-site-i18n --check`
+（458 labels / 35 fragments）全绿。
