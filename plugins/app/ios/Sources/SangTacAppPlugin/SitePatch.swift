@@ -2675,7 +2675,7 @@ enum SitePatch {
      "Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời" and the chapter
      never appears.
 
-     Two repairs, both driven by the server's own answer rather than a hard-coded
+     The repairs, all driven by the server's own answer rather than a hard-coded
      host list:
 
        1. `bestDomain()` never returns a mirror that already answered code 7.
@@ -2685,15 +2685,37 @@ enum SitePatch {
           banned, the cached chapter key is dropped (it was issued by the mirror
           being left, and `getKey()` would otherwise keep reusing it), and the
           chapter is fetched again.
+       3. a mirror that fails to deliver at all is banned too, on the way out of
+          `app.net.get`/`app.net.post` and of `getContent`. Code 7 was the only
+          failure a remembered mirror used to react to, so the mirror the app
+          remembered kept winning while it stalled: the 2026-09-23 log is four
+          10s timeouts in a row on the same `sajax=getchapterlist` and a chapter
+          list that never arrived, with the reader pinned to `.app` for the whole
+          session. A fresh probe that cannot reach the remembered mirror drops it
+          as well, and a mirror the reader picked by hand in the site's own 线路
+          row outranks the remembered one -- in that log two taps on that row
+          (23:14:14, 23:14:16) changed nothing at all.
+
+     A ping comparison deliberately plays no part in any of that. The mirror that
+     wins the site's race is routinely the one that answers code 7 to every
+     chapter (`scripts/test-site-patch.js` builds exactly that pair), so "another
+     mirror pings faster" is not evidence that the remembered one is bad.
 
      The alert only survives if every mirror refuses.
 
-     Both repairs have to be in place **before the site's first request**, not
+     The repairs have to be in place **before the site's first request**, not
      merely early: the host of every `app.net` call is resolved by
      `fullUrl()`/`bestDomain()` (`app.v2.js:110-129`, `:1136-1191`), and those run
      in the same turn the managers are created. The install is therefore driven by
      accessors on `window.app`, `app.net` and the two managers -- see the note at
      the bottom of this block for why a poll lost that race on the device.
+
+     `fullUrl()` resolves that host from three places and only two of them are the
+     managers: the page origin, `window.STV_SERVER` (`app.v2.js:1` hard-codes
+     `"https://sangtacviet.app"`) when the site believes the page is local, and
+     `app.config.ux.app_domain` when the reader picked a line. Which one won is
+     not visible in a device log, so the block reports all three -- plus the
+     ranking the site measured -- once per launch.
      */
     static let domainFailover = """
     (function () {
@@ -2705,8 +2727,11 @@ enum SitePatch {
         }
 
         var banned = {};
-        var banCount = 0;
         var MAX_BANS = 3;
+        // Code 7 refetches this read has already spent. Kept apart from the ban
+        // list: a mirror banned for stalling must not eat the retry budget that
+        // exists for the mirror that answers code 7.
+        var code7Seen = 0;
         var noted = {};
 
         function manager() {
@@ -2754,7 +2779,6 @@ enum SitePatch {
         function ban(domain, why) {
             if (!domain || banned[domain]) { return false; }
             banned[domain] = true;
-            banCount++;
             note('DOMAIN', 'mirror ' + domain + ' banned: ' + why);
             return true;
         }
@@ -2838,6 +2862,166 @@ enum SitePatch {
             } catch (e) {}
         }
 
+        // ---- the ways a remembered mirror loses -------------------------------
+        //
+        // A ping comparison cannot decide this. The mirror that wins the site's
+        // race is routinely the one that answers code 7 to every chapter
+        // (`scripts/test-site-patch.js` builds exactly that pair: 100ms answering
+        // code 7, 400ms serving the chapter), so "something else pings faster" is
+        // not evidence that the remembered mirror is bad.
+        //
+        // What is evidence:
+        //   * the site re-probed the remembered mirror and it did not answer
+        //     (status dead/timeout) -- a fresh measurement, not a ranking;
+        //   * the reader picked a line by hand in the site's own 线路 row;
+        //   * a request through it produced no payload at all, see `failed()`.
+        function rememberedGone(mgr, name) {
+            var known = mgr && mgr.domains ? mgr.domains : [];
+            for (var i = 0; i < known.length; i++) {
+                var d = known[i];
+                if (d && d.name === name) { return d.status !== 'alive'; }
+            }
+            // No entry is "no news", not "dead": `checkDomains()` clears `domains`
+            // and pushes each answer as it lands (app.v2.js:1060-1091), so the
+            // remembered mirror is missing from the list for the first seconds of
+            // every launch.
+            return false;
+        }
+
+        function preferredDomain() {
+            var app = window.app;
+            var ux = app && app.config ? app.config.ux : null;
+            var v = ux ? ux.app_domain : '';
+            v = String(v === null || v === undefined ? '' : v);
+            return v === 'auto' ? '' : v;
+        }
+
+        function pageOrigin() {
+            try {
+                return String((window.location && window.location.origin) || '');
+            } catch (e) { return ''; }
+        }
+
+        // Which of `fullUrl()`'s three host sources the app actually used is not
+        // visible in the device log, and the 2026-09-23 one shows every data
+        // request landing on .app for three minutes straight while the site's own
+        // probe ranked .com 4.6x faster. `fullUrl()` (app.v2.js:110-130) takes the
+        // page origin when the site believes it is alive, `window.STV_SERVER`
+        // (app.v2.js:1 hard-codes "https://sangtacviet.app") when the page looks
+        // local, and a manager otherwise. One line per launch settles it.
+        var routeLogged = false;
+
+        function routeNote(label) {
+            if (routeLogged) { return; }
+            routeLogged = true;
+            var mgr = xhrManager();
+            var alive = 'unknown';
+            try {
+                if (mgr && typeof mgr.isDomainAlive === 'function') {
+                    alive = mgr.isDomainAlive(pageOrigin()) ? 'yes' : 'no';
+                }
+            } catch (e) { alive = 'unknown'; }
+            var server = '';
+            try { server = String(window.STV_SERVER || ''); } catch (e) { server = ''; }
+            note('DOMAIN', label + ' route: page=' + pageOrigin() + ' alive=' + alive
+                + ' STV_SERVER=' + server
+                + ' app_domain=' + (preferredDomain() || 'auto'));
+        }
+
+        // The ranking the site just measured, once per distinct answer. Without it
+        // the log cannot say whether a mirror is slow, dead, or never probed.
+        var rankedSeen = {};
+
+        function rankNote(mgr, label) {
+            var known = mgr && mgr.domains ? mgr.domains : [];
+            if (!known.length) { return; }
+            var parts = [];
+            for (var i = 0; i < known.length; i++) {
+                var d = known[i];
+                if (d && typeof d.name === 'string') {
+                    parts.push(d.name + '=' + d.status + '/' + d.ping + 'ms');
+                }
+            }
+            parts.sort();
+            var sig = parts.join(' ');
+            if (rankedSeen[label] === sig) { return; }
+            rankedSeen[label] = sig;
+            note('DOMAIN', label + ' ranked ' + sig);
+        }
+
+        function usedHost() {
+            if (goodEntry && !banned[goodEntry.name]) { return goodEntry.name; }
+            var mgr = manager() || xhrManager();
+            var url = mgr && typeof mgr.bestDomain === 'function' ? mgr.bestDomain() : '';
+            return origin(url);
+        }
+
+        // A mirror that cannot deliver a payload is not a mirror. Until now the
+        // only way one lost was answering code 7, and a stalled mirror answers
+        // nothing: the 2026-09-23 log is four 10s timeouts in a row on the same
+        // `sajax=getchapterlist` and a chapter list that never arrived. The failed
+        // request is never replayed here -- a POST that already changed something
+        // must not run twice -- the site's own retries are what lands on the next
+        // mirror (`app.net.get` retries 3x, app.v2.js:702-712; `getContent2`
+        // retries once, app.v2.read.js:570-598).
+        function failed(domain, why) {
+            if (!domain || banned[domain]) { return false; }
+            ban(domain, why);
+            forgetGood(domain);
+            return true;
+        }
+
+        // Only a request aimed at one of the site's own mirrors can ban one;
+        // `fullUrl()` leaves external URLs alone.
+        function stvRequest(url) {
+            var s = String(url === undefined || url === null ? '' : url);
+            if (s.indexOf('http') !== 0) { return true; }
+            var mgr = xhrManager();
+            try {
+                if (mgr && typeof mgr.isStvDomain === 'function') { return !!mgr.isStvDomain(s); }
+            } catch (e) { return false; }
+            return false;
+        }
+
+        function patchOne(net, name) {
+            var original = net[name];
+            if (typeof original !== 'function' || original.__stvFailoverWrapped) {
+                return false;
+            }
+            var wrapper = function (url) {
+                var blame = stvRequest(url) ? usedHost() : '';
+                var result = original.apply(this, arguments);
+                if (!result || typeof result.then !== 'function') { return result; }
+                return result.then(function (data) {
+                    if (data === undefined || data === null) {
+                        failed(blame, name + ' answered with no payload');
+                    }
+                    return data;
+                }, function (error) {
+                    failed(blame, name + ' failed: '
+                        + (error && error.message ? error.message : String(error)));
+                    throw error;
+                });
+            };
+            wrapper.__stvFailoverWrapped = true;
+            net[name] = wrapper;
+            return true;
+        }
+
+        // `app.net.get`/`app.net.post` are the funnel for everything that is not
+        // the reader's own chapter request, so a stalled mirror is caught here for
+        // the chapter list too. Wrapped on the function, not on `app.net`: the site
+        // creates `app.net` as `{}` one statement before it adds `get`
+        // (app.v2.js:695-696), so an object-level "already patched" flag would lock
+        // in a wrapper that wrapped nothing.
+        function patchNet(app) {
+            if (!app || !app.net) { return false; }
+            var a = patchOne(app.net, 'get');
+            var b = patchOne(app.net, 'post');
+            if (a || b) { note('DOMAIN', 'transport failover installed'); }
+            return a && b;
+        }
+
         function patchBestDomain(mgr, label) {
             if (!mgr || typeof mgr.bestDomain !== 'function') { return false; }
             if (mgr.__stvFailoverInstalled) { return true; }
@@ -2846,13 +3030,39 @@ enum SitePatch {
             mgr.bestDomain = function () {
                 var siteChoice = original.apply(this, arguments);
                 var list = candidates(this);
+                rankNote(this, label);
+                routeNote(label);
+                // The reader picked this line by hand. The site honours it only
+                // while that mirror answers /warp.php (app.v2.js:937-943,
+                // :1040-1046), and that answer is the newest measurement there is,
+                // so satisfying it here is what makes the site's own 线路 row do
+                // anything at all -- the 2026-09-23 log has two taps on it at
+                // 23:14:14/23:14:16 and every later request still going to .app.
+                // Not gated on `siteChoice` agreeing: `original` cannot see the
+                // preference until its own probe of that mirror has landed, which
+                // is exactly the window the remembered mirror would win instead.
+                var pref = preferredDomain();
+                if (pref && !banned[pref] && list.indexOf(pref) >= 0
+                    && !rememberedGone(this, pref)) {
+                    if (goodEntry && goodEntry.name !== pref) { forgetGood(goodEntry.name); }
+                    if (!noted['explicit:' + pref]) {
+                        noted['explicit:' + pref] = true;
+                        note('DOMAIN', label + ' explicit domain ' + pref);
+                    }
+                    return pref;
+                }
                 var good = readGood();
                 if (good && !banned[good.name] && list.indexOf(good.name) >= 0) {
-                    if (!noted[good.name]) {
-                        noted[good.name] = true;
-                        note('DOMAIN', label + ' using remembered mirror ' + good.name);
+                    if (!rememberedGone(this, good.name)) {
+                        if (!noted[good.name]) {
+                            noted[good.name] = true;
+                            note('DOMAIN', label + ' using remembered mirror ' + good.name);
+                        }
+                        return good.name;
                     }
-                    return good.name;
+                    note('DOMAIN', label + ' remembered mirror ' + good.name
+                        + ' did not answer the fresh probe, dropping it');
+                    forgetGood(good.name);
                 }
                 var chosen = pick(list, siteChoice);
                 if (chosen && chosen !== siteChoice && !noted[siteChoice]) {
@@ -2876,14 +3086,15 @@ enum SitePatch {
                 var args = arguments;
                 // Retried through this same wrapper, so more than one bad mirror
                 // can be walked past in a single read. Each round either bans a
-                // new mirror (banCount is bounded) or gives up and hands the
-                // code 7 back to the site.
+                // new mirror (`code7Seen` is what bounds the walk) or gives up and
+                // hands the code 7 back to the site.
                 function attempt() {
                     var mgr = manager();
                     var used = mgr && mgr.bestDomain ? origin(mgr.bestDomain()) : '';
                     return Promise.resolve(original.apply(self, args)).then(function (data) {
                         var code = data ? String(data.code) : '';
-                        if (code === '7' && banCount < MAX_BANS) {
+                        if (code === '7' && code7Seen < MAX_BANS) {
+                            code7Seen++;
                             if (!ban(used, 'readchapter answered code 7')) { return data; }
                             forgetGood(used);
                             if (app.reader) { app.reader.cachekey = null; }
@@ -2891,10 +3102,21 @@ enum SitePatch {
                                 + ' after code 7');
                             return attempt();
                         }
-                        // Only a real answer is worth remembering; a transport
-                        // failure arrives here as a missing payload.
-                        if (data && code !== '7') { rememberGood(used); }
+                        if (!data) {
+                            // `getContent2` swallows two transport failures and
+                            // answers null (app.v2.read.js:570-599), so this is the
+                            // only place a stalled mirror becomes visible to the
+                            // reader. A transport failure is not remembered either
+                            // way -- there is no payload to trust.
+                            failed(used, 'readchapter returned no payload');
+                            return data;
+                        }
+                        if (code !== '7') { rememberGood(used); }
                         return data;
+                    }, function (error) {
+                        failed(used, 'readchapter failed: '
+                            + (error && error.message ? error.message : String(error)));
+                        throw error;
                     });
                 }
                 return attempt();
@@ -2928,7 +3150,8 @@ enum SitePatch {
             var a = patchBestDomain(manager(), 'networkManager');
             var b = patchBestDomain(xhrManager(), 'networkManagerXHR');
             var c = patchContent();
-            return a && b && c;
+            var d = patchNet(window.app);
+            return a && b && c && d;
         }
 
         function watchProperty(host, name, onSet) {
@@ -2963,7 +3186,11 @@ enum SitePatch {
 
         function watchNet(app) {
             if (!app) { return; }
-            watchProperty(app, 'net', watchManagers);
+            patchNet(app);
+            watchProperty(app, 'net', function (net) {
+                patchNet(app);
+                watchManagers(net);
+            });
         }
 
         // Read the remembered mirror now rather than on the first `bestDomain()`:

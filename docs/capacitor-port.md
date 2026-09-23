@@ -2618,6 +2618,132 @@ name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它�
   `documentElement.clientHeight` 一起打出来，下一次就能直接看出 768 是什么
   （目前**没有必要**：两处使用 `--vh100` 的地方都已被钳住，没有可见后果）。
 
+### 6.25 第二十三轮（用户报「加载目录、加载正文时间非常长」）：记住的镜像只会被 `code 7` 拔掉
+
+`日志.txt` 389 行，23:12:12–23:15:52。用户的现象是「目录和正文加载非常长」，日志里
+**目录一次都没出来**。
+
+#### (1) 真机上到底慢在哪
+
+| 请求 | 次数与耗时 | 字节 |
+|---|---|---|
+| `index.php?ngmar=chapterlist&…&sajax=getchapterlist` | **4 次全部 `FAILED in 10005/10002/10002/10001ms`** | 0 |
+| `mobile/bookmanage.php?act=getallhost` | 4 次 `FAILED in 10002/10005/10002/10002ms`，第 5 次 3862ms 成功 | 179 |
+| `mobile/booklist.php?method=bookmarked&p=1` | **57991ms** | 22 |
+| `/io/grantcontext/context?hostid=qidian&bookid=1034915599` | **63050ms / 37063ms**（同一 URL 两次） | 802554 / 780900 |
+| 同 URL，`hostid=trxs` | 27088ms | 722417 |
+| `?sajax=readchapter&h=qidian&…&c=866969379` | **35382ms** | 7430 |
+| `?sajax=readchapter&h=trxs&…`（5 次） | 2106 / 2066 / 2526 / 4293 / 4295ms | 约 10KB |
+
+10 秒不是我们的超时：**站点自己传的** `timeout: 10000`（`app.v2.js:1155`），插件照做
+（`SangTacHttpPlugin.swift:714`，而 `timeoutIntervalForRequest` 收到数据就重置，所以
+22 字节花 58 秒和 10 秒硬超时是同一件事的两面）。本轮之前加的 300 秒 `getchapterlist`
+缓存**一次都没命中**——它只缓存成功响应，而这些请求一次都没成功。
+
+同一分钟里的三路探测（`networkManager.verifyDomain`，原生，`[Http]` 行）：
+`.com/warp.php` **750ms**（`yes`）、`.app/warp.php` **3449ms**（`yes`）、
+`dns1…org/warp.php` 4322ms（`no`）。**全部数据请求都在 `.app` 上。**
+
+`.app` 是哪儿来的：`app.v2.read.js:564` 写死了
+`fullUrl(app.net.networkManager.bestDomain() + '/?sajax=readchapter…')`，而
+`fullUrl()` 对已经是 `http` 开头的 URL 原样返回（`app.v2.js:111-112`）——日志里那行
+`[LOG] https://sangtacviet.app/?sajax=readchapter…` 就是它 `console.log(url)` 出来的。
+`bestDomain()` 是本块包装过的，而日志 `:18` 明确写着
+`[DOMAIN] networkManagerXHR using remembered mirror https://sangtacviet.app`。**正文的主机
+确凿来自「记住的镜像」。** 目录走的是相对 URL（`app.v2.js:263-265` `app.net.get(url)`），
+主机由 `fullUrl()` 的三个来源之一决定，其中两个是 manager、第三个是 `window.STV_SERVER`
+（`app.v2.js:1` **硬编码** `"https://sangtacviet.app"`，只在站点认为页面是「本地」时使用）
+——这一条**这份日志分不出来**，所以本轮加了 `route` 诊断行（见 (4)）。
+
+#### (2) 结构缺陷：记忆镜像没有「慢」这个失败模式
+
+`patchBestDomain` 原来是「`good` 在候选里就返回它」，而 `candidates()` 无条件把
+`defaultDomains` 并进来，所以记忆镜像**永远**是候选；唯一的清除路径是 `patchContent` 里
+的 `code 7`。**慢、超时、无载荷都不算失败**，于是 `.app` 一旦卡住就被钉到 6 小时 TTL
+到期为止。同一份日志还有两处佐证：
+
+- 站点自己刚测出 `.com` 比 `.app` 快 4.6 倍，`bestDomain()` 的原实现会选 `.com`
+  （`app.v2.js:947-952`），被这一行 `return` 吃掉了。
+- 23:14:14 / 23:14:16 两次点「线路」菜单（`[LOG] app.config.ux.app_domain`），此后每个
+  请求仍在 `.app`——站点自己在 `app.v2.js:937-943`／`:1040-1046` 是**认**这个偏好的
+  （镜像 `alive` 时直接返回它），也被吃掉了。
+
+#### (3) 我本机测出来什么，以及要撤回的那句话
+
+**第一版探测（单次）**：`.com` 983ms 对 `.app` 6294ms，看起来像 6 倍差距。
+**连测 4 轮后不成立**：中位数 `.com` 3327 / `.app` 2389 / `dns1` 1367 ms，逐次区间
+478–9252ms，三个镜像**在本机噪声内等价**。所以「`.app` 全局更慢」**不成立**，本机测不出
+设备上那一段劣化（设备的 750 vs 3449 只有一组、各一次，且 `.com` 是页面同源、连接是热的）。
+能站住的只有第 (2) 条：**不管哪台快，这个钉子都逃不掉坏的那台。**
+
+#### (4) 改了什么（都在 `domainFailover` 块里）
+
+1. **没有载荷就是失败。** `app.net.get`/`app.net.post`（目录走这条）与 `getContent`
+   （正文走 `app.v2.read.js:556-599`，它自己吞掉两次失败后 `return null`——这正是原来注释里
+   那句「transport failure arrives here as a missing payload」的来源）出口新增
+   `failed()`：拉黑该镜像（`banned`）并从记忆里删掉（`forgetGood`）。站点自己的重试
+   （`app.net.get` 重试 3 次、`getContent2` 重试 1 次）因此落到下一台。
+   - **失败的那个请求不重放**：有副作用的 POST 绝不能跑第二遍，重试是站点自己的事。
+   - **只有指向站点自己镜像的请求才有资格拉黑**（`stvRequest()`：相对 URL 算，绝对 URL 问
+     `isStvDomain()`），否则翻译/封面这类外站请求失败会误伤镜像。
+   - 拉黑不再和 `code 7` 共用重试预算：新增 `code7Seen`，`banCount` 删掉。
+2. **站点刚探测过、记忆镜像没应答**（`domains` 里有它且 `status !== 'alive'`）就丢掉。
+   探测还没回来（`checkDomains()` 会先清空再逐条 push，`app.v2.js:1060-1091`）算「暂无消息」，
+   不是「死」——这条区分很重要，否则每次启动的头几秒会把记忆镜像误判掉。
+3. **手选线路优先**：`app.config.ux.app_domain`（非 `auto`、在候选里、未被拉黑、且没被探测
+   判死）直接返回，并把不同的记忆值清掉。**故意不要求 `original.bestDomain()` 也同意**——
+   它要等自己那次 `/warp.php` 探测回来才认这个偏好，而那段窗口恰好是记忆镜像会赢的窗口。
+4. **诊断**：每次启动一行
+   `[DOMAIN] <manager> route: page=… alive=… STV_SERVER=… app_domain=…`（`fullUrl()` 三个
+   主机来源一次全打出来）与 `[DOMAIN] <manager> ranked <name>=<status>/<ping>ms …`
+   （每次排名变化一行）。
+
+**刻意没做的事：按 ping 比快慢。** 赢得站点竞速的那台恰好经常是回 `code 7` 的那台
+（`scripts/test-site-patch.js` 里就是这个组合：100ms 的 `dns1` 回 code 7、400ms 的 `.com`
+出正文），所以「别人 ping 更快」**不构成**记忆镜像有问题的证据；照 ping 让记忆值输，
+等于把 round 20 修掉的 bug 装回去。
+
+**也刻意没做：给 `window.STV_SERVER` 装访问器。** 如果目录那台主机来自 `app.v2.js:1`
+的硬编码，一个 document-start 访问器能让它跟着实际排名走（和 `window.app` 同一手法）。
+但现在**没有证据**指向它——先让 `route` 行说话；在证据之前多做一层全局陷阱，正是我这次
+要避免的那种改动。
+
+#### (5) 顺手否掉的一个想法
+
+`grantcontext` 不能缓存：同一 session、同一 URL 两次返回 **802554 与 780900 字节**，
+内容会变。（它与 `getallhost` 都不在 round 21 的缓存名单里，现在确认应该继续不在。）
+
+#### (6) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **423411 字节** / **65 个标记**（新增 `function patchNet(`、`function failed(`、`transport failover installed`、`app_domain=`） |
+| `scripts/test-site-patch.js` | **598 条断言**（上一轮 587，新增 11 条） |
+| `scripts/gen-site-i18n.js --check` | 458 labels / 35 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言覆盖：`app.net.get` 确实被包上（函数级标记，不是对象级——站点是
+`app.net = app.net \|\| {}` 之后**下一句**才加 `get`，对象级标记会把一个什么都没包的包装
+锁死）、卡住的镜像被拉黑且从记忆里删掉、面板写出 `banned: get failed:`、站点重试落到另一台、
+探测判死的记忆镜像被丢、手选线路赢过记忆镜像、`route`/`ranked` 两行出现、
+**外站请求失败不拉黑镜像**。
+
+#### 未证实项
+
+- **目录那台主机到底是谁决定的**：`route` 行给出答案之前，`window.STV_SERVER`
+  （`app.v2.js:1` 硬编码 `.app`）这条来源无法排除。正文那条**已经确定**是本块的记忆镜像。
+- **`.app` 是否全局劣化**：本机 4 轮测不出差异（见 (3)），设备上只有一组样本。
+- **本轮的修复在设备上的实际效果**：可测的预期是——下一次日志里 `sajax=getchapterlist`
+  最多失败 **1 次**（第一次超时拉黑 `.app`）而不是 4 次，且失败后紧跟着的那次会落在另一台；
+  `[DOMAIN]` 里会出现 `banned: get failed: …` 与 `ranked`。
+- **`.com` 与页面同源会换走 XHR 通道**：`app.net.get` 里
+  `isDomainMatchOrigin(url)` 为真时走 `XMLHttpRequest`（`x-stv-transport: web`），不再经
+  原生插件、也就没有 `[Http]` 行、没有 10 秒超时。这是**站点自己的设计**（未打补丁时
+  `fullUrl()` 第三行就是页面 origin），不是本轮引入的；但「下一次日志里 `[Http]` 行变少」
+  是它的可观察后果，需要确认内容没变。
+- 日志里 2 次 `[ERR] unhandledrejection setContent@…chapterdisplay:1643:46 /
+  preload@…:1816:28`（正文落地瞬间）不是本轮的慢，**留作单独一轮排查**。
+
 
 
 

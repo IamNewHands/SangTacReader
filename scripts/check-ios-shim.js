@@ -139,6 +139,15 @@ const REQUIRED_MARKERS = [
   // ...and the way back out: if the declaration is ever refused, the trap is
   // dropped for good and the page reloaded once instead of the site never booting.
   'stv.domain.trap.off',
+  // A remembered mirror used to lose only by answering code 7, so a mirror that
+  // stalled kept winning: the 2026-09-23 log is four 10s timeouts in a row on the
+  // same chapter list and a reader that never got one. Now a request that comes
+  // back with no payload bans it, the site's own retries land elsewhere, an
+  // explicit 线路 choice wins, and the fresh probe ranking is logged.
+  'function patchNet(',
+  'function failed(',
+  'transport failover installed',
+  'app_domain=',
   // 关注/书签的结果上报：站点把回调传给了 `app.net.get` 的 `force` 参数（不是回调），
   // 所以站点自己写的 toast 与列表刷新是死代码，成与不成看起来一模一样。
   'function attachFollow(',

@@ -2491,6 +2491,133 @@ async function testDomainFailover() {
     String(recovered.code) === '0' && stillRememberedName !== bad,
     'still remembering ' + String(stillRememberedName));
 
+  // A mirror that stalls instead of answering. Nothing here answers code 7 --
+  // the mirror simply never delivers -- so before this the reader kept the pin,
+  // kept timing out, and the chapter list never arrived (the 2026-09-23 log:
+  // four 10s timeouts in a row on the same `sajax=getchapterlist`).
+  const slow = 'https://sangtacviet.app';
+  const twoMirrors = () => ({
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: slow, status: 'alive', ping: 100 },
+        { name: good, status: 'alive', ping: 400 },
+      ],
+      defaultDomains: [good, slow],
+    },
+  });
+
+  const stall = makeSandbox();
+  stall.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: slow, at: Date.now() }));
+  const stallApp = installFakeApp(stall, twoMirrors());
+  const stallServed = [];
+  stallApp.net.get = (url) => {
+    const domain = stallApp.net.networkManager.bestDomain();
+    stallServed.push(domain);
+    // The site's own 10s timeout, surfaced the way Capacitor surfaces it.
+    return domain === slow
+      ? Promise.reject(new Error('Network error: request timed out'))
+      : Promise.resolve({ code: 1, data: 'chapterlist' });
+  };
+  vm.runInContext(loadBlocks().join('\n'), stall);
+  await tick(300);
+
+  check('the transport failover wraps app.net.get',
+    typeof stallApp.net.get === 'function'
+      && stallApp.net.get.__stvFailoverWrapped === true,
+    String(stallApp.net.get && stallApp.net.get.__stvFailoverWrapped));
+
+  const stallFirst = await stallApp.net
+    .get('/index.php?ngmar=chapterlist&h=qidian&bookid=1&sajax=getchapterlist')
+    .catch(() => null);
+  check('a mirror that stalls is banned rather than kept',
+    stallFirst === null && stallServed.length === 1 && stallServed[0] === slow
+      && stallApp.net.networkManager.bestDomain() === good,
+    JSON.stringify([stallServed, stallApp.net.networkManager.bestDomain()]));
+  check('the stalled mirror is dropped from the remembered entry',
+    String(stall.localStorage.getItem('stv.domain.good') || '').indexOf(slow) < 0,
+    String(stall.localStorage.getItem('stv.domain.good')));
+  check('and the panel says what happened',
+    /banned: get failed:/.test(stall.window.__stvDiag.text()),
+    stall.window.__stvDiag.text().slice(-300));
+
+  const stallSecond = await stallApp.net
+    .get('/index.php?ngmar=chapterlist&h=qidian&bookid=1&sajax=getchapterlist');
+  check('the site retry that follows lands on the mirror that answers',
+    stallServed.length === 2 && stallServed[1] === good
+      && !!stallSecond && stallSecond.code === 1,
+    JSON.stringify([stallServed, stallSecond]));
+
+  // A fresh probe that cannot reach the remembered mirror is the same kind of
+  // evidence as a stalled request, and cheaper to act on.
+  const unreachable = makeSandbox();
+  unreachable.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: slow, at: Date.now() }));
+  const unreachableApp = installFakeApp(unreachable, {
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: slow, status: 'timeout', ping: -1 },
+        { name: good, status: 'alive', ping: 400 },
+      ],
+      defaultDomains: [good, slow],
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), unreachable);
+  await tick(300);
+  check('a remembered mirror the site just failed to reach is dropped',
+    unreachableApp.net.networkManager.bestDomain() === good,
+    unreachableApp.net.networkManager.bestDomain());
+
+  // The reader's own 线路 row. The site honours it (app.v2.js:937-943) and the
+  // remembered mirror used to override it, which is why two taps in the
+  // 2026-09-23 log changed nothing.
+  const picky = makeSandbox();
+  picky.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: slow, at: Date.now() }));
+  const pickyApp = installFakeApp(picky, twoMirrors());
+  pickyApp.config.ux = { app_domain: good };
+  vm.runInContext(loadBlocks().join('\n'), picky);
+  await tick(300);
+  check('an explicit 线路 choice beats the remembered mirror',
+    pickyApp.net.networkManager.bestDomain() === good,
+    pickyApp.net.networkManager.bestDomain());
+  check('and it is reported in the panel',
+    picky.window.__stvDiag.text().indexOf('explicit domain ' + good) >= 0,
+    picky.window.__stvDiag.text().slice(-400));
+
+  // Which of `fullUrl()`'s host sources was used is not visible in the device
+  // log, and neither is the ranking the site measured.
+  check('the launch reports where the host comes from',
+    stall.window.__stvDiag.text().indexOf(' route: page=') >= 0,
+    stall.window.__stvDiag.text().slice(-400));
+  check('and the ranking the site measured',
+    stall.window.__stvDiag.text().indexOf(' ranked ') >= 0,
+    stall.window.__stvDiag.text().slice(-400));
+
+  // A request that is not aimed at one of the site's own mirrors must not be
+  // able to ban one: translation and cover fetches fail all the time.
+  const external = makeSandbox();
+  external.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: slow, at: Date.now() }));
+  const externalApp = installFakeApp(external, twoMirrors());
+  externalApp.net.get = () => Promise.reject(new Error('offline'));
+  externalApp.net.networkManagerXHR = {
+    domains: [],
+    defaultDomains: [good, slow],
+    isStvDomain: (url) => String(url).indexOf('sangtacviet') >= 0,
+    bestDomain() { return this.defaultDomains[0]; },
+  };
+  vm.runInContext(loadBlocks().join('\n'), external);
+  await tick(300);
+  await externalApp.net
+    .get('https://translate.googleapis.com/translate_a/single?q=x')
+    .catch(() => null);
+  check('a failing request to a foreign host does not ban a mirror',
+    externalApp.net.networkManager.bestDomain() === slow,
+    externalApp.net.networkManager.bestDomain());
+
   // Two bad mirrors in front of a good one: the retry walks past both in a
   // single read instead of handing the first code 7 back to the site.
   const third = 'https://sangtacviet.app';
