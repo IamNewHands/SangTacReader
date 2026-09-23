@@ -238,14 +238,14 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         synthesizer.write(utterance) { buffer in
             guard let pcm = buffer as? AVAudioPCMBuffer else { return }
             if pcm.frameLength == 0 {
-                let snapshot = accumulator.snapshot()
-                if snapshot.samples.isEmpty {
-                    retry("\(snapshot.buffers) buffer callback(s), all empty")
+                let taken = accumulator.take()
+                if taken.samples.isEmpty {
+                    retry("\(taken.buffers) buffer callback(s), all empty")
                     return
                 }
-                let wav = NativeSpeech.wavContainer(samples: snapshot.samples,
-                                                    sampleRate: snapshot.sampleRate,
-                                                    channels: snapshot.channels)
+                let wav = NativeSpeech.wavContainer(samples: taken.samples,
+                                                    sampleRate: taken.sampleRate,
+                                                    channels: taken.channels)
                 succeed(wav)
                 return
             }
@@ -346,6 +346,11 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         let dataBytes = UInt32(samples.count * 2)
 
         var data = Data()
+        // One allocation for the header plus the whole sample block: the sample
+        // append below is the largest write in the app (a long sentence is
+        // hundreds of KB) and growing into it one reallocation at a time is
+        // pure overhead.
+        data.reserveCapacity(44 + samples.count * 2)
         func appendUInt32(_ value: UInt32) {
             var little = value.littleEndian
             withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
@@ -369,7 +374,13 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         data.append(contentsOf: Array("data".utf8))
         appendUInt32(dataBytes)
         if !samples.isEmpty {
-            data.append(Data(bytes: samples, count: samples.count * 2))
+            // Straight from the sample buffer into the Data. The previous
+            // `Data(bytes:count:)` built a full temporary copy of the sentence and
+            // then appended it, so this write cost two passes over the samples
+            // instead of one.
+            samples.withUnsafeBytes { raw in
+                data.append(contentsOf: raw)
+            }
         }
         return data
     }
@@ -395,43 +406,77 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
             if format.sampleRate > 0 { rate = format.sampleRate }
             channelCount = channels
 
-            if format.isInterleaved {
-                let total = frames * channels
-                if let floatData = buffer.floatChannelData {
-                    let pointer = floatData[0]
-                    for index in 0..<total { samples.append(NativeSpeech.int16(fromFloat: pointer[index])) }
-                } else if let int16Data = buffer.int16ChannelData {
-                    let pointer = int16Data[0]
-                    for index in 0..<total { samples.append(pointer[index]) }
-                } else if let int32Data = buffer.int32ChannelData {
-                    let pointer = int32Data[0]
-                    for index in 0..<total { samples.append(Int16(clamping: pointer[index] >> 16)) }
-                }
-                return
-            }
+            // Nothing to convert if the buffer carries none of the three layouts
+            // -- and the previous version appended nothing in that case either,
+            // so the array must not grow here.
+            guard buffer.floatChannelData != nil
+                || buffer.int16ChannelData != nil
+                || buffer.int32ChannelData != nil else { return }
 
-            if let floatData = buffer.floatChannelData {
-                for channel in 0..<channels {
-                    let pointer = floatData[channel]
-                    for index in 0..<frames { samples.append(NativeSpeech.int16(fromFloat: pointer[index])) }
+            // One buffer of exactly the right size, filled through a raw pointer,
+            // then appended in a single bulk copy. The old code called `append`
+            // once per sample -- a few thousand capacity checks and exclusivity
+            // accesses per callback, and tens of thousands across a sentence.
+            let total = frames * channels
+            var chunk = [Int16](repeating: 0, count: total)
+            chunk.withUnsafeMutableBufferPointer { out in
+                guard let target = out.baseAddress else { return }
+                if format.isInterleaved {
+                    if let floatData = buffer.floatChannelData {
+                        let source = floatData[0]
+                        for index in 0..<total {
+                            target[index] = NativeSpeech.int16(fromFloat: source[index])
+                        }
+                    } else if let int16Data = buffer.int16ChannelData {
+                        target.update(from: int16Data[0], count: total)
+                    } else if let int32Data = buffer.int32ChannelData {
+                        let source = int32Data[0]
+                        for index in 0..<total {
+                            target[index] = Int16(clamping: source[index] >> 16)
+                        }
+                    }
+                    return
                 }
-            } else if let int16Data = buffer.int16ChannelData {
-                for channel in 0..<channels {
-                    let pointer = int16Data[channel]
-                    for index in 0..<frames { samples.append(pointer[index]) }
-                }
-            } else if let int32Data = buffer.int32ChannelData {
-                for channel in 0..<channels {
-                    let pointer = int32Data[channel]
-                    for index in 0..<frames { samples.append(Int16(clamping: pointer[index] >> 16)) }
+                var offset = 0
+                if let floatData = buffer.floatChannelData {
+                    for channel in 0..<channels {
+                        let source = floatData[channel]
+                        for index in 0..<frames {
+                            target[offset + index] = NativeSpeech.int16(fromFloat: source[index])
+                        }
+                        offset += frames
+                    }
+                } else if let int16Data = buffer.int16ChannelData {
+                    for channel in 0..<channels {
+                        target.advanced(by: offset).update(from: int16Data[channel], count: frames)
+                        offset += frames
+                    }
+                } else if let int32Data = buffer.int32ChannelData {
+                    for channel in 0..<channels {
+                        let source = int32Data[channel]
+                        for index in 0..<frames {
+                            target[offset + index] = Int16(clamping: source[index] >> 16)
+                        }
+                        offset += frames
+                    }
                 }
             }
+            samples.append(contentsOf: chunk)
         }
 
-        func snapshot() -> (samples: [Int16], sampleRate: Double, channels: Int, buffers: Int) {
+        /// Hands the collected samples over and leaves the accumulator empty.
+        ///
+        /// Not a copy-avoidance trick: returning the array was already an O(1)
+        /// copy-on-write retain, and clearing the property does not copy either.
+        /// The point is that the accumulator stops holding the sentence once it
+        /// has been handed off, so a long chapter's samples are not kept alive
+        /// twice while the WAV is being written.
+        func take() -> (samples: [Int16], sampleRate: Double, channels: Int, buffers: Int) {
             lock.lock()
             defer { lock.unlock() }
-            return (samples, rate, channelCount, buffers)
+            let collected = samples
+            samples = []
+            return (collected, rate, channelCount, buffers)
         }
     }
 }

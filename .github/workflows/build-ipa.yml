@@ -175,6 +175,7 @@ jobs:
                         stvGridLayoutInstalled stvTabProbeInstalled \
                         stvKeyboardPopupInstalled \
                         stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled \
+                        stvAssetCache stvReaderPrefetchInstalled \
                         stvCommentTranslateInstalled; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
@@ -190,8 +191,9 @@ jobs:
             echo "::error::原生 TTS 桥接方法缺失（speakToFile 不在二进制里）"
             exit 1
           fi
-          # 安全区与设置备份的原生桥接方法名同样要在产物里。
-          for marker in getSafeArea settingsRestore settingsSave; do
+          # 安全区与设置备份的原生桥接方法名同样要在产物里。secretSave/secretLoad
+          # 是 API Key 的 Keychain 通道，缺了会让自备 Key 静默失效。
+          for marker in getSafeArea settingsRestore settingsSave secretSave secretLoad; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
@@ -199,6 +201,14 @@ jobs:
               exit 1
             fi
           done
+          # Http 插件的诊断开关。缺了不会崩，但原生侧的门会一直关着，面板里就只剩
+          # 失败行——一个只会让性能优化静默回退的洞。
+          if grep -q -F 'setDiagnostics' "$syms.strings"; then
+            echo "✓ setDiagnostics 已编入产物"
+          else
+            echo "::error::setDiagnostics 缺失（原生诊断门无法开关）"
+            exit 1
+          fi
           # 系统离线翻译的三个桥接方法名。iOS 15-17 上它们也必须在（返回
           # "unsupported" 让 JS 换联网引擎），缺了会变成不透明的桥接错误。
           for marker in translationStatus translationPrepare translationTranslate; do

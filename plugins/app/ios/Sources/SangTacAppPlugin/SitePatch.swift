@@ -119,6 +119,158 @@ enum SitePatch {
      title bar can be dragged vertically, so the bottom 58% of the screen stays
      usable.
      */
+    // MARK: - Asset cache-buster stabiliser
+
+    /**
+     The site's own headers say `Cache-Control: max-age=86400` for everything
+     under `/asset/`, and then its shell HTML defeats that by appending
+     `Math.random()` to the URL of every file on the critical path
+     (_page_vip.html):
+
+         ui.scriptmanager.load("/asset/app.v2.js?" + Math.random(), ...)
+         link.setAttribute('href', "/asset/app.v2.css?r=" + Math.random())
+         ui.scriptmanager.load("/asset/app.v2.bookdisplay.js?" + Math.random(), ...)
+         ui.scriptmanager.load("/asset/app.v2.config.js?" + Math.random(), ...)
+
+     Every launch is therefore a brand-new URL and the disk cache can never hit,
+     so `app.v2.js` -- the gate the whole app boots behind, documented as
+     finished evaluating at +8s -- is refetched over a 300-900ms-TTFB link on
+     every cold start.
+
+     This block swaps the random token for a stable one. The lifetime is not
+     invented: max-age=86400 is exactly what the server asked for, and the URL
+     now expresses it. `generation` is bumped by the "强制刷新站点资源" row on the
+     settings page, which changes every URL at once without waiting for the day
+     to roll over.
+
+     Deliberately narrow: only `/asset/` URLs, and only a random-looking
+     `?<value>` / `?r=<value>` / `?nocache=<value>` parameter. Real version
+     numbers (`?v=1.360`, `?v2`, `?v=7`) are the site's version contract and are
+     left alone, as is every other URL on the page.
+     */
+    static let assetCache = """
+    (function () {
+        if (window.__stvAssetCache) { return; }
+
+        var DAY = 86400000;
+        var GEN_KEY = 'stv.asset.generation';
+
+        function readLocal(key) {
+            try {
+                return window.localStorage ? (window.localStorage.getItem(key) || '') : '';
+            } catch (e) { return ''; }
+        }
+
+        function writeLocal(key, value) {
+            try {
+                if (window.localStorage) { window.localStorage.setItem(key, value); }
+            } catch (e) {}
+        }
+
+        function generation() {
+            var value = parseInt(readLocal(GEN_KEY), 10);
+            return (isFinite(value) && value > 0) ? value : 1;
+        }
+
+        // One token per page load: every asset in a load has to agree, or the
+        // same file ends up cached under two names.
+        var TOKEN = 'stv' + generation() + '-' + Math.floor(Date.now() / DAY);
+
+        // No backslashes anywhere in these blocks: they are Swift multiline
+        // strings, and a backslash reaches JavaScript as a literal backslash.
+        // Hence [.] and [0-9] instead of the usual escapes.
+        var RANDOM_PARAM = /([?&])(nocache|r|_)=0[.][0-9]+/g;
+        var BARE_RANDOM = /[?]0[.][0-9]+$/;
+
+        function stabilize(url) {
+            if (typeof url !== 'string' || url.indexOf('/asset/') < 0) { return url; }
+            var out = url.replace(RANDOM_PARAM, '$1$2=' + TOKEN);
+            if (BARE_RANDOM.test(out)) { out = out.replace(BARE_RANDOM, '?' + TOKEN); }
+            return out;
+        }
+
+        function wrapProperty(proto, name) {
+            if (!proto) { return false; }
+            var descriptor = null;
+            try { descriptor = Object.getOwnPropertyDescriptor(proto, name); } catch (e) {
+                return false;
+            }
+            if (!descriptor || typeof descriptor.set !== 'function') { return false; }
+            var setter = descriptor.set;
+            try {
+                Object.defineProperty(proto, name, {
+                    configurable: true,
+                    enumerable: descriptor.enumerable,
+                    get: descriptor.get,
+                    set: function (value) {
+                        // The property hook, not an insertion hook, is what
+                        // matters: stv.ui.js appends the <script> FIRST and only
+                        // then assigns `.src`, so rewriting at insertion time
+                        // would already be too late.
+                        return setter.call(this, stabilize(value));
+                    }
+                });
+                return true;
+            } catch (e) { return false; }
+        }
+
+        function wrapSetAttribute() {
+            var proto = window.Element && window.Element.prototype;
+            if (!proto || typeof proto.setAttribute !== 'function') { return false; }
+            var original = proto.setAttribute;
+            proto.setAttribute = function (name, value) {
+                // Fast path: the site calls setAttribute constantly and almost
+                // never with one of our URLs.
+                if (typeof value === 'string' && value.indexOf('/asset/') >= 0) {
+                    var key = String(name).toLowerCase();
+                    if (key === 'src' || key === 'href') { value = stabilize(value); }
+                }
+                return original.call(this, name, value);
+            };
+            // Report honestly: on a non-writable prototype this assignment is a
+            // silent no-op in sloppy mode, and `hooks` is what the panel shows.
+            return proto.setAttribute !== original;
+        }
+
+        var hooks = 0;
+        if (wrapProperty(window.HTMLScriptElement && window.HTMLScriptElement.prototype, 'src')) {
+            hooks++;
+        }
+        if (wrapProperty(window.HTMLLinkElement && window.HTMLLinkElement.prototype, 'href')) {
+            hooks++;
+        }
+        if (wrapProperty(window.HTMLImageElement && window.HTMLImageElement.prototype, 'src')) {
+            hooks++;
+        }
+        if (wrapSetAttribute()) { hooks++; }
+
+        window.__stvAssetCache = {
+            token: TOKEN,
+            stabilize: stabilize,
+            hooks: hooks,
+            // Drops the whole stabilised set at once by moving every URL to a
+            // new generation, then reloads so the page picks them up.
+            refresh: function () {
+                writeLocal(GEN_KEY, String(generation() + 1));
+                try { window.location.reload(); } catch (e) {}
+            }
+        };
+
+        // `diag` is injected after this block, so __stvDiag does not exist yet
+        // here -- announce once the document is parsed instead.
+        function announce() {
+            if (!window.__stvDiag) { return; }
+            window.__stvDiag.log('ASSET', 'cache-buster stabilised (token=' + TOKEN
+                + ', hooks=' + hooks + ')');
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', announce);
+        } else {
+            announce();
+        }
+    })();
+    """
+
     static let diag = """
     (function () {
         if (window.__stvDiagInstalled) { return; }
@@ -400,22 +552,65 @@ enum SitePatch {
 
         // ---- logging ---------------------------------------------------------
 
+        function raw(text, isError) {
+            lines.push(stamp() + ' ' + text);
+            while (lines.length > MAX) { lines.shift(); }
+            if (isError) {
+                errors++;
+                badgeHidden = false;
+            }
+        }
+
+        function paint() {
+            if (open) { render(); } else { paintBadge(); }
+        }
+
         function log(tag, msg) {
             // The switch is checked here and nowhere else: every caller (all the
             // other blocks, the console tee, the tap listeners) keeps working
             // unchanged and pays one boolean while logging is off.
             if (!enabled) { return; }
-            lines.push(stamp() + ' [' + tag + '] ' + fmt(msg));
-            while (lines.length > MAX) { lines.shift(); }
-            if (tag === 'ERR') {
-                errors++;
-                badgeHidden = false;
+            raw('[' + tag + '] ' + fmt(msg), tag === 'ERR');
+            paint();
+        }
+
+        /**
+         The native Http plugin ships its lines one batch per runloop turn -- a
+         single evaluateJavaScript instead of one per request -- so they arrive
+         pre-formatted as "[TAG] message" and are replayed here.
+
+         `forced` marks a batch the native side kept because it was a failure. A
+         failure is worth holding on to even while the switch is off: it costs
+         nothing to render (there is no panel), it is bounded by MAX like every
+         other line, and it means "why did that fail?" survives a reader who never
+         turned logging on. A non-forced batch while off is still dropped, so the
+         per-request firehose stays off.
+         */
+        function logBatch(list, forced) {
+            if (!list || !list.length) { return; }
+            if (!enabled && !forced) { return; }
+            for (var i = 0; i < list.length; i++) {
+                var text = String(list[i] === null || list[i] === undefined ? '' : list[i]);
+                raw(text, text.indexOf('[ERR]') === 0);
             }
-            if (open) {
-                render();
-            } else {
-                paintBadge();
-            }
+            // With the switch off there is no badge and no panel to paint into.
+            if (enabled) { paint(); }
+        }
+
+        /**
+         The native side keeps its own copy of the switch so it can skip building
+         a diagnostic line at all -- decoding a response body and a cross-process
+         evaluateJavaScript per request is the cost this removes. Tell it every
+         time the switch moves.
+         */
+        function pushNativeSwitch() {
+            var plugin = window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.Http;
+            if (!plugin || typeof plugin.setDiagnostics !== 'function') { return; }
+            try {
+                var call = plugin.setDiagnostics({ enabled: enabled });
+                if (call && typeof call.catch === 'function') { call.catch(function () {}); }
+            } catch (e) {}
         }
 
         // ---- the switch ------------------------------------------------------
@@ -446,6 +641,7 @@ enum SitePatch {
             enabled = !!on;
             writeEnabled(enabled);
             persist(enabled);
+            pushNativeSwitch();
             if (!enabled) {
                 lines = [];
                 errors = 0;
@@ -475,6 +671,7 @@ enum SitePatch {
 
         window.__stvDiag = {
             log: log,
+            logBatch: logBatch,
             show: show,
             hide: hide,
             toggle: toggle,
@@ -542,6 +739,13 @@ enum SitePatch {
         // A switch that was left on stays on across launches: the badge is
         // always visible and the panel opens with it, which is the "启用后就一直
         // 显示" the reader asked for. Everything stays off until then.
+        //
+        // The native gate defaults to off, so a switch that was left on has to be
+        // re-sent. Plugins.Http may not be published yet at document start, hence
+        // the retries; the function is idempotent and costs one boolean.
+        pushNativeSwitch();
+        document.addEventListener('DOMContentLoaded', pushNativeSwitch);
+        setTimeout(pushNativeSwitch, 2000);
         if (enabled) {
             if (!activate()) {
                 document.addEventListener('DOMContentLoaded', function () {
@@ -1665,6 +1869,11 @@ enum SitePatch {
         }
 
         var restored = false;
+        // In flight, as opposed to done. The two are separate so a refusal or a
+        // transient keychain error does not latch "already restored" and cost the
+        // whole page load its backup.
+        var restoreStarted = false;
+        var mirrorFailed = {};
         var lastEntries = null;
         var restoredKeys = [];
 
@@ -1699,9 +1908,10 @@ enum SitePatch {
             // taken. The accessor block publishes the flag; it always does, even
             // when there is nothing to repair.
             if (!window.__stvStorageAccessorPatched) { return false; }
-            if (restored) { return true; }
-            restored = true;
+            if (restored || restoreStarted) { return true; }
+            restoreStarted = true;
             plugin.settingsRestore({}).then(function (result) {
+                restored = true;
                 var entries = (result && result.entries) || {};
                 lastEntries = entries;
                 var keys = [];
@@ -1765,6 +1975,14 @@ enum SitePatch {
                     applyDiagSetting(entries, restoredKeys);
                 });
             }).catch(function (e) {
+                // Covers a rejected settingsRestore (the native origin guard, or a
+                // transient keychain error) and a failure inside the restore
+                // chain. Deliberately not latched: the interval above retries, so
+                // one refusal does not cost the whole page load its backup. A
+                // retry is idempotent because a key the store already holds is
+                // kept rather than rewritten.
+                restoreStarted = false;
+                restored = false;
                 note('ERR', 'settingsRestore failed: ' + e);
             });
             return true;
@@ -1855,7 +2073,19 @@ enum SitePatch {
             if (!plugin || typeof plugin.settingsSave !== 'function') { return; }
             try {
                 var call = plugin.settingsSave({ key: key, value: value });
-                if (call && typeof call.catch === 'function') { call.catch(function () {}); }
+                if (call && typeof call.then === 'function') {
+                    call.then(function () {
+                        delete mirrorFailed[key];
+                    }, function (error) {
+                        // Once per key, and never silently: the native side
+                        // refuses keys outside its allow-list and values over its
+                        // size cap, and a swallowed rejection would look exactly
+                        // like "this setting was never backed up" on device.
+                        if (mirrorFailed[key]) { return; }
+                        mirrorFailed[key] = true;
+                        note('ERR', 'keychain backup refused ' + key + ': ' + error);
+                    });
+                }
             } catch (e) {}
         }
 
@@ -1980,8 +2210,7 @@ enum SitePatch {
             return list;
         }
 
-        function pick(mgr, siteChoice) {
-            var list = candidates(mgr);
+        function pick(list, siteChoice) {
             for (var i = 0; i < list.length; i++) {
                 if (!banned[list[i]]) { return list[i]; }
             }
@@ -1996,22 +2225,109 @@ enum SitePatch {
             return true;
         }
 
-        function patchBestDomain() {
-            var mgr = manager();
+        // ---- remembered working mirror -----------------------------------
+        //
+        // The site races its mirrors on every launch and takes the cheapest
+        // ping, and `verifyDomain()` only probes /warp.php -- so the mirror that
+        // wins the race is routinely the one that answers `code 7` to every
+        // readchapter (1.2s per attempt, then the ban/retry dance above). The
+        // mirror that actually returned a chapter last time is the better first
+        // guess, so it is remembered and used until it expires or fails.
+        //
+        // The race still runs: the site calls checkDomains() itself, and this
+        // entry only ever short-circuits the *choice*, never the probing. A
+        // remembered mirror that is not one of the site's own mirrors is ignored,
+        // so a tampered localStorage entry cannot redirect the app.
+        var GOOD_KEY = 'stv.domain.good';
+        var GOOD_TTL = 6 * 60 * 60 * 1000;
+
+        // Parsed once and kept in memory. `bestDomain()` runs on every request
+        // the site makes, and a localStorage read plus a JSON.parse on that path
+        // is exactly the per-request cost this block exists to remove.
+        var goodEntry = null;
+        var goodLoaded = false;
+
+        function writeGood() {
+            try {
+                if (window.localStorage && goodEntry) {
+                    window.localStorage.setItem(GOOD_KEY, JSON.stringify(goodEntry));
+                }
+            } catch (e) {}
+        }
+
+        function readGood() {
+            if (!goodLoaded) {
+                goodLoaded = true;
+                var raw = '';
+                try {
+                    raw = window.localStorage ? (window.localStorage.getItem(GOOD_KEY) || '') : '';
+                } catch (e) { raw = ''; }
+                if (raw) {
+                    var parsed = null;
+                    try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+                    if (parsed && typeof parsed.name === 'string' && parsed.name
+                        && typeof parsed.at === 'number') {
+                        goodEntry = parsed;
+                    }
+                }
+            }
+            if (!goodEntry) { return null; }
+            if ((Date.now() - goodEntry.at) > GOOD_TTL) {
+                goodEntry = null;
+                return null;
+            }
+            return goodEntry;
+        }
+
+        function rememberGood(domain) {
+            if (!domain || banned[domain]) { return; }
+            if (goodEntry && goodEntry.name === domain) {
+                // Keep it alive while it keeps working, but not with a write per
+                // chapter: ten minutes of slack is plenty.
+                if ((Date.now() - goodEntry.at) > 600000) {
+                    goodEntry.at = Date.now();
+                    writeGood();
+                }
+                return;
+            }
+            goodEntry = { name: domain, at: Date.now() };
+            goodLoaded = true;
+            writeGood();
+            note('DOMAIN', 'remembered working mirror ' + domain);
+        }
+
+        function forgetGood(domain) {
+            if (!goodEntry || (domain && goodEntry.name !== domain)) { return; }
+            goodEntry = null;
+            try {
+                if (window.localStorage) { window.localStorage.removeItem(GOOD_KEY); }
+            } catch (e) {}
+        }
+
+        function patchBestDomain(mgr, label) {
             if (!mgr || typeof mgr.bestDomain !== 'function') { return false; }
             if (mgr.__stvFailoverInstalled) { return true; }
             mgr.__stvFailoverInstalled = true;
             var original = mgr.bestDomain;
             mgr.bestDomain = function () {
                 var siteChoice = original.apply(this, arguments);
-                var chosen = pick(this, siteChoice);
+                var list = candidates(this);
+                var good = readGood();
+                if (good && !banned[good.name] && list.indexOf(good.name) >= 0) {
+                    if (!noted[good.name]) {
+                        noted[good.name] = true;
+                        note('DOMAIN', label + ' using remembered mirror ' + good.name);
+                    }
+                    return good.name;
+                }
+                var chosen = pick(list, siteChoice);
                 if (chosen && chosen !== siteChoice && !noted[siteChoice]) {
                     noted[siteChoice] = true;
-                    note('DOMAIN', 'bestDomain ' + siteChoice + ' -> ' + chosen);
+                    note('DOMAIN', label + ' bestDomain ' + siteChoice + ' -> ' + chosen);
                 }
                 return chosen;
             };
-            note('DOMAIN', 'mirror failover installed');
+            note('DOMAIN', label + ' mirror failover installed');
             return true;
         }
 
@@ -2029,17 +2345,22 @@ enum SitePatch {
                 // new mirror (banCount is bounded) or gives up and hands the
                 // code 7 back to the site.
                 function attempt() {
+                    var mgr = manager();
+                    var used = mgr && mgr.bestDomain ? origin(mgr.bestDomain()) : '';
                     return Promise.resolve(original.apply(self, args)).then(function (data) {
-                        if (!data || String(data.code) !== '7' || banCount >= MAX_BANS) {
-                            return data;
+                        var code = data ? String(data.code) : '';
+                        if (code === '7' && banCount < MAX_BANS) {
+                            if (!ban(used, 'readchapter answered code 7')) { return data; }
+                            forgetGood(used);
+                            if (app.reader) { app.reader.cachekey = null; }
+                            note('DOMAIN', 'refetching ' + h + '/' + i + ' chapter ' + c
+                                + ' after code 7');
+                            return attempt();
                         }
-                        var mgr = manager();
-                        var bad = mgr ? origin(mgr.bestDomain ? mgr.bestDomain() : '') : '';
-                        if (!ban(bad, 'readchapter answered code 7')) { return data; }
-                        if (app.reader) { app.reader.cachekey = null; }
-                        note('DOMAIN', 'refetching ' + h + '/' + i + ' chapter ' + c
-                            + ' after code 7');
-                        return attempt();
+                        // Only a real answer is worth remembering; a transport
+                        // failure arrives here as a missing payload.
+                        if (data && code !== '7') { rememberGood(used); }
+                        return data;
                     });
                 }
                 return attempt();
@@ -2051,9 +2372,12 @@ enum SitePatch {
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
-            var a = patchBestDomain();
-            var b = patchContent();
-            if ((a && b) || attempts > 600) { clearInterval(timer); }
+            var app = window.app;
+            var xhr = app && app.net && app.net.networkManagerXHR;
+            var a = patchBestDomain(manager(), 'networkManager');
+            var b = patchBestDomain(xhr, 'networkManagerXHR');
+            var c = patchContent();
+            if ((a && b && c) || attempts > 600) { clearInterval(timer); }
         }, 50);
     })();
     """
@@ -3716,6 +4040,12 @@ enum SitePatch {
         window.__stvCommentTranslateInstalled = true;
 
         var STORE_KEY = 'stv.translate.settings';
+        // The API key does NOT live in STORE_KEY. app.storage is plaintext inside
+        // the app container, this page shares a JS context with the site's own
+        // scripts, and settingsBackup mirrors every app.storage key into the
+        // keychain backup. The key gets its own this-device-only keychain item and
+        // the stored record keeps only a boolean (hasApiKey).
+        var SECRET_KEY = 'translate.apiKey';
         var PANEL_ID = 'stv-translate-panel';
         var NL = String.fromCharCode(10);
 
@@ -3857,6 +4187,7 @@ enum SitePatch {
             return {
                 engine: 'apple',
                 apiKey: '',
+                hasApiKey: false,
                 region: '',
                 endpoint: '',
                 model: '',
@@ -3881,6 +4212,77 @@ enum SitePatch {
             return base;
         }
 
+        // ---- secret store (the API key) -----------------------------------
+
+        function secretPlugin() {
+            var plugin = appPlugin();
+            return (plugin && typeof plugin.secretSave === 'function'
+                && typeof plugin.secretLoad === 'function') ? plugin : null;
+        }
+
+        function writeSecret(value) {
+            var plugin = secretPlugin();
+            if (!plugin) { return Promise.reject(new Error('原生密钥存储不可用')); }
+            return Promise.resolve(plugin.secretSave({ key: SECRET_KEY, value: value || '' }));
+        }
+
+        // What actually goes into app.storage: everything except the key itself.
+        // `apiKey` stays in the object (the engines read config.apiKey) but is
+        // written as an empty string, so a script that dumps the store -- or the
+        // keychain mirror of it -- learns only whether a key is configured.
+        function storedForm(config) {
+            var out = {};
+            for (var field in config) {
+                if (!Object.prototype.hasOwnProperty.call(config, field)) { continue; }
+                if (field === 'apiKey' || field === 'clearKey') { continue; }
+                out[field] = config[field];
+            }
+            out.apiKey = '';
+            return out;
+        }
+
+        function persistSettings(config) {
+            var app = window.app;
+            var storage = app && app.storage;
+            if (!storage || typeof storage.set !== 'function') { return Promise.resolve(); }
+            return Promise.resolve(storage.set(STORE_KEY, JSON.stringify(storedForm(config))));
+        }
+
+        /**
+         Pull the key out of the keychain into memory. Called from loadSettings,
+         so every engine sees the same config.apiKey it always did.
+
+         The `legacy` branch is the upgrade path: builds before this change wrote
+         the key in plaintext into app.storage. When one of those records is found
+         the key is moved to the keychain and the record rewritten without it, so
+         the plaintext copy does not survive. If the keychain write fails the
+         plaintext value is kept -- losing the user's key is worse than leaving it
+         where it was.
+         */
+        function hydrateSecret(config) {
+            var plugin = secretPlugin();
+            if (!plugin) { return Promise.resolve(config); }
+            var legacy = typeof config.apiKey === 'string' ? config.apiKey : '';
+            if (legacy && !config.hasApiKey) {
+                return writeSecret(legacy).then(function () {
+                    config.hasApiKey = true;
+                    note('TRANSLATE', 'API Key 已移入 Keychain（原明文存储已清除）');
+                    return persistSettings(config);
+                }, function (error) {
+                    note('ERR', 'API Key 迁移失败，保留原存储: ' + messageOf(error));
+                }).then(function () { return config; });
+            }
+            if (!config.hasApiKey) { return Promise.resolve(config); }
+            return Promise.resolve(plugin.secretLoad({ key: SECRET_KEY })).then(function (result) {
+                var value = result && typeof result.value === 'string' ? result.value : '';
+                if (value) { config.apiKey = value; }
+                return config;
+            }, function (error) {
+                note('ERR', 'API Key 读取失败: ' + messageOf(error));
+                return config;
+            });
+        }
+
         function loadSettings() {
             if (settings) { return Promise.resolve(settings); }
             var base = defaults();
@@ -3888,31 +4290,55 @@ enum SitePatch {
             var storage = app && app.storage;
             if (!storage || typeof storage.get !== 'function') {
                 settings = base;
-                return Promise.resolve(settings);
+                return hydrateSecret(settings);
             }
             return Promise.resolve(storage.get(STORE_KEY)).then(function (raw) {
                 settings = mergeSettings(base, raw);
-                return settings;
+                return hydrateSecret(settings);
             }, function (error) {
                 note('ERR', 'translate settings read failed: ' + messageOf(error));
                 settings = base;
-                return settings;
+                return hydrateSecret(settings);
             });
         }
 
+        /**
+         Save the panel's values. The key field starts empty on every open, so an
+         empty field means "leave the stored key alone" and only the 清除 button
+         removes it -- a save can never silently wipe a credential the user cannot
+         see.
+         */
         function saveSettings(next) {
-            settings = next;
-            var app = window.app;
-            var storage = app && app.storage;
-            if (!storage || typeof storage.set !== 'function') {
-                return Promise.resolve();
+            var typed = typeof next.apiKey === 'string' ? next.apiKey : '';
+            var has = !!next.hasApiKey;
+            var live = settings ? settings.apiKey : '';
+            var work = Promise.resolve();
+
+            if (next.clearKey) {
+                has = false;
+                live = '';
+                work = writeSecret('');
+            } else if (typed) {
+                has = true;
+                live = typed;
+                work = writeSecret(typed);
             }
-            return Promise.resolve(storage.set(STORE_KEY, JSON.stringify(next)))
-                .then(function () {
-                    note('TRANSLATE', 'settings saved (engine=' + next.engine + ')');
+
+            return work.then(function () {
+                settings = next;
+                settings.apiKey = live;
+                settings.hasApiKey = has;
+                delete settings.clearKey;
+                return persistSettings(settings).then(function () {
+                    note('TRANSLATE', 'settings saved (engine=' + next.engine
+                        + ', key=' + (has ? 'set' : 'none') + ')');
                 }, function (error) {
                     note('ERR', 'translate settings save failed: ' + messageOf(error));
                 });
+            }, function (error) {
+                note('ERR', 'API Key 保存失败: ' + messageOf(error));
+                throw error;
+            });
         }
 
         // ---- engines -----------------------------------------------------
@@ -4038,13 +4464,18 @@ enum SitePatch {
                 });
         }
 
+        // The key rides in a header, never in the query string. The native Http
+        // plugin writes every request URL into the diagnostic panel -- which has a
+        // COPY button -- and into the system log, so a `?key=` would hand the
+        // user's Google credential to anyone who taps COPY once. Same header the
+        // official client sends.
         function googleBatch(texts, source, target, config) {
-            var url = 'https://translation.googleapis.com/language/translate/v2?key='
-                + encodeURIComponent(config.apiKey);
+            var url = 'https://translation.googleapis.com/language/translate/v2';
             var payload = { q: texts, target: target, format: 'text' };
             if (source && source !== 'auto') { payload.source = source; }
             return httpRequest('POST', url,
-                { 'Content-Type': 'application/json; charset=UTF-8' },
+                { 'Content-Type': 'application/json; charset=UTF-8',
+                  'X-goog-api-key': config.apiKey },
                 JSON.stringify(payload)).then(function (response) {
                     var data = bodyOf(response);
                     var list = data && data.data && data.data.translations;
@@ -4698,6 +5129,27 @@ enum SitePatch {
             host.appendChild(item);
             note('TRANSLATE', 'settings entry added');
 
+            // The asset cache (the assetCache block) can hold a stale file for
+            // up to a day if the site republishes one without changing its name.
+            // One tap here moves every stabilised URL to a new generation and
+            // reloads, which is the only way out of a bad cache without a
+            // reinstall.
+            var cacheItem = document.createElement('div');
+            cacheItem.className = 'settingitem stv-assetcache-entry';
+            cacheItem.innerHTML = '<div class="settingitemtitle">强制刷新站点资源</div>'
+                + '<div class=""><i class="fas fa-rotate-right"></i></div>';
+            cacheItem.addEventListener('click', function (event) {
+                stop(event);
+                var cache = window.__stvAssetCache;
+                if (!cache || typeof cache.refresh !== 'function') {
+                    note('ERR', 'asset cache block is not installed');
+                    return;
+                }
+                note('ASSET', 'forcing a refresh (generation ' + cache.token + ')');
+                cache.refresh();
+            }, true);
+            host.appendChild(cacheItem);
+
             var logHeader = document.createElement('div');
             logHeader.className = 'settingsection mt-3';
             logHeader.textContent = '诊断';
@@ -4902,9 +5354,40 @@ enum SitePatch {
             }
 
             var enginePicker = row('翻译引擎', picker(ENGINE_LABELS, config.engine));
-            var keyInput = row('API Key（系统离线与免密钥通道不用填）',
-                textInput(config.apiKey, 'Azure / Google / DeepL / OpenAI 的 Key',
-                    'stv-translate-key'));
+
+            // The stored key is never written back into the DOM. This panel shares
+            // a JS context with the site's own scripts, and the field is a plain
+            // text input, so echoing the key would hand it to anything running on
+            // the page. The field starts empty; an empty field on save means
+            // "keep the stored key", and only the 清除 button removes it.
+            var keyStored = !!config.hasApiKey;
+            var clearingKey = false;
+
+            function keyPlaceholder() {
+                return (keyStored && !clearingKey)
+                    ? '已保存（留空则不修改）'
+                    : 'Azure / Google / DeepL / OpenAI 的 Key';
+            }
+
+            var keyInput = textInput('', keyPlaceholder(), 'stv-translate-key');
+            keyInput.style.flex = '1';
+            var keyClear = makeButton('清除', 'stv-translate-key-clear');
+            keyClear.style.cssText = BUTTON_CSS + 'margin-left:6px;';
+            keyClear.style.display = keyStored ? '' : 'none';
+            var keyWrap = document.createElement('div');
+            keyWrap.style.cssText = 'display:flex;align-items:center;';
+            keyWrap.appendChild(keyInput);
+            keyWrap.appendChild(keyClear);
+            row('API Key（系统离线与免密钥通道不用填）', keyWrap);
+            keyClear.addEventListener('click', function (event) {
+                stop(event);
+                clearingKey = true;
+                keyInput.value = '';
+                keyInput.placeholder = keyPlaceholder();
+                keyClear.style.display = 'none';
+                status.textContent = 'Key 将在点“保存”后清除';
+            }, true);
+
             var regionInput = row('区域 Region（Azure 需要，可选）',
                 textInput(config.region, '例如 eastasia'));
             var endpointInput = row('自定义接口地址（可选）',
@@ -4941,9 +5424,20 @@ enum SitePatch {
             card.appendChild(actions);
 
             function collect() {
+                // The field is empty whenever a key is already stored -- it is
+                // never echoed back -- so an empty field has to resolve to the
+                // stored key. Resolving it to "no key" would make the 测试 button
+                // exercise the engine without a credential and report a
+                // misleading failure.
+                var typed = keyInput.value || '';
+                var effective = clearingKey
+                    ? ''
+                    : (typed || (settings ? settings.apiKey : ''));
                 return {
                     engine: enginePicker.__value() || 'apple',
-                    apiKey: keyInput.value || '',
+                    apiKey: effective,
+                    hasApiKey: keyStored,
+                    clearKey: clearingKey,
                     region: regionInput.value || '',
                     endpoint: endpointInput.value || '',
                     model: modelInput.value || '',
@@ -4954,6 +5448,16 @@ enum SitePatch {
                 };
             }
 
+            // The field is emptied and re-masked after every save, so a key the
+            // user just typed does not stay on screen (or in the DOM) either.
+            function reflectKeyState() {
+                keyStored = !!(settings && settings.hasApiKey);
+                clearingKey = false;
+                keyInput.value = '';
+                keyInput.placeholder = keyPlaceholder();
+                keyClear.style.display = keyStored ? '' : 'none';
+            }
+
             var saveButton = makeButton('保存', 'stv-translate-save');
             saveButton.style.cssText = BUTTON_CSS
                 + 'background:#2563eb;border-color:#3b82f6;color:#fff;';
@@ -4961,8 +5465,12 @@ enum SitePatch {
                 stop(event);
                 var next = collect();
                 saveSettings(next).then(function () {
-                    status.textContent = '已保存：' + engineName(next.engine);
+                    reflectKeyState();
+                    status.textContent = '已保存：' + engineName(next.engine)
+                        + (keyStored ? '（Key 已存入 Keychain）' : '');
                     refreshLabels();
+                }, function (error) {
+                    status.textContent = '保存失败：' + messageOf(error);
                 });
             }, true);
             actions.appendChild(saveButton);
@@ -5266,6 +5774,78 @@ enum SitePatch {
             return '';
         }
 
+        function releaseNow(reason) {
+            if (released) { return true; }
+            var ready = siteCssReady();
+            if (!ready) { return false; }
+            release(ready + ' at +' + (Date.now() - started) + 'ms (' + reason + ')');
+            return true;
+        }
+
+        function stylesheetTouched(records) {
+            // A bare callback (no records) means "something changed"; treat it as
+            // relevant rather than ignoring a signal we cannot inspect.
+            if (!records || !records.length) { return true; }
+            for (var i = 0; i < records.length; i++) {
+                var added = records[i] && records[i].addedNodes;
+                if (!added) { continue; }
+                for (var j = 0; j < added.length; j++) {
+                    var name = String((added[j] && added[j].tagName) || '').toLowerCase();
+                    if (name === 'link' || name === 'style') { return true; }
+                }
+            }
+            return false;
+        }
+
+        function watchLinks() {
+            var head = document.head;
+            if (!head) { return; }
+            var nodes = head.children || head.childNodes || [];
+            for (var i = 0; i < nodes.length; i++) {
+                var link = nodes[i];
+                if (String((link && link.tagName) || '').toLowerCase() !== 'link') { continue; }
+                if (link.__stvWatched || typeof link.addEventListener !== 'function') { continue; }
+                link.__stvWatched = true;
+                // `load` fires the instant the stylesheet is applied, which is
+                // the earliest moment the real UI is styled.
+                link.addEventListener('load', function () { releaseNow('link load'); });
+                link.addEventListener('error', function () { releaseNow('link error'); });
+            }
+        }
+
+        /**
+         Deterministic release. The site's own stylesheet is the signal, and a
+         <link> fires `load` the moment it is applied -- so the fake shell can
+         come down as soon as the real one is styled.
+
+         The old implementation only sampled at 0/1/3/6/10/20s, which meant a
+         stylesheet that arrived at 1.1s kept "载入中…" on screen until the 3s
+         sample. The samples stay as the fallback for a stylesheet that appears
+         without either event (a sheet pushed into document.styleSheets by
+         script, which is what the tests do).
+         */
+        function watch() {
+            var head = document.head;
+            if (!head) {
+                document.addEventListener('DOMContentLoaded', watch);
+                return;
+            }
+            // Bare global, like the comment-translation sweep: `window` is the
+            // page's own window object, and the constructor lives on the global.
+            if (typeof MutationObserver === 'function') {
+                var observer = new MutationObserver(function (records) {
+                    if (!stylesheetTouched(records)) { return; }
+                    watchLinks();
+                    if (releaseNow('stylesheet inserted')) { observer.disconnect(); }
+                });
+                try {
+                    observer.observe(head, { childList: true, subtree: true });
+                } catch (e) {}
+            }
+            watchLinks();
+        }
+        watch();
+
         var samples = [
             [0, 'document start'],
             [1000, 'stylesheet'],
@@ -5277,10 +5857,7 @@ enum SitePatch {
         for (var i = 0; i < samples.length; i++) {
             (function (delay, label) {
                 setTimeout(function () {
-                    var ready = siteCssReady();
-                    if (ready) {
-                        release(ready + ' at +' + (Date.now() - started) + 'ms');
-                    }
+                    releaseNow(label);
                     note('BOOT', '+' + (Date.now() - started) + 'ms ' + label
                         + ': app=' + (window.app ? 'yes' : 'no')
                         + ' config=' + ((window.app && window.app.config && window.app.config.reader)
@@ -5311,12 +5888,116 @@ enum SitePatch {
     })();
     """
 
-    /// Injected in order; every block is independently guarded. `SiteI18nData`
-    /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
-    static let all: [String] = [compat, diag, activityLog, tabProbe, storageAccessor,
-                                readerDefaults, ttsProvider, followFallback,
-                                safeArea, keyboardPopup, gridLayout, settingsBackup,
-                                domainFailover, bookmarkToggle, readerTts,
-                                pageRepair, commentTranslate, bootShell,
-                                SiteI18nData.script]
+    // MARK: - Reader module prefetch
+
+    /**
+     Opening the reader for the first time pulls four modules, each behind its
+     own 300-800ms TTFB, and none of them is needed until then:
+
+         /asset/app.v2.read.js            32KB   app.v2.js:3943
+         /asset/app.v2.chapterdisplay.js  25KB   app.v2.read.js:237
+         /stv.tts.js?v=7                   9KB   app.v2.read.js:2341
+         /hanviet.js                      80KB   _page_vip.html:4546
+
+     146KB in series, which is the "卡一下" the first chapter tap costs. Asking
+     for them once the home screen has painted moves that off the path the
+     reader waits on.
+
+     Safe without touching the site's logic because `scriptmanager.load`
+     de-duplicates by URL: in app mode `isCachedFrontend` is true
+     (app.v2.js:15), so `!isCachedFrontend` is false and the site requests all
+     four with a clean URL -- exactly the keys used here. The site's later call
+     therefore finds this entry in `stack` and just waits on it instead of
+     fetching again. Passing no `nocache` argument is deliberate: with it the
+     site would append `?nocache=<random>` and its own de-duplication (which
+     keys on the pre-append URL) would miss.
+     */
+    static let readerPrefetch = """
+    (function () {
+        if (window.__stvReaderPrefetchInstalled) { return; }
+        window.__stvReaderPrefetchInstalled = true;
+
+        var MODULES = [
+            '/asset/app.v2.read.js',
+            '/asset/app.v2.chapterdisplay.js',
+            '/stv.tts.js?v=7',
+            '/hanviet.js'
+        ];
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function scriptManager() {
+            var ui = window.ui;
+            return (ui && ui.scriptmanager && typeof ui.scriptmanager.load === 'function')
+                ? ui.scriptmanager : null;
+        }
+
+        var requested = false;
+
+        function prefetch(reason) {
+            if (requested) { return true; }
+            var manager = scriptManager();
+            if (!manager) { return false; }
+            requested = true;
+            for (var i = 0; i < MODULES.length; i++) {
+                try {
+                    manager.load(MODULES[i], function () {});
+                } catch (e) {
+                    note('ERR', 'prefetch failed for ' + MODULES[i] + ': ' + e);
+                }
+            }
+            note('PREFETCH', 'reader modules requested (' + reason + ')');
+            return true;
+        }
+
+        function start() {
+            // One idle slot after load, so the site's own first-screen requests
+            // are already in flight and keep the connection to themselves.
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(function () { prefetch('idle'); }, { timeout: 5000 });
+            } else {
+                setTimeout(function () { prefetch('timer'); }, 1500);
+            }
+        }
+
+        if (document.readyState === 'complete') { start(); }
+        else { window.addEventListener('load', start); }
+    })();
+    """
+
+    /**
+     Injected in order, and every block is independently guarded, so the order
+     is about *when the reader sees something* rather than correctness.
+
+     All of these are `WKUserScript` at document start, which means the whole
+     list parses and executes before the page's first inline script runs. The
+     list is therefore ordered by what the first frame needs:
+
+       1. `compat` first -- the site calls `nativeclick` unguarded on the book
+          list, so without it the very first tap throws.
+       2. `assetCache` next -- its URL hooks have to be installed before the
+          shell HTML starts creating <script> and <link> elements.
+       3. `diag` -- so every later block's `note()` lands somewhere, and early
+          errors are captured.
+       4. the rest of the boot-critical set, ending with `bootShell` and the
+          Vietnamese->Chinese overlay.
+
+     The heavy, page-specific blocks (`pageRepair` 57KB, `commentTranslate`
+     62KB, and the rest of the long tail) come last: they still run before the
+     page's own scripts, but only after the fake shell has painted. That drops
+     the amount of injected JavaScript parsed before first paint from ~285KB to
+     roughly 60KB, which is the number that matters here.
+
+     `SiteI18nData` is generated from data/site-i18n.json by
+     scripts/gen-site-i18n.js.
+     */
+    static let all: [String] = [compat, assetCache, diag,
+                                storageAccessor, readerDefaults, safeArea,
+                                domainFailover, bootShell, SiteI18nData.script,
+                                activityLog, tabProbe, ttsProvider, followFallback,
+                                keyboardPopup, gridLayout, settingsBackup,
+                                bookmarkToggle, readerTts,
+                                pageRepair, commentTranslate, readerPrefetch]
 }

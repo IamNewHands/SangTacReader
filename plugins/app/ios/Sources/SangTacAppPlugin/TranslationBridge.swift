@@ -119,6 +119,9 @@ final class AppleTranslationHost: ObservableObject {
     private var sessionKey: String?
     private var prepared: Set<String> = []
     private var pending: [PendingRequest] = []
+    /// The 30s acquisition deadline for each in-flight request, so it can be
+    /// cancelled the moment that request resolves.
+    private var deadlines: [UUID: Task<Void, Never>] = []
     private var requestedKey: String?
     private var hostController: UIHostingController<AppleTranslationHostView>?
 
@@ -168,9 +171,18 @@ final class AppleTranslationHost: ObservableObject {
                 self.configuration = TranslationSession.Configuration(source: source,
                                                                      target: target)
             }
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                self.fail(requestId: requestId, error: AppleTranslationError.timeout)
+            // Cancelled by adopt()/fail(). Without that, every acquisition left a
+            // 30s sleep running: a long session accumulated one sleeping task per
+            // configuration change, each waking up only to call a no-op fail().
+            // (It did not keep the host alive -- that is a static singleton -- so
+            // this is about the tasks, not about retention.)
+            deadlines[requestId] = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                } catch {
+                    return
+                }
+                self?.fail(requestId: requestId, error: AppleTranslationError.timeout)
             }
         }
     }
@@ -181,6 +193,7 @@ final class AppleTranslationHost: ObservableObject {
         let waiting = pending
         pending = []
         for request in waiting {
+            cancelDeadline(request.id)
             request.continuation.resume(returning: session)
         }
     }
@@ -200,7 +213,12 @@ final class AppleTranslationHost: ObservableObject {
     private func fail(requestId: UUID, error: Error) {
         guard let index = pending.firstIndex(where: { $0.id == requestId }) else { return }
         let request = pending.remove(at: index)
+        cancelDeadline(requestId)
         request.continuation.resume(throwing: error)
+    }
+
+    private func cancelDeadline(_ requestId: UUID) {
+        deadlines.removeValue(forKey: requestId)?.cancel()
     }
 }
 

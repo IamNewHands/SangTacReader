@@ -31,6 +31,9 @@ const REQUIRED_MARKERS = [
   'window.nativeclick',
   'window.TTS',
   'window.__stvDiag',
+  // The asset cache-buster stabiliser: the site appends Math.random() to the
+  // URLs of its own /asset/ bundles, which defeats the max-age=86400 it sends.
+  'window.__stvAssetCache',
   // The logging switch (off by default) and the two things that make it
   // permanent: its keychain-mirrored store key, and the "view downloads" button
   // of the download-started dialog.
@@ -59,6 +62,8 @@ const REQUIRED_MARKERS = [
   'window.__stvPageRepairInstalled',
   'window.__stvCommentTranslateInstalled',
   'window.__stvBootShellInstalled',
+  // The reader modules the site only asks for once the reader opens.
+  'window.__stvReaderPrefetchInstalled',
   'pageflip',
 ];
 

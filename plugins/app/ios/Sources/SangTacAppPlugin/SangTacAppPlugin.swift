@@ -44,6 +44,8 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getSafeArea", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "settingsSave", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "settingsRestore", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "secretSave", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "secretLoad", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationPrepare", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationTranslate", returnType: CAPPluginReturnPromise)
@@ -274,6 +276,56 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Settings backup
 
     /**
+     Host check for the methods below that touch the keychain.
+
+     What it does: refuses the call unless the web view's *main frame* is on one
+     of the site's own domains. That closes the real case where the top frame is
+     navigated somewhere else and the bridge comes with it -- `challenges.cloudflare.com`
+     is in `allowNavigation` precisely because the login challenge may become the
+     top frame, so this is a state the app can actually be in, not a hypothetical.
+
+     What it does NOT do, and must not be described as doing: stop a script that
+     already runs inside the site's own page. Capacitor's script-message handler
+     does not check `frameInfo.isMainFrame`
+     (node_modules/@capacitor/ios/.../WebViewDelegationHandler.swift:192), and
+     `bridge.webView.url` reports the main frame, so a hostile iframe -- or
+     main-frame XSS, or a compromised third-party script -- still reports
+     `sangtacviet.com` and passes this check. The boundary that actually holds for
+     those callers is the key allow-list in `settingsSave` plus the fact that
+     `secretLoad` only ever returns the single named secret. This limitation is
+     inherent to injecting into the page at all (the optimization plan's S6 says
+     the same thing); it is not something this method can fix from inside a plugin.
+
+     `speakToFile` and the translation bridge are deliberately not gated: they
+     reach the speech synthesizer and the system translation sheet, not stored
+     state.
+
+     `trustedHosts` is kept a deliberate *superset* of
+     `capacitor.config.json`'s `allowNavigation`, so adding a domain there later
+     cannot silently start refusing the keychain to a page that is legitimately
+     the top frame.
+     */
+    private static let trustedHosts = [
+        "sangtacviet.com",
+        "sangtacviet.vip",
+        "sangtacviet.app"
+    ]
+
+    private func isTrustedCaller(_ method: String) -> Bool {
+        guard let host = bridge?.webView?.url?.host?.lowercased(), !host.isEmpty else {
+            CAPLog.print("[SangTacApp:\(method)] refused: no web view origin")
+            return false
+        }
+        let allowed = SangTacAppPlugin.trustedHosts.contains {
+            host == $0 || host.hasSuffix("." + $0)
+        }
+        if !allowed {
+            CAPLog.print("[SangTacApp:\(method)] refused for origin \(host)")
+        }
+        return allowed
+    }
+
+    /**
      The site stores its configuration in localStorage, which lives in the app's
      data container and is therefore erased by every reinstall of a sideloaded
      IPA. Keychain items are not removed when an app is deleted, so they are the
@@ -283,10 +335,40 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
      */
     private static let settingsService = "com.sangtacviet.mobilereader.settings"
 
+    /// Keys the `settingsBackup` patch is allowed to mirror. Kept in sync with
+    /// that block's KEYS / PREFIXES lists: an open key namespace would let any
+    /// script on the page fill the keychain with arbitrary entries.
+    private static let settingKeys: Set<String> = [
+        "config.reader", "config.ux", "config.comicReader", "tts.setting",
+        "readthemeset", "offlineBook", "stv.translate.settings", "stv.diag.settings"
+    ]
+    private static let settingKeyPrefixes = ["reader.style."]
+    private static let maxSettingKeyLength = 64
+    private static let maxSettingValueBytes = 512 * 1024
+
+    private static func isAllowedSettingKey(_ key: String) -> Bool {
+        if settingKeys.contains(key) { return true }
+        if key.count > maxSettingKeyLength { return false }
+        return settingKeyPrefixes.contains { key.hasPrefix($0) }
+    }
+
     @objc func settingsSave(_ call: CAPPluginCall) {
+        guard isTrustedCaller("settingsSave") else {
+            call.reject("settingsSave is not available from this origin")
+            return
+        }
         guard let key = call.getString("key"), !key.isEmpty,
               let value = call.getString("value") else {
             call.reject("Missing 'key' or 'value'")
+            return
+        }
+        guard SangTacAppPlugin.isAllowedSettingKey(key) else {
+            CAPLog.print("[SangTacApp:settings] rejected key \(key)")
+            call.reject("key not backed up by this app")
+            return
+        }
+        guard value.utf8.count <= SangTacAppPlugin.maxSettingValueBytes else {
+            call.reject("value too large for the settings backup")
             return
         }
         let query: [String: Any] = [
@@ -314,6 +396,10 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
      dynamic key (`reader.style.<name>`) needs no bookkeeping here.
      */
     @objc func settingsRestore(_ call: CAPPluginCall) {
+        guard isTrustedCaller("settingsRestore") else {
+            call.reject("settingsRestore is not available from this origin")
+            return
+        }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: SangTacAppPlugin.settingsService,
@@ -337,6 +423,102 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         CAPLog.print("[SangTacApp:settings] \(entries.count) key(s) found in keychain")
         call.resolve(["entries": entries])
+    }
+
+    // MARK: - Secret store (API keys)
+
+    /**
+     A second keychain namespace for credentials, separate from the settings
+     mirror for three reasons:
+
+       * The settings mirror is deliberately readable after a reinstall, which is
+         exactly what a credential must not be. This service uses
+         `AfterFirstUnlockThisDeviceOnly`, so the item is excluded from iCloud and
+         iTunes backups and never migrates to another device.
+       * The translate settings record is mirrored wholesale into that backup, so
+         a key stored inside it would ride along. The record now keeps only
+         `hasApiKey`; the value lives here and is fetched on demand.
+       * Keeping it out of `settingsRestore` means the bulk restore can never
+         replay a stale credential over a newer one.
+     */
+    private static let secretService = "com.sangtacviet.mobilereader.secrets"
+    private static let maxSecretKeyLength = 64
+    private static let maxSecretValueBytes = 8 * 1024
+
+    private static func secretQuery(key: String) -> [String: Any] {
+        return [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: secretService,
+            kSecAttrAccount as String: key
+        ]
+    }
+
+    /// `value: ""` clears the item, so the JS side needs no third method. A
+    /// *missing* `value` is rejected rather than treated as empty: otherwise a
+    /// malformed `secretSave({key})` would silently delete the stored key.
+    @objc func secretSave(_ call: CAPPluginCall) {
+        guard isTrustedCaller("secretSave") else {
+            call.reject("secretSave is not available from this origin")
+            return
+        }
+        guard let key = call.getString("key"), !key.isEmpty,
+              key.count <= SangTacAppPlugin.maxSecretKeyLength else {
+            call.reject("Missing or oversized 'key'")
+            return
+        }
+        guard let value = call.getString("value") else {
+            call.reject("Missing 'value'")
+            return
+        }
+        guard value.utf8.count <= SangTacAppPlugin.maxSecretValueBytes else {
+            call.reject("secret too large")
+            return
+        }
+        let query = SangTacAppPlugin.secretQuery(key: key)
+        SecItemDelete(query as CFDictionary)
+        if value.isEmpty {
+            call.resolve(["value": true, "stored": false])
+            return
+        }
+        var insert = query
+        insert[kSecValueData as String] = Data(value.utf8)
+        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(insert as CFDictionary, nil)
+        if status == errSecSuccess {
+            call.resolve(["value": true, "stored": true, "bytes": value.count])
+        } else {
+            CAPLog.print("[SangTacApp:secret] keychain write failed for \(key): \(status)")
+            call.reject("keychain write failed (\(status))")
+        }
+    }
+
+    /// Returns `{value: ""}` when nothing is stored; the caller treats an empty
+    /// value as "no key configured" rather than as an error.
+    @objc func secretLoad(_ call: CAPPluginCall) {
+        guard isTrustedCaller("secretLoad") else {
+            call.reject("secretLoad is not available from this origin")
+            return
+        }
+        guard let key = call.getString("key"), !key.isEmpty,
+              key.count <= SangTacAppPlugin.maxSecretKeyLength else {
+            call.reject("Missing or oversized 'key'")
+            return
+        }
+        var query = SangTacAppPlugin.secretQuery(key: key)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound {
+            call.resolve(["value": ""])
+            return
+        }
+        guard status == errSecSuccess, let data = item as? Data else {
+            CAPLog.print("[SangTacApp:secret] keychain read failed for \(key): \(status)")
+            call.reject("keychain read failed (\(status))")
+            return
+        }
+        call.resolve(["value": String(data: data, encoding: .utf8) ?? ""])
     }
 
     // MARK: - Offline translation (iOS 18+)

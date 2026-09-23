@@ -11,8 +11,6 @@
     "allowNavigation": [
       "sangtacviet.com",
       "*.sangtacviet.com",
-      "sangtacviet.vip",
-      "*.sangtacviet.vip",
       "sangtacviet.app",
       "*.sangtacviet.app",
       "challenges.cloudflare.com"

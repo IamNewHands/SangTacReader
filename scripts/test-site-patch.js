@@ -358,10 +358,15 @@ function makeSandbox(options) {
       return true;
     },
   };
+  const windowListeners = {};
   const window = {
     innerHeight: 800,
     innerWidth: 400,
-    addEventListener() {},
+    // Recorded, not ignored: the reader-prefetch block waits for the window's
+    // `load` event (the document's own listeners are separate).
+    addEventListener(type, handler) {
+      windowListeners[type] = (windowListeners[type] || []).concat([handler]);
+    },
     removeEventListener() {},
     getComputedStyle: (element) => ({
       getPropertyValue: (name) => (element.style && element.style.getPropertyValue
@@ -405,14 +410,16 @@ function makeSandbox(options) {
   vm.createContext(sandbox);
   sandbox.__dom = { byId, store, head };
   // The page-repair block installs a capture-phase click listener on document;
-  // the tests need to be able to fire it.
+  // the tests need to be able to fire it. Window listeners are fired too, so a
+  // `load`-driven block can be exercised.
   sandbox.__dispatch = (type, event) => {
     for (const handler of listeners[type] || []) { handler(event); }
+    for (const handler of windowListeners[type] || []) { handler(event); }
   };
   sandbox.__listenerCount = (type) => (listeners[type] || []).length;
   // Minimal MutationObserver: it records the observed node and the callback so a
-  // test can flush it by hand. Only the comment-translation block uses one, and
-  // it is how a comment that arrives after the first render gets decorated.
+  // test can flush it by hand. The comment-translation sweep and the boot
+  // shell's stylesheet watch both use one.
   const observers = [];
   sandbox.MutationObserver = class {
     constructor(callback) {
@@ -466,6 +473,10 @@ function installFakeApp(sandbox, options) {
   const calls = [];
   const stored = {};
   const keychain = Object.assign({}, options.keychain || {});
+  // A second namespace, mirroring the native plugin: the settings backup is
+  // readable after a reinstall, the secret store is not, and the API key lives
+  // only in the latter (see SangTacAppPlugin.secretSave / secretLoad).
+  const secrets = Object.assign({}, options.secrets || {});
   const posts = [];
   // Chapter requests the fake holds open, so a test can keep the download loop in
   // flight and then release it. `releaseChapters(true)` also lets every later
@@ -794,6 +805,7 @@ function installFakeApp(sandbox, options) {
   sandbox.__stored = stored;
   sandbox.__posts = posts;
   sandbox.__keychain = keychain;
+  sandbox.__secrets = secrets;
 
   sandbox.Capacitor = {
     Plugins: {
@@ -820,11 +832,39 @@ function installFakeApp(sandbox, options) {
           return Promise.resolve(options.safeArea || { top: 62, bottom: 34, left: 0, right: 0 });
         },
         settingsSave(payload) {
+          // `settingsSaveRejects` models the native key allow-list / size cap,
+          // which rejects rather than silently dropping the backup.
+          const rejects = options.settingsSaveRejects;
+          const rejected = Array.isArray(rejects) ? rejects.indexOf(payload.key) >= 0
+            : (typeof rejects === 'function' ? rejects(payload) : false);
+          if (rejected) {
+            return Promise.reject(new Error('key not backed up by this app'));
+          }
           keychain[payload.key] = payload.value;
           return Promise.resolve({ value: true });
         },
         settingsRestore() {
+          // `settingsRestoreFails` models the native origin guard refusing the
+          // call (or a transient keychain error) for the first N attempts.
+          if ((options.settingsRestoreFails || 0) > 0) {
+            options.settingsRestoreFails -= 1;
+            return Promise.reject(new Error('settingsRestore is not available from this origin'));
+          }
           return Promise.resolve({ entries: Object.assign({}, keychain) });
+        },
+        // The API key never goes through settingsSave: app.storage is plaintext
+        // and the settings mirror rides into backups, so the key has its own
+        // this-device-only item. An empty value clears it.
+        secretSave(payload) {
+          (stored.secretSave || (stored.secretSave = [])).push(payload);
+          if (!payload.value) { delete secrets[payload.key]; }
+          else { secrets[payload.key] = payload.value; }
+          return Promise.resolve({ value: true, stored: !!payload.value });
+        },
+        secretLoad(payload) {
+          (stored.secretLoad || (stored.secretLoad = [])).push(payload);
+          const value = secrets[payload.key];
+          return Promise.resolve({ value: typeof value === 'string' ? value : '' });
         },
         // Apple's Translation framework, reached through the always-present
         // selectors. Defaults model an iOS 18+ device with the pack installed.
@@ -853,6 +893,12 @@ function installFakeApp(sandbox, options) {
             return Promise.resolve(options.httpResponse(String(payload.url), payload));
           }
           return Promise.reject(new Error('no Http stub for ' + payload.url));
+        },
+        // The diag block pushes the logging switch to the native side so it can
+        // skip building diagnostic lines at all.
+        setDiagnostics(payload) {
+          (stored.setDiagnostics || (stored.setDiagnostics = [])).push(payload);
+          return Promise.resolve({ enabled: !!payload.enabled });
         },
       },
     },
@@ -1502,6 +1548,30 @@ async function testBootShell() {
   check('the boot timeline is reported',
     String(diag).indexOf('[BOOT]') >= 0 && String(diag).indexOf('shell released') >= 0,
     String(diag).slice(-200));
+
+  // Deterministic release: a stylesheet that arrives at 1.1s must take the shell
+  // down then, not at the 3s sample.
+  const early = makeSandbox();
+  installFakeApp(early, { displayType: 'auto' });
+  // Model document start, where the site's own app object does not exist yet --
+  // otherwise `app.config.reader` is a release signal on its own and the
+  // stylesheet path would never be exercised.
+  delete early.window.app.config.reader;
+  vm.runInContext(loadBlocks().join('\n'), early);
+  const earlyRoot = early.document.documentElement;
+  const sheet = makeElement('link');
+  early.document.head.appendChild(sheet);
+  early.__flushObservers();
+  check('the shell stays up while the site stylesheet is still missing',
+    String(earlyRoot.className).indexOf('stv-boot') >= 0, String(earlyRoot.className));
+
+  early.document.styleSheets.push({ href: 'https://sangtacviet.app/asset/app.v2.css?v=4' });
+  sheet.__fire('load', {});
+  check('a stylesheet link that fires load releases the shell immediately',
+    String(earlyRoot.className).indexOf('stv-boot') < 0, String(earlyRoot.className));
+  check('the early release names the signal that fired',
+    String(early.window.__stvDiag.text()).indexOf('link load') >= 0,
+    String(early.window.__stvDiag.text()).slice(-200));
 }
 
 async function testCommentButton() {
@@ -1800,6 +1870,79 @@ async function testDomainFailover() {
   check('later chapters go straight to the working mirror',
     String(second.code) === '0' && served.length === 1 && served[0] === good,
     JSON.stringify(served));
+
+  // The remembered mirror: the next launch must not re-run the ping race and
+  // land on the mirror that answers code 7 to every chapter.
+  const mirrorOptions = () => ({
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: bad, status: 'alive', ping: 100 },
+        { name: good, status: 'alive', ping: 400 },
+      ],
+      defaultDomains: [good, bad, 'https://sangtacviet.app'],
+    },
+  });
+
+  const warm = makeSandbox();
+  warm.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: good, at: Date.now() }));
+  const warmApp = installFakeApp(warm, mirrorOptions());
+  const warmServed = [];
+  warmApp.reader.getContent = function () {
+    const domain = warmApp.net.networkManager.bestDomain();
+    warmServed.push(domain);
+    return Promise.resolve(domain === bad ? { code: 7 } : { code: 0, data: 'chapter' });
+  };
+  vm.runInContext(loadBlocks().join('\n'), warm);
+  await tick(300);
+  check('a remembered mirror is used without re-running the ping race',
+    warmApp.net.networkManager.bestDomain() === good,
+    warmApp.net.networkManager.bestDomain());
+  const warmData = await warmApp.reader.getContent('qidian', '1', 'c1');
+  check('the first chapter goes straight to the remembered mirror',
+    String(warmData.code) === '0' && warmServed.length === 1 && warmServed[0] === good,
+    JSON.stringify(warmServed));
+
+  // Expired: the site's own race is the only source of truth again.
+  const stale = makeSandbox();
+  stale.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: good, at: Date.now() - (7 * 60 * 60 * 1000) }));
+  const staleApp = installFakeApp(stale, mirrorOptions());
+  vm.runInContext(loadBlocks().join('\n'), stale);
+  await tick(300);
+  check('an expired remembered mirror is ignored',
+    staleApp.net.networkManager.bestDomain() === bad,
+    staleApp.net.networkManager.bestDomain());
+
+  // A forged entry pointing somewhere the site does not know is ignored, so a
+  // tampered localStorage cannot redirect the app to another origin.
+  const forged = makeSandbox();
+  forged.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: 'https://evil.example', at: Date.now() }));
+  const forgedApp = installFakeApp(forged, mirrorOptions());
+  vm.runInContext(loadBlocks().join('\n'), forged);
+  await tick(300);
+  check('a remembered mirror outside the site list is ignored',
+    forgedApp.net.networkManager.bestDomain() === bad,
+    forgedApp.net.networkManager.bestDomain());
+
+  // A mirror that answered code 7 must not stay remembered.
+  const poisoned = makeSandbox();
+  poisoned.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: bad, at: Date.now() }));
+  const poisonedApp = installFakeApp(poisoned, mirrorOptions());
+  poisonedApp.reader.getContent = function () {
+    const domain = poisonedApp.net.networkManager.bestDomain();
+    return Promise.resolve(domain === bad ? { code: 7 } : { code: 0, data: 'chapter' });
+  };
+  vm.runInContext(loadBlocks().join('\n'), poisoned);
+  await tick(300);
+  const recovered = await poisonedApp.reader.getContent('qidian', '1', 'c1');
+  check('a remembered mirror that fails is dropped',
+    String(recovered.code) === '0'
+      && poisoned.localStorage.getItem('stv.domain.good').indexOf(bad) < 0,
+    String(poisoned.localStorage.getItem('stv.domain.good')));
 
   // Two bad mirrors in front of a good one: the retry walks past both in a
   // single read instead of handing the first code 7 back to the site.
@@ -2973,6 +3116,47 @@ async function testSettingsBackup() {
   await tick(50);
   check('a cached chapter is not mirrored', write.__keychain['chaptercache.1'] === undefined);
 
+  // The native side refuses keys outside its allow-list and values over its size
+  // cap. A swallowed rejection would look exactly like "this setting was never
+  // backed up", so it has to reach the panel.
+  const refused = makeSandbox();
+  const refusedApp = installFakeApp(refused, {
+    displayType: 'auto',
+    settingsSaveRejects: ['config.reader'],
+  });
+  vm.runInContext(loadBlocks().join('\n'), refused);
+  await tick(250);
+  await refusedApp.storage.set('config.reader', '{"display_type":"pageflip"}');
+  await refusedApp.storage.set('config.reader', '{"display_type":"pageflip"}');
+  await tick(60);
+  check('a refused keychain backup is not silently dropped',
+    refused.__keychain['config.reader'] === undefined);
+  const refusedDiag = String(refused.window.__stvDiag.text());
+  check('the refusal is reported to the panel',
+    refusedDiag.indexOf('keychain backup refused config.reader') >= 0,
+    refusedDiag.slice(-240));
+  check('the refusal is reported once per key, not once per write',
+    refusedDiag.split('keychain backup refused config.reader').length - 1 === 1,
+    refusedDiag.slice(-240));
+
+  // A single refusal from the native origin guard must not latch "already
+  // restored" and cost the whole page load its backup.
+  const retry = makeSandbox();
+  installFakeApp(retry, {
+    displayType: 'auto',
+    settingsRestoreFails: 1,
+    keychain: { 'config.reader': '{"display_type":"pageflip","show_title":false}' },
+  });
+  vm.runInContext(loadBlocks().join('\n'), retry);
+  await tick(400);
+  check('a refused restore is retried instead of being given up on',
+    retry.localStorage.getItem('config.reader')
+      === '{"display_type":"pageflip","show_title":false}',
+    String(retry.localStorage.getItem('config.reader')));
+  check('the refusal itself is reported',
+    String(retry.window.__stvDiag.text()).indexOf('settingsRestore failed') >= 0,
+    String(retry.window.__stvDiag.text()).slice(-240));
+
   // The download list lives in the same store under the objectStore key
   // (app.v2.read.js:3189). Losing it loses every downloaded book's row, so it is
   // mirrored and restored alongside the settings.
@@ -3502,12 +3686,23 @@ async function testCommentTranslate() {
     pickers[0].textContent);
 
   const keyField = panel.querySelectorAll('.stv-translate-key')[0];
+  check('the panel never echoes a stored key back into the DOM',
+    keyField.value === '', JSON.stringify(keyField.value));
   keyField.value = 'key-123';
   click(panel.querySelectorAll('.stv-translate-save')[0]);
   await tick(80);
   const saved = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
-  check('the panel saves the engine and the key',
-    saved.engine === 'free' && saved.apiKey === 'key-123', JSON.stringify(saved));
+  check('the panel saves the engine', saved.engine === 'free', JSON.stringify(saved));
+  check('the key is NOT written to app.storage',
+    saved.apiKey === '', JSON.stringify(saved.apiKey));
+  check('app.storage only records that a key exists',
+    saved.hasApiKey === true, JSON.stringify(saved.hasApiKey));
+  check('the key went to the secret store instead',
+    sandbox.__secrets['translate.apiKey'] === 'key-123',
+    JSON.stringify(sandbox.__secrets));
+  check('the key field is emptied again after saving',
+    keyField.value === '' && keyField.placeholder.indexOf('已保存') === 0,
+    JSON.stringify(keyField.value) + ' / ' + keyField.placeholder);
 
   click(panel.querySelectorAll('.stv-translate-test')[0]);
   await tick(150);
@@ -3597,8 +3792,10 @@ async function testCommentTranslateProviders() {
       engine: 'google',
       extra: { apiKey: 'google-key' },
       texts: (payload) => JSON.parse(payload.data).q,
-      url: 'https://translation.googleapis.com/language/translate/v2?key=google-key',
-      headers: () => true,
+      // The key must NOT be in the query string: the native Http plugin writes
+      // every request URL into the diagnostic panel, which has a COPY button.
+      url: 'https://translation.googleapis.com/language/translate/v2',
+      headers: (headers) => headers['X-goog-api-key'] === 'google-key',
       answer: (texts) => ({ status: 200, data: { data: { translations: texts.map((text) => ({ translatedText: '【谷歌】' + text })) } } }),
       marker: '【谷歌】',
     },
@@ -3672,6 +3869,391 @@ async function testCommentTranslateProviders() {
   }
 }
 
+/**
+ * The API key is the one setting that must not sit in app.storage -- that store
+ * is plaintext inside the app container and `settingsBackup` mirrors all of it
+ * into the keychain backup -- and must never be echoed back into the DOM, which
+ * shares a JS context with the site's own scripts.
+ */
+async function testTranslateKeyStorage() {
+  console.log('translate API key storage');
+
+  const openPanel = async (sandbox, settingsFixture) => {
+    sandbox.app.pushPage('pagesetting', {});
+    await tick(40);
+    const entry = settingsFixture.content.querySelectorAll('.stv-translate-entry');
+    click(entry[0]);
+    await tick(60);
+    return sandbox.document.getElementById('stv-translate-panel');
+  };
+
+  // An install that predates this change kept the key in plaintext.
+  const fixture = settingsPageFixture();
+  const sandbox = makeSandbox();
+  sandbox.localStorage.setItem('stv.translate.settings', JSON.stringify({
+    engine: 'google', apiKey: 'legacy-plaintext-key', region: '', endpoint: '',
+    model: '', readSource: 'vi', readTarget: 'zh-Hans', writeTarget: 'vi', auto: false,
+  }));
+  const http = [];
+  installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { pagesetting: fixture.page },
+    httpResponse: (url, payload) => {
+      http.push({ url, headers: payload.headers });
+      return {
+        status: 200,
+        data: { data: { translations: [{ translatedText: '【谷歌】ok' }] } },
+      };
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  const panel = await openPanel(sandbox, fixture);
+  check('the translation panel opens', !!panel);
+  if (!panel) { return; }
+
+  const migrated = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
+  check('a legacy plaintext key is moved into the secret store',
+    sandbox.__secrets['translate.apiKey'] === 'legacy-plaintext-key',
+    JSON.stringify(sandbox.__secrets));
+  check('the plaintext copy is rewritten out of app.storage',
+    migrated.apiKey === '' && migrated.hasApiKey === true, JSON.stringify(migrated));
+
+  const keyField = panel.querySelectorAll('.stv-translate-key')[0];
+  check('the stored key is not echoed into the DOM',
+    keyField.value === '', JSON.stringify(keyField.value));
+  check('the key field says a key is already saved',
+    keyField.placeholder.indexOf('已保存') === 0, keyField.placeholder);
+
+  // Saving with the field left empty must keep the key: the field is always
+  // empty when a key is stored, so "empty" cannot mean "delete".
+  click(panel.querySelectorAll('.stv-translate-save')[0]);
+  await tick(80);
+  check('saving an untouched panel keeps the stored key',
+    sandbox.__secrets['translate.apiKey'] === 'legacy-plaintext-key',
+    JSON.stringify(sandbox.__secrets));
+  check('and keeps the hasApiKey marker set',
+    JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}').hasApiKey === true,
+    sandbox.localStorage.getItem('stv.translate.settings'));
+
+  // Typing a new key replaces it, and the field is masked again afterwards.
+  keyField.value = 'replacement-key';
+  click(panel.querySelectorAll('.stv-translate-save')[0]);
+  await tick(80);
+  check('a typed key replaces the stored one',
+    sandbox.__secrets['translate.apiKey'] === 'replacement-key',
+    JSON.stringify(sandbox.__secrets));
+  check('the field is emptied again after saving',
+    keyField.value === '', JSON.stringify(keyField.value));
+  check('the replacement key never reaches app.storage',
+    JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}').apiKey === '',
+    sandbox.localStorage.getItem('stv.translate.settings'));
+
+  // The field is empty whenever a key is stored, so 测试 must resolve it to the
+  // stored key rather than testing the engine without one.
+  keyField.value = '';
+  click(panel.querySelectorAll('.stv-translate-test')[0]);
+  await tick(120);
+  check('the 测试 button uses the stored key, not an empty one',
+    http.length === 1 && http[0].headers['X-goog-api-key'] === 'replacement-key',
+    JSON.stringify(http.map((call) => call.headers)));
+
+  // 清除 is the only thing that removes it.
+  click(panel.querySelectorAll('.stv-translate-key-clear')[0]);
+  click(panel.querySelectorAll('.stv-translate-save')[0]);
+  await tick(80);
+  check('清除 removes the key from the secret store',
+    sandbox.__secrets['translate.apiKey'] === undefined,
+    JSON.stringify(sandbox.__secrets));
+  check('清除 clears the hasApiKey marker',
+    JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}').hasApiKey === false,
+    sandbox.localStorage.getItem('stv.translate.settings'));
+}
+
+/**
+ * The site sends Cache-Control: max-age=86400 for /asset/* and then defeats it
+ * by appending Math.random() to the URL of every bundle on the critical path
+ * (_page_vip.html:5207-5211 and :3066), so the disk cache can never hit.
+ */
+async function testAssetCacheStabiliser() {
+  console.log('asset cache-buster stabiliser');
+
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { appLanguage: 'zh' });
+  // The real web view has these; the stub has to model them for the property
+  // hooks to be exercised at all.
+  // The sandbox keeps a separate `window` object from the vm global (see
+  // makeSandbox), and the blocks reach the DOM through `window.*`.
+  const view = sandbox.window;
+  const accessor = (store) => ({
+    configurable: true,
+    enumerable: true,
+    get() { return store.value || ''; },
+    set(value) { store.value = String(value); },
+  });
+  const scriptSrc = {};
+  const linkHref = {};
+  view.HTMLScriptElement = function () {};
+  view.HTMLScriptElement.prototype = {};
+  Object.defineProperty(view.HTMLScriptElement.prototype, 'src', accessor(scriptSrc));
+  view.HTMLLinkElement = function () {};
+  view.HTMLLinkElement.prototype = {};
+  Object.defineProperty(view.HTMLLinkElement.prototype, 'href', accessor(linkHref));
+  view.Element = function () {};
+  view.Element.prototype = {
+    setAttribute(name, value) {
+      this.attrs = this.attrs || {};
+      this.attrs[name] = String(value);
+    },
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  const cache = view.__stvAssetCache;
+  check('the asset cache block is installed', !!cache);
+  if (!cache) { return; }
+  check('it hooked every insertion path it could find', cache.hooks >= 3,
+    String(cache.hooks));
+  check('the token is stable within a load', cache.token === cache.token,
+    cache.token);
+
+  const stable = cache.token;
+  // The four cache-busted URLs the shell actually builds.
+  check('a random query on a bundle is replaced with the stable token',
+    cache.stabilize('/asset/app.v2.js?0.84921') === '/asset/app.v2.js?' + stable,
+    cache.stabilize('/asset/app.v2.js?0.84921'));
+  check('the ?r= cache-buster on the stylesheet is replaced too',
+    cache.stabilize('/asset/app.v2.css?r=0.331') === '/asset/app.v2.css?r=' + stable,
+    cache.stabilize('/asset/app.v2.css?r=0.331'));
+  check('the bookdisplay bundle is stabilised',
+    cache.stabilize('/asset/app.v2.bookdisplay.js?0.77')
+      === '/asset/app.v2.bookdisplay.js?' + stable,
+    cache.stabilize('/asset/app.v2.bookdisplay.js?0.77'));
+  check('a second random value maps to the same URL',
+    cache.stabilize('/asset/app.v2.js?0.111') === cache.stabilize('/asset/app.v2.js?0.999'),
+    cache.stabilize('/asset/app.v2.js?0.111') + ' vs '
+      + cache.stabilize('/asset/app.v2.js?0.999'));
+
+  // The site's real version numbers are its version contract.
+  check('a real version number is left alone',
+    cache.stabilize('/stv.ui.js?v=1.360') === '/stv.ui.js?v=1.360',
+    cache.stabilize('/stv.ui.js?v=1.360'));
+  check('a ?v2 bundle version is left alone',
+    cache.stabilize('/asset/app.v2.db.js?v2') === '/asset/app.v2.db.js?v2',
+    cache.stabilize('/asset/app.v2.db.js?v2'));
+  check('a tts bundle version is left alone',
+    cache.stabilize('/stv.tts.js?v=7') === '/stv.tts.js?v=7',
+    cache.stabilize('/stv.tts.js?v=7'));
+  check('a URL outside /asset/ is untouched',
+    cache.stabilize('/mobile/bookinfo.php?bookid=1') === '/mobile/bookinfo.php?bookid=1',
+    cache.stabilize('/mobile/bookinfo.php?bookid=1'));
+  check('a cover image URL is untouched',
+    cache.stabilize('https://img.sangtacviet.com/a/b.jpg?0.5')
+      === 'https://img.sangtacviet.com/a/b.jpg?0.5',
+    cache.stabilize('https://img.sangtacviet.com/a/b.jpg?0.5'));
+  check('a non-string is passed straight through', cache.stabilize(null) === null);
+
+  // The property hook: stv.ui.js appends the <script> and only then assigns
+  // .src, so the setter is the hook that has to do the work.
+  const script = new view.HTMLScriptElement();
+  script.src = '/asset/app.v2.js?0.4242';
+  check('assigning <script>.src after insertion still gets stabilised',
+    script.src === '/asset/app.v2.js?' + stable, script.src);
+  const link = new view.HTMLLinkElement();
+  link.href = '/asset/app.v2.css?r=0.9';
+  check('assigning <link>.href is stabilised',
+    link.href === '/asset/app.v2.css?r=' + stable, link.href);
+
+  // The setAttribute path, which is how the shell builds the stylesheet link.
+  const node = new view.Element();
+  node.setAttribute('href', '/asset/app.v2.css?r=0.5');
+  check('setAttribute href is stabilised',
+    node.attrs.href === '/asset/app.v2.css?r=' + stable, node.attrs.href);
+  const other = new view.Element();
+  other.setAttribute('data-x', '0.5');
+  check('setAttribute on anything else is untouched',
+    other.attrs['data-x'] === '0.5', other.attrs['data-x']);
+
+  // A forced refresh must move every URL, not just today's.
+  view.location = { reload() { sandbox.__reloaded = true; } };
+  cache.refresh();
+  check('强制刷新 reloads the page', sandbox.__reloaded === true);
+  const after = makeSandbox();
+  after.localStorage.setItem('stv.asset.generation', '2');
+  installFakeApp(after, { appLanguage: 'zh' });
+  vm.runInContext(loadBlocks().join('\n'), after);
+  await tick(60);
+  check('a forced refresh changes the token',
+    after.window.__stvAssetCache.token !== stable,
+    after.window.__stvAssetCache.token + ' vs ' + stable);
+}
+
+/**
+ * The injection order is a performance contract, not a style choice: every
+ * block is a WKUserScript at document start, so the whole list parses and runs
+ * before the page's first inline script. The blocks the first frame needs have
+ * to come before the heavy page-specific ones, or the fake shell cannot paint
+ * until ~285KB of injected JavaScript has been parsed.
+ *
+ * Nothing else in the build would notice a block being dropped from the list,
+ * listed twice, or moved back to the end.
+ */
+function testInjectionOrder() {
+  console.log('injection order');
+
+  const swift = fs.readFileSync(path.join(TARGET_DIR, 'SitePatch.swift'), 'utf8');
+  const declared = [...swift.matchAll(/static let (\w+) = """/g)].map((m) => m[1]);
+  const allMatch = swift.match(/static let all: \[String\] = \[([\s\S]*?)\]/);
+  check('SitePatch declares the injection list', !!allMatch);
+  if (!allMatch) { return; }
+
+  const raw = allMatch[1];
+  const listed = raw.split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => entry.replace(/^SiteI18nData[.]/, ''));
+
+  check('every declared block is injected',
+    declared.every((name) => listed.indexOf(name) >= 0),
+    declared.filter((name) => listed.indexOf(name) < 0).join(', '));
+  check('no block is injected twice',
+    listed.length === new Set(listed).size, listed.join(', '));
+  check('the generated i18n overlay is injected',
+    /SiteI18nData[.]script/.test(raw));
+
+  check('compat runs first, because the site calls nativeclick unguarded',
+    listed[0] === 'compat', listed[0]);
+  check('the asset URL hooks are installed before anything creates elements',
+    listed[1] === 'assetCache', listed[1]);
+  check('diag runs before every block that logs through it',
+    listed[2] === 'diag', listed[2]);
+
+  const bootCritical = ['compat', 'assetCache', 'diag', 'storageAccessor',
+    'readerDefaults', 'safeArea', 'domainFailover', 'bootShell'];
+  check('the boot-critical blocks are a prefix of the injection list',
+    bootCritical.every((name, index) => listed[index] === name),
+    listed.slice(0, bootCritical.length).join(', '));
+  check('the shell is injected before the page-specific heavy blocks',
+    listed.indexOf('bootShell') < listed.indexOf('pageRepair')
+      && listed.indexOf('bootShell') < listed.indexOf('commentTranslate'),
+    listed.join(', '));
+}
+
+/**
+ * The reader's four modules are only requested once the reader opens, each
+ * behind its own TTFB (app.v2.js:3943, app.v2.read.js:237/:2341,
+ * _page_vip.html:4546). They are prefetched once the home screen has painted.
+ */
+async function testReaderPrefetch() {
+  console.log('reader module prefetch');
+
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { appLanguage: 'zh' });
+  // The site's own loader, with the real de-duplication rule: `stack` is keyed
+  // on the URL as passed, BEFORE `nocache` is appended.
+  const loaded = [];
+  sandbox.window.ui = {
+    scriptmanager: {
+      stack: {},
+      load(url, onload) {
+        if (url in this.stack) {
+          if (onload) { onload(); }
+          return;
+        }
+        loaded.push(url);
+        this.stack[url] = Promise.resolve();
+        if (onload) { onload(); }
+      },
+    },
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  check('nothing is prefetched before the page has loaded',
+    loaded.length === 0, JSON.stringify(loaded));
+
+  sandbox.__dispatch('load', {});
+  await tick(1600);
+
+  check('the reader modules are prefetched after load',
+    loaded.length === 4, JSON.stringify(loaded));
+  check('app.v2.read.js is prefetched',
+    loaded.indexOf('/asset/app.v2.read.js') >= 0, JSON.stringify(loaded));
+  check('chapterdisplay is prefetched with the same key the site uses',
+    loaded.indexOf('/asset/app.v2.chapterdisplay.js') >= 0, JSON.stringify(loaded));
+  check('the tts module keeps its real version number',
+    loaded.indexOf('/stv.tts.js?v=7') >= 0, JSON.stringify(loaded));
+  check('hanviet.js is prefetched',
+    loaded.indexOf('/hanviet.js') >= 0, JSON.stringify(loaded));
+  check('the prefetch is reported',
+    String(sandbox.window.__stvDiag.text()).indexOf('[PREFETCH]') >= 0,
+    String(sandbox.window.__stvDiag.text()).slice(-160));
+
+  // The site's own later request must be served from `stack`, not refetched.
+  sandbox.window.ui.scriptmanager.load('/asset/app.v2.read.js', function () {});
+  check('the site\'s own later load is de-duplicated against the prefetch',
+    loaded.length === 4, JSON.stringify(loaded));
+}
+
+/**
+ * The native Http plugin ships its diagnostic lines in batches, pre-formatted as
+ * "[TAG] message", through `window.__stvDiag.logBatch`. If that entry point is
+ * missing the call throws inside `evaluateJavaScript` and every `[Http]` line
+ * disappears from the panel silently. The logging switch has to reach the native
+ * side too, or the hot-path gate stays closed and the lines are never built.
+ */
+async function testNativeDiagnosticsBridge() {
+  console.log('native diagnostics bridge');
+
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { appLanguage: 'zh' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  const diag = sandbox.window.__stvDiag;
+  check('the panel exports the batch entry point the native side calls',
+    !!diag && typeof diag.logBatch === 'function');
+
+  diag.logBatch(['[Http] GET /mobile/bookinfo.php -> 200 1234b',
+    '[ERR] GET /x -> 500']);
+  const text = String(diag.text());
+  check('a native batch is appended to the buffer',
+    text.indexOf('[Http] GET /mobile/bookinfo.php -> 200 1234b') >= 0,
+    text.slice(-200));
+  check('a native line tagged ERR is recorded as an error',
+    text.indexOf('[ERR] GET /x -> 500') >= 0, text.slice(-200));
+
+  const pushes = sandbox.__stored.setDiagnostics || [];
+  check('the panel tells the native side the switch is on',
+    pushes.length >= 1 && pushes[0].enabled === true, JSON.stringify(pushes));
+
+  diag.setEnabled(false);
+  await tick(20);
+  const off = (sandbox.__stored.setDiagnostics || []).slice(-1)[0];
+  check('switching logging off tells the native side too',
+    !!off && off.enabled === false, JSON.stringify(off));
+
+  // With the switch off the native side still sends failures, marked `forced`.
+  // Those are kept (bounded, and the whole point of a bug report) while the
+  // per-request firehose is dropped.
+  diag.logBatch(['[Http] late line']);
+  check('a non-forced batch arriving while logging is off is dropped',
+    String(diag.text()).indexOf('late line') < 0, String(diag.text()).slice(-200));
+  diag.logBatch(['[ERR] GET /x FAILED'], true);
+  check('a forced failure batch is kept while logging is off',
+    String(diag.text()).indexOf('[ERR] GET /x FAILED') >= 0,
+    String(diag.text()).slice(-200));
+
+  // Turning it on shows what was collected.
+  diag.setEnabled(true);
+  await tick(20);
+  check('turning logging on surfaces the failures collected while it was off',
+    String(diag.text()).indexOf('[ERR] GET /x FAILED') >= 0,
+    String(diag.text()).slice(-200));
+}
+
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -3711,6 +4293,11 @@ await testBootShell();
   await testTranslateAllWaitsForTheList();
   await testAutoTranslateWaitsForTheList();
   await testCommunityBoardTranslate();
+  await testTranslateKeyStorage();
+  await testAssetCacheStabiliser();
+  testInjectionOrder();
+  await testReaderPrefetch();
+  await testNativeDiagnosticsBridge();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
