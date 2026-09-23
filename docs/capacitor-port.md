@@ -59,7 +59,7 @@
 5. ~~旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）~~ —— **已退役**（2026-09-22，新构建多轮真机验证通过后删除，含它打包的 `www/` 资源与 `tests/` 下的一次性探测脚本）。旧实现仍可从 git 历史取回。
 6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）；`tabProbe` 同批退役，见 §6.11 (4)。
 7. 站点 `filterDownloadingChapters`（`read.js:3445`）参数遮蔽导致跨任务去重失效 —— 低危、未改（改动会牵动 `total` 口径，见 §6.11 (2)）。
-8. 储物袋顶部 tab 的错位成因未定（`/stv.ui.js` 不在仓库，几何算式看不到）——已加 `tabProbe` 探针，等一份真机日志，见 §6.11 (4)。
+8. ~~储物袋顶部 tab 的错位成因未定~~ —— **已定性**：不是位移错位，是末页「Đang kích hoạt」本来就没有数据（服务端 `act` 为空数组，见 §6.11/§6.12 (6)）。`tabProbe` 探针已补 `panes`/`activate`，若后续发现该有数据再收口。
 
 ## 6. 真机问题档案
 
@@ -1059,4 +1059,140 @@ for (...) { addedElements[i].style.height = h + "px"; }
 `check-ios-shim`（16 块 / 154877 字节 / 19 markers）、`test-site-patch`（175 条断言，新增
 `site storage accessor` 9 条、`download range dialog` 8 条、`download task lifecycle` 7 条、
 `grid tap targets` 4 条、`inventory tab probe` 5 条）、`gen-site-i18n --check`
+（458 labels / 35 fragments）全绿。
+
+### 6.12 第十一轮反馈（`日志2.txt`，321 行）：下载来源/归类/节奏、历史网格、键盘遮挡
+
+上一轮的四项按预期收口，日志直接给出证据：
+
+```
+[STORAGE] app.storage.get reads the Preferences result properly
+[SETTINGS] keychain restore: 0 written, 8 kept [… offlineBook:260 …]
+[DOWNLOAD] range dialog defaulted to 1-310
+[DOWNLOAD] range 1-10 of 310 -> 10 chapter(s)
+```
+
+存储读取口修好之后，"存储为空"变成"8 个键全部 kept" —— 设置与下载记录现在是站点自己读回来的，
+Keychain 只是兜底。
+
+#### (0) 先修我上一轮引入的回归
+
+```
+[ERR] onerror TypeError: null is not an object (evaluating 'pop.q(`.${template.focus}`).focus') @app.v2.js:2254
+```
+
+`app.context.popup()` 会无保护地对 `template.focus` 取元素并 `.focus()`
+（app.v2.js:2252-2257）。上一轮把第二个输入框改名成 `numend`，但
+`app.context.menu.downloadchapter.focus` 还是旧章数字段的 `"total"`，于是每次打开下载框都抛一次。
+现在 `focus = 'numend'`。
+
+#### (1) 下载来源：站点早就支持，只是下载框没有
+
+日志里打开小说详情时那两行就是来源表：
+
+```
+{"data":[{"host":"qidian","id":"1034915599","chaptercount":"310"},
+         {"host":"trxs","id":"11728","chaptercount":"253"},
+         {"host":"trxs2","id":"11728","chaptercount":"253"}],"code":400}
+```
+
+它来自 `app.fun.openChapterList`（page-vip:4429-4472）：`/mobile/bookmanage.php?act=getallhost
+&name=<书名>&author=<作者>` → `d.data` → 每个来源建一个 `tabitem`（`${host}(${chaptercount})`）。
+**章节目录页早就能切来源，只有下载对话框没有。**
+
+修法：对话框加 `<select class="dlsource">`，在 `app.context.showPopup` 那个"值落到输入框"的接缝上
+用同一个接口填充（`attach` 就是 book，取 `name`/`author`），当前来源置顶选中；`startdownload`
+优先读选择框的 `host|id`，切换来源时把结束章默认值换成该来源的 `chaptercount`（不同镜像章节数不同）。
+
+#### (2) 下载完成不归到「已下载」+ 已下载没有删除按钮
+
+站点的完成分支只做两件事（app.v2.read.js:3521-3524）：
+
+```js
+if(this.total == this.downloaded){ this.setStatus("Hoàn thành"); this.book.save(); }
+```
+
+不把任务从 `app.bookDownloaderList` 摘掉、不通知页面；而「已下载」列表是 `bookdownloaded`
+视图加载时**一次性**拉的（page-vip:4038-4076，`loader()` 只跑一次，下拉刷新被注释掉）。删除入口
+也不存在：`bookdownloadedrow`（page-vip:4014-4037）只渲染封面/书名/`Đã tải N/M`，而站点有
+`OfflineBook.deleteAll()`（app.v2.read.js:3368，逐章删正文）与 `delete()`（:3314，摘记录）却
+没有任何 UI 调它们。
+
+修法：完成时摘出列表 + `onUpdate()` 刷新 `(n)` + 移除该行 + 往「已下载」区追加一行（复用
+`app.celldisplay.bookdownloadedrow(null, data)`，与 loader 同一路径，落在 DOWNLOADED 标题之后）；
+包装 `app.celldisplay.bookdownloadedrow` 给每行加「删除」按钮 → `deleteAll()` → `delete()` →
+`store.save()` → 移除行。注意两个都要调：`deleteAll()` 只删章节正文，不删记录。
+
+#### (3) 下载慢与限流：站点循环的两处问题
+
+- **慢**：站点 `start()`（app.v2.read.js:3504-3520）每 3 章一批、批间 `await sleepFor(3000)`。
+  上一轮日志 10:24:33→10:24:49 下 10 章用了 16s，其中 3 次 3s 睡眠占 9s。`sleepFor` 是
+  app.v2.js:8725 的 **`const`**（不在 `window` 上、也不能重新赋值），所以只能替换循环本身。
+- **限流**：`downloadChapter`（:3533-3582）对 429（HTML 体、JSON.parse 失败）只重试 3 次、
+  间隔 200ms；一旦最终抛错，`start()` 的 catch 会 `isBreak = true` **中断整个任务** ——
+  剩下的章节永远不下。这才是"先保证能完整下载"的真正缺口。
+
+修法：`start()` 换成我们自己的循环（保留 3 并发与 `total/downloaded` 口径）：去掉批间睡眠
+（900ms 起步闸门已经在按请求间隔限速）、单个章节失败只记入 `failed` 并继续、完成后走 (2) 的
+归类；`downloadChapter` 包装改成退避重试（1.5s/3s/6s，共 3 轮），失败时把闸门从 900ms 放大到
+2500ms、连续 10 次成功后逐步回落到 900ms。这样站点那个 `isBreak` 中断分支永远不会被触发。
+
+面板新增 `[DOWNLOAD] retry N/3 …` / `throttled (…) gap widened to 2500ms` / `gap relaxed to
+Nms` / `chapter … gave up`，下一份日志能直接看出限流阈值。
+
+#### (4) 历史网格：一行 3 个 + 行间大空白
+
+两个 tab 是两套布局：
+
+| | 容器 | 列数 |
+|---|---|---|
+| 历史 | `infbookgrid`（page-vip:3873/3877）→ flex + `f-3-col`（`flex:0 0 33.33%`） | 恒 3 |
+| 书签 | `BookGrid`（bookdisplay.js:101/110）→ `<div class="book-grid-parent grid g-100px">`（page-vip:2109） | CSS grid `repeat(auto-fill,minmax(100px,1fr))`，按宽度自动塞 |
+
+空白来自**行拉伸**：`infbookgrid` 在 refresh 模式给容器设了 `height:100%`（page-vip:3936），
+flex 多行容器的 `align-content` 默认 `stretch`，内容不足一屏时剩余高度被摊到行与行之间。书签那边
+没这问题，因为 `celldisplay.bookgrid` 给容器写死 `grid.style.height = scrollHeight + "px"`
+（page-vip:3857）。
+
+修法：`gridLayout` 块新增 `.stv-bookgrid4`（`display:grid` + `repeat(auto-fill,minmax(100px,1fr))`
++ `align-content:start`，并清掉 `.f-3-col > *` 的 `max-width:33.33%`），通过包装
+`app.history.setContainer`（infbookgrid 的唯一调用方）把该类打在历史网格容器上，因此只影响历史 tab；
+全局另加 `align-content:flex-start` 兜住其它 flex 书格。
+
+#### (5) 键盘遮挡下载输入框
+
+站点的机制是 `keyboardWillShow` 时把 `--nkbheight: -<kbHeight>px` / `--popwithkb: 5%` 写到
+`:root`（app.v2.js:4509-4531），css:1605-1608 的 `.popupedit[hasedit]` 靠这两个变量抬起来。
+`KeyboardPlugin` 确实在 `packageClassList` 里，但日志里没有任何键盘行，无法判断变量是否落地、
+或 `position:absolute` 是否被视觉视口吃掉。
+
+修法：新增 `keyboardPopup` 块，不再赌站点变量 —— `visualViewport` 与 Capacitor 事件双通道检测
+键盘高度，键盘弹起时直接接管 `.popupedit[hasedit]` 的纵向定位（`transform: translate(-50%,0)`
+抵消站点的位移，`bottom: kb+10px` 顶在键盘上方，并把弹窗与 `.popupedit_body` 的 `max-height`
+压到可视区内），收起时把内联样式清空、交还站点 CSS。上报
+`[KEYBOARD] kb=…px visible=…px, popup anchored above the keyboard (focused=…)`。
+
+#### (6) 储物袋顶部 tab：不是错位，是末页没有数据
+
+探针（10:25:19-10:25:30，6 项那组就是储物袋）：
+
+```
+items=[0+40 40+40 80+40 120+40 160+40 200+54] views=6 lastview=0 child(ren) div=translateZ(0px)
+```
+
+`div=translateZ(0px)` 说明切换不靠 transform（所以不是位移错位），而末页在点击前后都是 0 个子节点。
+末页「Đang kích hoạt」由 `app.items.inv.activate` 填（app.v2.js:7745/7760/7826-7829）；若是
+`undefined`，`loadListIntoView` 会在 `list.length` 抛错并出现在面板里 —— 日志里没有这条 `[ERR]`，
+所以服务端给的 `act` 是空数组，也就是"这个账号没有激活中的道具"。
+
+这一版把探针补成 `panes=[i:子节点数 …] activate=<长度>`：一次点击就能同时看到"被点的面板有没有
+子节点"和"activate 列表有多长"，把"无数据"与"切换未触发"彻底分开。用户已确认网页版也找不到对应
+设置，倾向就是无数据。
+
+#### 验证
+
+`check-ios-shim`（17 块 / 175812 字节 / 20 markers）、`test-site-patch`（213 条断言，新增
+`download source picker` 6 条、`a finished download moves to DOWNLOADED` 10 条、
+`a failing chapter is retried instead of abandoning the job` 5 条、`keyboard vs popup inputs` 8 条、
+`grid tap targets` +4 条、`inventory tab probe` +2 条）、`gen-site-i18n --check`
 （458 labels / 35 fragments）全绿。

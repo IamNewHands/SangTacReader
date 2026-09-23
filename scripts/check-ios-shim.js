@@ -34,6 +34,7 @@ const REQUIRED_MARKERS = [
   'window.__stvTabProbeInstalled',
   'window.__stvStorageAccessorInstalled',
   'window.__stvGridLayoutInstalled',
+  'window.__stvKeyboardPopupInstalled',
   'window.__stvReaderDefaultsInstalled',
   'window.__stvTtsProviderInstalled',
   'window.__stvI18nInstalled',

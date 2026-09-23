@@ -120,16 +120,26 @@ function makeElement(tagName) {
       return found.length ? found[0] : null;
     },
     querySelectorAll(selector) {
-      // Supports the shapes the injected blocks actually use: one or more
-      // comma-separated class selectors, plus bare tag and #id selectors.
+      // Supports the shapes the injected blocks actually use: comma-separated
+      // selectors, compound class selectors (`.flex2.f-3-col`), bare tag and #id
+      // selectors, each optionally carrying a `[attr]` presence test.
       const matchers = String(selector)
         .split(',')
         .map((part) => part.trim())
         .filter(Boolean)
         .map((part) => {
-          if (part.charAt(0) === '.') { return { cls: part.slice(1) }; }
-          if (part.charAt(0) === '#') { return { id: part.slice(1) }; }
-          return { tag: part.toUpperCase() };
+          const attrMatch = /\[([^\]]+)\]/.exec(part);
+          const attr = attrMatch ? attrMatch[1] : null;
+          if (attrMatch) { part = part.replace(/\[[^\]]*\]/, ''); }
+          const matcher = { attr: attr, cls: [], id: null, tag: null };
+          if (part.charAt(0) === '.') {
+            matcher.cls = part.split('.').filter(Boolean);
+          } else if (part.charAt(0) === '#') {
+            matcher.id = part.slice(1);
+          } else {
+            matcher.tag = part.toUpperCase();
+          }
+          return matcher;
         });
       const found = [];
       const visit = (node) => {
@@ -137,9 +147,15 @@ function makeElement(tagName) {
           if (child.nodeType !== 1) { continue; }
           const names = String(child.className || '').split(/\s+/);
           for (const matcher of matchers) {
-            const hit = (matcher.cls && names.indexOf(matcher.cls) >= 0)
-              || (matcher.id && child.id === matcher.id)
-              || (matcher.tag && child.tagName === matcher.tag);
+            let hit = matcher.cls.length
+              ? matcher.cls.every((name) => names.indexOf(name) >= 0)
+              : true;
+            if (hit && matcher.id) { hit = child.id === matcher.id; }
+            if (hit && matcher.tag) { hit = child.tagName === matcher.tag; }
+            if (hit && matcher.attr
+                && !Object.prototype.hasOwnProperty.call(child.attributes || {}, matcher.attr)) {
+              hit = false;
+            }
             if (hit) { found.push(child); break; }
           }
           visit(child);
@@ -256,6 +272,7 @@ function makeSandbox() {
     },
     removeEventListener() {},
     getElementById: byId,
+    querySelector: (selector) => documentElement.querySelectorAll(selector)[0] || null,
     querySelectorAll: (selector) => documentElement.querySelectorAll(selector),
     styleSheets: [],
     elementFromPoint() {
@@ -345,6 +362,11 @@ function installFakeApp(sandbox, options) {
   const stored = {};
   const keychain = Object.assign({}, options.keychain || {});
   const posts = [];
+  // Chapter requests the fake holds open, so a test can keep the download loop in
+  // flight and then release it. `releaseChapters(true)` also lets every later
+  // request through, because the gate spaces the next batch ~900ms out.
+  const pendingChapters = [];
+  let autoRelease = false;
 
   const setting = {
     provider: options.provider || 'bing',
@@ -480,10 +502,20 @@ function installFakeApp(sandbox, options) {
     });
   };
   app.offlineBook = {
-    store: { data: options.offlineBooks || [] },
+    store: {
+      data: options.offlineBooks || [],
+      save() {
+        stored.storeSaves = (stored.storeSaves || 0) + 1;
+        return Promise.resolve();
+      },
+    },
     getNewBook(bookInfo) {
       stored.newBooks = (stored.newBooks || []).concat([bookInfo]);
       return Promise.resolve({ host: bookInfo.host, id: bookInfo.id });
+    },
+    getExistedBook(obj) {
+      stored.existedLookups = (stored.existedLookups || []).concat([obj.host + '/' + obj.id]);
+      return options.existedBook || null;
     },
     getDownloadBooks(from, to) {
       stored.listReads = (stored.listReads || []).concat([from + ':' + to]);
@@ -533,20 +565,38 @@ function installFakeApp(sandbox, options) {
     }
     downloadChapter(chapter) {
       stored.downloadStarts = (stored.downloadStarts || []).concat([Date.now()]);
+      stored.chapterCalls = (stored.chapterCalls || 0) + 1;
+      stored.chapters = (stored.chapters || []).concat([chapter]);
       if (options.downloadFails) { return Promise.reject(new Error('Không thể đọc dữ liệu')); }
+      // Fail the first N attempts at a chapter, so the shim's retry/backoff is
+      // observable (the site's own downloadChapter would give up and start() would
+      // then abandon every remaining chapter).
+      if (options.failFirst) {
+        const seen = stored.failCounts || (stored.failCounts = {});
+        seen[chapter] = (seen[chapter] || 0) + 1;
+        if (seen[chapter] <= options.failFirst) {
+          return Promise.reject(new Error('Không thể đọc dữ liệu'));
+        }
+      }
+      // The download loop lives in the shim now, so a test that needs the loop to
+      // stay in flight holds the chapter requests open instead of the old start().
+      if (options.slowChapter && !autoRelease) {
+        return new Promise((resolve) => { pendingChapters.push(resolve); });
+      }
       return Promise.resolve(chapter);
     }
     pause() { this.isPaused = true; }
     start() {
       this.isPaused = false;
       stored.resumes = (stored.resumes || 0) + 1;
-      if (options.slowStart) {
-        return new Promise((resolve) => { stored.finishStart = resolve; });
-      }
       return undefined;
     }
   }
   app.BookDownloadManager = FakeDownloadManager;
+  stored.releaseChapters = (all) => {
+    if (all) { autoRelease = true; }
+    while (pendingChapters.length) { pendingChapters.shift()(); }
+  };
 
   // The site's mirror picker (app.v2.js:890). Only installed when a test asks
   // for it, because the failover block wraps bestDomain()/getContent().
@@ -563,6 +613,21 @@ function installFakeApp(sandbox, options) {
       },
     };
   }
+
+  // The history view (app.v2.js:3178-3217): setContainer() builds the grid through
+  // infbookgrid and appends the flex container the shim tags.
+  app.history = {
+    container: null,
+    setContainer() {
+      const wrapper = makeContainer('div', 'historywrapper');
+      wrapper.appendChild(
+        makeContainer('div', 'flex2 g0 fleft f-3-col f-sm-4-col f-md-6-col'));
+      this.container.appendChild(wrapper);
+      return wrapper;
+    },
+  };
+  // The inventory's last pane is filled from app.items.inv.activate (app.v2.js:7760).
+  app.items = { inv: { activate: options.activate || [] } };
 
   sandbox.app = app;
   sandbox.window.app = app;
@@ -642,6 +707,16 @@ function installFakeApp(sandbox, options) {
 
 function tick(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Wait for a condition, because the download gate spaces request starts out. */
+async function waitFor(predicate, timeout = 8000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    if (predicate()) { return true; }
+    await tick(50);
+  }
+  return predicate();
 }
 
 // ---------------------------------------------------------------- tests
@@ -1198,10 +1273,13 @@ async function testOfflineBookDetailPage() {
   const clickEvent = { stopPropagation() {}, preventDefault() {} };
   buttons[0].__fire('click', clickEvent);
   check('the pause button pauses the task', throttled.isPaused === true);
+  const callsBeforeResume = sandbox.__stored.chapterCalls || 0;
   buttons[0].__fire('click', clickEvent);
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) > callsBeforeResume, 4000);
   check('the same button resumes it',
-    throttled.isPaused === false && (sandbox.__stored.resumes || 0) === 1,
-    'resumes=' + String(sandbox.__stored.resumes));
+    throttled.isPaused === false
+      && (sandbox.__stored.chapterCalls || 0) > callsBeforeResume,
+    'paused=' + String(throttled.isPaused) + ' calls=' + String(sandbox.__stored.chapterCalls));
   buttons[1].__fire('click', clickEvent);
   check('the delete button drops the task',
     app.bookDownloaderList.indexOf(throttled) < 0,
@@ -1541,7 +1619,9 @@ async function testDownloadRange() {
   for (let i = 1; i <= 30; i += 1) { chapters.push({ cid: 'c' + i }); }
   const sandbox = makeSandbox();
   sandbox.getChapterList = async () => chapters;
-  const app = installFakeApp(sandbox, { displayType: 'auto' });
+  // Hold the chapter requests open so the job stays in the list: a completed job
+  // is moved to the DOWNLOADED list and dropped from bookDownloaderList.
+  const app = installFakeApp(sandbox, { displayType: 'auto', slowChapter: true });
   // The site's dialog: 起始章 + 章数 (count), the count hard-coded to 20 upstream.
   app.context = {
     menu: {
@@ -1583,9 +1663,9 @@ async function testDownloadRange() {
   await tick(30);
   const job = app.bookDownloaderList[app.bookDownloaderList.length - 1];
   check('the job covers exactly the requested range',
-    job && job.chapters.length === 10
-      && job.chapters[0] === 'c1' && job.chapters[9] === 'c10',
-    JSON.stringify(job && job.chapters));
+    job && job.chaptersOrginal.length === 10
+      && job.chaptersOrginal[0] === 'c1' && job.chaptersOrginal[9] === 'c10',
+    JSON.stringify(job && job.chaptersOrginal));
   check('the site action is not used', sandbox.__stored.siteStart === undefined);
   check('the range is reported',
     String(sandbox.window.__stvDiag.text() || '').indexOf('range 1-10 of 30') >= 0,
@@ -1598,8 +1678,8 @@ async function testDownloadRange() {
   await tick(30);
   const tail = app.bookDownloaderList[app.bookDownloaderList.length - 1];
   check('an end past the last chapter clamps',
-    tail && tail.chapters.length === 6 && tail.chapters[5] === 'c30',
-    JSON.stringify(tail && tail.chapters));
+    tail && tail.chaptersOrginal.length === 6 && tail.chaptersOrginal[5] === 'c30',
+    JSON.stringify(tail && tail.chaptersOrginal));
 
   // The dialog defaults to the whole book, not to "where I stopped + 20".
   // showPopup() is the seam: it returns the popup element, and the site's
@@ -1640,37 +1720,54 @@ async function testDownloadRange() {
 async function testDownloadLifecycle() {
   console.log('download task lifecycle');
   const sandbox = makeSandbox();
-  const app = installFakeApp(sandbox, { displayType: 'auto', slowStart: true });
+  const app = installFakeApp(sandbox, { displayType: 'auto', slowChapter: true });
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(300);
 
-  const manager = new app.BookDownloadManager('qidian', '1034915599');
+  // The download loop belongs to the shim now, so the loop is held in flight by
+  // holding its chapter requests open. The gate spaces request starts 900ms apart,
+  // so every step is waited for rather than assumed.
+  const manager = new app.BookDownloadManager('qidian', '1034915599',
+    ['c1', 'c2', 'c3', 'c4', 'c5']);
   const first = manager.start();
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) === 3);
+  check('the loop runs three chapters at a time',
+    (sandbox.__stored.chapterCalls || 0) === 3, String(sandbox.__stored.chapterCalls));
   const again = manager.start();
   check('a second start() while one is running is ignored',
-    (sandbox.__stored.resumes || 0) === 1, String(sandbox.__stored.resumes));
+    (sandbox.__stored.chapterCalls || 0) === 3, String(sandbox.__stored.chapterCalls));
   check('the ignored start is reported',
     String(sandbox.window.__stvDiag.text() || '').indexOf('start() ignored') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-200));
-  sandbox.__stored.finishStart();
+  sandbox.__stored.releaseChapters(true);
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) === 5);
   await Promise.all([first, again]);
-  await tick(20);
   check('a repeat start() is not replayed after the loop exits',
-    (sandbox.__stored.resumes || 0) === 1, String(sandbox.__stored.resumes));
+    (sandbox.__stored.chapterCalls || 0) === 5, String(sandbox.__stored.chapterCalls));
+  check('every chapter of the range is fetched exactly once',
+    (sandbox.__stored.chapters || []).length === 5
+      && (sandbox.__stored.chapters || []).join(',') === 'c1,c2,c3,c4,c5',
+    JSON.stringify(sandbox.__stored.chapters));
 
-  // A resume that arrives while the paused loop is still winding down is
-  // replayed once the loop exits.
-  const resumed = new app.BookDownloadManager('qidian', '2');
+  // A resume that arrives while the paused loop is still winding down is replayed
+  // once the loop exits, so the chapters the pause left behind are still fetched.
+  const resumed = new app.BookDownloadManager('qidian', '2', ['d1', 'd2', 'd3', 'd4', 'd5']);
   const running = resumed.start();
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) === 8);
+  const afterFirstBatch = sandbox.__stored.chapterCalls || 0;
   resumed.pause();
   const deferred = resumed.start();
   check('a resume during the running loop is deferred, not doubled',
-    (sandbox.__stored.resumes || 0) === 2, String(sandbox.__stored.resumes));
-  sandbox.__stored.finishStart();
+    (sandbox.__stored.chapterCalls || 0) === afterFirstBatch,
+    String(sandbox.__stored.chapterCalls));
+  sandbox.__stored.releaseChapters();
+  await waitFor(() => (sandbox.__stored.chapterCalls || 0) === afterFirstBatch + 2);
   await Promise.all([running, deferred]);
-  await tick(30);
-  check('the deferred resume replays after the loop exits',
-    (sandbox.__stored.resumes || 0) === 3, String(sandbox.__stored.resumes));
+  check('the deferred resume replays and fetches the rest',
+    (sandbox.__stored.chapterCalls || 0) === afterFirstBatch + 2,
+    String(sandbox.__stored.chapterCalls));
+  sandbox.__stored.releaseChapters(true);
+  await tick(60);
 
   // Deleting a task has to redraw the DOWNLOADING (n) counter.
   const deleting = new app.BookDownloadManager('qidian', '3');
@@ -1699,6 +1796,25 @@ async function testGridLayout() {
     css.indexOf('.booksquarecont { height: auto !important; }') >= 0, css);
   check('titles are clamped so rows stay even',
     css.indexOf('-webkit-line-clamp: 2') >= 0, css);
+  check('rows no longer stretch to fill the container',
+    css.indexOf('align-content: flex-start') >= 0, css);
+  check('the history grid uses auto-fill columns like the bookmark tab',
+    css.indexOf('grid-template-columns: repeat(auto-fill, minmax(100px, 1fr))') >= 0, css);
+  check('the fixed 33.33% column cap is lifted for grid items',
+    css.indexOf('.stv-bookgrid4 > * { max-width: none !important; }') >= 0, css);
+
+  // app.history.setContainer builds the history grid, so wrapping it is how the
+  // CSS above is scoped to the history tab alone.
+  const app = sandbox.app;
+  app.history.container = makeContainer('div', 'bookhistory');
+  sandbox.document.body.appendChild(app.history.container);
+  app.history.setContainer();
+  const grid = app.history.container.children[0].children[0];
+  check('the history grid is tagged for the auto-fill rule',
+    grid.classList.contains('stv-bookgrid4'), String(grid.className));
+  check('the tagging is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('history grid switched') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
 }
 
 async function testTabProbe() {
@@ -1732,6 +1848,7 @@ async function testTabProbe() {
   tab.appendChild(div);
   sandbox.document.body.appendChild(tab);
 
+  sandbox.app.items.inv.activate = [{ i: 1 }, { i: 2 }];
   sandbox.__dispatch('click', { target: last });
   await tick(500);
   const lines = String(sandbox.window.__stvDiag.text() || '')
@@ -1745,8 +1862,245 @@ async function testTabProbe() {
   check('the pane transform is reported', before.indexOf('div=translateX(0px)') >= 0, before);
   check('the last pane child count is reported (blank-pane check)',
     before.indexOf('views=2 lastview=0 child(ren)') >= 0, before);
+  check('every pane child count is reported, so the tapped one is covered',
+    before.indexOf('panes=[0:1 1:0]') >= 0, before);
+  check('the inventory activate list length is reported',
+    before.indexOf('activate=2') >= 0, before);
   check('the state after the framework reacts is reported too',
     after.indexOf('after') >= 0 && after.indexOf('index=1/2') >= 0, after);
+}
+
+async function testDownloadSources() {
+  console.log('download source picker');
+  const sandbox = makeSandbox();
+  sandbox.getChapterList = async () => [{ cid: 't1' }, { cid: 't2' }];
+  const app = installFakeApp(sandbox, { displayType: 'auto', slowChapter: true });
+  const mirrors = {
+    code: 400,
+    data: [
+      { host: 'qidian', id: '1034915599', chaptercount: '310' },
+      { host: 'trxs', id: '11728', chaptercount: '253' },
+    ],
+  };
+  app.net.get = (url) => {
+    sandbox.__stored.netGets = (sandbox.__stored.netGets || []).concat([url]);
+    return Promise.resolve(url.indexOf('getallhost') >= 0 ? mirrors : null);
+  };
+
+  const popupNode = makeContainer('div', 'popupedit');
+  popupNode.setAttribute('hasedit', 'true');
+  popupNode.q = (selector) => popupNode.querySelector(selector);
+  const hostInput = makeElement('input');
+  const idInput = makeElement('input');
+  const startInput = makeElement('input');
+  const endInput = makeElement('input');
+  const select = makeElement('select');
+  hostInput.className = 'bookhost';
+  hostInput.value = 'qidian';
+  idInput.className = 'bookid';
+  idInput.value = '1034915599';
+  startInput.className = 'numstart';
+  endInput.className = 'numend';
+  select.className = 'dlsource';
+  [hostInput, idInput, startInput, endInput, select]
+    .forEach((node) => popupNode.appendChild(node));
+
+  app.context = {
+    menu: {
+      downloadchapter: {
+        body: '<input class="numstart"/><input class="numend"/>'
+          + '<select class="dlsource"></select>',
+        action: {
+          startdownload: async function () { sandbox.__stored.siteStart = true; },
+          cancel() {},
+        },
+      },
+    },
+    showPopup: () => popupNode,
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  app.context.showPopup(app.context.menu.downloadchapter, {
+    host: 'qidian', id: '1034915599', name: '这些仙子全都不正常！', author: '作者', chaptercount: 310,
+  });
+  await tick(80);
+
+  const options = select.children.filter((child) => child.tagName === 'OPTION');
+  check('every mirror of the book is offered',
+    options.length === 2 && options[0].value === 'qidian|1034915599'
+      && options[1].value === 'trxs|11728',
+    JSON.stringify(options.map((option) => option.value)));
+  check('the mirror the detail page opened is preselected', select.selectedIndex === 0,
+    String(select.selectedIndex));
+  check('the source list is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('sources: 2 [qidian trxs]') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  select.value = 'trxs|11728';
+  select.__fire('change', {});
+  check('choosing a mirror retargets the end chapter', endInput.value === '253',
+    String(endInput.value));
+
+  await app.context.menu.downloadchapter.action.startdownload.call({ cancel() {} }, popupNode);
+  await tick(60);
+  const job = app.bookDownloaderList[app.bookDownloaderList.length - 1];
+  check('the chosen mirror is what gets downloaded',
+    !!job && job.host === 'trxs' && job.id === '11728',
+    job ? job.host + '/' + job.id : 'no job');
+  check('the site action is not used', sandbox.__stored.siteStart === undefined);
+}
+
+async function testDownloadCompletion() {
+  console.log('a finished download moves to DOWNLOADED');
+  const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
+  const sandbox = makeSandbox();
+  const deleted = [];
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    bookInfoResponses: {
+      [url]: { book: { host: 'qidian', id: '1034915599', lid: '3972206', chaptercount: '310' } },
+    },
+    existedBook: {
+      deleteAll() { deleted.push('deleteAll'); return Promise.resolve(); },
+      delete() { deleted.push('delete'); return Promise.resolve(); },
+    },
+  });
+  // The DOWNLOADED area is #download-manager's parent (page-vip:4041-4075).
+  const page = makeContainer('div', 'bookdownloaded');
+  const manager = makeContainer('div', 'bookdownloadmanager');
+  const area = makeContainer('div', 'download-manager');
+  area.id = 'download-manager';
+  manager.appendChild(area);
+  page.appendChild(manager);
+  sandbox.document.body.appendChild(page);
+  const rendered = [];
+  app.celldisplay = {
+    bookdownloadedrow(ele, data) {
+      rendered.push(data);
+      return makeContainer('div', 'bookdownloadedrow');
+    },
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('the downloaded-row renderer is wrapped', app.celldisplay.__stvRowPatched === true);
+
+  const job = new app.BookDownloadManager('qidian', '1034915599', ['c1', 'c2']);
+  let updates = 0;
+  app.bookDownloaderList.onUpdate = function () { updates += 1; };
+  await job.start();
+  await waitFor(() => rendered.length === 1, 5000);
+
+  check('a finished job leaves the DOWNLOADING list',
+    app.bookDownloaderList.indexOf(job) < 0);
+  check('the DOWNLOADING counter is refreshed', updates >= 1, String(updates));
+  check('the finished book is appended to the DOWNLOADED list',
+    rendered.length === 1 && rendered[0].id === '1034915599'
+      && rendered[0].totalDownloaded === 2,
+    JSON.stringify(rendered));
+  check('the move is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('moved qidian/1034915599') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // The row is appended to #download-manager's parent, i.e. after the
+  // "DOWNLOADED" header inside the manager wrapper (page-vip:2292-2298).
+  const row = manager.children[manager.children.length - 1];
+  const buttons = row.querySelectorAll('button');
+  check('the downloaded row gets a delete button',
+    buttons.length === 1 && buttons[0].textContent === '删除',
+    JSON.stringify(buttons.map((button) => button.textContent)));
+  buttons[0].__fire('click', { stopPropagation() {}, preventDefault() {} });
+  await waitFor(() => deleted.indexOf('delete') >= 0, 3000);
+  check('deleting removes the chapter bodies and then the record',
+    deleted.join(',') === 'deleteAll,delete', deleted.join(','));
+  check('the record list is saved', (sandbox.__stored.storeSaves || 0) >= 1,
+    String(sandbox.__stored.storeSaves));
+  check('the row is removed from the page', row.parentElement === null);
+  check('the delete is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('removed downloaded book qidian/1034915599') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+}
+
+async function testChapterRetry() {
+  console.log('a failing chapter is retried instead of abandoning the job');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    failFirst: 1,
+    bookInfoResponses: {
+      '/mobile/bookinfo.php?hid=1&host=qidian': {
+        book: { host: 'qidian', id: '1', chaptercount: '1' },
+      },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+  const job = new app.BookDownloadManager('qidian', '1', ['c1']);
+  await job.start();
+  check('the chapter is fetched again after a failure',
+    (sandbox.__stored.chapterCalls || 0) === 2, String(sandbox.__stored.chapterCalls));
+  check('the retry is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('retry 1/3') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+  check('the failure widens the pacing gap',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('gap widened to 2500ms') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-320));
+  check('the job still completes', job.downloaded === 1 && job.total === 1,
+    job.downloaded + '/' + job.total);
+  check('the failing chapter did not abandon the job',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('gave up') < 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+}
+
+async function testKeyboardPopup() {
+  console.log('keyboard vs popup inputs');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  const viewport = { height: 800, offsetTop: 0, addEventListener() {} };
+  sandbox.window.visualViewport = viewport;
+  sandbox.window.innerHeight = 800;
+  const popup = makeContainer('div', 'popupedit');
+  popup.setAttribute('hasedit', 'true');
+  const body = makeContainer('div', 'popupedit_body');
+  const input = makeElement('input');
+  input.className = 'numend';
+  body.appendChild(input);
+  popup.appendChild(body);
+  sandbox.document.body.appendChild(popup);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(150);
+  check('the keyboard shim is installed',
+    sandbox.window.__stvKeyboardPopupInstalled === true);
+  check('a closed keyboard leaves the site placement alone',
+    !popup.style.bottom && !popup.style.transform, String(popup.style.bottom));
+
+  // The keyboard opens: the visual viewport shrinks by 300px.
+  viewport.height = 500;
+  sandbox.document.activeElement = input;
+  sandbox.__dispatch('focusin', { target: input });
+  await tick(150);
+  check('the popup is anchored just above the keyboard',
+    popup.style.bottom === '310px', String(popup.style.bottom));
+  check('the site transform is neutralised so it cannot double up',
+    popup.style.transform === 'translate(-50%, 0px)', String(popup.style.transform));
+  check('the popup is capped to the visible area',
+    popup.style.maxHeight === '480px', String(popup.style.maxHeight));
+  check('the popup body is capped too',
+    body.style.maxHeight === '360px', String(body.style.maxHeight));
+  check('the numbers are reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('kb=300px visible=500px') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  viewport.height = 800;
+  sandbox.__dispatch('focusout', { target: input });
+  await tick(150);
+  check('hiding the keyboard hands the placement back',
+    popup.style.bottom === '' && popup.style.transform === ''
+      && popup.style.maxHeight === '',
+    JSON.stringify({ bottom: popup.style.bottom, transform: popup.style.transform }));
 }
 
 async function testSettingsBackup() {
@@ -1908,6 +2262,10 @@ await testBootShell();
   await testStorageAccessor();
   await testDownloadRange();
   await testDownloadLifecycle();
+  await testDownloadSources();
+  await testDownloadCompletion();
+  await testChapterRetry();
+  await testKeyboardPopup();
   await testGridLayout();
   await testTabProbe();
   console.log('');

@@ -1132,6 +1132,105 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Keyboard vs popup inputs
+
+    /**
+     "点击下载时弹出起始章-结束章的输入框，此时系统的输入法也弹出来，但是这个下载框
+     没有相应的往上移动，用户在输入时看不到输入框，只能盲打".
+
+     The site does have a mechanism: with `Capacitor.Plugins.Keyboard` present it
+     listens for `keyboardWillShow` and writes `--nkbheight: -<kbHeight>px` and
+     `--popwithkb: 5%` onto `:root` (app.v2.js:4509-4531), and app.v2.css:1605-1608
+     positions `.popupedit[hasedit]` with exactly those two variables. The plugin is
+     in the build (CI's packageClassList carries `KeyboardPlugin`), yet the device log
+     has no keyboard line at all, so whether those variables land -- and whether
+     `position: absolute` survives the keyboard on iOS -- is unproven.
+
+     Rather than depend on it, measure and place the popup directly: while the
+     keyboard is up, anchor the popup just above it and let the popup body scroll,
+     then hand the site's own CSS back when it hides. Both channels are watched
+     (`visualViewport` always works in a WKWebView; the Capacitor events fire when
+     the plugin does), and the numbers are reported so the next log can confirm.
+     */
+    static let keyboardPopup = """
+    (function () {
+        if (window.__stvKeyboardPopupInstalled) { return; }
+        window.__stvKeyboardPopupInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function visualHeight() {
+            var viewport = window.visualViewport;
+            return (viewport && viewport.height) || window.innerHeight || 0;
+        }
+
+        // How much of the layout viewport the keyboard covers: the visual viewport
+        // shrinks when it opens, so the difference is the keyboard.
+        function keyboardHeight() {
+            var viewport = window.visualViewport;
+            if (!viewport) { return 0; }
+            var covered = (window.innerHeight || 0) - viewport.height
+                - (viewport.offsetTop || 0);
+            return covered > 60 ? Math.round(covered) : 0;
+        }
+
+        var applied = '';
+
+        function fix() {
+            var pop = document.querySelector('.popupedit[hasedit]');
+            var kb = keyboardHeight();
+            var key = (pop ? 'popup' : 'none') + ':' + kb;
+            if (key === applied) { return; }
+            applied = key;
+            if (!pop) { return; }
+            var body = pop.querySelector('.popupedit_body');
+            if (!kb) {
+                pop.style.transform = '';
+                pop.style.bottom = '';
+                pop.style.maxHeight = '';
+                if (body) { body.style.maxHeight = ''; }
+                note('KEYBOARD', 'hidden, popup placement restored');
+                return;
+            }
+            // Own the vertical placement while the keyboard is up: the site's own
+            // transform lifts by its --nkbheight, which would double up with this.
+            var visible = visualHeight();
+            pop.style.transform = 'translate(-50%, 0px)';
+            pop.style.bottom = (kb + 10) + 'px';
+            pop.style.maxHeight = Math.max(160, visible - 20) + 'px';
+            if (body) { body.style.maxHeight = Math.max(120, visible - 140) + 'px'; }
+            var focused = document.activeElement;
+            var name = (focused && focused.className) ? focused.className : '?';
+            note('KEYBOARD', 'kb=' + kb + 'px visible=' + visible
+                + 'px, popup anchored above the keyboard (focused=' + name + ')');
+        }
+
+        function soon() {
+            fix();
+            setTimeout(fix, 80);
+            setTimeout(fix, 260);
+            setTimeout(fix, 600);
+        }
+
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', fix);
+            window.visualViewport.addEventListener('scroll', fix);
+        }
+        window.addEventListener('resize', fix);
+        document.addEventListener('focusin', soon, true);
+        document.addEventListener('focusout', soon, true);
+        var plugin = window.Capacitor && window.Capacitor.Plugins
+            && window.Capacitor.Plugins.Keyboard;
+        if (plugin && plugin.addListener) {
+            plugin.addListener('keyboardWillShow', soon);
+            plugin.addListener('keyboardWillHide', soon);
+        }
+        note('KEYBOARD', 'popup placement shim installed');
+    })();
+    """
+
     // MARK: - Grid tap targets
 
     /**
@@ -1158,10 +1257,21 @@ enum SitePatch {
         if (window.__stvGridLayoutInstalled) { return; }
         window.__stvGridLayoutInstalled = true;
 
-        var CSS = '.f-3-col, .f-sm-4-col, .f-md-6-col { align-items: flex-start; }'
+        var CSS = '.f-3-col, .f-sm-4-col, .f-md-6-col { align-items: flex-start;'
+            + ' align-content: flex-start; }'
             + '.booksquarecont { height: auto !important; }'
             + '.booksquare .tname { display: -webkit-box; -webkit-line-clamp: 2;'
-            + ' -webkit-box-orient: vertical; overflow: hidden; }';
+            + ' -webkit-box-orient: vertical; overflow: hidden; }'
+            // The history grid is the one book grid built as a flex row of fixed
+            // 33.33% cells; every other one (bookmark tab, search, ranking) is
+            // `.grid.g-100px`, i.e. `repeat(auto-fill, minmax(100px, 1fr))`, which
+            // packs as many columns as fit. Give the history grid the same shape so
+            // it matches, and start-align the rows so the container's own
+            // `height: 100%` (page-vip:3936) cannot stretch them apart.
+            + '.stv-bookgrid4 { display: grid !important;'
+            + ' grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));'
+            + ' gap: 3vw !important; align-content: start; }'
+            + '.stv-bookgrid4 > * { max-width: none !important; }';
 
         function inject() {
             if (document.getElementById('stv-grid-layout')) { return true; }
@@ -1178,13 +1288,45 @@ enum SitePatch {
             return true;
         }
 
-        if (!inject()) {
-            var attempts = 0;
-            var timer = setInterval(function () {
-                attempts++;
-                if (inject() || attempts > 500) { clearInterval(timer); }
-            }, 20);
+        // `app.history.setContainer` (app.v2.js:3178-3217) builds the history grid
+        // through app.celoader.infbookgrid and appends the flex container it
+        // creates; infbookgrid has exactly one caller, so tagging that container is
+        // how the CSS above is scoped to the history tab alone.
+        function tagHistoryGrid() {
+            var app = window.app;
+            var history = app && app.history;
+            if (!history || typeof history.setContainer !== 'function') { return false; }
+            if (history.__stvGridTagged) { return true; }
+            history.__stvGridTagged = true;
+            var original = history.setContainer;
+            history.setContainer = function () {
+                var out = original.apply(this, arguments);
+                try {
+                    var host = this.container;
+                    var kids = (host && host.children) || [];
+                    var wrapper = kids.length ? kids[kids.length - 1] : null;
+                    var grid = wrapper && wrapper.querySelector
+                        ? wrapper.querySelector('.flex2.f-3-col') : null;
+                    if (grid && grid.classList) {
+                        grid.classList.add('stv-bookgrid4');
+                        if (window.__stvDiag) {
+                            window.__stvDiag.log('GRID',
+                                'history grid switched to auto-fill columns');
+                        }
+                    }
+                } catch (e) {}
+                return out;
+            };
+            return true;
         }
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            var styled = inject();
+            var tagged = tagHistoryGrid();
+            if ((styled && tagged) || attempts > 2500) { clearInterval(timer); }
+        }, 20);
     })();
     """
 
@@ -2237,14 +2379,24 @@ enum SitePatch {
         }
 
         // The download endpoint is rate limited: the device log shows the first
-        // eighteen chapters answered 200 and then everything came back 429 with
-        // an HTML body, which fails JSON.parse and surfaces as
+        // eighteen chapters answered 200 and then everything came back 429 with an
+        // HTML body, which fails JSON.parse and surfaces as
         // "Lỗi: Không thể đọc dữ liệu". DownloadManager.start() fires three
-        // requests at once with no spacing, so the fix is to space the request
-        // starts out; a failure widens the gap for the rest of the session.
-        var DOWNLOAD_GAP = 900;
+        // requests at once with no spacing, so request starts are spaced out.
+        //
+        // The gap adapts: a failure widens it (the server is throttling), a run of
+        // successes walks it back towards the floor. It is the only pacing knob --
+        // the site's own 3s nap between batches is dropped in the start() wrapper
+        // below, because this gap already spaces every request start.
+        var DOWNLOAD_GAP_MIN = 900;
         var DOWNLOAD_GAP_MAX = 2500;
+        var DOWNLOAD_GAP = DOWNLOAD_GAP_MIN;
+        var DOWNLOAD_OK_RUN = 0;
         var lastDownloadStart = 0;
+
+        function sleep(ms) {
+            return new Promise(function (resolve) { setTimeout(resolve, ms); });
+        }
 
         function downloadGate() {
             var now = Date.now();
@@ -2252,7 +2404,23 @@ enum SitePatch {
             if (wait < 0) { wait = 0; }
             lastDownloadStart = now + wait;
             if (!wait) { return Promise.resolve(); }
-            return new Promise(function (resolve) { setTimeout(resolve, wait); });
+            return sleep(wait);
+        }
+
+        function widenGate(why) {
+            DOWNLOAD_OK_RUN = 0;
+            if (DOWNLOAD_GAP >= DOWNLOAD_GAP_MAX) { return; }
+            DOWNLOAD_GAP = DOWNLOAD_GAP_MAX;
+            note('DOWNLOAD', 'throttled (' + why + '), gap widened to '
+                + DOWNLOAD_GAP + 'ms');
+        }
+
+        function relaxGate() {
+            DOWNLOAD_OK_RUN++;
+            if (DOWNLOAD_OK_RUN < 10 || DOWNLOAD_GAP <= DOWNLOAD_GAP_MIN) { return; }
+            DOWNLOAD_GAP = Math.max(DOWNLOAD_GAP_MIN, DOWNLOAD_GAP - 400);
+            DOWNLOAD_OK_RUN = 0;
+            note('DOWNLOAD', 'gap relaxed to ' + DOWNLOAD_GAP + 'ms');
         }
 
         // The site's download row has no controls at all: pausing and retrying
@@ -2406,19 +2574,34 @@ enum SitePatch {
             if (manager && manager.prototype && !manager.prototype.__stvThrottled) {
                 manager.prototype.__stvThrottled = true;
                 var originalChapter = manager.prototype.downloadChapter;
+                // The site retries a chapter a few times at 200-300ms and then
+                // gives up, and start()'s catch turns that into `isBreak = true`
+                // and abandons every remaining chapter. Retry here with a real
+                // backoff instead, so a throttled chapter delays the job instead of
+                // truncating the book.
+                var CHAPTER_BACKOFF = [1500, 3000, 6000];
                 manager.prototype.downloadChapter = function () {
                     var self = this;
                     var args = arguments;
-                    return downloadGate().then(function () {
-                        return originalChapter.apply(self, args);
-                    }, function (error) {
-                        if (DOWNLOAD_GAP < DOWNLOAD_GAP_MAX) {
-                            DOWNLOAD_GAP = DOWNLOAD_GAP_MAX;
-                            note('DOWNLOAD', 'download failed, widening the gap to '
-                                + DOWNLOAD_GAP + 'ms: ' + (error && error.message));
-                        }
-                        throw error;
-                    });
+                    var round = 0;
+                    function once() {
+                        return downloadGate().then(function () {
+                            return originalChapter.apply(self, args);
+                        }).then(function (result) {
+                            relaxGate();
+                            return result;
+                        }, function (error) {
+                            if (round >= CHAPTER_BACKOFF.length) { throw error; }
+                            var wait = CHAPTER_BACKOFF[round];
+                            round++;
+                            widenGate('chapter failed: ' + (error && error.message));
+                            note('DOWNLOAD', 'retry ' + round + '/'
+                                + CHAPTER_BACKOFF.length + ' for ' + self.host + '/'
+                                + self.id + ' chapter ' + args[0] + ' in ' + wait + 'ms');
+                            return sleep(wait).then(once);
+                        });
+                    }
+                    return once();
                 };
                 note('DOWNLOAD', 'download throttle installed (' + DOWNLOAD_GAP + 'ms gap)');
             }
@@ -2427,19 +2610,11 @@ enum SitePatch {
                 var originalStart = manager.prototype.start;
                 manager.prototype.start = function () {
                     var self = this;
-                    // start() walks this.chapters with three requests in flight
-                    // and splices the list as it goes, so entering it again while
-                    // that loop is still awaiting gives two loops over the same
-                    // chapters. The device log shows the result: the same chapter
-                    // fetched three times and the counter running past the total
-                    // (20/20, 21/20 ... 32/20). A resume request that arrives
-                    // while the loop is winding down is replayed once it exits.
+                    // A start() that arrives while the loop is still winding down
+                    // after a pause is a resume and is replayed once it exits; a
+                    // plain repeat start() is a no-op, otherwise the replay would
+                    // spawn the second loop this guard exists to prevent.
                     if (self.__stvStartRunning) {
-                        // Only a resume is worth replaying: the site's start() is
-                        // the resume path (pause() sets isPaused, start() clears
-                        // it). A plain repeat start() while the loop is genuinely
-                        // running must stay a no-op, or the replay would spawn the
-                        // second loop this guard exists to prevent.
                         if (self.isPaused) { self.__stvStartAgain = true; }
                         note('DOWNLOAD', 'start() ignored while a loop is running for '
                             + self.host + '/' + self.id);
@@ -2450,20 +2625,24 @@ enum SitePatch {
                         self.__stvStartRunning = false;
                         if (self.__stvStartAgain) {
                             self.__stvStartAgain = false;
-                            // The deferred call was a resume, so run the loop again
-                            // over the chapters that are left. The pause flag is
-                            // deliberately left set until now: it is what makes the
-                            // running loop break instead of carrying on into a
-                            // second one.
                             return self.start();
                         }
                         return null;
                     };
-                    return Promise.resolve(originalStart.apply(self, arguments))
+                    var run;
+                    try {
+                        run = runJob(self);
+                    } catch (error) {
+                        note('ERR', 'download loop failed, falling back to the site one: '
+                            + error);
+                        run = originalStart.apply(self, arguments);
+                    }
+                    return Promise.resolve(run)
                         .then(function (result) { done(); return result; },
                               function (error) { done(); throw error; });
                 };
-                note('DOWNLOAD', 'download start() made re-entrant-safe');
+                note('DOWNLOAD', 'download loop replaced (no 3s nap, a failure no longer'
+                    + ' truncates the job)');
             }
             if (typeof app.offlineBook.getDownloadBooks === 'function'
                 && !app.offlineBook.__stvWarmedList) {
@@ -2481,6 +2660,208 @@ enum SitePatch {
             return !!(manager && manager.prototype && manager.prototype.__stvWarmed
                     && manager.prototype.__stvThrottled)
                 && !!app.offlineBook.__stvWarmedList;
+        }
+
+        // The site's loop (app.v2.read.js:3488-3532) runs three chapters at a time,
+        // sleeps 3000ms between batches, and abandons the whole job on the first
+        // chapter that fails. Re-implemented with the same total/downloaded
+        // accounting so that the redundant nap is gone (the adaptive gap already
+        // paces request starts), a failing chapter is recorded instead of
+        // truncating the book, and completion can hand the book to the DOWNLOADED
+        // list.
+        var MAX_PARALLEL = 3;
+
+        function runJob(manager) {
+            var self = manager;
+            self.isPaused = false;
+            if (self.setStatus) { self.setStatus('Đang tải...'); }
+            var queue = (self.chapters || []).slice();
+            var failed = [];
+            function step() {
+                if (self.isPaused || !queue.length) { return Promise.resolve(); }
+                var batch = queue.splice(0, MAX_PARALLEL);
+                return Promise.all(batch.map(function (cid) {
+                    return self.downloadChapter(cid).then(function () {
+                        self.downloaded++;
+                        if (self.onProgress) { self.onProgress(); }
+                        var index = self.chapters.indexOf(cid);
+                        if (index >= 0) { self.chapters.splice(index, 1); }
+                        console.log(self.downloaded + '/' + self.total);
+                    }, function (error) {
+                        failed.push(cid);
+                        note('DOWNLOAD', 'chapter ' + cid + ' of ' + self.host + '/'
+                            + self.id + ' gave up: ' + (error && error.message));
+                    });
+                })).then(function () {
+                    if (self.isPaused) { return null; }
+                    return step();
+                });
+            }
+            return step().then(function () {
+                if (self.total && self.total === self.downloaded) {
+                    if (self.setStatus) { self.setStatus('Hoàn thành'); }
+                    if (self.book && self.book.save) { self.book.save(); }
+                    moveJobToDownloaded(self);
+                } else if (failed.length) {
+                    note('DOWNLOAD', 'finished with ' + failed.length + ' chapter(s)'
+                        + ' missing for ' + self.host + '/' + self.id);
+                }
+                if (self.status && self.status.textContent === 'Đang tải...') {
+                    if (self.setStatus) { self.setStatus('Đã dừng'); }
+                }
+                if (self.onProgress) { self.onProgress(); }
+                if (failed.length) { self.isPaused = true; }
+            });
+        }
+
+        // The site's completion branch only sets a status and saves the record
+        // (app.v2.read.js:3521-3524): the finished job stays in the DOWNLOADING
+        // list, the "(n)" counter never drops, and the DOWNLOADED list -- built
+        // once when the view loads (page-vip:4038-4076, its pull-to-refresh is
+        // commented out) -- never learns about the new book.
+        function moveJobToDownloaded(manager) {
+            var app = window.app;
+            var list = app.bookDownloaderList || [];
+            var index = list.indexOf(manager);
+            if (index >= 0) { list.splice(index, 1); }
+            if (manager.node && manager.node.parentElement) {
+                manager.node.parentElement.removeChild(manager.node);
+            }
+            if (typeof list.onUpdate === 'function') { list.onUpdate(); }
+            var host = manager.host;
+            var id = manager.id;
+            warmOne(host, id).then(function (down) {
+                var book = down && down.book ? down.book : null;
+                var container = document.getElementById('download-manager');
+                var area = container ? container.parentElement : null;
+                if (!book || !area || !app.celldisplay
+                    || typeof app.celldisplay.bookdownloadedrow !== 'function') {
+                    note('DOWNLOAD', 'finished ' + host + '/' + id
+                        + '; the DOWNLOADED list is not open');
+                    return;
+                }
+                var data = {};
+                var key;
+                for (key in book) { data[key] = book[key]; }
+                var base = (manager.book && manager.book.baseObject) || {};
+                for (key in base) { data[key] = base[key]; }
+                if (!data.chaptercount) { data.chaptercount = manager.total; }
+                data.totalDownloaded = manager.downloaded;
+                var row = app.celldisplay.bookdownloadedrow(null, data);
+                if (row) {
+                    area.appendChild(row);
+                    note('DOWNLOAD', 'moved ' + host + '/' + id + ' into the DOWNLOADED list');
+                }
+            }, function () {});
+        }
+
+        // Nothing in the site can delete a downloaded book: the row
+        // (page-vip:4014-4037) renders the cover, the title and "Đã tải N/M" and
+        // that is all, while OfflineBook.deleteAll() (app.v2.read.js:3368) removes
+        // the chapter bodies and delete() (:3314) removes the record. Add both.
+        function patchDownloadedRow() {
+            var app = window.app;
+            if (!app || !app.celldisplay
+                || typeof app.celldisplay.bookdownloadedrow !== 'function') { return false; }
+            if (app.celldisplay.__stvRowPatched) { return true; }
+            app.celldisplay.__stvRowPatched = true;
+            var original = app.celldisplay.bookdownloadedrow;
+            app.celldisplay.bookdownloadedrow = function (ele, data) {
+                var node = original.apply(this, arguments);
+                decorateDownloadedRow(node, data);
+                return node;
+            };
+            note('DOWNLOAD', 'downloaded rows get a delete button');
+            return true;
+        }
+
+        function decorateDownloadedRow(node, data) {
+            if (!node || node.__stvDelete) { return; }
+            node.__stvDelete = true;
+            var book = data || {};
+            // Same trap as the job row: `.bookrowcont` is a fixed 77px box with an
+            // absolutely positioned `.bookrow` inside, so anything appended in
+            // normal flow is painted underneath and cannot be tapped.
+            node.style.height = 'auto';
+            node.style.minHeight = '77px';
+            var bar = document.createElement('div');
+            bar.setAttribute('style',
+                'position:relative;z-index:5;margin-top:77px;display:flex;gap:6px;'
+                + 'padding:0 6px 8px;justify-content:flex-end;');
+            var button = document.createElement('button');
+            button.textContent = '删除';
+            button.setAttribute('style', 'padding:6px 12px;font-size:13px;border-radius:6px;');
+            button.addEventListener('click', function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+                var app = window.app;
+                var target = app.offlineBook && app.offlineBook.getExistedBook
+                    ? app.offlineBook.getExistedBook({ host: book.host, id: book.id })
+                    : null;
+                var finish = function () {
+                    if (node.parentElement) { node.parentElement.removeChild(node); }
+                    note('DOWNLOAD', 'removed downloaded book ' + book.host + '/' + book.id);
+                };
+                if (!target) { finish(); return; }
+                note('DOWNLOAD', 'deleting downloaded book ' + book.host + '/' + book.id);
+                Promise.resolve(target.deleteAll())
+                    .then(function () { return target.delete(); })
+                    .then(function () {
+                        return app.offlineBook.store && app.offlineBook.store.save
+                            ? app.offlineBook.store.save() : null;
+                    })
+                    .then(finish, function (error) {
+                        note('ERR', 'delete failed for ' + book.host + '/' + book.id
+                            + ': ' + error);
+                    });
+            });
+            bar.appendChild(button);
+            node.appendChild(bar);
+        }
+
+        // The same novel is usually mirrored on several hosts, and the source the
+        // detail page happened to open is not always the one worth downloading.
+        // The chapter-list page already asks
+        // /mobile/bookmanage.php?act=getallhost&name=&author= and builds a tab per
+        // source (app.v2.js:4429-4472); reuse that endpoint for the dialog.
+        function fillSources(select, book) {
+            if (!select || !book || !book.name) { return; }
+            var url = '/mobile/bookmanage.php?act=getallhost&name='
+                + encodeURIComponent(book.name) + '&author='
+                + encodeURIComponent(book.author || '');
+            app.net.get(url, true).then(function (down) {
+                var list = down && down.code != -1 && down.data ? down.data : null;
+                if (!list || !list.length) {
+                    list = [{ host: book.host, id: book.id, chaptercount: book.chaptercount }];
+                }
+                var current = -1;
+                var names = [];
+                for (var i = 0; i < list.length; i++) {
+                    names.push(list[i].host);
+                    if (list[i].host === book.host
+                        && String(list[i].id) === String(book.id)) {
+                        current = i;
+                    }
+                }
+                if (current < 0) {
+                    list.unshift({ host: book.host, id: book.id,
+                                   chaptercount: book.chaptercount });
+                    names.unshift(book.host);
+                    current = 0;
+                }
+                select.innerHTML = '';
+                for (var j = 0; j < list.length; j++) {
+                    var option = document.createElement('option');
+                    option.value = list[j].host + '|' + list[j].id;
+                    option.textContent = list[j].host + ' (' + list[j].chaptercount + ')';
+                    select.appendChild(option);
+                }
+                select.selectedIndex = current;
+                select.__stvSources = list;
+                note('DOWNLOAD', 'sources: ' + list.length + ' [' + names.join(' ') + ']');
+            }, function (error) {
+                note('ERR', 'source list failed: ' + error);
+            });
         }
 
         // The download dialog asks for a chapter COUNT and hard-codes 20 of them.
@@ -2502,16 +2883,34 @@ enum SitePatch {
             menu.__stvRangePatched = true;
             // Same classes for bookid/bookhost (the popup binds template.data keys
             // to `.<key>` inputs, app.v2.js:2244-2251); the count field becomes an
-            // end chapter.
+            // end chapter, and a source picker is added because the same novel is
+            // usually mirrored on several hosts (the chapter-list page already
+            // offers them, app.v2.js:4429-4472).
             menu.body = 'Nhập khoảng chương để tải:<br>'
                 + '<input class="bookid" type="hidden"/>'
                 + '<input class="bookhost" type="hidden"/>'
                 + '<input class="numstart" type="text" placeholder="Bắt đầu từ" />'
-                + '<input class="numend" type="text" placeholder="Đến chương" />';
+                + '<input class="numend" type="text" placeholder="Đến chương" />'
+                + '<div class="dlsourcelabel">Nguồn truyện</div>'
+                + '<select class="dlsource"></select>';
+            // app.context.popup() focuses `template.focus` unguarded
+            // (app.v2.js:2252-2257). The site's value names the old count field,
+            // which no longer exists after the rename above, so the device log
+            // gets `TypeError: null is not an object (... .focus)`. Point it at
+            // the field that does exist.
+            menu.focus = 'numend';
             var originalStart = menu.action.startdownload;
             menu.action.startdownload = async function (p) {
                 var host = p.q('.bookhost').value;
                 var bookid = p.q('.bookid').value;
+                // The picker holds "host|id" and defaults to the host the detail
+                // page opened, so an untouched dialog behaves as before.
+                var select = p.q('.dlsource');
+                if (select && select.value && select.value.indexOf('|') > 0) {
+                    var chosen = select.value.split('|');
+                    host = chosen[0];
+                    bookid = chosen[1];
+                }
                 var start = parseInt(p.q('.numstart').value, 10);
                 var end = parseInt(p.q('.numend').value, 10);
                 if (!(start > 0)) { start = 1; }
@@ -2558,6 +2957,27 @@ enum SitePatch {
                             if (endInput && latest) { endInput.value = String(latest); }
                             note('DOWNLOAD', 'range dialog defaulted to 1-'
                                 + (latest ? latest : '?'));
+                            var sourceSelect = pick('.dlsource');
+                            fillSources(sourceSelect, attach);
+                            if (sourceSelect && sourceSelect.addEventListener) {
+                                sourceSelect.addEventListener('change', function () {
+                                    var sources = sourceSelect.__stvSources || [];
+                                    var picked = null;
+                                    for (var i = 0; i < sources.length; i++) {
+                                        if (sources[i].host + '|' + sources[i].id
+                                            === sourceSelect.value) { picked = sources[i]; }
+                                    }
+                                    if (!picked) { return; }
+                                    // The range is per source: the mirror can have
+                                    // fewer chapters than the one first shown.
+                                    if (endInput) {
+                                        endInput.value = String(picked.chaptercount || '');
+                                    }
+                                    note('DOWNLOAD', 'source -> ' + picked.host + '/'
+                                        + picked.id + ' (' + picked.chaptercount
+                                        + ' chapters)');
+                                });
+                            }
                         }
                     } catch (e) {}
                     return pop;
@@ -2596,7 +3016,10 @@ enum SitePatch {
             patchAttempts++;
             var readers = patchReaders();
             var range = patchDownloadRange();
-            if ((readers && range) || patchAttempts > 600) { clearInterval(patchTimer); }
+            var rows = patchDownloadedRow();
+            if ((readers && range && rows) || patchAttempts > 600) {
+                clearInterval(patchTimer);
+            }
         }, 200);
 
         // Books downloaded after boot enter store.data later, so keep sweeping.
@@ -2670,12 +3093,25 @@ enum SitePatch {
             var views = (div && div.children) || [];
             var lastChildren = views.length
                 ? ((views[views.length - 1].children || []).length) : -1;
+            // Every pane's child count, not just the last one: it separates "the
+            // tapped pane was never filled" from "the framework never switched to
+            // it". The inventory's last pane ("Đang kích hoạt") is filled from
+            // app.items.inv.activate (app.v2.js:7760, 7828), so report that length
+            // too -- an empty array there is data, not a layout bug.
+            var panes = [];
+            for (var k = 0; k < views.length; k++) {
+                panes.push(k + ':' + (((views[k].children) || []).length));
+            }
+            var inv = window.app && window.app.items && window.app.items.inv;
+            var activate = (inv && inv.activate) ? inv.activate.length : -1;
             return 'index=' + items.indexOf(item) + '/' + items.length
                 + ' items=[' + widths.join(' ') + ']'
                 + ' mark=' + (mark ? (mark.style.width || '?') + ' '
                     + (mark.style.transform || '?') : 'none')
                 + ' div=' + (div ? (div.style.transform || '?') : 'none')
-                + ' views=' + views.length + ' lastview=' + lastChildren + ' child(ren)';
+                + ' views=' + views.length + ' lastview=' + lastChildren + ' child(ren)'
+                + ' panes=[' + panes.join(' ') + ']'
+                + ' activate=' + activate;
         }
 
         document.addEventListener('click', function (event) {
@@ -2839,7 +3275,7 @@ enum SitePatch {
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
     static let all: [String] = [compat, diag, tabProbe, storageAccessor,
                                 readerDefaults, ttsProvider, followFallback,
-                                safeArea, gridLayout, settingsBackup,
+                                safeArea, keyboardPopup, gridLayout, settingsBackup,
                                 domainFailover, bookmarkToggle, readerTts,
                                 pageRepair, bootShell, SiteI18nData.script]
 }

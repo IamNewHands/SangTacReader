@@ -173,6 +173,7 @@ jobs:
                         stvSafeAreaInstalled stvSettingsBackupInstalled stvDomainFailoverInstalled \
                         stvBookmarkToggleInstalled stvStorageAccessorInstalled \
                         stvGridLayoutInstalled stvTabProbeInstalled \
+                        stvKeyboardPopupInstalled \
                         stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
