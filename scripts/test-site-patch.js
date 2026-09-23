@@ -519,11 +519,13 @@ function installFakeApp(sandbox, options) {
       stored.pushed = (stored.pushed || []).concat([name]);
       const page = (options.pages || {})[name];
       if (!page) { return null; }
-      return {
-        root: page,
-        q: (selector) => page.querySelector(selector),
-        qq: (selector) => page.querySelectorAll(selector),
-      };
+      // The real app.pushPage() returns the page ELEMENT, with q()/qq() mixed
+      // into Element.prototype by /stv.ui.js -- not a wrapper object. The
+      // translation block walks up from a comment embed to that element, so the
+      // stub has to be an element too.
+      page.q = (selector) => page.querySelector(selector);
+      page.qq = (selector) => page.querySelectorAll(selector);
+      return page;
     },
   };
   app.config.reader.__defineSetter__('display_type', function (value) {
@@ -638,24 +640,36 @@ function installFakeApp(sandbox, options) {
     }
     render() {
       stored.renderCache = (stored.cacheLater || []).slice();
-      // The real row is `<div class="bookrowcont"><div class="bookrow">` with
-      // the title in `.tname` (view-bookdownloadjob); the failover/guard code
-      // reads `.tname` to tell a row that got book data from one that did not.
-      const node = makeContainer('div', 'bookrowcont');
-      const row = makeContainer('div', 'bookrow');
-      const right = makeContainer('div', 'right');
-      const title = makeContainer('div', 'tname', options.rowTitle || '');
-      right.appendChild(title);
-      right.appendChild(makeContainer('div', 'status'));
-      const pbar = makeContainer('div', 'pgbar');
-      pbar.appendChild(makeContainer('div', 'pgbarinner'));
-      right.appendChild(pbar);
-      row.appendChild(right);
-      node.appendChild(row);
-      this.node = node;
-      this.status = right.children[1];
-      this.progress = pbar.children[0];
-      return Promise.resolve(node);
+      stored.renderCalls = (stored.renderCalls || 0) + 1;
+      const build = () => {
+        // The real row is `<div class="bookrowcont"><div class="bookrow">` with
+        // the title in `.tname` (view-bookdownloadjob); the failover/guard code
+        // reads `.tname` to tell a row that got book data from one that did not.
+        const node = makeContainer('div', 'bookrowcont');
+        const row = makeContainer('div', 'bookrow');
+        const right = makeContainer('div', 'right');
+        const title = makeContainer('div', 'tname', options.rowTitle || '');
+        right.appendChild(title);
+        right.appendChild(makeContainer('div', 'status'));
+        const pbar = makeContainer('div', 'pgbar');
+        pbar.appendChild(makeContainer('div', 'pgbarinner'));
+        right.appendChild(pbar);
+        row.appendChild(right);
+        node.appendChild(row);
+        this.node = node;
+        this.status = right.children[1];
+        this.progress = pbar.children[0];
+        return node;
+      };
+      // render() is async in the site and sets this.node after an await, so two
+      // callers can both clear its `if (this.node)` guard. slowRender makes the
+      // stub yield the same way instead of resolving in one microtask.
+      if (options.slowRender) {
+        return new Promise((resolve) => {
+          sandbox.setTimeout(() => { resolve(build()); }, options.slowRender);
+        });
+      }
+      return Promise.resolve(build());
     }
     downloadChapter(chapter) {
       stored.downloadStarts = (stored.downloadStarts || []).concat([Date.now()]);
@@ -1343,8 +1357,14 @@ async function testOfflineBookDetailPage() {
   check('the downloaded list warms the cache before building its rows',
     (sandbox.__stored.cacheLater || []).indexOf(url) >= 0,
     JSON.stringify(sandbox.__stored.cacheLater || []));
+  check('a book with a live download job is not in the downloaded list yet',
+    rows.length === 0, JSON.stringify(rows));
+
+  // Drop the job, as a finished download does, and the same read finds the book.
+  app.bookDownloaderList.length = 0;
+  const settled = await app.offlineBook.getDownloadBooks(0, 20);
   check('the warmed cache makes populateBookInfo() find the book',
-    rows.length === 1, JSON.stringify(rows));
+    settled.length === 1, JSON.stringify(settled));
 
   // A book downloaded after boot only appears in store.data later.
   const lateUrl = '/mobile/bookinfo.php?hid=999&host=fanqie';
@@ -1793,7 +1813,10 @@ async function testDownloadRange() {
     String(sandbox.window.__stvDiag.text() || '').indexOf('range 1-10 of 30') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-200));
 
-  // An end past the last chapter clamps to the book's length.
+  // An end past the last chapter clamps to the book's length. The first job is
+  // dropped first: a second start for a book that is still downloading is now
+  // ignored on purpose, and this assertion is about the slice, not that guard.
+  app.bookDownloaderList.length = 0;
   inputs['.numstart'].value = '25';
   inputs['.numend'].value = '999';
   await menu.action.startdownload.call({ cancel() {} }, popup);
@@ -2097,7 +2120,10 @@ async function testDownloadCompletion() {
   page.appendChild(manager);
   sandbox.document.body.appendChild(page);
   const rendered = [];
-  app.celldisplay = {
+  // The site's row loader is app.celoader (page-vip:3610), not app.celldisplay.
+  // The stub used to expose the misspelled name, so the test agreed with a patch
+  // that never installed on the device.
+  app.celoader = {
     bookdownloadedrow(ele, data) {
       rendered.push(data);
       return makeContainer('div', 'bookdownloadedrow');
@@ -2106,7 +2132,9 @@ async function testDownloadCompletion() {
 
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(400);
-  check('the downloaded-row renderer is wrapped', app.celldisplay.__stvRowPatched === true);
+  check('the downloaded-row renderer is wrapped', app.celoader.__stvRowPatched === true);
+  check('a row renderer under the misspelled name is not required',
+    app.celldisplay === undefined);
 
   const job = new app.BookDownloadManager('qidian', '1034915599', ['c1', 'c2']);
   let updates = 0;
@@ -2143,6 +2171,152 @@ async function testDownloadCompletion() {
     String(sandbox.window.__stvDiag.text() || '')
       .indexOf('removed downloaded book qidian/1034915599') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-260));
+}
+
+async function testDownloadRenderRace() {
+  console.log('one job renders one row even when two updates overlap');
+  const url = '/mobile/bookinfo.php?hid=1034915599&host=qidian';
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    // The site's render() yields before it sets this.node, so two callers can
+    // both clear its `if (this.node)` guard.
+    slowRender: 25,
+    bookInfoResponses: {
+      [url]: { book: { id: '1034915599', host: 'qidian', name: '这些仙子全都不正常！' } },
+    },
+  });
+  const container = makeContainer('div', 'download-manager');
+  container.id = 'download-manager';
+  sandbox.document.body.appendChild(container);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  new app.BookDownloadManager('qidian', '1034915599', ['c1']);
+  // The site's own onUpdate (app.v2.read.js:3428-3444), verbatim.
+  app.bookDownloaderList.onUpdate = async function (n) {
+    const target = n || container;
+    for (let i = 0; i < this.length; i++) {
+      const node = await this[i].render();
+      if (node.parentElement === target || node.parentNode === target) { continue; }
+      target.appendChild(node);
+    }
+  };
+
+  await Promise.all([
+    app.bookDownloaderList.onUpdate(),
+    app.bookDownloaderList.onUpdate(),
+  ]);
+  await tick(60);
+
+  const rows = container.children.filter((child) => child.className === 'bookrowcont');
+  check('two overlapping updates leave exactly one row',
+    rows.length === 1, String(rows.length));
+  check('the overlapping callers share one render',
+    (sandbox.__stored.renderCalls || 0) === 1,
+    String(sandbox.__stored.renderCalls));
+}
+
+async function testDownloadedListHidesRunningJobs() {
+  console.log('a running download is not listed as DOWNLOADED');
+  const running = { host: 'qidian', id: '1034915599' };
+  const idle = { host: 'qidian', id: '999' };
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    offlineBooks: [running, idle],
+    bookInfoResponses: {
+      '/mobile/bookinfo.php?hid=1034915599&host=qidian':
+        { book: { id: '1034915599', host: 'qidian', name: 'running' } },
+      '/mobile/bookinfo.php?hid=999&host=qidian':
+        { book: { id: '999', host: 'qidian', name: 'idle' } },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  const job = new app.BookDownloadManager('qidian', '1034915599', ['c1', 'c2']);
+  const listed = await app.offlineBook.getDownloadBooks(0, 20);
+  check('the book whose job is still running is filtered out of the list',
+    listed.length === 1 && listed[0].id === '999',
+    JSON.stringify(listed.map((book) => book.id)));
+  check('the store record itself is kept, so offline reading still resolves',
+    app.offlineBook.store.data.length === 2,
+    String(app.offlineBook.store.data.length));
+
+  job.pause();
+  const paused = await app.offlineBook.getDownloadBooks(0, 20);
+  check('a paused job no longer hides its partially downloaded book',
+    paused.length === 2, JSON.stringify(paused.map((book) => book.id)));
+
+  job.isPaused = false;
+  job.downloaded = 2;
+  const finished = await app.offlineBook.getDownloadBooks(0, 20);
+  check('a completed job no longer hides its book either',
+    finished.length === 2, JSON.stringify(finished.map((book) => book.id)));
+  check('the store is put back after every read',
+    app.offlineBook.store.data.length === 2,
+    String(app.offlineBook.store.data.length));
+}
+
+async function testDuplicateDownloadStart() {
+  console.log('a second start for a running book is ignored');
+  const sandbox = makeSandbox();
+  sandbox.getChapterList = async () => [{ cid: 't1' }, { cid: 't2' }];
+  const app = installFakeApp(sandbox, { displayType: 'auto', slowChapter: true });
+
+  const popupNode = makeContainer('div', 'popupedit');
+  popupNode.q = (selector) => popupNode.querySelector(selector);
+  const hostInput = makeElement('input');
+  const idInput = makeElement('input');
+  const startInput = makeElement('input');
+  const endInput = makeElement('input');
+  hostInput.className = 'bookhost';
+  hostInput.value = 'qidian';
+  idInput.className = 'bookid';
+  idInput.value = '1034915599';
+  startInput.className = 'numstart';
+  startInput.value = '1';
+  endInput.className = 'numend';
+  endInput.value = '2';
+  [hostInput, idInput, startInput, endInput].forEach((node) => popupNode.appendChild(node));
+
+  app.context = {
+    menu: {
+      downloadchapter: {
+        body: '<input class="numstart"/><input class="numend"/>',
+        action: {
+          startdownload: async function () { sandbox.__stored.siteStart = true; },
+          cancel() {},
+        },
+      },
+    },
+    showPopup: () => popupNode,
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  const action = app.context.menu.downloadchapter.action.startdownload;
+  await action.call({ cancel() {} }, popupNode);
+  await tick(60);
+  check('the first start creates one job', app.bookDownloaderList.length === 1,
+    String(app.bookDownloaderList.length));
+
+  await action.call({ cancel() {} }, popupNode);
+  await tick(60);
+  check('a second start while that job is live adds no second job',
+    app.bookDownloaderList.length === 1, String(app.bookDownloaderList.length));
+  check('the ignored start is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('already running') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  app.bookDownloaderList[0].pause();
+  await action.call({ cancel() {} }, popupNode);
+  await tick(60);
+  check('a paused job does not block a fresh start',
+    app.bookDownloaderList.length === 2, String(app.bookDownloaderList.length));
 }
 
 async function testChapterRetry() {
@@ -2419,6 +2593,229 @@ function edgeAnswer(texts) {
   };
 }
 
+/**
+ * A community board: page-pageposts (_page_vip.html:1087) -- a title bar and a
+ * `.posts` list that app.socialpost.channel[].fetch() fills afterwards. Each row
+ * is a view-post (:2671) whose text is `.postcontent > .content`.
+ */
+function communityBoardFixture() {
+  const page = makeContainer('div', '');
+  const bar = makeContainer('div', 'titlebar');
+  const ctx = makeContainer('div', 'rctx');
+  bar.appendChild(ctx);
+  const posts = makeContainer('div', 'posts');
+  page.appendChild(bar);
+  page.appendChild(posts);
+  const addPost = (text) => {
+    const cont = makeContainer('div', 'postcont');
+    const post = makeContainer('div', 'post');
+    const postcontent = makeContainer('div', 'postcontent');
+    postcontent.appendChild(makeContainer('div', 'content', text));
+    post.appendChild(postcontent);
+    cont.appendChild(post);
+    posts.appendChild(cont);
+    return cont;
+  };
+  return { page, bar, ctx, posts, addPost };
+}
+
+/**
+ * page-pagepost (_page_vip.html:1105): one post body plus an embedcomment
+ * (:2892) whose poster is a textarea and a `.finish` button.
+ */
+function singlePostFixture(text) {
+  const page = makeContainer('div', '');
+  const bar = makeContainer('div', 'titlebar');
+  const ctx = makeContainer('div', 'rctx');
+  bar.appendChild(ctx);
+  const postcontent = makeContainer('div', 'postcontent');
+  postcontent.appendChild(makeContainer('div', 'content', text));
+  const embed = makeContainer('div', 'embedcomment');
+  const poster = makeContainer('div', 'embed-poster');
+  const input = makeElement('textarea');
+  input.className = 'comment-input';
+  const finish = makeContainer('button', 'finish');
+  poster.appendChild(input);
+  poster.appendChild(finish);
+  embed.appendChild(poster);
+  const comments = makeContainer('div', 'comments');
+  embed.appendChild(comments);
+  page.appendChild(bar);
+  page.appendChild(postcontent);
+  page.appendChild(embed);
+  return { page, bar, ctx, postcontent, embed, poster, input, finish, comments };
+}
+
+function addCommentBlock(view, text) {
+  const block = makeContainer('div', '');
+  block.setAttribute('view', 'commentblock');
+  const body = makeContainer('div', 'cmtbody');
+  body.appendChild(makeContainer('div', 'cmtcontent content', text));
+  block.appendChild(body);
+  view.appendChild(block);
+  return block;
+}
+
+async function testTranslateAllWaitsForTheList() {
+  console.log('译全部 waits for the list and opens no popup');
+  const fixture = commentPageFixture([]);
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { comment: fixture.page },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.document.body.appendChild(fixture.page);
+  app.pushPage('comment', {});
+  await tick(40);
+
+  // Tapped before the comments have loaded: no popup, no engine call, and the
+  // request is armed for the moment the list lands.
+  const all = fixture.bar.querySelectorAll('.stv-translate-all')[0];
+  click(all);
+  await tick(60);
+  check('an empty list opens no popup',
+    (sandbox.__stored.toasts || []).length === 0,
+    JSON.stringify(sandbox.__stored.toasts || []));
+  check('an empty list calls no engine',
+    (sandbox.__stored.translationTranslate || []).length === 0,
+    JSON.stringify(sandbox.__stored.translationTranslate || []));
+  check('the button says it is waiting', all.textContent === '等加载…', all.textContent);
+
+  const block = addCommentBlock(fixture.view, 'Bình luận muộn');
+  sandbox.__flushObservers();
+  await tick(200);
+
+  const calls = sandbox.__stored.translationTranslate || [];
+  check('the armed request runs once the comments arrive',
+    calls.length === 1
+      && JSON.stringify(calls[0].texts) === JSON.stringify(['Bình luận muộn']),
+    JSON.stringify(calls));
+  check('the late comment is translated',
+    block.querySelectorAll('.cmtcontent')[0].textContent === '【系统】Bình luận muộn',
+    block.querySelectorAll('.cmtcontent')[0].textContent);
+  check('the button goes back to its own label', all.textContent === '译全部', all.textContent);
+  check('still no popup anywhere',
+    (sandbox.__stored.toasts || []).length === 0,
+    JSON.stringify(sandbox.__stored.toasts || []));
+}
+
+async function testAutoTranslateWaitsForTheList() {
+  console.log('auto-translate waits for the comments to load');
+  const fixture = commentPageFixture([]);
+  const sandbox = makeSandbox();
+  sandbox.localStorage.setItem('stv.translate.settings', JSON.stringify({
+    engine: 'apple',
+    apiKey: '',
+    region: '',
+    endpoint: '',
+    model: '',
+    readSource: 'vi',
+    readTarget: 'zh-Hans',
+    writeTarget: 'vi',
+    auto: true,
+  }));
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { comment: fixture.page },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.document.body.appendChild(fixture.page);
+  app.pushPage('comment', {});
+  await tick(150);
+
+  check('auto-translate does not run against an empty page',
+    (sandbox.__stored.translationTranslate || []).length === 0,
+    JSON.stringify(sandbox.__stored.translationTranslate || []));
+  check('auto-translate does not report an empty list either',
+    (sandbox.__stored.toasts || []).length === 0,
+    JSON.stringify(sandbox.__stored.toasts || []));
+
+  addCommentBlock(fixture.view, 'Nhận xét tự động');
+  sandbox.__flushObservers();
+  await tick(220);
+  const calls = sandbox.__stored.translationTranslate || [];
+  check('auto-translate runs once the comments arrive',
+    calls.length === 1
+      && JSON.stringify(calls[0].texts) === JSON.stringify(['Nhận xét tự động']),
+    JSON.stringify(calls));
+}
+
+async function testCommunityBoardTranslate() {
+  console.log('community boards are translatable');
+  const board = communityBoardFixture();
+  const single = singlePostFixture('Nội dung bài viết');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { pageposts: board.page, pagepost: single.page },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.document.body.appendChild(board.page);
+  sandbox.document.body.appendChild(single.page);
+
+  app.pushPage('pageposts', {});
+  await tick(40);
+  check('a community board gets the title buttons',
+    board.bar.querySelectorAll('.stv-translate-all').length === 1
+      && board.bar.querySelectorAll('.stv-translate-settings').length === 1,
+    String(board.bar.querySelectorAll('.stv-translate-all').length));
+
+  board.addPost('Bài viết một');
+  board.addPost('Bài viết hai');
+  sandbox.__flushObservers();
+  check('every post on a board gets its own translate button',
+    board.posts.querySelectorAll('.stv-translate-one').length === 2,
+    String(board.posts.querySelectorAll('.stv-translate-one').length));
+
+  click(board.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(200);
+  const calls = sandbox.__stored.translationTranslate || [];
+  check('译全部 translates the post bodies on a board',
+    calls.length === 1
+      && JSON.stringify(calls[0].texts) === JSON.stringify(['Bài viết một', 'Bài viết hai']),
+    calls.length ? JSON.stringify(calls[0].texts) : 'no call');
+  const bodies = board.posts.querySelectorAll('.content');
+  check('the post bodies show the translation',
+    bodies[0].textContent === '【系统】Bài viết một', bodies[0].textContent);
+  check('a board report opens no popup',
+    (sandbox.__stored.toasts || []).length === 0,
+    JSON.stringify(sandbox.__stored.toasts || []));
+
+  // A single post: the body, its comment list and its textarea.
+  app.pushPage('pagepost', {});
+  await tick(40);
+  check('a single post gets the title buttons',
+    single.bar.querySelectorAll('.stv-translate-all').length === 1,
+    String(single.bar.querySelectorAll('.stv-translate-all').length));
+  check('the post body gets its own translate button',
+    single.postcontent.querySelectorAll('.stv-translate-one').length === 1,
+    String(single.postcontent.querySelectorAll('.stv-translate-one').length));
+  check('the post textarea gets a translate button',
+    single.poster.querySelectorAll('.stv-translate-input').length === 1,
+    String(single.poster.querySelectorAll('.stv-translate-input').length));
+
+  addCommentBlock(single.comments, 'Bình luận bài viết');
+  sandbox.__flushObservers();
+  check('a post comment gets its own translate button',
+    single.comments.querySelectorAll('.stv-translate-one').length === 1,
+    String(single.comments.querySelectorAll('.stv-translate-one').length));
+
+  single.input.value = '这是一条帖子评论';
+  click(single.poster.querySelectorAll('.stv-translate-input')[0]);
+  await tick(200);
+  const inputCalls = (sandbox.__stored.translationTranslate || []).slice(1);
+  check('translating a post comment reads the textarea value',
+    inputCalls.length === 1
+      && JSON.stringify(inputCalls[0].texts) === JSON.stringify(['这是一条帖子评论']),
+    JSON.stringify(inputCalls));
+  check('the translated post comment goes back into the textarea',
+    single.input.value === '【系统】这是一条帖子评论', single.input.value);
+}
+
 async function testCommentTranslate() {
   console.log('comment translation (system offline engine)');
   const fixture = commentPageFixture(['Bình luận một', 'Bình luận hai']);
@@ -2531,21 +2928,42 @@ async function testCommentTranslate() {
   check('the translation panel opens', !!panel);
   if (!panel) { return; }
 
-  const selects = panel.querySelectorAll('select');
-  const fields = panel.querySelectorAll('input');
-  check('the panel offers every engine', selects.length === 4 && fields.length >= 4,
-    'selects=' + selects.length + ' inputs=' + fields.length);
+  const pickers = panel.querySelectorAll('.stv-translate-picker');
+  const fields = panel.querySelectorAll('.stv-translate-field');
+  check('the panel offers a picker for the engine and each language',
+    pickers.length === 4 && fields.length === 4,
+    'pickers=' + pickers.length + ' fields=' + fields.length);
+  check('the panel uses no native select, which the webview cannot open',
+    panel.querySelectorAll('select').length === 0,
+    String(panel.querySelectorAll('select').length));
 
-  selects[0].value = 'free';
-  fields[0].value = 'key-123';
-  const panelButtons = panel.querySelectorAll('button');
-  click(panelButtons[1]);
+  // Each picker owns its own list; a panel-wide query would find the first
+  // matching code in whichever list comes first in document order.
+  const pickOption = (pickerIndex, value) => {
+    const picker = pickers[pickerIndex];
+    click(picker);
+    const option = picker.parentNode.querySelectorAll('.stv-translate-option')
+      .filter((node) => node.getAttribute('data-value') === value)[0];
+    if (option) { click(option); }
+    return option;
+  };
+
+  check('the engine picker lists every engine',
+    panel.querySelectorAll('.stv-translate-option').length >= 6,
+    String(panel.querySelectorAll('.stv-translate-option').length));
+  check('picking a channel changes the picker label',
+    !!pickOption(0, 'free') && pickers[0].textContent.indexOf('微软') >= 0,
+    pickers[0].textContent);
+
+  const keyField = panel.querySelectorAll('.stv-translate-key')[0];
+  keyField.value = 'key-123';
+  click(panel.querySelectorAll('.stv-translate-save')[0]);
   await tick(80);
   const saved = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
   check('the panel saves the engine and the key',
     saved.engine === 'free' && saved.apiKey === 'key-123', JSON.stringify(saved));
 
-  click(panelButtons[2]);
+  click(panel.querySelectorAll('.stv-translate-test')[0]);
   await tick(150);
   const http = sandbox.__stored.http || [];
   check('the keyless Microsoft channel is used',
@@ -2559,6 +2977,27 @@ async function testCommentTranslate() {
     http.length === 1
       && JSON.parse(http[0].data)[0] === 'Xin chào, đây là một bình luận thử nghiệm.',
     http.length ? http[0].data : 'no request');
+
+  // The reader can pick any pair, not just Vietnamese <-> Chinese.
+  const languageCount = panel.querySelectorAll('.stv-translate-option').length;
+  pickOption(2, 'ja');
+  click(panel.querySelectorAll('.stv-translate-save')[0]);
+  await tick(60);
+  const repicked = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
+  check('any language can be chosen as the reading target',
+    repicked.readTarget === 'ja', JSON.stringify(repicked.readTarget));
+  check('the language list is not limited to two languages',
+    languageCount > 20, String(languageCount));
+
+  // The engine picker holds engines, so search the language picker.
+  const search = pickers[2].parentNode.querySelectorAll('.stv-translate-pickersearch')[0];
+  search.value = '韩';
+  search.__fire('input', {});
+  const visible = pickers[2].parentNode.querySelectorAll('.stv-translate-option')
+    .filter((node) => node.style.display !== 'none');
+  check('the language list can be searched',
+    visible.length === 1 && visible[0].getAttribute('data-value') === 'ko',
+    JSON.stringify(visible.map((node) => node.getAttribute('data-value'))));
 }
 
 async function testCommentTranslateFallback() {
@@ -2709,6 +3148,9 @@ await testBootShell();
   await testDownloadLifecycle();
   await testDownloadSources();
   await testDownloadCompletion();
+  await testDownloadRenderRace();
+  await testDownloadedListHidesRunningJobs();
+  await testDuplicateDownloadStart();
   await testChapterRetry();
   await testKeyboardPopup();
   await testGridLayout();
@@ -2716,6 +3158,9 @@ await testBootShell();
   await testCommentTranslate();
   await testCommentTranslateFallback();
   await testCommentTranslateProviders();
+  await testTranslateAllWaitsForTheList();
+  await testAutoTranslateWaitsForTheList();
+  await testCommunityBoardTranslate();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

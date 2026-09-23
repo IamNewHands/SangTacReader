@@ -2548,6 +2548,22 @@ enum SitePatch {
             });
         }, true);
 
+        // A job is live while its loop is running and it still has chapters to
+        // fetch. A paused or finished job is not live: a paused job's book is a
+        // perfectly good entry for the DOWNLOADED list, and a fresh start() is a
+        // legitimate new task.
+        function liveJob(host, id) {
+            var list = (window.app && window.app.bookDownloaderList) || [];
+            for (var i = 0; i < list.length; i++) {
+                var job = list[i];
+                if (!job || job.host != host || job.id != id) { continue; }
+                if (job.isPaused) { continue; }
+                if (job.total && job.downloaded >= job.total) { continue; }
+                return job;
+            }
+            return null;
+        }
+
         // Two entry points read that cache for a list of books: the download
         // manager's rows (render) and the 储物袋 downloaded list
         // (getDownloadBooks -> populateBookInfo). Warm in front of both.
@@ -2558,16 +2574,32 @@ enum SitePatch {
             if (manager && manager.prototype && !manager.prototype.__stvWarmed) {
                 manager.prototype.__stvWarmed = true;
                 var originalRender = manager.prototype.render;
+                // render() (:3605) is async and its only guard is `if (this.node)`,
+                // which it reads before its first await. Two onUpdate() calls in
+                // flight -- the constructor's, plus the ones our own buttons and
+                // the completion hand-off fire -- therefore both get past that
+                // guard, both build a node, and the list shows one job twice
+                // ("下载页面有时会出现两次相同的下载"). Memoise the promise, not
+                // just the finished node, so the second caller awaits the first.
                 manager.prototype.render = function () {
                     var self = this;
                     var args = arguments;
-                    return warmOne(self.host, self.id).then(function (down) {
-                        return Promise.resolve(originalRender.apply(self, args))
-                            .then(function (node) {
-                                decorateRow(self, node, down && down.book ? down.book : null);
-                                return node;
-                            });
-                    });
+                    if (self.node) { return Promise.resolve(self.node); }
+                    if (self.__stvRenderPending) { return self.__stvRenderPending; }
+                    self.__stvRenderPending = warmOne(self.host, self.id).then(
+                        function (down) {
+                            return Promise.resolve(originalRender.apply(self, args))
+                                .then(function (node) {
+                                    decorateRow(self, node,
+                                        down && down.book ? down.book : null);
+                                    self.__stvRenderPending = null;
+                                    return node;
+                                });
+                        }, function (error) {
+                            self.__stvRenderPending = null;
+                            throw error;
+                        });
+                    return self.__stvRenderPending;
                 };
                 note('BOOKINFO', 'download manager render warmed');
             }
@@ -2648,12 +2680,51 @@ enum SitePatch {
                 && !app.offlineBook.__stvWarmedList) {
                 app.offlineBook.__stvWarmedList = true;
                 var originalList = app.offlineBook.getDownloadBooks;
+                // getNewBook() (app.v2.read.js:3231) calls book.save(), which
+                // prepends the record to store.data, the instant the download
+                // starts -- so an unfinished job was already listed under
+                // DOWNLOADED ("正在下载中的任务还没完成就已经在已下载中显示了").
+                // Serve the list from the store minus every live job instead.
+                //
+                // The record itself stays: the reader resolves offline chapters
+                // through isBookExist(), so removing it would break offline
+                // reading of a partially downloaded book. Only the view changes.
+                //
+                // store.data is swapped for the duration of the call because
+                // getDownloadBooks slices it by index before populating, so
+                // filtering afterwards would shift the page's 20-per-page
+                // accounting. The swap is not reentrant, hence the chain.
+                var listChain = Promise.resolve();
                 app.offlineBook.getDownloadBooks = function () {
                     var self = this;
                     var args = arguments;
-                    return warmStore().then(function () {
-                        return originalList.apply(self, args);
-                    });
+                    var run = function () {
+                        return warmStore().then(function () {
+                            var store = app.offlineBook.store;
+                            var all = (store && store.data) || [];
+                            var visible = [];
+                            for (var i = 0; i < all.length; i++) {
+                                if (!liveJob(all[i].host, all[i].id)) {
+                                    visible.push(all[i]);
+                                }
+                            }
+                            if (visible.length === all.length) {
+                                return originalList.apply(self, args);
+                            }
+                            store.data = visible;
+                            return Promise.resolve(originalList.apply(self, args))
+                                .then(function (books) {
+                                    store.data = all;
+                                    return books;
+                                }, function (error) {
+                                    store.data = all;
+                                    throw error;
+                                });
+                        });
+                    };
+                    var next = listChain.then(run, run);
+                    listChain = next.then(function () {}, function () {});
+                    return next;
                 };
                 note('BOOKINFO', 'downloaded-list bookinfo warm-up installed');
             }
@@ -2734,8 +2805,8 @@ enum SitePatch {
                 var book = down && down.book ? down.book : null;
                 var container = document.getElementById('download-manager');
                 var area = container ? container.parentElement : null;
-                if (!book || !area || !app.celldisplay
-                    || typeof app.celldisplay.bookdownloadedrow !== 'function') {
+                if (!book || !area || !app.celoader
+                    || typeof app.celoader.bookdownloadedrow !== 'function') {
                     note('DOWNLOAD', 'finished ' + host + '/' + id
                         + '; the DOWNLOADED list is not open');
                     return;
@@ -2747,7 +2818,7 @@ enum SitePatch {
                 for (key in base) { data[key] = base[key]; }
                 if (!data.chaptercount) { data.chaptercount = manager.total; }
                 data.totalDownloaded = manager.downloaded;
-                var row = app.celldisplay.bookdownloadedrow(null, data);
+                var row = app.celoader.bookdownloadedrow(null, data);
                 if (row) {
                     area.appendChild(row);
                     note('DOWNLOAD', 'moved ' + host + '/' + id + ' into the DOWNLOADED list');
@@ -2759,14 +2830,20 @@ enum SitePatch {
         // (page-vip:4014-4037) renders the cover, the title and "Đã tải N/M" and
         // that is all, while OfflineBook.deleteAll() (app.v2.read.js:3368) removes
         // the chapter bodies and delete() (:3314) removes the record. Add both.
+        //
+        // The loader is `app.celoader` (page-vip:3610; bookdownloadedrow at
+        // :4014, called from the downloaded list at :4074). An earlier revision
+        // guarded on `app.celldisplay`, which does not exist anywhere in the
+        // site bundle, so this patch never installed and the rows had no delete
+        // button at all.
         function patchDownloadedRow() {
             var app = window.app;
-            if (!app || !app.celldisplay
-                || typeof app.celldisplay.bookdownloadedrow !== 'function') { return false; }
-            if (app.celldisplay.__stvRowPatched) { return true; }
-            app.celldisplay.__stvRowPatched = true;
-            var original = app.celldisplay.bookdownloadedrow;
-            app.celldisplay.bookdownloadedrow = function (ele, data) {
+            if (!app || !app.celoader
+                || typeof app.celoader.bookdownloadedrow !== 'function') { return false; }
+            if (app.celoader.__stvRowPatched) { return true; }
+            app.celoader.__stvRowPatched = true;
+            var original = app.celoader.bookdownloadedrow;
+            app.celoader.bookdownloadedrow = function (ele, data) {
                 var node = original.apply(this, arguments);
                 decorateDownloadedRow(node, data);
                 return node;
@@ -2915,6 +2992,18 @@ enum SitePatch {
                 var end = parseInt(p.q('.numend').value, 10);
                 if (!(start > 0)) { start = 1; }
                 this.cancel(p);
+                // A second confirm while the first job is still running would
+                // push a second row for the same book, and the site's own
+                // filterDownloadingChapters() (:3445) would hand that job an
+                // empty chapter list -- a row stuck at 0/N that never finishes
+                // and never leaves the DOWNLOADING list. The first job already
+                // covers the book, so the second start is a no-op.
+                var running = liveJob(host, bookid);
+                if (running) {
+                    note('DOWNLOAD', 'a download for ' + host + '/' + bookid
+                        + ' is already running; ignoring the second start');
+                    return;
+                }
                 try {
                     var book = await app.offlineBook.getNewBook({ id: bookid, host: host });
                     var clist = await getChapterList(host, bookid);
@@ -3029,17 +3118,25 @@ enum SitePatch {
     })();
     """
 
-    // MARK: - Comment translation
+    // MARK: - Comment and community-post translation
 
     /**
-     Comment translation on the reader's comment page (_page_vip.html:914-941):
+     Translation for everything the app renders as text the reader did not write:
+     book comments (_page_vip.html:914), and the 社区 boards -- the channel/post
+     list (pageposts, :1087, reached from Kênh truyện / Kênh linh tinh / 势力 /
+     a user's posts), a single post with its comments (:1105), a user home's
+     comments (:4843) and the broadcast/fromuser comment boards. The Cbox board
+     is a cross-origin iframe (:982) and cannot be reached from this page.
 
-       * a 译全部 button in the title bar translates every comment currently
-         loaded;
-       * every comment block gets its own 译 that toggles back to the original;
-       * the comment input gets a 译成X button that rewrites what the reader
-         typed into the language the site's commenters actually read, so a
-         Chinese reader can post in Vietnamese;
+       * a 译全部 button in the page's title bar translates every comment and
+         post body the page has loaded -- with no popup: the button carries the
+         progress, and if the list has not arrived yet the request is armed and
+         runs the moment the first item lands;
+       * every comment and every post gets its own 译 that toggles back to the
+         original;
+       * the comment input (both the page's contenteditable and a post's
+         textarea) gets a 译成X button that rewrites what the reader typed into
+         the language the site's commenters actually read;
        * 设置 -> 翻译 opens a panel for the engine, the API key and the languages.
 
      Engines, in the order the UI offers them:
@@ -3080,12 +3177,27 @@ enum SitePatch {
             ['openai', 'OpenAI 兼容接口（自备 Key）']
         ];
 
+        // The reader picks the pair freely -- the two defaults below are only
+        // starting points. Codes are the ones Apple's Translation framework and
+        // the HTTP engines both accept (DeepL is mapped separately, see
+        // deeplLanguage()).
         var LANGUAGES = [
-            ['vi', '越南语'], ['zh-Hans', '简体中文'], ['zh-Hant', '繁体中文'],
+            ['zh-Hans', '简体中文'], ['zh-Hant', '繁体中文'], ['vi', '越南语'],
             ['en', '英语'], ['ja', '日语'], ['ko', '韩语'], ['th', '泰语'],
-            ['id', '印尼语'], ['ms', '马来语'], ['fr', '法语'], ['de', '德语'],
-            ['es', '西班牙语'], ['ru', '俄语'], ['pt', '葡萄牙语'],
-            ['ar', '阿拉伯语'], ['hi', '印地语']
+            ['id', '印尼语'], ['ms', '马来语'], ['tl', '菲律宾语'],
+            ['my', '缅甸语'], ['km', '高棉语'], ['lo', '老挝语'],
+            ['hi', '印地语'], ['bn', '孟加拉语'], ['ta', '泰米尔语'],
+            ['ur', '乌尔都语'], ['fa', '波斯语'], ['ar', '阿拉伯语'],
+            ['he', '希伯来语'], ['tr', '土耳其语'], ['ru', '俄语'],
+            ['uk', '乌克兰语'], ['pl', '波兰语'], ['cs', '捷克语'],
+            ['sk', '斯洛伐克语'], ['hu', '匈牙利语'], ['ro', '罗马尼亚语'],
+            ['bg', '保加利亚语'], ['el', '希腊语'], ['de', '德语'],
+            ['fr', '法语'], ['es', '西班牙语'], ['pt', '葡萄牙语'],
+            ['it', '意大利语'], ['nl', '荷兰语'], ['sv', '瑞典语'],
+            ['no', '挪威语'], ['da', '丹麦语'], ['fi', '芬兰语'],
+            ['et', '爱沙尼亚语'], ['lv', '拉脱维亚语'], ['lt', '立陶宛语'],
+            ['sl', '斯洛文尼亚语'], ['hr', '克罗地亚语'], ['sr', '塞尔维亚语'],
+            ['ca', '加泰罗尼亚语'], ['af', '南非荷兰语'], ['sw', '斯瓦希里语']
         ];
 
         var SOURCE_LANGUAGES = [['auto', '自动识别']].concat(LANGUAGES);
@@ -3148,6 +3260,13 @@ enum SitePatch {
 
         function textOf(node) {
             if (!node) { return ''; }
+            var tag = String(node.tagName || '').toUpperCase();
+            // A post's comment box is a plain <textarea> (_dl_app.v2.js:3603
+            // reads `.value`), which carries neither innerText nor textContent.
+            if ((tag === 'TEXTAREA' || tag === 'INPUT')
+                && typeof node.value === 'string' && node.value) {
+                return node.value;
+            }
             var text = node.innerText;
             if (typeof text !== 'string' || !text) { text = node.textContent; }
             return typeof text === 'string' ? text : '';
@@ -3582,16 +3701,34 @@ enum SitePatch {
             return button;
         }
 
-        function toast(message) {
-            var app = window.app;
-            if (app && typeof app.toast === 'function') { app.toast(message); }
+        // app.toast() is `app.context.info(msg, true)` (app.v2.js:614) -- a modal
+        // info popup, not a transient strip. Every report from this feature used
+        // to go through it, so "译全部" opened a window instead of just
+        // translating. Reports now go to the button label, the panel's status
+        // line, the diagnostic log, and this non-interactive strip.
+        function hint(message) {
             note('TRANSLATE', message);
+            var host = document.body || document.documentElement;
+            if (!host) { return; }
+            var node = document.createElement('div');
+            node.className = 'stv-translate-hint';
+            node.setAttribute('data-stvtranslate', 'hint');
+            node.style.cssText = 'position:fixed;left:50%;bottom:26px;'
+                + 'transform:translateX(-50%);z-index:2147483645;max-width:86vw;'
+                + 'padding:7px 12px;border-radius:9px;background:rgba(0,0,0,0.82);'
+                + 'color:#fff;font:12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;'
+                + 'pointer-events:none;text-align:center;';
+            node.textContent = message;
+            host.appendChild(node);
+            setTimeout(function () {
+                if (node.parentNode) { node.parentNode.removeChild(node); }
+            }, 2600);
         }
 
         function fail(error) {
             var text = messageOf(error);
             note('ERR', 'translate failed: ' + text);
-            toast('翻译失败：' + text);
+            hint('翻译失败：' + text);
         }
 
         function decorateComment(block) {
@@ -3615,6 +3752,30 @@ enum SitePatch {
             var body = q(block, '.cmtbody') || content.parentNode;
             if (!body) { return; }
             body.appendChild(row);
+        }
+
+        // A community board row is `view-post` (page-vip:2671) and its text is
+        // `.postcontent > .content`; the single-post page (:1105) has the same
+        // pair. One 译 per post, inserted right under the body.
+        function decoratePost(body) {
+            if (!body || !body.getAttribute) { return; }
+            if (body.getAttribute('stv-tr')) { return; }
+            var host = body.parentNode;
+            if (!host) { return; }
+            body.setAttribute('stv-tr', '1');
+            var row = document.createElement('div');
+            row.className = 'stv-translate-row';
+            row.style.cssText = 'margin-top:4px;';
+            var button = makeButton('译', 'stv-translate-one');
+            button.style.fontSize = '12px';
+            button.style.padding = '2px 8px';
+            button.style.marginLeft = '0';
+            button.addEventListener('click', function (event) {
+                stop(event);
+                translateOne(button, body);
+            }, true);
+            row.appendChild(button);
+            host.appendChild(row);
         }
 
         function originalOf(node) {
@@ -3654,51 +3815,118 @@ enum SitePatch {
             });
         }
 
-        function commentTargets(view) {
-            var blocks = qq(view, '[view=commentblock]');
-            var targets = [];
+        // Everything on a page that can be translated, whatever shape it has.
+        // Written with single-class selectors on purpose: the site's own q()/qq()
+        // (and the test stub that stands in for them) do not implement the
+        // descendant or child combinators.
+        function textTargets(scope) {
+            var out = [];
+            var blocks = qq(scope, '[view=commentblock]');
             for (var i = 0; i < blocks.length; i++) {
                 var content = q(blocks[i], '.cmtcontent');
                 if (!content) { continue; }
-                var text = textOf(content);
-                if (!text) { continue; }
-                targets.push({ node: content, text: text });
+                var comment = textOf(content);
+                if (comment) { out.push({ node: content, kind: 'comment', text: comment }); }
             }
-            return targets;
+            var wraps = qq(scope, '.postcontent');
+            for (var j = 0; j < wraps.length; j++) {
+                var body = q(wraps[j], '.content');
+                if (!body) { continue; }
+                var post = textOf(body);
+                if (post) { out.push({ node: body, kind: 'post', text: post }); }
+            }
+            return out;
         }
 
-        function translateComments(page) {
-            var view = q(page, '.commentview');
-            if (!view) { return; }
-            var targets = commentTargets(view);
+        function applyTranslations(targets, out) {
+            var done = 0;
+            for (var i = 0; i < targets.length; i++) {
+                var piece = out[i];
+                if (typeof piece !== 'string' || !piece || piece === targets[i].text) {
+                    continue;
+                }
+                targets[i].node.setAttribute('stv-orig', targets[i].node.innerHTML);
+                targets[i].node.textContent = piece;
+                done++;
+            }
+            return done;
+        }
+
+        // The reader pressed 译全部. No popup: the button itself carries the
+        // progress, and a list that has not arrived yet arms a one-shot instead
+        // of answering "还没有可翻译的评论".
+        function translateAll(page, button) {
+            var targets = textTargets(page);
             if (!targets.length) {
-                toast('还没有可翻译的评论');
+                page.__stvPendingAll = true;
+                if (button) { button.textContent = '等加载…'; }
+                note('TRANSLATE', 'nothing loaded yet; translating when it arrives');
                 return;
             }
             loadSettings().then(function (config) {
                 var texts = [];
                 for (var i = 0; i < targets.length; i++) { texts.push(targets[i].text); }
-                toast('正在翻译 ' + texts.length + ' 条评论…');
+                if (button) { button.textContent = '翻译中…'; }
                 return runTranslate(texts, config.readSource, config.readTarget, config)
                     .then(function (out) {
-                        var done = 0;
-                        for (var j = 0; j < targets.length; j++) {
-                            var piece = out[j];
-                            if (typeof piece !== 'string' || !piece
-                                || piece === targets[j].text) { continue; }
-                            targets[j].node.setAttribute('stv-orig',
-                                targets[j].node.innerHTML);
-                            targets[j].node.textContent = piece;
-                            done++;
-                        }
+                        var done = applyTranslations(targets, out);
+                        if (button) { button.textContent = '译全部'; }
                         note('TRANSLATE', 'translated ' + done + ' of ' + targets.length
-                            + ' comment(s) with ' + config.engine);
-                        toast('已翻译 ' + done + ' 条（单条点「原文」可还原）');
-                    }, function (error) { fail(error); });
+                            + ' item(s) with ' + config.engine);
+                    }, function (error) {
+                        if (button) { button.textContent = '译全部'; }
+                        fail(error);
+                    });
             });
         }
 
+        // The page a comment embed lives on. The site's own topPage() is the
+        // authoritative answer while a page is open (app.comment.reset() uses
+        // it, app.v2.js:3616); walking up is the fallback, and it stops at the
+        // first ancestor that owns a title bar.
+        function containsNode(ancestor, node) {
+            var walk = node;
+            while (walk) {
+                if (walk === ancestor) { return true; }
+                walk = walk.parentElement;
+            }
+            return false;
+        }
+
+        function pageOf(node) {
+            var app = window.app;
+            if (node && app && typeof app.topPage === 'function') {
+                var top = null;
+                try { top = app.topPage(); } catch (error) { top = null; }
+                if (top && top.nodeType === 1 && containsNode(top, node)) { return top; }
+            }
+            var page = node;
+            while (page && page.nodeType === 1) {
+                if (q(page, '.titlebar')) { return page; }
+                page = page.parentElement;
+            }
+            return null;
+        }
+
+        // Boards and comment hosts, i.e. everything under 社区 that is rendered
+        // in this webview: the channel/post list (`.posts`, page-vip:1087), the
+        // book comment page (`.commentview`, :914) and the embeds used by a
+        // single post and by a user home (`.comments`/`.embedcomment`, :2892).
+        // The Cbox board is a cross-origin iframe and cannot be reached from
+        // here.
+        function hasTranslatableContent(page) {
+            return !!(q(page, '.commentview') || q(page, '.comments')
+                || q(page, '.embedcomment') || q(page, '.posts'));
+        }
+
         function setInputText(input, text) {
+            var tag = String(input.tagName || '').toUpperCase();
+            if (tag === 'TEXTAREA') {
+                // The post embed reads `.value` off its textarea
+                // (_dl_app.v2.js:3603).
+                input.value = text;
+                return;
+            }
             // The site reads innerHTML off this contenteditable
             // (_page_vip.html:4586 hands it to replyContext.set()), so write
             // escaped text with <br> for the line breaks the editable would
@@ -3716,11 +3944,10 @@ enum SitePatch {
         function translateInput(button, input) {
             var text = textOf(input);
             if (!text) {
-                toast('请先输入评论内容');
+                hint('请先输入内容');
                 return;
             }
             loadSettings().then(function (config) {
-                var previous = button.textContent;
                 button.textContent = '翻译中…';
                 return runTranslate([text], 'auto', config.writeTarget, config)
                     .then(function (out) {
@@ -3728,13 +3955,11 @@ enum SitePatch {
                             setInputText(input, out[0]);
                             note('TRANSLATE', 'comment input translated into '
                                 + config.writeTarget);
-                            toast('已译成' + languageName(config.writeTarget)
+                            hint('已译成' + languageName(config.writeTarget)
                                 + '，可以直接发送');
                         }
-                        button.textContent = previous;
                         refreshLabels();
                     }, function (error) {
-                        button.textContent = previous;
                         refreshLabels();
                         fail(error);
                     });
@@ -3749,10 +3974,12 @@ enum SitePatch {
             input.setAttribute('stv-tr-input', '1');
             var bar = document.createElement('div');
             bar.className = 'stv-translate-inputbar';
-            // `.lock-bot` is a flex row (replyinfo | input | send), so the button
-            // goes between the input and the paper plane rather than onto a line
-            // of its own -- that row is already absolute-positioned above the
-            // safe area and must not grow.
+            // page-comment: `.lock-bot` is a flex row (replyinfo | input | send),
+            // so the button goes between the input and the paper plane rather
+            // than onto a line of its own -- that row is already
+            // absolute-positioned above the safe area and must not grow.
+            // A post's embed poster (`.embed-poster`, page-vip:2906) is the same
+            // shape with `.comment-input` + `.finish`.
             bar.style.cssText = 'display:flex;align-items:center;padding:0 2px;';
             var button = makeButton('译', 'stv-translate-input');
             button.style.fontSize = '12px';
@@ -3762,9 +3989,17 @@ enum SitePatch {
                 translateInput(button, input);
             }, true);
             bar.appendChild(button);
-            var send = q(host, '.sendcmt');
+            var send = q(host, '.sendcmt') || q(host, '.finish');
             if (send && send.parentNode === host) { host.insertBefore(bar, send); }
             else { host.insertBefore(bar, null); }
+            refreshLabels();
+        }
+
+        function decorateInputs(page) {
+            var node = q(page, '.commentinput');
+            if (node) { decorateInput(node); }
+            var embed = q(page, '.comment-input');
+            if (embed) { decorateInput(embed); }
         }
 
         function refreshLabels() {
@@ -3774,23 +4009,44 @@ enum SitePatch {
             for (var i = 0; i < nodes.length; i++) { nodes[i].textContent = label; }
         }
 
-        function observeComments(view) {
-            if (!view || view.__stvTranslateObserved) { return; }
-            view.__stvTranslateObserved = true;
+        function decorateAll(page) {
+            var blocks = qq(page, '[view=commentblock]');
+            for (var i = 0; i < blocks.length; i++) { decorateComment(blocks[i]); }
+            var wraps = qq(page, '.postcontent');
+            for (var j = 0; j < wraps.length; j++) {
+                var body = q(wraps[j], '.content');
+                if (body) { decoratePost(body); }
+            }
+            decorateInputs(page);
+        }
+
+        // Comments and posts arrive twice: the initial loadEmbed()/fetch()
+        // render, and later pushes over the comment channel or a "load more".
+        // Only a mutation observer catches the second one -- and it is also what
+        // makes 译全部 and the auto-translate setting wait for the list instead
+        // of running against an empty page.
+        function observePage(page) {
+            if (!page || page.__stvSweep) { return page ? page.__stvSweep : null; }
             var sweep = function () {
-                var blocks = qq(view, '[view=commentblock]');
-                for (var i = 0; i < blocks.length; i++) { decorateComment(blocks[i]); }
+                decorateAll(page);
+                if (!page.__stvPendingAll && !page.__stvAutoPending) { return; }
+                if (!textTargets(page).length) { return; }
+                var auto = !!page.__stvAutoPending;
+                page.__stvPendingAll = false;
+                page.__stvAutoPending = false;
+                var button = auto ? null : q(page, '.stv-translate-all');
+                if (button) { button.textContent = '译全部'; }
+                translateAll(page, button);
             };
+            page.__stvSweep = sweep;
             sweep();
-            // Comments arrive twice: the initial loadEmbed() render, and later
-            // pushes over the comment channel. Only a mutation observer catches
-            // the second one.
             if (typeof MutationObserver === 'function') {
                 var observer = new MutationObserver(sweep);
-                observer.observe(view, { childList: true, subtree: true });
-                view.__stvTranslateObserver = observer;
-                note('TRANSLATE', 'watching the comment list for late arrivals');
+                observer.observe(page, { childList: true, subtree: true });
+                page.__stvTranslateObserver = observer;
+                note('TRANSLATE', 'watching the page for late comments and posts');
             }
+            return sweep;
         }
 
         function addTitleButtons(bar, page) {
@@ -3801,7 +4057,7 @@ enum SitePatch {
             var translate = makeButton('译全部', 'stv-translate-all');
             translate.addEventListener('click', function (event) {
                 stop(event);
-                translateComments(page);
+                translateAll(page, translate);
             }, true);
             var gear = makeButton('⚙', 'stv-translate-settings');
             gear.addEventListener('click', function (event) {
@@ -3813,21 +4069,30 @@ enum SitePatch {
             host.insertBefore(group, host.firstChild);
         }
 
-        function onCommentPage(page) {
+        // One entry point for every page that carries comments or posts: the
+        // book comment page, the community channel boards, a single post, a user
+        // home. pushPage covers the pages that exist when they open; the
+        // loadEmbed hook covers the embeds the site appends afterwards.
+        function installOnPage(page) {
+            if (!page || page.nodeType !== 1) { return; }
+            if (!hasTranslatableContent(page)) { return; }
             var bar = q(page, '.titlebar');
             if (bar) { addTitleButtons(bar, page); }
-            var view = q(page, '.commentview');
-            if (view) { observeComments(view); }
-            var input = q(page, '.commentinput');
-            if (input) { decorateInput(input); }
+            observePage(page);
+            decorateAll(page);
             loadSettings().then(function (config) {
                 refreshLabels();
-                if (config.auto && view) { translateComments(page); }
+                if (!config.auto) { return; }
+                // The list is filled asynchronously, so arm the sweep rather
+                // than translating an empty page (the device log showed
+                // "还没有可翻译的评论" from exactly that race).
+                page.__stvAutoPending = true;
+                if (page.__stvSweep) { page.__stvSweep(); }
             });
         }
 
         function onSettingsPage(page) {
-            if (!page || !page.q) { return; }
+            if (!page || page.nodeType !== 1) { return; }
             if (q(page, '.stv-translate-entry')) { return; }
             var section = q(page, '.settingsection');
             var host = section && section.parentNode;
@@ -3837,7 +4102,7 @@ enum SitePatch {
             header.textContent = '翻译';
             var item = document.createElement('div');
             item.className = 'settingitem stv-translate-entry';
-            item.innerHTML = '<div class="settingitemtitle">评论翻译与发帖语言</div>'
+            item.innerHTML = '<div class="settingitemtitle">评论/帖子翻译与发帖语言</div>'
                 + '<div class=""><i class="fas fa-chevron-right"></i></div>';
             item.addEventListener('click', function (event) {
                 stop(event);
@@ -3868,10 +4133,15 @@ enum SitePatch {
             // Top-anchored on purpose: the panel has text fields, and a centred
             // card would put the focused field behind the keyboard. Every field
             // that matters (engine, API Key) is in the first two rows.
+            //
+            // user-select is re-enabled because the site turns it off on <body>
+            // (app.v2.css:28); with it inherited, the text fields and the
+            // picker's search box cannot be focused reliably.
             root.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;'
                 + 'z-index:2147483644;background:rgba(0,0,0,0.55);display:flex;'
                 + 'align-items:flex-start;justify-content:center;padding:12px;'
-                + 'padding-top:5vh;overflow:auto;';
+                + 'padding-top:5vh;overflow:auto;'
+                + '-webkit-user-select:text;user-select:text;';
 
             var card = document.createElement('div');
             card.style.cssText = 'width:100%;max-width:430px;max-height:74vh;'
@@ -3884,7 +4154,7 @@ enum SitePatch {
             head.style.cssText = 'display:flex;align-items:center;margin-bottom:4px;';
             var title = document.createElement('div');
             title.style.cssText = 'flex:1;font-size:16px;font-weight:600;';
-            title.textContent = '评论翻译';
+            title.textContent = '评论/帖子翻译';
             var close = makeButton('关闭', 'stv-translate-close');
             close.style.fontSize = '13px';
             close.addEventListener('click', function (event) {
@@ -3907,44 +4177,119 @@ enum SitePatch {
                 return control;
             }
 
-            function textInput(value, placeholder) {
+            function textInput(value, placeholder, className) {
                 var el = document.createElement('input');
                 el.type = 'text';
                 el.value = value || '';
                 el.placeholder = placeholder || '';
+                el.className = 'stv-translate-field'
+                    + (className ? ' ' + className : '');
                 el.style.cssText = FIELD_CSS;
                 return el;
             }
 
-            function selectInput(pairs, value) {
-                var el = document.createElement('select');
-                el.style.cssText = FIELD_CSS;
+            // A native <select> is the wrong control in this webview: the site
+            // sets `user-select: none` on <body> (app.v2.css:28), and a native
+            // picker inside a fixed, scrollable overlay is not reliably
+            // tappable. The device log is the evidence -- not one tap in the
+            // panel ever reported `select` as its target, only the rows around
+            // it, so the engine and the languages could not be changed at all.
+            // This picker is made of ordinary elements, so it always works.
+            function picker(pairs, value) {
+                var wrap = document.createElement('div');
+                var current = value || (pairs.length ? pairs[0][0] : '');
+                var currentLabel = pairs.length ? pairs[0][1] : '';
                 for (var i = 0; i < pairs.length; i++) {
-                    var option = document.createElement('option');
-                    option.value = pairs[i][0];
-                    option.textContent = pairs[i][1];
-                    if (pairs[i][0] === value) { option.selected = true; }
-                    el.appendChild(option);
+                    if (pairs[i][0] === current) { currentLabel = pairs[i][1]; }
                 }
-                el.value = value || pairs[0][0];
-                return el;
+                var button = makeButton('', 'stv-translate-picker');
+                button.setAttribute('data-stvtranslate', 'picker');
+                button.style.cssText = FIELD_CSS + 'display:flex;align-items:center;'
+                    + 'justify-content:space-between;text-align:left;';
+                var label = document.createElement('span');
+                label.textContent = currentLabel;
+                var caret = document.createElement('span');
+                caret.textContent = '▾';
+                caret.style.cssText = 'opacity:0.6;margin-left:8px;';
+                button.appendChild(label);
+                button.appendChild(caret);
+
+                var list = document.createElement('div');
+                list.className = 'stv-translate-pickerlist';
+                list.style.cssText = 'display:none;max-height:40vh;overflow:auto;'
+                    + 'border:1px solid #555;border-radius:8px;margin-top:5px;'
+                    + 'background:#242424;';
+                var search = document.createElement('input');
+                search.type = 'text';
+                search.className = 'stv-translate-pickersearch';
+                search.placeholder = '搜索语言…';
+                search.style.cssText = FIELD_CSS + 'margin:6px;width:calc(100% - 12px);';
+                list.appendChild(search);
+
+                var options = [];
+                for (var j = 0; j < pairs.length; j++) {
+                    var option = document.createElement('div');
+                    option.className = 'stv-translate-option';
+                    option.setAttribute('data-stvtranslate', 'option');
+                    option.setAttribute('data-value', pairs[j][0]);
+                    option.style.cssText = 'padding:9px 12px;font-size:13px;'
+                        + 'border-bottom:1px solid rgba(128,128,128,0.18);';
+                    option.textContent = pairs[j][1] + '（' + pairs[j][0] + '）';
+                    option.__code = pairs[j][0];
+                    option.__name = pairs[j][1];
+                    (function (node) {
+                        node.addEventListener('click', function (event) {
+                            stop(event);
+                            current = node.__code;
+                            currentLabel = node.__name;
+                            label.textContent = currentLabel;
+                            list.style.display = 'none';
+                            search.value = '';
+                            filter('');
+                        }, true);
+                    })(option);
+                    list.appendChild(option);
+                    options.push(option);
+                }
+
+                function filter(needle) {
+                    var q2 = String(needle || '').toLowerCase();
+                    for (var k = 0; k < options.length; k++) {
+                        var hay = (options[k].__name + ' ' + options[k].__code)
+                            .toLowerCase();
+                        options[k].style.display = (q2 && hay.indexOf(q2) < 0) ? 'none' : '';
+                    }
+                }
+                search.addEventListener('input', function () { filter(search.value); });
+                button.addEventListener('click', function (event) {
+                    stop(event);
+                    var open = list.style.display !== 'none';
+                    list.style.display = open ? 'none' : 'block';
+                    if (!open) { filter(''); }
+                }, true);
+
+                wrap.appendChild(button);
+                wrap.appendChild(list);
+                wrap.__value = function () { return current; };
+                return wrap;
             }
 
-            var engineSelect = row('翻译引擎', selectInput(ENGINE_LABELS, config.engine));
+            var enginePicker = row('翻译引擎', picker(ENGINE_LABELS, config.engine));
             var keyInput = row('API Key（系统离线与免密钥通道不用填）',
-                textInput(config.apiKey, 'Azure / Google / DeepL / OpenAI 的 Key'));
+                textInput(config.apiKey, 'Azure / Google / DeepL / OpenAI 的 Key',
+                    'stv-translate-key'));
             var regionInput = row('区域 Region（Azure 需要，可选）',
                 textInput(config.region, '例如 eastasia'));
             var endpointInput = row('自定义接口地址（可选）',
                 textInput(config.endpoint, 'DeepL 或 OpenAI 兼容接口的地址'));
             var modelInput = row('模型名（OpenAI 兼容接口用）',
                 textInput(config.model, '例如 gpt-4o-mini'));
-            var readSourceSelect = row('评论原文语言',
-                selectInput(SOURCE_LANGUAGES, config.readSource));
-            var readTargetSelect = row('评论翻译成',
-                selectInput(LANGUAGES, config.readTarget));
-            var writeTargetSelect = row('发评论时译成',
-                selectInput(LANGUAGES, config.writeTarget));
+            var readSourcePicker = row('原文语言（评论和帖子）',
+                picker(SOURCE_LANGUAGES, config.readSource));
+            var readTargetPicker = row('翻译成（评论和帖子）',
+                picker(LANGUAGES, config.readTarget));
+            var writeTargetPicker = row('我发评论时译成',
+                picker(LANGUAGES, config.writeTarget));
 
             var autoWrap = document.createElement('label');
             autoWrap.style.cssText = 'display:flex;align-items:center;margin:9px 0;'
@@ -3955,7 +4300,7 @@ enum SitePatch {
             autoBox.style.cssText = 'margin-right:7px;';
             autoWrap.appendChild(autoBox);
             var autoText = document.createElement('span');
-            autoText.textContent = '打开评论页自动翻译';
+            autoText.textContent = '打开评论/帖子页时，等内容加载完自动翻译';
             autoWrap.appendChild(autoText);
             card.appendChild(autoWrap);
 
@@ -3970,14 +4315,14 @@ enum SitePatch {
 
             function collect() {
                 return {
-                    engine: engineSelect.value || 'apple',
+                    engine: enginePicker.__value() || 'apple',
                     apiKey: keyInput.value || '',
                     region: regionInput.value || '',
                     endpoint: endpointInput.value || '',
                     model: modelInput.value || '',
-                    readSource: readSourceSelect.value || 'vi',
-                    readTarget: readTargetSelect.value || 'zh-Hans',
-                    writeTarget: writeTargetSelect.value || 'vi',
+                    readSource: readSourcePicker.__value() || 'vi',
+                    readTarget: readTargetPicker.__value() || 'zh-Hans',
+                    writeTarget: writeTargetPicker.__value() || 'vi',
                     auto: !!autoBox.checked
                 };
             }
@@ -4038,9 +4383,10 @@ enum SitePatch {
 
         // ---- wiring ------------------------------------------------------
 
-        // pushPage is the single funnel for every page the app opens, so
-        // decorating here covers both the comment page (pushed by
-        // app.fun.showComment) and the settings page.
+        // pushPage is the single funnel for every page the app opens, so this
+        // covers the book comment page (app.fun.showComment), the settings page,
+        // the community channel boards (showCommChannel/showUserPosts ->
+        // pageposts, _page_vip.html:4710) and the single-post page (:4846).
         function hookPushPage() {
             var app = window.app;
             if (!app || typeof app.pushPage !== 'function') { return false; }
@@ -4050,8 +4396,8 @@ enum SitePatch {
             app.pushPage = function (name) {
                 var page = original.apply(this, arguments);
                 try {
-                    if (name === 'comment') { onCommentPage(page); }
                     if (name === 'pagesetting') { onSettingsPage(page); }
+                    else { installOnPage(page); }
                 } catch (error) {
                     note('ERR', 'translate page hook: ' + messageOf(error));
                 }
@@ -4061,10 +4407,37 @@ enum SitePatch {
             return true;
         }
 
+        // Every comment list in the app is created by app.comment.loadEmbed
+        // (app.v2.js:3560): the book comment page, a single post's comments
+        // (:5230), a user home (:4843) and the fromuser board. Hooking it is
+        // what makes a board translatable even when the site appends the
+        // container after pushPage has already returned.
+        function hookCommentEmbed() {
+            var app = window.app;
+            if (!app || !app.comment
+                || typeof app.comment.loadEmbed !== 'function') { return false; }
+            if (app.comment.__stvTranslateHooked) { return true; }
+            app.comment.__stvTranslateHooked = true;
+            var original = app.comment.loadEmbed;
+            app.comment.loadEmbed = function (container) {
+                var result = original.apply(this, arguments);
+                try {
+                    var page = pageOf(container);
+                    if (page) { installOnPage(page); }
+                } catch (error) {
+                    note('ERR', 'translate comment-embed hook: ' + messageOf(error));
+                }
+                return result;
+            };
+            note('TRANSLATE', 'community comment embeds are covered');
+            return true;
+        }
+
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
-            if (hookPushPage() || attempts > 2500) { clearInterval(timer); }
+            var ready = hookPushPage() && hookCommentEmbed();
+            if (ready || attempts > 2500) { clearInterval(timer); }
         }, 20);
     })();
     """

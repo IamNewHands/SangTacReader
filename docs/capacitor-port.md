@@ -58,10 +58,11 @@
 4. `CapacitorSQLite`、`MlKit`/`MainClass`（OCR）、`AdMob` 未接 → 对应功能降级。
 5. ~~旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）~~ —— **已退役**（2026-09-22，新构建多轮真机验证通过后删除，含它打包的 `www/` 资源与 `tests/` 下的一次性探测脚本）。旧实现仍可从 git 历史取回。
 6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）；`tabProbe` 同批退役，见 §6.11 (4)。
-7. 站点 `filterDownloadingChapters`（`read.js:3445`）参数遮蔽导致跨任务去重失效 —— 低危、未改（改动会牵动 `total` 口径，见 §6.11 (2)）。
+7. 站点 `filterDownloadingChapters`（`read.js:3445`）参数遮蔽导致跨任务去重失效 —— 站点代码本身仍未改，但影响已被绕开：下载对话框现在拒绝为同一本**正在下载**的书起第二个任务（§6.14 (1)），所以那个「被过滤成空章节列表、永远停在 0/N」的任务不会再产生。
 8. ~~储物袋顶部 tab 的错位成因未定~~ —— **已定性**：不是位移错位，是末页「Đang kích hoạt」本来就没有数据（服务端 `act` 为空数组，见 §6.11/§6.12 (6)）。`tabProbe` 探针已补 `panes`/`activate`，若后续发现该有数据再收口。
 9. **系统离线翻译要 iOS 18+ 且语言包已下载**（见 §6.13）。iOS 15-17 上 `App.translationStatus` 如实回 `unsupported`，`commentTranslate` 会自动改用联网引擎（免密钥微软通道，或用户自备 Key），因此该功能在旧系统上不是不可用，只是必须联网。
 10. **自备 API Key 存在站点存储里**（`app.storage` → Capacitor Preferences → UserDefaults），并被 `settingsBackup` 一并镜像进 Keychain（`stv.translate.settings`）。日志只记引擎名，不打印 Key；但它不是独立的加密存储，介意的话请用可随时吊销的 Key。
+11. **社区里的 Cbox 板块翻译不了**：`page-pagecbox`（`_page_vip.html:982`）是一个跨域 iframe（`www6.cbox.ws`），父页面拿不到里面的 DOM；Facebook 的两个按钮是外部浏览器。其余板块（Kênh truyện / Kênh linh tinh / 势力 / 单帖 / 用户主页评论 / 广播）都已覆盖，见 §6.14 (7)。
 
 ## 6. 真机问题档案
 
@@ -1242,10 +1243,23 @@ JS 只会拿到一个不透明的桥接错误，没法判断该不该降级。
 
 #### (4) 站点侧：`commentTranslate` 块
 
-- 挂钩点是 `app.pushPage`（所有页面的唯一漏斗）：`comment` → 装按钮，`pagesetting` → 加
-  「设置 → 翻译」入口。
-- 评论页（`_page_vip.html:914-941`）加三处 UI：标题栏 `译全部` + `⚙`、每条 `[view=commentblock]`
-  的 `.cmtbody` 里一个 `译／原文` 切换、`.commentinput` 上方一个 `译成X`。
+- 挂钩点有两个：`app.pushPage`（所有页面的唯一漏斗）与 `app.comment.loadEmbed`
+  （`app.v2.js:3560`，站内每一个评论列表都由它建）。前者覆盖「页面打开时就有容器」的
+  情况（书籍评论页、社区频道板 `pageposts`、设置页），后者覆盖「容器是打开之后才
+  append 的」情况（单帖的评论区、用户主页的评论）。`installOnPage()` 对没有评论/帖子
+  容器的页面直接返回，所以不会到处加按钮。
+- 可翻译内容的两种形状：评论 `[view=commentblock] > .cmtbody > .cmtcontent`
+  （`_page_vip.html:2333`）与帖子 `.postcontent > .content`（`view-post` :2671、单帖页
+  :1105）。`textTargets()` 同时收集两者，所以「译全部」在一页里既能翻评论也能翻帖子。
+- 每处 UI：标题栏 `译全部` + `⚙`；每条评论/每个帖子一个 `译／原文` 切换；评论输入框
+  一个 `译成X`（书籍评论页是 `.commentinput` contenteditable，帖子是 `.comment-input`
+  textarea —— 后者站点读 `.value`，所以写入方式按标签区分）。
+- **译全部不弹窗**：原先走 `app.toast()`，而它是 `app.context.info(msg, true)`
+  （`app.v2.js:614`），是个模态信息框，于是「点译全部先弹一个窗」。现在进度写在按钮
+  文案上（`翻译中…`），结果写进诊断日志，另有自绘的非交互条 `hint()`。
+- **等列表加载**：`loadEmbed()` 是异步的，用户可能先点按钮。此时不再回「还没有可翻译的
+  评论」，而是把请求挂起（`page.__stvPendingAll`），`MutationObserver` 一旦看到第一条
+  评论/帖子落地就自动执行。`auto`（自动翻译）同理：只在真正有内容时才发请求。
 - 评论是分两批到的：`loadEmbed()` 的首屏渲染，以及之后评论频道推来的新评论。只挂一次
   `MutationObserver` 才能覆盖第二批。
 - 发帖方向不能只写 `innerHTML` 就完事：站点在 `_page_vip.html:4586` 把
@@ -1255,15 +1269,107 @@ JS 只会拿到一个不透明的桥接错误，没法判断该不该降级。
   于是和阅读设置一样能跨重装恢复（走 Keychain）。
 - 长列表按 3000 字符切块串行发送；单块失败只让那一块保留原文，不会把整页翻译丢掉。
 
+#### (5) 设置面板为什么不用原生 `<select>`
+
+站点在 `body` 上设了 `user-select: none`（`app.v2.css:28`），而面板是 `position:fixed`
+的可滚动浮层；真机日志里这一片区域**没有任何一次点击的目标是 `select`**，只有它周围的
+`div` —— 也就是引擎和语言根本点不开。现在引擎与三个语言项都是自绘选择器：一个按钮显示
+当前值，点开是一个普通 `div` 列表（带搜索框），完全由我们的事件处理驱动。语言表从 16 种
+扩到 49 种，`readSource` 也可以选具体语言而不只是「自动识别」。
+
 #### 验证
 
-`check-ios-shim`（18 块 / 219102 字节 / 21 markers）、`test-site-patch`（257 条断言，新增
-`comment translation (system offline engine)` 22 条、`comment translation without the system engine`
-3 条、`comment translation provider request shapes` 16 条）、`gen-site-i18n --check`
-（458 labels / 35 fragments）全绿。CI 另加：二进制里必须有
+`check-ios-shim`（18 块 / 239432 字节 / 21 markers）、`test-site-patch`（297 条断言，
+其中 `comment translation (system offline engine)`、`comment translation without the system
+engine`、`comment translation provider request shapes`、`译全部 waits for the list and opens
+no popup`、`auto-translate waits for the comments to load`、`community boards are translatable`）、
+`gen-site-i18n --check`（458 labels / 35 fragments）全绿。CI 另加：二进制里必须有
 `translationStatus`/`translationPrepare`/`translationTranslate` 与 `stvCommentTranslateInstalled`，
 且 `Translation.framework` 必须是弱链接。
 
 **未证实项**：`TranslationSession` 跨调用复用是主要运行时假设（与 newsnook-ios 相同）；
 真机若失败，provider 的 `discardSession()` + 重建路径会在下次调用自愈。首次翻译新语对会弹
-系统语言包下载确认，CI 无法覆盖。
+系统语言包下载确认，CI 无法覆盖。Cbox 板块（`page-pagecbox`，`_page_vip.html:982`）是跨域
+iframe，父页面够不到里面的文字，翻译不了；Facebook 的两个按钮是外部浏览器，同理。
+
+### 6.14 第十二轮真机反馈（`日志.txt`，389 行）：下载重复/归类/删除、翻译弹窗与选择器、社区板块
+
+六条反馈，前三条在下载，后三条在翻译。逐条给出根因（都能在日志或站点源码里指到具体行）。
+
+#### (1) 「下载页面有时会出现两次相同的下载」
+
+`DownloadManager.render()`（`app.v2.read.js:3605`）是 async，而它唯一的幂等守卫是
+`if (this.node) return this.node;` —— 在第一个 `await` **之前**读的。`onUpdate()`
+（:3428）被并发调用两次（构造函数的、完成归类的、我们按钮的），两次都能穿过这个守卫，
+各自建一个节点，于是同一个任务在列表里出现两行。修复：把**进行中的 promise** 也记住
+（`__stvRenderPending`），第二个调用者等第一个的结果，`onUpdate` 的父节点判断随后
+自然去重。
+
+另外在下载对话框的动作里加了一道闸：同一本书已经有**正在跑**的任务时，第二次「确定」
+直接忽略。站点自己的 `filterDownloadingChapters()`（:3445）会把重复任务的章节列表过滤
+成空，于是那一行永远停在 0/N，既下不完也离不开列表 —— 这正是「没完成就出现在别处」的
+另一半来源。暂停或完成的任务不算「正在跑」，不影响重新下载。
+
+#### (2) 「正在下载中的任务还没完成就已经在已下载中显示了」
+
+`getNewBook()`（:3218）在下载**开始**时就调 `book.save()`，而 `OfflineBook.save()`
+（:3304）会 `store.prepend(baseObject)` —— 书在第一个章节还没下下来时就已经进了
+`offlineBook.store.data`，而「已下载」列表正是读这个数组（`getDownloadBooks` → :3202）。
+
+修复：包装 `getDownloadBooks`，读列表时把「有正在跑的任务」的书临时从视图里去掉。
+`store.data` 用「换入过滤后的数组、调用完换回」的方式处理，这样站点按 index 分页的
+`20 条/页` 计数不会被带偏（直接过滤结果会让页数错位）；也不是把记录删掉 —— 阅读器
+靠 `isBookExist()` 找离线章节，删了记录就没法离线读半本。列表读取本身用 promise 链
+串行化，避免换入换出重入。
+
+#### (3) 「已下载的小说没有删除按钮」
+
+删除按钮的代码一直在，但装不上：`patchDownloadedRow()` 判的是
+`app.celldisplay.bookdownloadedrow`，而站点里这个渲染器叫 **`app.celoader`**
+（`_page_vip.html:3610`，`bookdownloadedrow` 在 :4014，已下载列表在 :4074 调它）。
+`app.celldisplay` 在整个站点包里根本不存在，于是补丁永远返回 false，计时器白跑 600 次，
+按钮从未出现。同一处拼写错误也出现在完成归类的 `moveJobToDownloaded()` 里 —— 这就是
+日志里每次都是「finished ...; the DOWNLOADED list is not open」的原因。两处都改成
+`app.celoader`。
+
+测试里原本写的是 `app.celldisplay`，等于**把 bug 写进了断言**：现在改成 `app.celoader`，
+并加一条断言确保不再依赖那个不存在的名字。
+
+#### (4) 「点击译全部会弹提示窗口」
+
+`app.toast()` = `app.context.info(msg, true)`（`app.v2.js:614`），是模态信息框。翻译
+流程里三处都在用它（「正在翻译 N 条」「已翻译 N 条」「还没有可翻译的评论」），所以点一下
+就弹一个窗。现在：进度写在按钮文案上，结果只进诊断日志，另加自绘的非交互提示条
+（`pointer-events:none`，2.6 秒自消失）。新增断言直接检查 `app.toast` 一次都没被调用。
+
+#### (5) 「还没加载出评论，翻译就已经开始，提示没有评论」
+
+`loadEmbed()` 是异步的，而自动翻译在 `pushPage('comment')` 的同一轮就发起，于是必然撞上
+空列表。现在自动翻译只置一个 `__stvAutoPending` 标记，由 `MutationObserver` 在第一条评论
+落地时才真正发请求；手动点「译全部」时若列表还空，同样挂起（按钮显示「等加载…」），
+内容到了自动继续。
+
+#### (6) 「配置页无法切换通道/语言，语言不要只限越南语和中文」
+
+见 §6.13 (5)：原生 `<select>` 在这个 webview 里点不开（日志证据：该区域没有一次点击目标
+是 `select`），已全部换成自绘选择器；语言表扩到 49 种，可搜索，源语言也可指定。
+
+#### (7) 「翻译功能扩展到社区分类下各个板块」
+
+社区 tab（`_page_vip.html:196-263`）里能在本 webview 内渲染的板块，入口都收敛到两处：
+`app.pushPage('pageposts')`（`showCommChannel` → Kênh truyện / Kênh linh tinh / 势力，
+`showUserPosts` → 用户动态）与 `app.comment.loadEmbed`（单帖 `:5230`、用户主页 `:4843`、
+广播与 fromuser 评论板）。所以挂钩 `pushPage` + `loadEmbed` 就覆盖了全部：频道板翻帖子
+正文，单帖翻正文 + 评论 + 输入框，用户主页翻评论。`page-pagecbox`（Cbox web）是跨域
+iframe，父页面取不到内部文字，**不支持**；两个 Facebook 按钮是外部浏览器，同理。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 18 块 / 239432 字节 / 21 markers
+- `node scripts/test-site-patch.js` → 297 条断言全过（本轮新增 4 组：并发渲染去重、已下载
+  列表过滤、重复启动忽略、译全部等待 + 无弹窗 + 自动翻译等待 + 社区板块）
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
+
+**未证实项**：`user-select: none` 与原生 `select` 的关系是从日志反推的（真机上点不到），
+自绘选择器绕开了这个不确定性；社区板块的真机布局（标题栏空间是否够放两个按钮）需要下一
+轮日志确认。
