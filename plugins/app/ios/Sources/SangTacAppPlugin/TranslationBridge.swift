@@ -120,8 +120,9 @@ final class AppleTranslationHost: ObservableObject {
     private var prepared: Set<String> = []
     private var pending: [PendingRequest] = []
     /// The 30s acquisition deadline for each in-flight request, so it can be
-    /// cancelled the moment that request resolves.
-    private var deadlines: [UUID: Task<Void, Never>] = []
+    /// cancelled the moment that request resolves. `[:]` and not `[]`: an empty
+    /// *array* literal is not a valid initialiser for a dictionary.
+    private var deadlines: [UUID: Task<Void, Never>] = [:]
     private var requestedKey: String?
     private var hostController: UIHostingController<AppleTranslationHostView>?
 
