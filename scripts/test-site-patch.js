@@ -42,6 +42,27 @@ function check(name, condition, detail) {
   }
 }
 
+/**
+ * Parsed host of a URL string, or the empty string when it does not parse.
+ * Host checks must compare this, never a substring of the URL: a substring can
+ * appear in the path or query of a completely different host.
+ */
+function urlHost(value) {
+  try {
+    return new URL(String(value)).hostname;
+  } catch (err) {
+    return '';
+  }
+}
+
+/**
+ * Field NAMES of a stored object for failure messages, never values: the
+ * values include API keys, and the failure detail is printed to the console.
+ */
+function fieldsOf(value) {
+  return value && typeof value === 'object' ? Object.keys(value).sort().join(',') : String(value);
+}
+
 function loadBlocks() {
   const blocks = [];
   for (const name of fs.readdirSync(TARGET_DIR).filter((f) => f.endsWith('.swift')).sort()) {
@@ -2459,10 +2480,16 @@ async function testDomainFailover() {
   vm.runInContext(loadBlocks().join('\n'), poisoned);
   await tick(300);
   const recovered = await poisonedApp.reader.getContent('qidian', '1', 'c1');
+  // Parse before comparing: the entry is a JSON object whose `name` field must
+  // not equal the rejected mirror, and a substring test could be fooled by the
+  // rejected URL appearing inside an unrelated field or host.
+  const stillRememberedRaw = poisoned.localStorage.getItem('stv.domain.good');
+  const stillRememberedName = stillRememberedRaw
+    ? JSON.parse(stillRememberedRaw).name
+    : null;
   check('a remembered mirror that fails is dropped',
-    String(recovered.code) === '0'
-      && poisoned.localStorage.getItem('stv.domain.good').indexOf(bad) < 0,
-    String(poisoned.localStorage.getItem('stv.domain.good')));
+    String(recovered.code) === '0' && stillRememberedName !== bad,
+    'still remembering ' + String(stillRememberedName));
 
   // Two bad mirrors in front of a good one: the retry walks past both in a
   // single read instead of handing the first code 7 back to the site.
@@ -4684,7 +4711,7 @@ async function testCommentTranslate() {
     appLanguage: 'zh',
     pages: { comment: fixture.page, pagesetting: settingsFixture.page },
     httpResponse: (url, payload) => (
-      url.indexOf('edge.microsoft.com') >= 0
+      urlHost(url) === 'edge.microsoft.com'
         ? edgeAnswer(JSON.parse(payload.data))
         : { status: 500, data: '' }
     ),
@@ -4816,30 +4843,31 @@ async function testCommentTranslate() {
 
   const keyField = panel.querySelectorAll('.stv-translate-key')[0];
   check('the panel never echoes a stored key back into the DOM',
-    keyField.value === '', JSON.stringify(keyField.value));
+    keyField.value === '', 'field empty: ' + String(keyField.value === ''));
   keyField.value = 'key-123';
   click(panel.querySelectorAll('.stv-translate-save')[0]);
   await tick(80);
   const saved = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
-  check('the panel saves the engine', saved.engine === 'free', JSON.stringify(saved));
+  check('the panel saves the engine', saved.engine === 'free', fieldsOf(saved));
   check('the key is NOT written to app.storage',
-    saved.apiKey === '', JSON.stringify(saved.apiKey));
+    saved.apiKey === '', 'apiKey empty: ' + String(saved.apiKey === ''));
   check('app.storage only records that a key exists',
-    saved.hasApiKey === true, JSON.stringify(saved.hasApiKey));
+    saved.hasApiKey === true, 'hasApiKey set: ' + String(saved.hasApiKey === true));
   check('the key went to the secret store instead',
     sandbox.__secrets['translate.apiKey'] === 'key-123',
-    JSON.stringify(sandbox.__secrets));
+    'secret store keys: ' + Object.keys(sandbox.__secrets).sort().join(','));
   check('the key field is emptied again after saving',
     keyField.value === '' && keyField.placeholder.indexOf('已保存') === 0,
-    JSON.stringify(keyField.value) + ' / ' + keyField.placeholder);
+    'field empty: ' + String(keyField.value === ''));
 
   click(panel.querySelectorAll('.stv-translate-test')[0]);
   await tick(150);
   const http = sandbox.__stored.http || [];
   check('the keyless Microsoft channel is used',
     http.length === 1
-      && String(http[0].url).indexOf('edge.microsoft.com/translate/translatetext') >= 0,
-    JSON.stringify(http.map((call) => call.url)));
+      && urlHost(http[0].url) === 'edge.microsoft.com'
+      && String(http[0].url).indexOf('/translate/translatetext') >= 0,
+    JSON.stringify(http.map((call) => urlHost(call.url))));
   check('the keyless channel is told the target language',
     http.length === 1 && String(http[0].url).indexOf('to=zh-Hans') >= 0,
     http.length ? http[0].url : 'no request');
@@ -4880,7 +4908,7 @@ async function testCommentTranslateFallback() {
     // An iOS 15-17 device: the selector exists but reports "unsupported".
     appleStatus: { status: 'unsupported', ready: false, reason: 'ios-version' },
     httpResponse: (url, payload) => (
-      url.indexOf('edge.microsoft.com') >= 0
+      urlHost(url) === 'edge.microsoft.com'
         ? edgeAnswer(JSON.parse(payload.data))
         : { status: 500, data: '' }
     ),
@@ -4987,7 +5015,7 @@ async function testCommentTranslateProviders() {
       JSON.stringify(http.map((call) => call.url)));
     check(item.engine + ': sends the key in the right header',
       http.length === 1 && item.headers(http[0].headers),
-      http.length ? JSON.stringify(http[0].headers) : 'no request');
+      http.length ? 'sent header names: ' + Object.keys(http[0].headers).sort().join(',') : 'no request');
     check(item.engine + ': posts exactly the comment texts',
       http.length === 1
         && JSON.stringify(item.texts(http[0])) === JSON.stringify(['Một bình luận']),
@@ -5045,15 +5073,16 @@ async function testTranslateKeyStorage() {
   const migrated = JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}');
   check('a legacy plaintext key is moved into the secret store',
     sandbox.__secrets['translate.apiKey'] === 'legacy-plaintext-key',
-    JSON.stringify(sandbox.__secrets));
+    'secret store keys: ' + Object.keys(sandbox.__secrets).sort().join(','));
   check('the plaintext copy is rewritten out of app.storage',
-    migrated.apiKey === '' && migrated.hasApiKey === true, JSON.stringify(migrated));
+    migrated.apiKey === '' && migrated.hasApiKey === true, fieldsOf(migrated));
 
   const keyField = panel.querySelectorAll('.stv-translate-key')[0];
   check('the stored key is not echoed into the DOM',
-    keyField.value === '', JSON.stringify(keyField.value));
+    keyField.value === '', 'field empty: ' + String(keyField.value === ''));
   check('the key field says a key is already saved',
-    keyField.placeholder.indexOf('已保存') === 0, keyField.placeholder);
+    keyField.placeholder.indexOf('已保存') === 0,
+    'placeholder starts saved: ' + String(keyField.placeholder.indexOf('已保存') === 0));
 
   // Saving with the field left empty must keep the key: the field is always
   // empty when a key is stored, so "empty" cannot mean "delete".
@@ -5061,10 +5090,10 @@ async function testTranslateKeyStorage() {
   await tick(80);
   check('saving an untouched panel keeps the stored key',
     sandbox.__secrets['translate.apiKey'] === 'legacy-plaintext-key',
-    JSON.stringify(sandbox.__secrets));
+    'secret store keys: ' + Object.keys(sandbox.__secrets).sort().join(','));
   check('and keeps the hasApiKey marker set',
     JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}').hasApiKey === true,
-    sandbox.localStorage.getItem('stv.translate.settings'));
+    fieldsOf(JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}')));
 
   // Typing a new key replaces it, and the field is masked again afterwards.
   keyField.value = 'replacement-key';
@@ -5072,12 +5101,12 @@ async function testTranslateKeyStorage() {
   await tick(80);
   check('a typed key replaces the stored one',
     sandbox.__secrets['translate.apiKey'] === 'replacement-key',
-    JSON.stringify(sandbox.__secrets));
+    'secret store keys: ' + Object.keys(sandbox.__secrets).sort().join(','));
   check('the field is emptied again after saving',
-    keyField.value === '', JSON.stringify(keyField.value));
+    keyField.value === '', 'field empty: ' + String(keyField.value === ''));
   check('the replacement key never reaches app.storage',
     JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}').apiKey === '',
-    sandbox.localStorage.getItem('stv.translate.settings'));
+    fieldsOf(JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}')));
 
   // The field is empty whenever a key is stored, so 测试 must resolve it to the
   // stored key rather than testing the engine without one.
@@ -5086,7 +5115,7 @@ async function testTranslateKeyStorage() {
   await tick(120);
   check('the 测试 button uses the stored key, not an empty one',
     http.length === 1 && http[0].headers['X-goog-api-key'] === 'replacement-key',
-    JSON.stringify(http.map((call) => call.headers)));
+    'sent header names: ' + (http.length ? Object.keys(http[0].headers).sort().join(',') : 'none'));
 
   // 清除 is the only thing that removes it.
   click(panel.querySelectorAll('.stv-translate-key-clear')[0]);
@@ -5094,10 +5123,10 @@ async function testTranslateKeyStorage() {
   await tick(80);
   check('清除 removes the key from the secret store',
     sandbox.__secrets['translate.apiKey'] === undefined,
-    JSON.stringify(sandbox.__secrets));
+    'secret store keys: ' + Object.keys(sandbox.__secrets).sort().join(','));
   check('清除 clears the hasApiKey marker',
     JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}').hasApiKey === false,
-    sandbox.localStorage.getItem('stv.translate.settings'));
+    fieldsOf(JSON.parse(sandbox.localStorage.getItem('stv.translate.settings') || '{}')));
 }
 
 /**
