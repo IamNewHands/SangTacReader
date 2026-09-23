@@ -45,6 +45,16 @@ const REQUIRED_MARKERS = [
   'store.remove unwraps OfflineBook records',
   'resumed in place for ',
   'stvPaused',
+  // The detail page's like button is one-way in the site's own client; without
+  // this wrapper the second tap re-likes the book and looks like a dead button.
+  'like toggle installed',
+  // Re-running a finished range must queue only what is not on disk yet.
+  'already downloaded',
+  // Long-pressing a book cell has to open the menu without selecting text.
+  'webkit-touch-callout',
+  // Exporting a downloaded book: the in-page builder and the native hand-off.
+  'window.__stvExportInstalled',
+  'exportFile',
   'window.__stvActivityLogInstalled',
   'window.__stvTabProbeInstalled',
   'window.__stvStorageAccessorInstalled',

@@ -201,6 +201,14 @@ jobs:
               exit 1
             fi
           done
+          # 导出已下载小说（TXT/EPUB）的原生桥接方法。缺了的话导出按钮会
+          # 直接 reject，站点侧只能报「这个版本还没有导出功能」。
+          if grep -q -F 'exportFile' "$syms.strings"; then
+            echo "✓ exportFile 已编入产物"
+          else
+            echo "::error::exportFile 缺失（导出功能无法送达系统分享面板）"
+            exit 1
+          fi
           # Http 插件的诊断开关。缺了不会崩，但原生侧的门会一直关着，面板里就只剩
           # 失败行——一个只会让性能优化静默回退的洞。
           if grep -q -F 'setDiagnostics' "$syms.strings"; then

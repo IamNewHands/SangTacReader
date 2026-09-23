@@ -48,7 +48,8 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "secretLoad", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationPrepare", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "translationTranslate", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "translationTranslate", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "exportFile", returnType: CAPPluginReturnPromise)
     ]
 
     private var observers: [NSObjectProtocol] = []
@@ -539,6 +540,102 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func translationTranslate(_ call: CAPPluginCall) {
         TranslationSupport.handle("translate", call, parent: bridge?.viewController)
+    }
+
+    // MARK: - File export
+
+    /**
+     The downloaded list's 导出 button builds a TXT or an EPUB in the page (see
+     the `downloadExport` site patch) and hands the finished bytes here, because
+     a WKWebView has no other way to produce a file the reader can reach:
+     `<a download>` is ignored, and this build ships no Filesystem plugin.
+
+     The bytes go into the app's temporary directory and then straight into the
+     system share sheet, which is the only surface iOS offers for "here is a
+     document the reader asked for" -- 存储到"文件", AirDrop, or another reader.
+     The temporary directory is the right home: the copy only has to outlive the
+     sheet or the receiving app, and iOS reclaims it without this plugin having
+     to track anything.
+
+     Deliberately NOT behind isTrustedCaller, unlike the keychain methods. It
+     reads no stored state and returns no data to the caller: it writes bytes the
+     caller supplied into a file whose name the caller supplied, and raises UI.
+     `speakToFile` and the translation bridge are ungated for the same reason,
+     and gating this one would mean an export silently failing on a mirror
+     domain that is not in `trustedHosts` -- a bug report this codebase can do
+     without.
+     */
+    private static let maxExportBytes = 64 * 1024 * 1024
+    private static let maxExportNameLength = 120
+
+    /// The book title becomes the file name, so it can hold a path separator or
+    /// a character iOS rejects. Keep the leaf name, then neutralise the rest.
+    private static func safeFileName(_ raw: String) -> String {
+        let leaf = (raw as NSString).lastPathComponent
+        var cleaned = leaf.replacingOccurrences(of: "/", with: "_")
+        cleaned = cleaned.replacingOccurrences(of: ":", with: "_")
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "export" }
+        return String(trimmed.prefix(maxExportNameLength))
+    }
+
+    @objc func exportFile(_ call: CAPPluginCall) {
+        guard let rawName = call.getString("filename"), !rawName.isEmpty else {
+            call.reject("Missing 'filename'")
+            return
+        }
+        guard let encoded = call.getString("data"), !encoded.isEmpty else {
+            call.reject("Missing 'data'")
+            return
+        }
+        // Checked before decoding: base64 of a 64MB archive is ~85MB of string,
+        // and Data(base64Encoded:) would allocate it a second time.
+        let ceiling = (SangTacAppPlugin.maxExportBytes / 3 + 1) * 4 + 8
+        guard encoded.utf8.count <= ceiling else {
+            call.reject("export is too large for this bridge")
+            return
+        }
+        guard let payload = Data(base64Encoded: encoded,
+                                 options: .ignoreUnknownCharacters) else {
+            call.reject("'data' is not valid base64")
+            return
+        }
+        guard payload.count <= SangTacAppPlugin.maxExportBytes else {
+            call.reject("export is too large for this bridge")
+            return
+        }
+        let name = SangTacAppPlugin.safeFileName(rawName)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try payload.write(to: url, options: .atomic)
+        } catch {
+            CAPLog.print("[SangTacApp:export] write failed for \(name): \(error)")
+            call.reject("could not write \(name): \(error.localizedDescription)")
+            return
+        }
+        CAPLog.print("[SangTacApp:export] wrote \(payload.count) byte(s) to \(name)")
+        report("EXPORT", "wrote \(payload.count) byte(s) to \(name)")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let host = self?.bridge?.viewController else {
+                call.reject("no view controller to present the share sheet")
+                return
+            }
+            let sheet = UIActivityViewController(activityItems: [url],
+                                                 applicationActivities: nil)
+            // Regular-width presentation (iPad, or any future split view) needs
+            // an anchor or UIKit raises instead of degrading.
+            if let popover = sheet.popoverPresentationController {
+                popover.sourceView = host.view
+                popover.sourceRect = CGRect(x: host.view.bounds.midX,
+                                            y: host.view.bounds.midY,
+                                            width: 0, height: 0)
+                popover.permittedArrowDirections = []
+            }
+            host.present(sheet, animated: true) {
+                call.resolve(["value": true, "name": name, "bytes": payload.count])
+            }
+        }
     }
 
     // MARK: - Diagnostics

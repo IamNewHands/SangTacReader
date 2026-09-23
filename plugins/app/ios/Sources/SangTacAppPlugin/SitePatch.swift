@@ -1725,7 +1725,25 @@ enum SitePatch {
             + '.stv-bookgrid4 { display: grid !important;'
             + ' grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));'
             + ' gap: 3vw !important; align-content: start; }'
-            + '.stv-bookgrid4 > * { max-width: none !important; }';
+            + '.stv-bookgrid4 > * { max-width: none !important; }'
+            // Long-pressing a book cell opens the site's own menu (ui.hold ->
+            // app.context.current, page-vip:3901/3977/4000/4027), and the
+            // gesture was also selecting text: the menu appears under the
+            // finger and iOS carries the press on into the new node, so
+            // "长按小说名字会弹出选项，但会默认选中文字". app.v2.css only ever
+            // sets the unprefixed `user-select` (body:28, .booksquare:89,
+            // .bookrow:156) and never the WebKit property or the callout, which
+            // is the property that actually suppresses the iOS selection and
+            // magnifier. Scoped to the list cells and the menu itself: the
+            // comment and reader text has to stay selectable.
+            + '.booksquare, .booksquarecont, .booksquarecont > .booksquare,'
+            + ' .bookrow, .bookrowcont, .bookrowext'
+            + ' { -webkit-user-select: none; user-select: none;'
+            + ' -webkit-touch-callout: none; }'
+            + '.contextmenu, .contextmenu .contextmenuitem,'
+            + ' .mixedcontextmenu, .mixedcontextmenu > div'
+            + ' { -webkit-user-select: none; user-select: none;'
+            + ' -webkit-touch-callout: none; }';
 
         function inject() {
             if (document.getElementById('stv-grid-layout')) { return true; }
@@ -2382,21 +2400,33 @@ enum SitePatch {
     })();
     """
 
-    // MARK: - Bookmark cancel
+    // MARK: - Book-detail action toggles (bookmark, like)
 
     /**
-     The site can add a bookmark but its client cannot remove one:
-     `app.api.bookmark` only ever calls `ajax=addbookmark`, and there is no
-     un-bookmark action anywhere in app.v2.js (likes, by contrast, do have
-     `ajax=unlike`). Tapping the bookmark button on an already-bookmarked book
-     therefore just re-adds it -- which is exactly what "点击书签就取消不了"
-     describes, and the Android build behaves the same way.
+     Both buttons on the detail page are one-way in the site's own client:
 
-     This block makes the button a real toggle: when the book is already
-     bookmarked (the site marks the button `.active` from `querybookmarkstatus`)
-     it tries the plausible removal actions and reports each answer to the
-     panel, so the working endpoint -- if one exists -- is identified from the
-     device instead of guessed. The first action answering code 100 wins.
+       * bookmark -- `app.api.bookmark` only ever calls `ajax=addbookmark`, and
+         there is no un-bookmark action anywhere in app.v2.js. Tapping the
+         button on an already-bookmarked book just re-adds it, which is what
+         "点击书签就取消不了" describes.
+       * like -- the endpoint the reader needs already exists (`app.api.unlike`,
+         app.v2.js:4917), but nothing on the detail page calls it: `.likebook`
+         is bound to `app.api.likeBook`, which only runs `ajax=like`
+         (page-vip:4220, app.v2.js:4914). A second tap therefore re-likes the
+         book and "点赞后取消没反应" is what the reader sees.
+
+     Bookmark: when the book is already bookmarked (the site marks the button
+     `.active` from `querybookmarkstatus`) the plausible removal actions are
+     tried and each answer is reported to the panel, so the working endpoint --
+     if one exists -- is identified from the device instead of guessed. The
+     first action answering code 100 wins.
+
+     Like: the state is read from `queryBookExtStatus` (the same call the site's
+     own `updateBookPage` uses) and the matching endpoint is chosen from it, so
+     the toggle never guesses. The count next to the button is nudged here
+     because `updateBookPage` only rewrites the `.active` class; bookinfo.php
+     re-sends the real number when the page is reopened, so a drift cannot
+     survive a reload.
      */
     static let bookmarkToggle = """
     (function () {
@@ -2436,7 +2466,37 @@ enum SitePatch {
             return null;
         }
 
-        function attach() {
+        function applyLiked(state) {
+            var nodes = document.querySelectorAll('.likebook');
+            for (var i = 0; i < nodes.length; i++) {
+                if (!nodes[i].classList) { continue; }
+                if (state) { nodes[i].classList.add('active'); }
+                else { nodes[i].classList.remove('active'); }
+            }
+        }
+
+        /**
+         Scoped to the counters inside a `.likebook` on purpose: the community
+         boards put a bare `.liked` counter inside every post's own like button
+         (page-vip:1132), and bumping those while liking a book would be a
+         visible lie. `parseInt` rather than a digit regex, so this block stays
+         free of the backslashes check-ios-shim.js rejects.
+         */
+        function bumpLikedCount(delta) {
+            var books = document.querySelectorAll('.likebook');
+            for (var i = 0; i < books.length; i++) {
+                var nodes = books[i].querySelectorAll('.liked');
+                for (var j = 0; j < nodes.length; j++) {
+                    var current = parseInt(String(nodes[j].textContent).trim(), 10);
+                    if (isNaN(current)) { continue; }
+                    var next = current + delta;
+                    if (next < 0) { next = 0; }
+                    nodes[j].textContent = String(next);
+                }
+            }
+        }
+
+        function attachBookmark() {
             var app = window.app;
             if (!app || !app.api || typeof app.api.bookmark !== 'function') { return false; }
             if (app.api.__stvBookmarkWrapped) { return true; }
@@ -2487,11 +2547,76 @@ enum SitePatch {
             return true;
         }
 
-        if (!attach()) {
+        function attachLike() {
+            var app = window.app;
+            if (!app || !app.api || typeof app.api.likeBook !== 'function'
+                || typeof app.api.unlike !== 'function') { return false; }
+            if (app.api.__stvLikeWrapped) { return true; }
+            app.api.__stvLikeWrapped = true;
+            var api = app.api;
+            var originalLike = api.likeBook;
+
+            api.likeBook = function (bookdata) {
+                var book = target(bookdata);
+                if (!book) {
+                    note('LIKE', 'the tapped book could not be resolved; falling back to like');
+                    return originalLike.apply(this, arguments);
+                }
+                // Authoritative state, the site's own pre-check for the same
+                // result (`app.api.updateBookPage` asks the identical question).
+                var state = typeof api.queryBookExtStatus === 'function'
+                    ? api.queryBookExtStatus(book) : Promise.resolve(null);
+                return Promise.resolve(state).then(function (status) {
+                    // Logged on both paths on purpose: the fifteenth device log
+                    // held no like tap at all, so the next one has to say
+                    // whether this handler ran (and what the server reported)
+                    // even when the answer is "add the like".
+                    note('LIKE', book.host + '/' + book.id + ' status like='
+                        + (status ? String(status.like) : 'unknown'));
+                    if (!(status && status.like)) {
+                        return Promise.resolve(originalLike.call(api, book))
+                            .then(function (down) {
+                                note('LIKE', 'liked ' + book.host + '/' + book.id
+                                    + ' -> code ' + (down && down.code));
+                                if (down && down.code == 100) {
+                                    applyLiked(true);
+                                    bumpLikedCount(1);
+                                }
+                                return down;
+                            });
+                    }
+                    note('LIKE', book.host + '/' + book.id + ' is liked; unliking');
+                    return api.unlike(book.host, book.id).then(function (down) {
+                        if (down && down.code == 100) {
+                            applyLiked(false);
+                            bumpLikedCount(-1);
+                            note('LIKE', 'unliked ' + book.host + '/' + book.id);
+                            if (app.toast) { app.toast('已取消点赞'); }
+                        } else {
+                            note('LIKE', 'unlike refused for ' + book.host + '/' + book.id
+                                + ': ' + String(JSON.stringify(down)).slice(0, 200));
+                        }
+                        return down;
+                    }, function (error) {
+                        note('ERR', 'unlike failed for ' + book.host + '/' + book.id
+                            + ': ' + error);
+                        return null;
+                    });
+                });
+            };
+            note('LIKE', 'like toggle installed');
+            return true;
+        }
+
+        function install() {
+            return attachBookmark() && attachLike();
+        }
+
+        if (!install()) {
             var attempts = 0;
             var timer = setInterval(function () {
                 attempts++;
-                if (attach() || attempts > 400) { clearInterval(timer); }
+                if (install() || attempts > 400) { clearInterval(timer); }
             }, 100);
         }
     })();
@@ -3601,6 +3726,16 @@ enum SitePatch {
                     });
             });
             bar.appendChild(button);
+            // The export UI lives in its own block (`downloadExport`), which owns
+            // the TXT/EPUB builders and the native file hand-off; this block owns
+            // the row's action bar. Asking for the button keeps a single wrapper
+            // around app.celoader.bookdownloadedrow -- two independent wrappers
+            // around one renderer is how a row gets decorated twice.
+            var exporter = window.__stvExport;
+            if (exporter && typeof exporter.button === 'function') {
+                var exportButton = exporter.button(book);
+                if (exportButton) { bar.appendChild(exportButton); }
+            }
             node.appendChild(bar);
         }
 
@@ -3666,18 +3801,27 @@ enum SitePatch {
             if (overlay.removeChild) { overlay.removeChild(pop); }
         }
 
-        function showStartedDialog(host, bookid, start, end, count, running) {
+        function showStartedDialog(host, bookid, start, end, count, running, skipped) {
             var app = window.app;
             var ctx = app && app.context;
             if (!ctx || typeof ctx.showPopup !== 'function') { return; }
-            var detail = running
-                ? '这本书已经在下载中，没有重复添加。'
-                : '第 ' + start + ' - ' + end + ' 章，共 ' + count + ' 章';
+            var detail;
+            if (running) {
+                detail = '这本书已经在下载中，没有重复添加。';
+            } else if (!count) {
+                detail = '第 ' + start + ' - ' + end + ' 章都已经下载过了（跳过 '
+                    + skipped + ' 章），没有需要下载的内容。';
+            } else if (skipped) {
+                detail = '新增 ' + count + ' 章（第 ' + start + ' - ' + end + ' 章里已有 '
+                    + skipped + ' 章，直接跳过）';
+            } else {
+                detail = '第 ' + start + ' - ' + end + ' 章，共 ' + count + ' 章';
+            }
             var template = {
-                title: running ? '已在下载' : '已开始下载',
+                title: running ? '已在下载' : (count ? '已开始下载' : '无需重复下载'),
                 body: '<center>' + host + ' / ' + bookid + '<br>' + detail + '</center>',
                 button: '<button action=stvclose>关闭</button>'
-                    + '<button action=stvqueue>查看下载</button>',
+                    + (count ? '<button action=stvqueue>查看下载</button>' : ''),
                 action: {
                     stvclose: function (pop) { dismissPopup(pop); },
                     stvqueue: function (pop) {
@@ -3883,13 +4027,36 @@ enum SitePatch {
                     var clist = await getChapterList(host, bookid);
                     if (!(end > 0) || end > clist.length) { end = clist.length; }
                     if (end < start) { end = start; }
-                    var lists = clist.slice(start - 1, end)
-                        .map(function (e) { return e.cid; });
+                    var wanted = clist.slice(start - 1, end);
+                    // Chapters already on disk are skipped. OfflineBook keeps one
+                    // entry per chapter id under the book's own key
+                    // (app.v2.read.js:3322), so re-running a finished range used to
+                    // queue every chapter again -- "第二次继续下载 1-20 还是会创建
+                    // 新的下载任务". The record is per (host, id) on purpose:
+                    // another source of the same novel is a different book with
+                    // its own chapter ids, and has to be fetched from that source.
+                    var have = {};
+                    var done = [];
+                    if (book && typeof book.getChapterDownloaded === 'function') {
+                        done = (await book.getChapterDownloaded()) || [];
+                    }
+                    for (var d = 0; d < done.length; d++) { have[String(done[d])] = true; }
+                    var lists = [];
+                    for (var w = 0; w < wanted.length; w++) {
+                        if (have[String(wanted[w].cid)]) { continue; }
+                        lists.push(wanted[w].cid);
+                    }
+                    var skipped = wanted.length - lists.length;
                     note('DOWNLOAD', 'range ' + start + '-' + end + ' of ' + clist.length
-                        + ' -> ' + lists.length + ' chapter(s)');
+                        + ' -> ' + lists.length + ' new chapter(s), ' + skipped
+                        + ' already downloaded');
+                    if (!lists.length) {
+                        showStartedDialog(host, bookid, start, end, 0, false, skipped);
+                        return;
+                    }
                     var job = new app.BookDownloadManager(host, bookid, lists, book);
                     job.start();
-                    showStartedDialog(host, bookid, start, end, lists.length, false);
+                    showStartedDialog(host, bookid, start, end, lists.length, false, skipped);
                 } catch (error) {
                     // getChapterList() is a top-level function in app.v2.js; if it
                     // ever stops being reachable, keep the site's own action.
@@ -3990,6 +4157,746 @@ enum SitePatch {
         // Cheap: warmOne() answers immediately for anything already warmed, and
         // the store holds a handful of entries.
         setInterval(warmStore, 3000);
+    })();
+    """
+
+    // MARK: - Export a downloaded book
+
+    /**
+     The downloaded list (page-vip:4014-4037) shows a cover, a title and
+     "Đã tải N/M" and nothing else, so a book the reader has paid to download
+     cannot leave the app: reinstalling the sideloaded IPA drops the whole
+     data container with it. This block adds an 导出 button to every row and
+     turns the stored chapters into a real file:
+
+        txt   title, author, source and one section per chapter, in the order
+              they were downloaded (which is the order the chapter list was
+              sliced in, so it is reading order);
+        epub  the same text as XHTML inside a ZIP, with the cover image and the
+              site's own chapter titles, plus nav.xhtml and toc.ncx so both
+              EPUB 3 and older readers can build a table of contents.
+
+     The file itself is handed to the native side (`App.exportFile`), which
+     writes it into the app's temporary directory and opens the system share
+     sheet -- 存储到"文件", AirDrop, or straight into another reader. The site
+     cannot deliver a file any other way: a WKWebView ignores `<a download>`, and
+     there is no Filesystem plugin in this build.
+
+     The ZIP writer is stored-only on purpose. EPUB requires the `mimetype`
+     entry to be uncompressed, and the remaining entries are one novel that is
+     handed to another app immediately, so a DEFLATE pass (pako, or
+     CompressionStream on iOS 16.4+) would only add a dependency and a place for
+     the archive to be subtly wrong.
+
+     Written escape-free, like every block in this file: check-ios-shim.js
+     rejects a literal backslash, so there is no regex literal and no escaped
+     character anywhere. Line feeds come from String.fromCharCode.
+     */
+    static let downloadExport = """
+    (function () {
+        if (window.__stvExportInstalled) { return; }
+        window.__stvExportInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function toast(message) {
+            var app = window.app;
+            if (app && app.toast) { app.toast(message); }
+        }
+
+        var LF = String.fromCharCode(10);
+        var CRLF = String.fromCharCode(13, 10);
+        var TAB = String.fromCharCode(9);
+        var NBSP = String.fromCharCode(0xA0);
+        var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+        // ---- text -> UTF-8 bytes ------------------------------------------
+
+        // Two passes over the string (measure, then fill) rather than an array
+        // of char codes: a full novel is megabytes and an array of numbers per
+        // byte is what makes this run out of memory on a phone.
+        function utf8Length(text) {
+            var size = 0;
+            for (var i = 0; i < text.length; i++) {
+                var code = text.charCodeAt(i);
+                if (code < 0x80) { size += 1; }
+                else if (code < 0x800) { size += 2; }
+                else if (code >= 0xD800 && code <= 0xDBFF && i + 1 < text.length
+                    && text.charCodeAt(i + 1) >= 0xDC00
+                    && text.charCodeAt(i + 1) <= 0xDFFF) {
+                    size += 4;
+                    i++;
+                } else if (code >= 0xD800 && code <= 0xDFFF) { size += 3; }
+                else { size += 3; }
+            }
+            return size;
+        }
+
+        function textBytes(text) {
+            var bytes = new Uint8Array(utf8Length(text));
+            var at = 0;
+            for (var i = 0; i < text.length; i++) {
+                var code = text.charCodeAt(i);
+                if (code < 0x80) {
+                    bytes[at++] = code;
+                } else if (code < 0x800) {
+                    bytes[at++] = 0xC0 | (code >> 6);
+                    bytes[at++] = 0x80 | (code & 0x3F);
+                } else if (code >= 0xD800 && code <= 0xDBFF && i + 1 < text.length
+                    && text.charCodeAt(i + 1) >= 0xDC00
+                    && text.charCodeAt(i + 1) <= 0xDFFF) {
+                    var point = 0x10000 + ((code - 0xD800) << 10)
+                        + (text.charCodeAt(i + 1) - 0xDC00);
+                    bytes[at++] = 0xF0 | (point >> 18);
+                    bytes[at++] = 0x80 | ((point >> 12) & 0x3F);
+                    bytes[at++] = 0x80 | ((point >> 6) & 0x3F);
+                    bytes[at++] = 0x80 | (point & 0x3F);
+                    i++;
+                } else if (code >= 0xD800 && code <= 0xDFFF) {
+                    // A lone surrogate has no UTF-8 form; emit the same U+FFFD
+                    // the platform encoders do so the measured length still
+                    // matches what is written.
+                    bytes[at++] = 0xEF;
+                    bytes[at++] = 0xBF;
+                    bytes[at++] = 0xBD;
+                } else {
+                    bytes[at++] = 0xE0 | (code >> 12);
+                    bytes[at++] = 0x80 | ((code >> 6) & 0x3F);
+                    bytes[at++] = 0x80 | (code & 0x3F);
+                }
+            }
+            return bytes;
+        }
+
+        function base64(bytes) {
+            var out = '';
+            for (var i = 0; i < bytes.length; i += 3) {
+                var b0 = bytes[i];
+                var b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+                var b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+                out += B64.charAt(b0 >> 2);
+                out += B64.charAt(((b0 & 3) << 4) | (b1 >> 4));
+                out += i + 1 < bytes.length
+                    ? B64.charAt(((b1 & 15) << 2) | (b2 >> 6)) : '=';
+                out += i + 2 < bytes.length ? B64.charAt(b2 & 63) : '=';
+            }
+            return out;
+        }
+
+        function base64Bytes(text) {
+            var binary = atob(text);
+            var bytes = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i) & 0xFF;
+            }
+            return bytes;
+        }
+
+        // ---- stored chapter -> paragraphs ---------------------------------
+
+        var TRIM_RE = new RegExp('^[ ' + TAB + NBSP + ']+|[ ' + TAB + NBSP + ']+$', 'g');
+        var BREAK_RE = new RegExp('<br[^>]*>', 'gi');
+        var BLOCK_RE = new RegExp('</(p|div|h[1-6]|li|tr)>', 'gi');
+        var TAG_RE = new RegExp('<[^>]*>', 'g');
+        var ENTITY_RE = new RegExp('&#([0-9]+);', 'g');
+
+        function decodeEntities(text) {
+            var out = text
+                .replace(new RegExp('&nbsp;', 'gi'), ' ')
+                .replace(new RegExp('&quot;', 'gi'), '"')
+                .replace(new RegExp('&apos;', 'gi'), "'")
+                .replace(new RegExp('&lt;', 'gi'), '<')
+                .replace(new RegExp('&gt;', 'gi'), '>');
+            // Ampersand last: decoding it first would turn a doubly-encoded
+            // entity into one more level of markup.
+            out = out.replace(new RegExp('&amp;', 'gi'), '&');
+            out = out.replace(ENTITY_RE, function (match, digits) {
+                var value = parseInt(digits, 10);
+                return value > 0 && value <= 0xFFFF ? String.fromCharCode(value) : '';
+            });
+            return out;
+        }
+
+        // The chapter body is the site's own HTML-ish markup (app.v2.read.js
+        // stores the raw response string). Tags are dropped rather than
+        // re-emitted: the source is not well-formed XML, and one stray <br>
+        // would make the whole XHTML document unreadable in a strict reader.
+        function chapterParagraphs(html) {
+            var text = String(html === undefined || html === null ? '' : html);
+            text = text.replace(BREAK_RE, LF);
+            text = text.replace(BLOCK_RE, LF + LF);
+            text = text.replace(TAG_RE, '');
+            text = decodeEntities(text);
+            var lines = text.split(LF);
+            var out = [];
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i].replace(TRIM_RE, '');
+                if (line) { out.push(line); }
+            }
+            return out;
+        }
+
+        function parseChapter(raw) {
+            if (raw === null || raw === undefined || raw === '') { return null; }
+            var text = String(raw);
+            var json = null;
+            try { json = JSON.parse(text); } catch (error) { json = null; }
+            if (!json || typeof json !== 'object') { return null; }
+            var body = json.data;
+            if (body === undefined || body === null) { body = json.content; }
+            var paragraphs = chapterParagraphs(body);
+            if (!paragraphs.length) { return null; }
+            return {
+                title: String(json.chaptername || json.chapterName || '').trim(),
+                paragraphs: paragraphs
+            };
+        }
+
+        // ---- reading the stored chapters ----------------------------------
+
+        // getChapter() is one Preferences round trip per chapter, so the reads
+        // are windowed instead of sequential: a 300 chapter book is otherwise
+        // three hundred cross-process waits in a row. The results keep their
+        // original positions, so the reading order is untouched.
+        var READ_WINDOW = 6;
+
+        function readChapters(target, onProgress) {
+            return Promise.resolve(target.getChapterDownloaded()).then(function (ids) {
+                var list = (ids || []).slice();
+                var results = new Array(list.length);
+                var at = 0;
+                function batch() {
+                    if (at >= list.length) { return Promise.resolve(); }
+                    var group = [];
+                    while (group.length < READ_WINDOW && at < list.length) {
+                        group.push(at);
+                        at++;
+                    }
+                    return Promise.all(group.map(function (position) {
+                        return Promise.resolve(target.getChapter(list[position]))
+                            .then(function (raw) { results[position] = parseChapter(raw); },
+                                  function (error) {
+                                      results[position] = null;
+                                      note('EXPORT', 'chapter ' + list[position]
+                                          + ' could not be read: ' + error);
+                                  });
+                    })).then(function () {
+                        if (onProgress) { onProgress(at, list.length); }
+                        return batch();
+                    });
+                }
+                return batch().then(function () {
+                    var chapters = [];
+                    var unreadable = 0;
+                    for (var i = 0; i < results.length; i++) {
+                        if (results[i]) { chapters.push(results[i]); }
+                        else { unreadable++; }
+                    }
+                    return { chapters: chapters, unreadable: unreadable,
+                             total: list.length };
+                });
+            });
+        }
+
+        // ---- file naming --------------------------------------------------
+
+        // No regex: the character class would need a literal backslash, which
+        // check-ios-shim.js rejects. A code-point test is clearer anyway.
+        function safeName(text) {
+            var source = String(text || '');
+            var out = '';
+            for (var i = 0; i < source.length; i++) {
+                var code = source.charCodeAt(i);
+                var bad = code < 32 || code === 92 || code === 47
+                    || code === 58 || code === 42 || code === 63
+                    || code === 34 || code === 60 || code === 62 || code === 124;
+                out += bad ? '_' : source.charAt(i);
+            }
+            out = out.replace(TRIM_RE, '').replace(new RegExp('_+', 'g'), '_');
+            if (out.length > 60) { out = out.slice(0, 60); }
+            return out || 'book';
+        }
+
+        // ---- ZIP (stored entries only) ------------------------------------
+
+        var CRC_TABLE = (function () {
+            var table = new Array(256);
+            for (var n = 0; n < 256; n++) {
+                var value = n;
+                for (var bit = 0; bit < 8; bit++) {
+                    value = (value & 1) ? (0xEDB88320 ^ (value >>> 1)) : (value >>> 1);
+                }
+                table[n] = value >>> 0;
+            }
+            return table;
+        })();
+
+        function crc32(bytes) {
+            var value = 0xFFFFFFFF;
+            for (var i = 0; i < bytes.length; i++) {
+                value = (value >>> 8) ^ CRC_TABLE[(value ^ bytes[i]) & 0xFF];
+            }
+            return (value ^ 0xFFFFFFFF) >>> 0;
+        }
+
+        function u16(view, offset, value) {
+            view[offset] = value & 0xFF;
+            view[offset + 1] = (value >>> 8) & 0xFF;
+        }
+
+        function u32(view, offset, value) {
+            view[offset] = value & 0xFF;
+            view[offset + 1] = (value >>> 8) & 0xFF;
+            view[offset + 2] = (value >>> 16) & 0xFF;
+            view[offset + 3] = (value >>> 24) & 0xFF;
+        }
+
+        // 1980-01-01. Fixed rather than "now" so the same book exports to
+        // byte-identical archives, which is what makes this testable.
+        var DOS_DATE = 0x0021;
+
+        function zip(files) {
+            var entries = [];
+            // Two separate accumulators: `localSize` is where each entry's own
+            // header goes, `centralSize` is the directory's size. Using one
+            // running total for both writes the central directory's position
+            // into every local-header offset, and a reader then finds garbage.
+            var localSize = 0;
+            var i;
+            for (i = 0; i < files.length; i++) {
+                var name = textBytes(files[i].name);
+                var data = files[i].bytes;
+                var entry = {
+                    name: name,
+                    data: data,
+                    crc: crc32(data),
+                    offset: localSize
+                };
+                entries.push(entry);
+                localSize += 30 + name.length + data.length;
+            }
+            var centralSize = 0;
+            for (i = 0; i < entries.length; i++) {
+                centralSize += 46 + entries[i].name.length;
+            }
+            var out = new Uint8Array(localSize + centralSize + 22);
+            var at = 0;
+            for (i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                u32(out, at, 0x04034B50);
+                u16(out, at + 4, 20);
+                u16(out, at + 6, 0x0800);
+                u16(out, at + 8, 0);
+                u16(out, at + 10, 0);
+                u16(out, at + 12, DOS_DATE);
+                u32(out, at + 14, entry.crc);
+                u32(out, at + 18, entry.data.length);
+                u32(out, at + 22, entry.data.length);
+                u16(out, at + 26, entry.name.length);
+                u16(out, at + 28, 0);
+                out.set(entry.name, at + 30);
+                out.set(entry.data, at + 30 + entry.name.length);
+                at += 30 + entry.name.length + entry.data.length;
+            }
+            var central = at;
+            for (i = 0; i < entries.length; i++) {
+                var item = entries[i];
+                u32(out, at, 0x02014B50);
+                u16(out, at + 4, 20);
+                u16(out, at + 6, 20);
+                u16(out, at + 8, 0x0800);
+                u16(out, at + 10, 0);
+                u16(out, at + 12, 0);
+                u16(out, at + 14, DOS_DATE);
+                u32(out, at + 16, item.crc);
+                u32(out, at + 20, item.data.length);
+                u32(out, at + 24, item.data.length);
+                u16(out, at + 28, item.name.length);
+                u16(out, at + 30, 0);
+                u16(out, at + 32, 0);
+                u16(out, at + 34, 0);
+                u16(out, at + 36, 0);
+                u32(out, at + 38, 0);
+                u32(out, at + 42, item.offset);
+                out.set(item.name, at + 46);
+                at += 46 + item.name.length;
+            }
+            u32(out, at, 0x06054B50);
+            u16(out, at + 4, 0);
+            u16(out, at + 6, 0);
+            u16(out, at + 8, entries.length);
+            u16(out, at + 10, entries.length);
+            u32(out, at + 12, at - central);
+            u32(out, at + 16, central);
+            u16(out, at + 20, 0);
+            return out;
+        }
+
+        // ---- TXT ----------------------------------------------------------
+
+        function titleOf(book) {
+            return book.name || (book.host + ' / ' + book.id);
+        }
+
+        function chapterLabel(chapter, index) {
+            var label = String(chapter.title || '').replace(TRIM_RE, '');
+            return label || ('第 ' + (index + 1) + ' 章');
+        }
+
+        function buildTxt(book, chapters) {
+            var title = titleOf(book);
+            var lines = [];
+            lines.push(title);
+            if (book.author) { lines.push('作者：' + book.author); }
+            lines.push('来源：' + book.host + ' / ' + book.id);
+            lines.push('章节：' + chapters.length);
+            for (var i = 0; i < chapters.length; i++) {
+                lines.push('');
+                lines.push('----------');
+                lines.push(chapterLabel(chapters[i], i));
+                lines.push('');
+                for (var j = 0; j < chapters[i].paragraphs.length; j++) {
+                    lines.push(chapters[i].paragraphs[j]);
+                    lines.push('');
+                }
+            }
+            return {
+                title: title,
+                chapters: chapters.length,
+                filename: safeName(title) + '.txt',
+                mime: 'text/plain',
+                bytes: textBytes(lines.join(CRLF))
+            };
+        }
+
+        // ---- EPUB ---------------------------------------------------------
+
+        var CONTAINER_XML = '<?xml version="1.0" encoding="UTF-8"?>'
+            + '<container version="1.0"'
+            + ' xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            + '<rootfiles><rootfile full-path="OEBPS/content.opf"'
+            + ' media-type="application/oebps-package+xml"/></rootfiles></container>';
+
+        var STYLE_CSS = 'body { line-height: 1.6; margin: 1em; }'
+            + 'p { margin: 0 0 0.9em 0; text-indent: 2em; }'
+            + 'h2 { font-size: 1.15em; margin: 1.2em 0 0.8em 0;'
+            + ' text-align: center; text-indent: 0; }'
+            + 'body.cover { margin: 0; text-align: center; }'
+            + 'body.cover img { max-width: 100%; }';
+
+        function escapeXml(text) {
+            return String(text)
+                .replace(new RegExp('&', 'g'), '&amp;')
+                .replace(new RegExp('<', 'g'), '&lt;')
+                .replace(new RegExp('>', 'g'), '&gt;');
+        }
+
+        function pad4(value) {
+            return ('0000' + value).slice(-4);
+        }
+
+        function xhtmlDocument(lang, title, bodyClass, body) {
+            return '<?xml version="1.0" encoding="utf-8"?>'
+                + '<!DOCTYPE html>'
+                + '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="' + lang + '">'
+                + '<head><title>' + escapeXml(title) + '</title>'
+                + '<link rel="stylesheet" type="text/css" href="style.css"/></head>'
+                + '<body' + (bodyClass ? ' class="' + bodyClass + '"' : '') + '>'
+                + body + '</body></html>';
+        }
+
+        function chapterXhtml(lang, label, paragraphs) {
+            var body = '<h2>' + escapeXml(label) + '</h2>';
+            for (var i = 0; i < paragraphs.length; i++) {
+                body += '<p>' + escapeXml(paragraphs[i]) + '</p>';
+            }
+            return xhtmlDocument(lang, label, '', body);
+        }
+
+        function coverXhtml(lang, title) {
+            return xhtmlDocument(lang, title, 'cover',
+                '<div><img src="images/cover.jpg" alt="' + escapeXml(title)
+                + '"/></div>');
+        }
+
+        function buildEpub(book, chapters, cover) {
+            var title = titleOf(book);
+            var author = book.author || '';
+            var lang = 'vi';
+            var manifest = [];
+            var spine = [];
+            var navPoints = [];
+            var navItems = [];
+            var files = [];
+            var i;
+            var label;
+
+            files.push({ name: 'mimetype', bytes: textBytes('application/epub+zip') });
+            files.push({ name: 'META-INF/container.xml', bytes: textBytes(CONTAINER_XML) });
+            files.push({ name: 'OEBPS/style.css', bytes: textBytes(STYLE_CSS) });
+
+            if (cover && cover.length) {
+                files.push({ name: 'OEBPS/images/cover.jpg', bytes: cover });
+                files.push({ name: 'OEBPS/cover.xhtml',
+                             bytes: textBytes(coverXhtml(lang, title)) });
+                manifest.push('<item id="cover-image" href="images/cover.jpg"'
+                    + ' media-type="image/jpeg"/>');
+                manifest.push('<item id="cover" href="cover.xhtml"'
+                    + ' media-type="application/xhtml+xml"/>');
+                spine.push('<itemref idref="cover"/>');
+            }
+
+            for (i = 0; i < chapters.length; i++) {
+                var id = 'chapter-' + pad4(i + 1);
+                var href = id + '.xhtml';
+                label = chapterLabel(chapters[i], i);
+                files.push({ name: 'OEBPS/' + href,
+                             bytes: textBytes(chapterXhtml(lang, label,
+                                 chapters[i].paragraphs)) });
+                manifest.push('<item id="' + id + '" href="' + href
+                    + '" media-type="application/xhtml+xml"/>');
+                spine.push('<itemref idref="' + id + '"/>');
+                navPoints.push('<navPoint id="navPoint-' + (i + 1) + '" playOrder="'
+                    + (i + 1) + '"><navLabel><text>' + escapeXml(label)
+                    + '</text></navLabel><content src="' + href + '"/></navPoint>');
+                navItems.push('<li><a href="' + href + '">' + escapeXml(label) + '</a></li>');
+            }
+
+            manifest.push('<item id="nav" href="nav.xhtml"'
+                + ' media-type="application/xhtml+xml" properties="nav"/>');
+            manifest.push('<item id="ncx" href="toc.ncx"'
+                + ' media-type="application/x-dtbncx+xml"/>');
+            manifest.push('<item id="style" href="style.css" media-type="text/css"/>');
+
+            var identifier = 'urn:sangtacreader:' + safeName(book.host) + '-'
+                + String(book.id);
+            var opf = '<?xml version="1.0" encoding="utf-8"?>'
+                + '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"'
+                + ' unique-identifier="bookid">'
+                + '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                + '<dc:identifier id="bookid">' + escapeXml(identifier) + '</dc:identifier>'
+                + '<dc:title>' + escapeXml(title) + '</dc:title>'
+                + '<dc:creator>' + escapeXml(author) + '</dc:creator>'
+                + '<dc:language>' + lang + '</dc:language>'
+                + '<meta property="dcterms:modified">1980-01-01T00:00:00Z</meta>'
+                + (cover && cover.length
+                    ? '<meta name="cover" content="cover-image"/>' : '')
+                + '</metadata>'
+                + '<manifest>' + manifest.join('') + '</manifest>'
+                + '<spine toc="ncx">' + spine.join('') + '</spine>'
+                + '</package>';
+            files.push({ name: 'OEBPS/content.opf', bytes: textBytes(opf) });
+
+            var ncx = '<?xml version="1.0" encoding="utf-8"?>'
+                + '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
+                + '<head><meta name="dtb:uid" content="' + escapeXml(identifier) + '"/>'
+                + '<meta name="dtb:depth" content="1"/>'
+                + '<meta name="dtb:totalPageCount" content="0"/>'
+                + '<meta name="dtb:maxPageNumber" content="0"/></head>'
+                + '<docTitle><text>' + escapeXml(title) + '</text></docTitle>'
+                + '<navMap>' + navPoints.join('') + '</navMap></ncx>';
+            files.push({ name: 'OEBPS/toc.ncx', bytes: textBytes(ncx) });
+
+            var navBody = '<nav xmlns:epub="http://www.idpf.org/2007/ops"'
+                + ' epub:type="toc" id="toc"><h2>' + escapeXml(title)
+                + '</h2><ol>' + navItems.join('') + '</ol></nav>';
+            files.push({ name: 'OEBPS/nav.xhtml',
+                         bytes: textBytes(xhtmlDocument(lang, title, '', navBody)) });
+
+            return {
+                title: title,
+                chapters: chapters.length,
+                filename: safeName(title) + '.epub',
+                mime: 'application/epub+zip',
+                bytes: zip(files)
+            };
+        }
+
+        // ---- cover --------------------------------------------------------
+
+        // Covers arrive as base64 because the native Http plugin returns
+        // responseType arraybuffer that way (SangTacHttpPlugin.swift:749). A
+        // failure is not fatal: the book exports without a cover image.
+        function fetchCover(book) {
+            var plugin = window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.Http;
+            var url = book.thumb || book.cover || '';
+            if (!plugin || !url || typeof plugin.get !== 'function') {
+                return Promise.resolve(null);
+            }
+            if (typeof window.imgSrc === 'function') { url = window.imgSrc(url); }
+            return plugin.get({ url: url, responseType: 'arraybuffer' })
+                .then(function (response) {
+                    if (!response || typeof response.data !== 'string'
+                        || !response.data) {
+                        return null;
+                    }
+                    return base64Bytes(response.data);
+                }, function (error) {
+                    note('EXPORT', 'cover fetch failed for ' + url + ': ' + error);
+                    return null;
+                });
+        }
+
+        // ---- native hand-off ----------------------------------------------
+
+        // The bridge carries the archive as one base64 string, so the ceiling is
+        // about memory on both sides rather than any protocol limit. A book this
+        // large is hundreds of chapters of unbroken text.
+        var MAX_EXPORT_BYTES = 48 * 1024 * 1024;
+
+        function sendFile(filename, mime, bytes) {
+            var plugin = window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App;
+            if (!plugin || typeof plugin.exportFile !== 'function') {
+                return Promise.reject(new Error('这个版本还没有导出功能'));
+            }
+            if (bytes.length > MAX_EXPORT_BYTES) {
+                return Promise.reject(new Error('内容太大，无法一次导出'));
+            }
+            return plugin.exportFile({
+                filename: filename,
+                mime: mime,
+                data: base64(bytes)
+            });
+        }
+
+        // ---- entry point --------------------------------------------------
+
+        function resolveMeta(book) {
+            var meta = {
+                host: book.host,
+                id: book.id,
+                name: book.name || '',
+                author: book.author || '',
+                thumb: book.thumb || ''
+            };
+            if (meta.name) { return Promise.resolve(meta); }
+            var app = window.app;
+            if (!app || !app.net || typeof app.net.getCacheLater !== 'function') {
+                return Promise.resolve(meta);
+            }
+            var url = '/mobile/bookinfo.php?hid=' + book.id + '&host=' + book.host;
+            return app.net.getCacheLater(url).then(function (down) {
+                var info = down && down.book ? down.book : null;
+                if (info) {
+                    if (info.name) { meta.name = info.name; }
+                    if (info.author) { meta.author = info.author; }
+                    if (info.thumb) { meta.thumb = info.thumb; }
+                }
+                return meta;
+            }, function () { return meta; });
+        }
+
+        function reset(node, label) {
+            node.__stvExportBusy = false;
+            node.textContent = label || '导出';
+            node.disabled = false;
+        }
+
+        function run(book, format, node) {
+            if (node.__stvExportBusy) { return; }
+            node.__stvExportBusy = true;
+            node.disabled = true;
+            node.textContent = '准备中';
+            var app = window.app;
+            var target = app && app.offlineBook && app.offlineBook.getExistedBook
+                ? app.offlineBook.getExistedBook({ host: book.host, id: book.id })
+                : null;
+            if (!target || typeof target.getChapterDownloaded !== 'function') {
+                toast('这本书没有可导出的离线内容');
+                reset(node);
+                return;
+            }
+            resolveMeta(book).then(function (meta) {
+                return readChapters(target, function (done, total) {
+                    node.textContent = '读取 ' + done + '/' + total;
+                }).then(function (read) {
+                    if (!read.chapters.length) {
+                        throw new Error('没有读到章节内容');
+                    }
+                    note('EXPORT', 'read ' + read.chapters.length + ' of ' + read.total
+                        + ' chapter(s) for ' + book.host + '/' + book.id
+                        + (read.unreadable ? ', ' + read.unreadable + ' unreadable' : ''));
+                    node.textContent = '打包中';
+                    if (format !== 'epub') { return buildTxt(meta, read.chapters); }
+                    return fetchCover(meta).then(function (cover) {
+                        return buildEpub(meta, read.chapters, cover);
+                    });
+                });
+            }).then(function (payload) {
+                node.textContent = '导出中';
+                note('EXPORT', payload.filename + ' (' + payload.mime + '), '
+                    + payload.chapters + ' chapter(s), ' + payload.bytes.length
+                    + ' byte(s)');
+                return sendFile(payload.filename, payload.mime, payload.bytes)
+                    .then(function () {
+                        toast('已导出《' + payload.title + '》：' + payload.chapters
+                            + ' 章，' + format.toUpperCase());
+                        note('EXPORT', 'handed ' + payload.filename + ' to the system');
+                        reset(node);
+                    });
+            }).then(null, function (error) {
+                note('ERR', 'export failed for ' + book.host + '/' + book.id + ': '
+                    + error);
+                toast('导出失败：' + (error && error.message ? error.message : error));
+                reset(node);
+            });
+        }
+
+        function dismiss(pop) {
+            var overlay = pop && pop.parentNode;
+            if (!overlay) { return; }
+            if (typeof overlay.hide === 'function') { overlay.hide(); return; }
+            if (overlay.removeChild) { overlay.removeChild(pop); }
+        }
+
+        function chooseFormat(book, node) {
+            var app = window.app;
+            var ctx = app && app.context;
+            if (!ctx || typeof ctx.showPopup !== 'function') { return; }
+            ctx.showPopup({
+                title: '导出《' + titleOf(book) + '》',
+                body: '<center>选择导出格式<br>'
+                    + 'TXT：纯文本，带章节标题<br>'
+                    + 'EPUB：带封面，可在阅读器里直接打开</center>',
+                button: '<button action=stvtxt>导出 TXT</button>'
+                    + '<button action=stvepub>导出 EPUB</button>',
+                action: {
+                    stvtxt: function (pop) { dismiss(pop); run(book, 'txt', node); },
+                    stvepub: function (pop) { dismiss(pop); run(book, 'epub', node); }
+                }
+            });
+        }
+
+        // Called by the downloaded row's own action bar (pageRepair,
+        // decorateDownloadedRow) so the row keeps a single renderer wrapper.
+        function button(book) {
+            if (!book || !book.host || !book.id) { return null; }
+            var node = document.createElement('button');
+            node.textContent = '导出';
+            node.setAttribute('style', 'padding:6px 12px;font-size:13px;border-radius:6px;');
+            node.addEventListener('click', function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+                chooseFormat(book, node);
+            });
+            return node;
+        }
+
+        window.__stvExport = {
+            button: button,
+            buildTxt: buildTxt,
+            buildEpub: buildEpub,
+            zip: zip,
+            textBytes: textBytes,
+            base64: base64,
+            chapterParagraphs: chapterParagraphs,
+            safeName: safeName,
+            run: run
+        };
     })();
     """
 
@@ -5999,5 +6906,6 @@ enum SitePatch {
                                 activityLog, tabProbe, ttsProvider, followFallback,
                                 keyboardPopup, gridLayout, settingsBackup,
                                 bookmarkToggle, readerTts,
-                                pageRepair, commentTranslate, readerPrefetch]
+                                pageRepair, downloadExport, commentTranslate,
+                                readerPrefetch]
 }

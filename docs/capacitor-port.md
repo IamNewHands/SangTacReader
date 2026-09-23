@@ -65,6 +65,7 @@
 11. **社区里的 Cbox 板块翻译不了**：`page-pagecbox`（`_page_vip.html:982`）是一个跨域 iframe（`www6.cbox.ws`），父页面拿不到里面的 DOM；Facebook 的两个按钮是外部浏览器。其余板块（Kênh truyện / Kênh linh tinh / 势力 / 单帖 / 用户主页评论 / 广播）都已覆盖，见 §6.14 (7)。
 12. **标签栏切换的正式 API 未知**：`ui.smtab()` 来自 `/stv.ui.js`，该文件不在仓库里也拉不下来（本机 TLS 取不到），所以「跳转到下载页」是靠**在 tabitem 上派发 click**（和手指一样）+ 事后用 `tab.current()` 校验；校验不过才去探测 `select/go/switchTo/setIndex/activate/to` 这一组 setter 名字。走哪条路、`current()` 是否存在于 `#tabtusach`，都会写进 `[DOWNLOAD]` 日志，下一份真机日志即可定案，见 §6.15 (2)。
 13. 站点自身还有两处缺陷，已用包装绕过（站点代码仍未改，见 §6.16）：`store.remove()` 按**引用**找记录而 `OfflineBook.delete()` 递进去的是包装对象（`app.v2.js:661` / `read.js:3314`），所以删除恒不落盘、重启就复活；`OfflineBook.deleteAll()`（`read.js:3368`）边遍历边 `splice`，每隔一章漏删一个章节文件。
+14. 站点还有两处「只实现一半」的地方，同样只在我们的包装里补（见 §6.17）：详情页的点赞按钮只发 `ajax=like`（`_page_vip.html:4220` / `app.v2.js:4914`），而取消用的 `app.api.unlike`（`:4917`）没有任何调用方；站点的 `app.v2.css` 只写了无前缀的 `user-select: none`（`body:28` / `.booksquare:89` / `.bookrow:156`），没有 `-webkit-user-select` 也没有 `-webkit-touch-callout`，所以长按弹菜单时 iOS 的选中/放大镜手势仍然生效。范围下载也从不检查磁盘上已有的章节（`clist.slice(start-1, end)` 直接交新任务），重复下一个区间会整段重下并把限速节奏打坏。
 
 ## 6. 真机问题档案
 
@@ -1530,3 +1531,136 @@ iframe，父页面取不到内部文字，**不支持**；两个 Facebook 按钮
 + 重启后列表）；暂停的即时性在真机上的表现是「点暂停后不再有新请求」，`[DOWNLOAD] paused ... at
 d/ t` 与 `resumed in place for ...` 会写在日志里；「删除任务」按钮走的也是 `pause()`，
 现在同样会真的停下。
+
+### 6.17 第十五轮反馈（`日志.txt`，512 行）：点赞取消、下载去重、导出、长按选中
+
+四件事：两件是站点客户端的单向按钮/重复任务，一件是新功能（导出），一件是 iOS 手势与站点 CSS 的错配。
+
+#### 1. 小说详情页点赞后无法取消
+
+站点源码就是单向的：详情页把 `.likebook` 绑到 `app.api.likeBook`
+（`_page_vip.html:4220`），而它只发 `ajax=like`（`app.v2.js:4914-4916`）。
+**取消用的端点其实是有的**——`app.api.unlike`（`:4917-4931`，`ajax=unlike`）——只是详情页
+从来没有人调它。所以第二次点只是再 like 一次，状态与计数都不动。
+
+修法（`bookmarkToggle` 块，与「取消书签」同一个所有者：站点只单向实现的书本动作）：
+
+- `app.api.likeBook` 包一层，用 `app.api.queryBookExtStatus(book)` 读**权威状态**——这正是
+  站点自己 `updateBookPage`（`:4936`）用来决定 `.active` 的那个调用，所以不是猜；
+- `status.like` 为真 → `app.api.unlike(host, id)`；为假 → 走原本的 like；
+- 计数（`_page_vip.html:334` 的 `.liked`）由这次点击加减 1：`updateBookPage` 只改 `.active`
+  类，不管数字。作用域限定在 `.likebook` 内，因为社区帖子的点赞按钮里也有一个裸 `.liked`
+  （`:1132`），一起加会写错别人的数字。下次打开详情页 `bookinfo.php` 会送回真值，漂移不会累积。
+
+两条路径都写 `[LIKE] ... status like=...` / `liked ... -> code ...`：**本轮日志里根本没有点赞的
+TAP/POST 记录**（14:45:41 打开详情页到 14:45:48 点 `button.w-100` 之间没有任何 `[TAP]`，
+`jsonify.php` 一次都没出现），所以这个根因来自站点源码而不是日志。下一份日志能直接判定：
+有点赞的 `[LIKE]` 行 = 处理器在跑；没有 = 点击根本没到处理器，那是另一个问题。
+
+#### 2. 重复下载同一个区间会新建任务
+
+日志第 216-217 行与 410-411 行是同一个区间的两次执行：
+
+```
+14:46:22 [DOWNLOAD] range 1-20 of 310 -> 20 chapter(s)
+14:46:22 [DOWNLOAD] started dialog shown: 第 1 - 20 章，共 20 章
+...
+14:46:43 [DOWNLOAD] moved qidian/1034915599 into the DOWNLOADED list
+...
+14:47:27 [DOWNLOAD] range 1-20 of 310 -> 20 chapter(s)
+```
+
+第二次是在「已下载」之后发起的，20 章一个不落地重新下，还顺带把节奏打坏
+（第 452-465 行的 `throttled (chapter failed: Không thể đọc dữ liệu)`、
+`retry 1/3`/`retry 2/3`）。
+
+根因：范围对话框把 `clist.slice(start-1, end)` 的每一个 `cid` 直接交给新的
+`BookDownloadManager`，从不问磁盘上已经有什么。而 `OfflineBook` 一直知道答案：
+`getChapterDownloaded()`（`app.v2.read.js:3317`）读的就是按 book 存的章节 id 列表。
+
+修法：`menu.action.startdownload` 里先取 `book.getChapterDownloaded()` 建集合，
+过滤掉已有的 id，只把缺的交给新 job：
+
+- `[DOWNLOAD] range 1-20 of 310 -> 15 new chapter(s), 5 already downloaded`；
+- 全都有 → **不建 job**，弹「无需重复下载」（标题就是这个），不再产生一个 0/N 的僵尸行；
+- 弹窗文案区分三种情况：全新 / 部分新增（`新增 N 章（第 a - b 章里已有 M 章，直接跳过）`）/ 全部已有。
+- 记录按 (host, id) 分开：同一本书换个源就是另一本书、另一套章节 id，该下还得下——
+  这正是「检查已下载的章节和来源」里的「来源」那一半。
+
+#### 3. 已下载列表加「导出」（TXT / EPUB，带封面与书名）
+
+新增 `downloadExport` 块 + 原生 `SangTacAppPlugin.exportFile`。行内的按钮由 `pageRepair`
+的 `decorateDownloadedRow` 通过 `window.__stvExport.button(book)` 取——行布局归 `pageRepair`，
+导出归 `downloadExport`，`app.celoader.bookdownloadedrow` 只包一层（两个独立包装器是行被
+装饰两次的老路）。
+
+- TXT：书名 / 作者 / 来源 / 章节数 + 每章「站点原标题 + 正文」，`\r\n` 换行；
+- EPUB：把同样的文字转成 XHTML 塞进 ZIP，封面图（`Http.get({responseType:'arraybuffer'})`
+  拿回的 base64，`SangTacHttpPlugin.swift:749`）、`nav.xhtml` 与 `toc.ncx` 都给上，
+  EPUB 3 和只认 NCX 的老阅读器都能出目录；
+- ZIP 是**只存不压**的：格式要求 `mimetype` 必须是第一个且未压缩的条目，而剩下的内容马上就
+  交给别的 App，引 pako 或 `CompressionStream` 只会多一个依赖和一个出错点；
+- 文件交给原生 → 写进临时目录 → 弹系统分享面板（存到「文件」/ AirDrop / 直接进其他阅读器）。
+  WKWebView 里 `<a download>` 是空操作，这个构建又没有 Filesystem 插件，分享面板是唯一出路；
+- 没有封面、没有 `chapterTitle`、某一章读不出来都不致命：封面缺失就不放封面，读不出的章节
+  跳过并记 `[EXPORT] read N of M chapter(s), K unreadable`，一章都没有才报错。
+
+**测试第一次跑就抓出 zip 写入的真 bug**：`localSize` 与 `centralSize` 用了同一个累加变量，
+于是每个本地头的 offset 写成了「中央目录的位置」，`mimetype` 的 CRC 全对但数据段错位。
+测试用**独立的** ZIP 读取器（自己解析 EOCD / 中央目录 / 本地头）加 `zlib.crc32` 复核，
+不是把写入逻辑重抄一遍；修好后另外用 .NET `System.IO.Compression.ZipFile` 打开产物复核过
+（`mimetype` 是第 0 个条目、`CompressedLength == Length`、`content.opf` 正常）。
+
+原生侧：
+
+- `CAPPluginMethod(name: "exportFile")`，写 `FileManager.default.temporaryDirectory`，
+  `UIActivityViewController` 在主线程 present，popover 锚点也给了（iPad/分屏用法下 UIKit 会
+  直接抛异常而不是降级）；
+- 文件名走 `NSString.lastPathComponent` + 替换 `/` 与 `:`，长度截到 120；
+- **故意不加 `isTrustedCaller`**：它不读任何已存状态、不向调用方返回数据，只写调用方给的字节并
+  抬 UI（与 `speakToFile`、翻译桥同理）；加了的话，主框架落在 `trustedHosts` 之外的镜像域名时
+  导出会静默失败，换来的安全性并不存在；
+- 上限 64 MB，且**解码前**先按 base64 长度判断（64 MB 的 base64 是 ~85 MB 字符串，
+  `Data(base64Encoded:)` 会再分配一次）。
+
+#### 4. 历史列表长按会顺带选中文字
+
+站点给每个书本单元挂 `ui.hold(e, ...)` 弹菜单（`_page_vip.html:3901/3977/4000/4027`），
+并且只对里面的 `img` 挡了 `contextmenu`——文字上没有。`app.v2.css` 只在 `body:28`、
+`.booksquare:89`、`.bookrow:156` 写了**无前缀**的 `user-select: none`，从来没有
+`-webkit-user-select`，更没有 `-webkit-touch-callout`。菜单在手指下面冒出来的那一刻，
+iOS 的选中/放大镜手势正好落在新节点上，于是「弹选项的同时默认选中了文字」。
+
+修法：`gridLayout` 注入的那张样式表里补上 `.booksquare/.booksquarecont/.bookrow/
+.bookrowcont/.bookrowext` 与 `.contextmenu/.mixedcontextmenu` 系列的
+`-webkit-user-select: none` + `-webkit-touch-callout: none`。只圈列表单元和菜单本身——
+评论与正文的选择能力必须留着。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 22 块 / 334172 字节 / **34** markers（新增
+  `like toggle installed`、`already downloaded`、`webkit-touch-callout`、
+  `window.__stvExportInstalled`、`exportFile`）
+- `node scripts/test-site-patch.js` → **486 条断言**全过（上一轮 367 条）。新增四组：
+  - 点赞：已 like 时走 `unlike`、两个按钮的 `.active` 都掉、计数 25→24、再点回 25；
+    未登录（状态查询返回 null）时仍然走站点自己的 like 路径，不会对不存在的会话发 unlike；
+  - 去重：`alreadyDownloaded: ['c1'..'c5']` 时 1-20 只排队 `c6..c20`（15 章）、
+    弹窗写「已有 5 章」；整段都下过时**一个 job 都不建**，标题是「无需重复下载」；
+  - 导出：点行内按钮 → 格式弹窗 → TXT 命名/表头/章节顺序/去标签，EPUB 的
+    `mimetype` 是第 0 个且未压缩、**每个条目的 CRC32 用 `zlib.crc32` 复核**、
+    container/opf/nav/ncx/封面齐备、spine 含 cover + 两章、章节 XHTML 转义正确、
+    封面字节就是取回的那份；空书报「导出失败」而不是产出空文件；
+    `textBytes` 与 `Buffer.from(...,'utf8')` 逐字节比对（含 emoji 这种代理对），
+    `safeName` 挡掉 `/ : * ? " < > |`；
+  - 长按：注入的样式表里有 `-webkit-touch-callout: none` / `-webkit-user-select: none`，
+    覆盖列表单元与菜单，且**没有**任何 `user-select: text`。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
+- 产物复核：`STV_EXPORT_DUMP=1 node scripts/test-site-patch.js` 会往
+  `_export-check/`（gitignore）写一份 TXT + EPUB，本轮用 .NET `ZipFile` 独立打开验证过。
+
+**未证实项**：真机上四件事都要看下一份日志——点赞要 `[LIKE] ... status like=...`；
+去重要 `[DOWNLOAD] ... 15 new chapter(s), 5 already downloaded`；导出要有
+`[EXPORT] read N of M chapter(s)` 与系统分享面板弹出；长按是否还选中文字只能眼看（手势事件
+不进日志）。Swift 侧本机无法编译验证：开发机是 Windows，`exportFile`
+只有 CI 的 `macos-26` 会编（workflow 里加了 `exportFile` 的符号校验）。
+

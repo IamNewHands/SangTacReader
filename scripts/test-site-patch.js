@@ -28,6 +28,7 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const zlib = require('zlib');
 
 const TARGET_DIR = path.join(__dirname, '..', 'plugins', 'app', 'ios', 'Sources', 'SangTacAppPlugin');
 
@@ -513,7 +514,16 @@ function installFakeApp(sandbox, options) {
         return Promise.resolve();
       },
       cache: {
-        getFile() {
+        // The offline chapter bodies live under
+        // offlineBook_<host>_<id>_<cid> (app.v2.read.js:3295, :3402). Anything
+        // the test did not supply keeps the old stand-in, which the TTS tests
+        // rely on.
+        getFile(key) {
+          const files = options.chapterFiles || {};
+          if (Object.prototype.hasOwnProperty.call(files, key)) {
+            stored.fileReads = (stored.fileReads || []).concat([key]);
+            return Promise.resolve(files[key]);
+          }
           return Promise.resolve(options.storedTtsSetting || '');
         },
         setFile(key, value) {
@@ -659,7 +669,22 @@ function installFakeApp(sandbox, options) {
     },
     getNewBook(bookInfo) {
       stored.newBooks = (stored.newBooks || []).concat([bookInfo]);
-      return Promise.resolve({ host: bookInfo.host, id: bookInfo.id });
+      const book = { host: bookInfo.host, id: bookInfo.id };
+      // `alreadyDownloaded` models getNewBook() returning the existing
+      // OfflineBook singleton, whose getChapterDownloaded() reads the stored
+      // chapter list (app.v2.read.js:3317).
+      if (options.alreadyDownloaded) {
+        book.baseObject = {
+          host: bookInfo.host,
+          id: bookInfo.id,
+          chapterStoreKey: 'offlineBook_' + bookInfo.host + '_' + bookInfo.id + '_chapters',
+          chapterPreKey: 'offlineBook_' + bookInfo.host + '_' + bookInfo.id + '_',
+        };
+        book.getChapterDownloaded = () => Promise.resolve(options.alreadyDownloaded.slice());
+        book.getChapter = (cid) => Promise.resolve(
+          (options.chapterFiles || {})[book.baseObject.chapterPreKey + cid] || '');
+      }
+      return Promise.resolve(book);
     },
     getExistedBook(obj) {
       stored.existedLookups = (stored.existedLookups || []).concat([obj.host + '/' + obj.id]);
@@ -883,6 +908,20 @@ function installFakeApp(sandbox, options) {
             translations: payload.texts.map((text) => '【系统】' + text),
           });
         },
+        // The export block builds the TXT/EPUB in the page and hands the bytes
+        // here; the real method writes them into the temporary directory and
+        // opens the share sheet. `exportFileFails` models the bridge rejecting.
+        exportFile(payload) {
+          (stored.exports || (stored.exports = [])).push(payload);
+          if (options.exportFileFails) {
+            return Promise.reject(new Error(options.exportFileFails));
+          }
+          return Promise.resolve({
+            value: true,
+            name: payload.filename,
+            bytes: payload.data.length,
+          });
+        },
       },
       // Every network engine goes through the native Http plugin, because a
       // page-level fetch to those hosts is blocked by CORS.
@@ -893,6 +932,15 @@ function installFakeApp(sandbox, options) {
             return Promise.resolve(options.httpResponse(String(payload.url), payload));
           }
           return Promise.reject(new Error('no Http stub for ' + payload.url));
+        },
+        // Covers are fetched with responseType arraybuffer, which the native
+        // plugin answers as base64 (SangTacHttpPlugin.swift:749).
+        get(payload) {
+          (stored.httpGet || (stored.httpGet = [])).push(payload);
+          if (options.httpGetResponse) {
+            return Promise.resolve(options.httpGetResponse(String(payload.url), payload));
+          }
+          return Promise.reject(new Error('no Http.get stub for ' + payload.url));
         },
         // The diag block pushes the logging switch to the native side so it can
         // skip building diagnostic lines at all.
@@ -2570,6 +2618,17 @@ async function testGridLayout() {
     css.indexOf('grid-template-columns: repeat(auto-fill, minmax(100px, 1fr))') >= 0, css);
   check('the fixed 33.33% column cap is lifted for grid items',
     css.indexOf('.stv-bookgrid4 > * { max-width: none !important; }') >= 0, css);
+  // "长按小说名字会弹出选项，现在会默认选择文字": the site only ever sets the
+  // unprefixed user-select (app.v2.css:28, :89, :156), so the iOS long-press
+  // selection and callout were still live under the menu.
+  check('book cells suppress the iOS long-press selection and callout',
+    css.indexOf('.booksquare, .booksquarecont') >= 0
+      && css.indexOf('-webkit-touch-callout: none') >= 0
+      && css.indexOf('-webkit-user-select: none') >= 0, css);
+  check('the long-press menu itself is not selectable either',
+    css.indexOf('.contextmenu, .contextmenu .contextmenuitem') >= 0, css);
+  check('the injected sheet never re-enables text selection',
+    css.indexOf('user-select: text') < 0, css);
 
   // app.history.setContainer builds the history grid, so wrapping it is how the
   // CSS above is scoped to the history tab alone.
@@ -2793,8 +2852,9 @@ async function testDownloadCompletion() {
   // "DOWNLOADED" header inside the manager wrapper (page-vip:2292-2298).
   const row = manager.children[manager.children.length - 1];
   const buttons = row.querySelectorAll('button');
-  check('the downloaded row gets a delete button',
-    buttons.length === 1 && buttons[0].textContent === '删除',
+  check('the downloaded row gets a delete button and an export button',
+    buttons.length === 2 && buttons[0].textContent === '删除'
+      && buttons[1].textContent === '导出',
     JSON.stringify(buttons.map((button) => button.textContent)));
   app.offlineBook.offlineBookSingletons['qidian_1034915599'] = book;
   buttons[0].__fire('click', { stopPropagation() {}, preventDefault() {} });
@@ -3236,6 +3296,440 @@ async function testBookmarkToggle() {
   check('a book that is not bookmarked still goes through addbookmark',
     add.__stored.bookmarkAdds === 1);
   check('no removal probe without an active bookmark', add.__posts.length === 0);
+}
+
+/**
+ * The detail page's like button is bound to `app.api.likeBook`, which only ever
+ * runs `ajax=like` (page-vip:4220, app.v2.js:4914) -- so tapping an already
+ * liked book re-liked it and "点赞后取消没反应". The endpoint the reader needs
+ * already exists (`app.api.unlike`); the wrapper picks between the two from the
+ * same status call the site's own `updateBookPage` uses.
+ */
+async function testLikeToggle() {
+  console.log('like toggles back off');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'auto' });
+
+  // Both buttons on the detail page (page-vip:334 and :372). Only the first
+  // carries the counter, and the second must not grow one.
+  const stat = makeContainer('div', 'book-tag blk-item likebook active');
+  const counter = makeContainer('span', 'liked', '25');
+  stat.appendChild(counter);
+  sandbox.document.body.appendChild(stat);
+  const actionCell = makeContainer('div', 'blk-item likebook');
+  sandbox.document.body.appendChild(actionCell);
+
+  let liked = true;
+  const likes = [];
+  const unlikes = [];
+  app.api.queryBookExtStatus = () => Promise.resolve({
+    like: liked, bookmark: false, follow: false,
+  });
+  app.api.likeBook = function (bookinfo) {
+    likes.push(bookinfo.host + '/' + bookinfo.id);
+    liked = true;
+    return Promise.resolve({ code: 100 });
+  };
+  app.api.unlike = function (host, id) {
+    unlikes.push(host + '/' + id);
+    liked = false;
+    return Promise.resolve({ code: 100 });
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  check('the like wrapper is installed', app.api.__stvLikeWrapped === true);
+
+  const book = { host: 'qidian', id: '1034915599', name: '这些仙子全都不正常！' };
+  await app.api.likeBook(book);
+  await tick(40);
+  check('an already liked book is unliked instead of liked again',
+    unlikes.join(',') === 'qidian/1034915599' && likes.length === 0,
+    'likes=' + likes.join(',') + ' unlikes=' + unlikes.join(','));
+  check('every like button drops its active state',
+    !stat.classList.contains('active') && !actionCell.classList.contains('active'),
+    stat.className + ' | ' + actionCell.className);
+  check('the counter next to the button drops by one', counter.textContent === '24',
+    String(counter.textContent));
+  check('the cancellation is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('is liked; unliking') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // Tapping again: the server now says "not liked", so the add path has to run
+  // and the counter goes back up.
+  await app.api.likeBook(book);
+  await tick(40);
+  check('an unliked book is liked through the site endpoint',
+    likes.length === 1 && unlikes.length === 1,
+    'likes=' + likes.join(',') + ' unlikes=' + unlikes.join(','));
+  check('the button shows as active again', stat.classList.contains('active'));
+  check('the counter goes back up', counter.textContent === '25',
+    String(counter.textContent));
+
+  // A reader who is not logged in: the status call answers null, the site's own
+  // like() raises the login prompt, and the wrapper must not fire unlike at a
+  // session that does not exist.
+  const anon = makeSandbox();
+  const anonApp = installFakeApp(anon, { displayType: 'auto' });
+  const anonLikened = [];
+  anonApp.api.queryBookExtStatus = () => Promise.resolve(null);
+  anonApp.api.likeBook = () => { anonLikened.push('like'); return Promise.resolve({ code: 0 }); };
+  anonApp.api.unlike = () => { anonLikened.push('unlike'); return Promise.resolve({ code: 0 }); };
+  vm.runInContext(loadBlocks().join('\n'), anon);
+  await tick(250);
+  await anonApp.api.likeBook(book);
+  await tick(40);
+  check('a signed-out tap still goes to the site own like path',
+    anonLikened.join(',') === 'like', anonLikened.join(','));
+}
+
+/**
+ * "第二次继续下载 1-20 还是会创建新的下载任务，应该要检查已下载的章节" -- the
+ * range dialog handed every id in [start, end] to a brand new job. OfflineBook
+ * already knows what is on disk (`getChapterDownloaded`, app.v2.read.js:3317),
+ * so only the missing chapters may be queued.
+ */
+async function testDownloadSkipsDownloaded() {
+  console.log('a re-run range only queues the missing chapters');
+  const sandbox = makeSandbox();
+  sandbox.getChapterList = async () => {
+    const list = [];
+    for (let i = 1; i <= 30; i += 1) { list.push({ cid: 'c' + i }); }
+    return list;
+  };
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    slowChapter: true,
+    alreadyDownloaded: ['c1', 'c2', 'c3', 'c4', 'c5'],
+  });
+
+  const popupNode = makeContainer('div', 'popupedit');
+  popupNode.q = (selector) => popupNode.querySelector(selector);
+  const hostInput = makeElement('input');
+  const idInput = makeElement('input');
+  const startInput = makeElement('input');
+  const endInput = makeElement('input');
+  hostInput.className = 'bookhost';
+  hostInput.value = 'qidian';
+  idInput.className = 'bookid';
+  idInput.value = '1034915599';
+  startInput.className = 'numstart';
+  startInput.value = '1';
+  endInput.className = 'numend';
+  endInput.value = '20';
+  [hostInput, idInput, startInput, endInput]
+    .forEach((node) => popupNode.appendChild(node));
+
+  app.context = {
+    menu: {
+      downloadchapter: {
+        body: '<input class="numstart"/><input class="numend"/>',
+        action: {
+          startdownload: async function () { sandbox.__stored.siteStart = true; },
+          cancel() {},
+        },
+      },
+    },
+    showPopup: (template) => {
+      (sandbox.__stored.popups = sandbox.__stored.popups || []).push(template);
+      return popupNode;
+    },
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  const action = app.context.menu.downloadchapter.action.startdownload;
+  await action.call({ cancel() {} }, popupNode);
+  await tick(60);
+  const job = app.bookDownloaderList[app.bookDownloaderList.length - 1];
+  check('chapters already on disk are not queued again',
+    !!job && job.chaptersOrginal.length === 15
+      && job.chaptersOrginal[0] === 'c6' && job.chaptersOrginal[14] === 'c20',
+    JSON.stringify(job && job.chaptersOrginal));
+  check('the remaining chapters still come from the chosen source',
+    !!job && job.host === 'qidian' && job.id === '1034915599',
+    job ? job.host + '/' + job.id : '(no job)');
+  const diag = String(sandbox.window.__stvDiag.text() || '');
+  check('the skip is reported',
+    diag.indexOf('15 new chapter(s), 5 already downloaded') >= 0, diag.slice(-260));
+  const opened = sandbox.__stored.popups[sandbox.__stored.popups.length - 1];
+  check('the dialog says what was skipped',
+    !!opened && String(opened.body).indexOf('已有 5 章') >= 0,
+    JSON.stringify(opened && opened.body));
+
+  // A range that is entirely on disk must not create a job at all. The first
+  // job is dropped first: a live job for the same book is ignored on purpose.
+  app.bookDownloaderList.length = 0;
+  startInput.value = '1';
+  endInput.value = '5';
+  await action.call({ cancel() {} }, popupNode);
+  await tick(60);
+  check('a fully downloaded range creates no job',
+    app.bookDownloaderList.length === 0, String(app.bookDownloaderList.length));
+  const closed = sandbox.__stored.popups[sandbox.__stored.popups.length - 1];
+  check('the dialog says there is nothing left to download',
+    !!closed && closed.title === '无需重复下载'
+      && String(closed.body).indexOf('都已经下载过了') >= 0,
+    JSON.stringify(closed && { title: closed.title, body: closed.body }));
+}
+
+/** Read a ZIP the way a reader would, so the writer is checked, not restated. */
+function readZip(buffer) {
+  let eocd = -1;
+  for (let i = buffer.length - 22; i >= 0; i -= 1) {
+    if (buffer.readUInt32LE(i) === 0x06054B50) { eocd = i; break; }
+  }
+  if (eocd < 0) { throw new Error('no end-of-central-directory record'); }
+  const count = buffer.readUInt16LE(eocd + 10);
+  let at = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let i = 0; i < count; i += 1) {
+    if (buffer.readUInt32LE(at) !== 0x02014B50) {
+      throw new Error('bad central directory header at ' + at);
+    }
+    const method = buffer.readUInt16LE(at + 10);
+    const crc = buffer.readUInt32LE(at + 16);
+    const compressed = buffer.readUInt32LE(at + 20);
+    const size = buffer.readUInt32LE(at + 24);
+    const nameLength = buffer.readUInt16LE(at + 28);
+    const extraLength = buffer.readUInt16LE(at + 30);
+    const commentLength = buffer.readUInt16LE(at + 32);
+    const offset = buffer.readUInt32LE(at + 42);
+    const name = buffer.toString('utf8', at + 46, at + 46 + nameLength);
+    const localNameLength = buffer.readUInt16LE(offset + 26);
+    const localExtraLength = buffer.readUInt16LE(offset + 28);
+    const start = offset + 30 + localNameLength + localExtraLength;
+    entries.push({
+      name, method, crc, compressed, size,
+      data: buffer.subarray(start, start + compressed),
+    });
+    at += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+/**
+ * CRC32 without a lookup table. The committed check uses zlib.crc32 when the
+ * runtime has it (Node 22+); this is the fallback, and either way it is a
+ * second implementation rather than a restatement of the block's own.
+ */
+function slowCrc32(buffer) {
+  let crc = 0xFFFFFFFF;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 1) ? ((crc >>> 1) ^ 0xEDB88320) : (crc >>> 1);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function crcOf(buffer) {
+  return typeof zlib.crc32 === 'function' ? zlib.crc32(buffer) : slowCrc32(buffer);
+}
+
+/**
+ * The downloaded rows only ever offered 删除, so a book the reader had paid to
+ * download could not leave the app. The export button builds the TXT or the
+ * EPUB in the page and hands the bytes to App.exportFile, which writes the file
+ * and raises the share sheet.
+ */
+async function testExportDownloadedBook() {
+  console.log('export a downloaded book');
+  const prefix = 'offlineBook_qidian_1034915599_';
+  const ids = ['7001', '7002'];
+  const files = {};
+  ids.forEach((cid, index) => {
+    files[prefix + cid] = JSON.stringify({
+      code: '0',
+      chaptername: 'Chương ' + (index + 1) + ': <mở đầu>',
+      data: '<p>第一段 &amp; 第二段</p><p>第三段</p>',
+    });
+  });
+
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    chapterFiles: files,
+    existedBook: {
+      host: 'qidian',
+      id: '1034915599',
+      baseObject: { chapterPreKey: prefix },
+      getChapterDownloaded: () => Promise.resolve(ids.slice()),
+      getChapter: (cid) => Promise.resolve(files[prefix + cid]),
+    },
+    httpGetResponse: () => ({
+      status: 200,
+      data: Buffer.from('FAKE-JPEG-BYTES').toString('base64'),
+    }),
+  });
+
+  // The row's own action bar: pageRepair builds it and asks the export block for
+  // this button. The format dialog goes through the site's own popup
+  // (app.context.showPopup), so the stub records it.
+  const row = makeContainer('div', 'bookrowcont');
+  sandbox.document.body.appendChild(row);
+  app.context = {
+    showPopup(template) {
+      (sandbox.__stored.popups = sandbox.__stored.popups || []).push(template);
+      return makeContainer('div', 'popupedit');
+    },
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('the export block publishes its API', !!sandbox.window.__stvExport);
+
+  const book = {
+    host: 'qidian',
+    id: '1034915599',
+    name: '这些仙子全都不正常！',
+    author: '叁司',
+    thumb: 'https://bookcover.yuewen.com/qdbimg/349573/1034915599/180',
+  };
+  const exportButton = sandbox.window.__stvExport.button(book);
+  check('the export button exists', !!exportButton && exportButton.textContent === '导出',
+    exportButton && exportButton.textContent);
+
+  exportButton.__fire('click', { stopPropagation() {}, preventDefault() {} });
+  const choices = sandbox.__stored.popups || [];
+  const dialog = choices[choices.length - 1];
+  check('the format dialog is offered',
+    !!dialog && String(dialog.button).indexOf('stvtxt') >= 0
+      && String(dialog.button).indexOf('stvepub') >= 0,
+    JSON.stringify(dialog && dialog.button));
+
+  // ---- TXT ----
+  dialog.action.stvtxt(makeContainer('div', 'popupedit'));
+  await waitFor(() => (sandbox.__stored.exports || []).length === 1, 5000);
+  const txt = sandbox.__stored.exports[0];
+  const txtBody = Buffer.from(txt.data, 'base64').toString('utf8');
+  check('the txt is named after the book',
+    txt.filename === '这些仙子全都不正常！.txt', txt.filename);
+  check('the txt carries the title, author and source',
+    txtBody.indexOf('这些仙子全都不正常！') === 0
+      && txtBody.indexOf('作者：叁司') >= 0
+      && txtBody.indexOf('来源：qidian / 1034915599') >= 0,
+    txtBody.slice(0, 120));
+  check('the txt carries the site chapter titles in download order',
+    txtBody.indexOf('Chương 1: <mở đầu>') >= 0
+      && txtBody.indexOf('Chương 2: <mở đầu>') > txtBody.indexOf('Chương 1: <mở đầu>'),
+    txtBody.slice(0, 300));
+  check('the chapter markup is reduced to text',
+    txtBody.indexOf('第一段 & 第二段') >= 0 && txtBody.indexOf('<p>') < 0,
+    txtBody.slice(0, 300));
+  check('the export is reported to the panel',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('read 2 of 2 chapter(s)') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+  check('the button is usable again after the export',
+    exportButton.textContent === '导出' && exportButton.__stvExportBusy === false,
+    exportButton.textContent);
+
+  // ---- EPUB ----
+  exportButton.__fire('click', { stopPropagation() {}, preventDefault() {} });
+  const epubDialog = (sandbox.__stored.popups || [])[
+    (sandbox.__stored.popups || []).length - 1];
+  epubDialog.action.stvepub(makeContainer('div', 'popupedit'));
+  await waitFor(() => (sandbox.__stored.exports || []).length === 2, 5000);
+  const epub = sandbox.__stored.exports[1];
+  check('the epub is named after the book and carries the epub mime type',
+    epub.filename === '这些仙子全都不正常！.epub'
+      && epub.mime === 'application/epub+zip', epub.filename + ' ' + epub.mime);
+  check('the cover is fetched as an arraybuffer',
+    (sandbox.__stored.httpGet || []).length === 1
+      && sandbox.__stored.httpGet[0].responseType === 'arraybuffer',
+    JSON.stringify(sandbox.__stored.httpGet));
+
+  const archive = Buffer.from(epub.data, 'base64');
+  const entries = readZip(archive);
+  const names = entries.map((entry) => entry.name);
+  check('mimetype is the first entry', names[0] === 'mimetype', names.join(','));
+  check('mimetype is stored uncompressed, as the format requires',
+    entries[0].method === 0
+      && entries[0].data.toString('utf8') === 'application/epub+zip',
+    entries[0].data.toString('utf8'));
+  check('every entry carries a correct CRC32',
+    entries.every((entry) => crcOf(entry.data) === entry.crc),
+    entries.map((entry) => entry.name + '=' + entry.crc).join(','));
+  check('the archive holds the container, the opf, both navigation files and the cover',
+    ['META-INF/container.xml', 'OEBPS/content.opf', 'OEBPS/nav.xhtml',
+      'OEBPS/toc.ncx', 'OEBPS/images/cover.jpg', 'OEBPS/cover.xhtml']
+      .every((name) => names.indexOf(name) >= 0),
+    names.join(','));
+  const byName = {};
+  entries.forEach((entry) => { byName[entry.name] = entry.data.toString('utf8'); });
+  check('the container points at the package document',
+    byName['META-INF/container.xml'].indexOf('full-path="OEBPS/content.opf"') >= 0,
+    byName['META-INF/container.xml']);
+  check('the package document names the book and its author',
+    byName['OEBPS/content.opf'].indexOf('<dc:title>这些仙子全都不正常！</dc:title>') >= 0
+      && byName['OEBPS/content.opf'].indexOf('<dc:creator>叁司</dc:creator>') >= 0,
+    byName['OEBPS/content.opf'].slice(0, 400));
+  check('the spine orders every chapter',
+    byName['OEBPS/content.opf'].indexOf('<itemref idref="chapter-0001"/>') >= 0
+      && byName['OEBPS/content.opf'].indexOf('<itemref idref="chapter-0002"/>') >= 0
+      && byName['OEBPS/content.opf'].indexOf('<itemref idref="cover"/>') >= 0,
+    byName['OEBPS/content.opf'].slice(0, 600));
+  check('the chapters are well-formed XHTML with escaped text',
+    byName['OEBPS/chapter-0001.xhtml'].indexOf('第一段 &amp; 第二段') >= 0
+      && byName['OEBPS/chapter-0001.xhtml'].indexOf('Chương 1: &lt;mở đầu&gt;') >= 0,
+    byName['OEBPS/chapter-0001.xhtml'].slice(0, 400));
+  check('the navigation lists every chapter',
+    byName['OEBPS/nav.xhtml'].indexOf('chapter-0002.xhtml') >= 0
+      && byName['OEBPS/toc.ncx'].indexOf('chapter-0002.xhtml') >= 0);
+  check('the cover is embedded and referenced by the cover page',
+    byName['OEBPS/cover.xhtml'].indexOf('images/cover.jpg') >= 0
+      && entries.filter((entry) => entry.name === 'OEBPS/images/cover.jpg')
+        .map((entry) => entry.data.toString('utf8')).join('') === 'FAKE-JPEG-BYTES',
+    entries.map((entry) => entry.name).join(','));
+
+  // The helpers the byte and name handling rests on, checked against the
+  // platform's own encoders rather than against themselves.
+  const utf8 = sandbox.window.__stvExport.textBytes('a汉𠮷z');
+  check('the UTF-8 encoder agrees with the platform, including astral characters',
+    Buffer.from(utf8).toString('hex')
+      === Buffer.from('a汉𠮷z', 'utf8').toString('hex'),
+    Buffer.from(utf8).toString('hex'));
+  check('file names lose the characters iOS rejects',
+    sandbox.window.__stvExport.safeName('a/b:c*?"<>|') === 'a_b_c_',
+    sandbox.window.__stvExport.safeName('a/b:c*?"<>|'));
+  check('a name that is nothing but separators still yields a file',
+    sandbox.window.__stvExport.safeName('///') === '_',
+    sandbox.window.__stvExport.safeName('///'));
+
+  if (process.env.STV_EXPORT_DUMP) {
+    const dir = path.join(__dirname, '..', '_export-check');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'book.txt'),
+      Buffer.from(txt.data, 'base64'));
+    fs.writeFileSync(path.join(dir, 'book.epub'), archive);
+  }
+
+  // A book with no chapters on disk must say so instead of exporting nothing.
+  const empty = makeSandbox();
+  installFakeApp(empty, {
+    displayType: 'auto',
+    existedBook: {
+      host: 'qidian',
+      id: '1',
+      baseObject: { chapterPreKey: 'offlineBook_qidian_1_' },
+      getChapterDownloaded: () => Promise.resolve([]),
+      getChapter: () => Promise.resolve(''),
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), empty);
+  await tick(300);
+  const emptyBook = { host: 'qidian', id: '1', name: 'X' };
+  const emptyButton = empty.window.__stvExport.button(emptyBook);
+  await empty.window.__stvExport.run(emptyBook, 'txt', emptyButton);
+  await tick(60);
+  check('an empty book is refused with a message, not an empty file',
+    (empty.__stored.exports || []).length === 0
+      && (empty.__stored.toasts || []).join('|').indexOf('导出失败') >= 0,
+    JSON.stringify(empty.__stored.toasts));
+  check('the refusal reaches the diagnostics panel',
+    String(empty.window.__stvDiag.text() || '').indexOf('没有读到章节内容') >= 0,
+    String(empty.window.__stvDiag.text() || '').slice(-240));
 }
 
 // ------------------------------------------------------ comment translation
@@ -4267,6 +4761,9 @@ await testChapterNamePlace();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();
   await testBookmarkToggle();
+  await testLikeToggle();
+  await testDownloadSkipsDownloaded();
+  await testExportDownloadedBook();
   await testReaderTts();
 await testBootShell();
   await testCommentButton();
