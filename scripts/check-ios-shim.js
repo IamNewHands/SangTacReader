@@ -66,9 +66,18 @@ const REQUIRED_MARKERS = [
   // the chapter into an off-screen element and moves the split pages into the
   // frames it shows, so that element and the body are leftovers -- which is
   // what the device was reading aloud.
-  'pageModelText',
+  'visiblePageText',
   'pageflip page ',
   '__stvPageKey',
+  // ...and it reads that page from the line the reader is looking at, not from
+  // the top of the node tree: the splitter clones a paragraph for both halves,
+  // so the second page's text opens with the lines the first half already read.
+  // The caret is asked of WebKit itself; the spill half is recognised by the
+  // negative margin the splitter leaves on it.
+  'caretRangeFromPoint',
+  'skipSpill',
+  'isSpillBlock',
+  'chaptertopinfo',
   // A frame inside a frame: the page-flip template is one srcdoc frame and the
   // chapter can be another, and querySelectorAll does not cross that boundary.
   'attachFramesIn',

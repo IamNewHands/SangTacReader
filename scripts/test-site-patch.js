@@ -134,7 +134,10 @@ function makeElement(tagName) {
       return true;
     },
     getBoundingClientRect() {
-      return { left: 0, top: 0, width: 26, height: 26, right: 26, bottom: 26 };
+      // A test that cares about layout (the reader's start-of-page probe does)
+      // hands the element the rect it should report; everything else keeps the
+      // stand-in the other blocks were written against.
+      return this.__rect || { left: 0, top: 0, width: 26, height: 26, right: 26, bottom: 26 };
     },
     select() {},
     querySelector(selector) {
@@ -306,6 +309,71 @@ function makeContainer(tagName, className, text) {
   return element;
 }
 
+/**
+ * The rendered-line table a text node needs for the caret model below. Each
+ * entry is one visual line: its slice of the node's text, and the viewport rect
+ * it occupies. Real layout produces this; a stub has to be told, because the
+ * whole point of the reader's start-of-page logic is that it asks layout instead
+ * of assuming that the text of a node starts where the box does.
+ */
+function layoutLines(textNode, lines) {
+  let start = 0;
+  textNode.__lines = lines.map((line) => {
+    const entry = {
+      start,
+      text: line.text,
+      top: line.top,
+      bottom: line.bottom,
+      left: line.left === undefined ? 0 : line.left,
+      right: line.right === undefined ? 200 : line.right,
+    };
+    start += line.text.length;
+    return entry;
+  });
+  return textNode;
+}
+
+/**
+ * caretRangeFromPoint answered from those tables, so a hit test behaves the way
+ * WebKit's does: a line the splitter clipped above its box is not reachable, and
+ * the point a probe asks about resolves to the character under it.
+ */
+function attachCaretModel(doc, root) {
+  doc.caretRangeFromPoint = (x, y) => {
+    let found = null;
+    const visit = (node) => {
+      if (found) { return; }
+      if (node.nodeType === 3) {
+        for (const line of node.__lines || []) {
+          if (y < line.top || y >= line.bottom) { continue; }
+          const width = line.right - line.left;
+          const ratio = width > 0 ? (x - line.left) / width : 0;
+          const within = Math.max(0, Math.min(line.text.length, Math.round(ratio * line.text.length)));
+          found = { node, offset: line.start + within, line };
+          return;
+        }
+        return;
+      }
+      for (const child of node.childNodes || []) { visit(child); }
+    };
+    visit(root);
+    if (!found) { return null; }
+    return {
+      startContainer: found.node,
+      startOffset: found.offset,
+      getBoundingClientRect: () => ({
+        left: found.line.left,
+        top: found.line.top,
+        right: found.line.right,
+        bottom: found.line.bottom,
+        width: found.line.right - found.line.left,
+        height: found.line.bottom - found.line.top,
+      }),
+    };
+  };
+  return doc;
+}
+
 function makeSandbox(options) {
   const opts = options || {};
   const body = makeElement('body');
@@ -468,11 +536,18 @@ function makeFakeFrame(contentElements) {
     querySelectorAll: (selector) => html.querySelectorAll(selector),
   };
   frame.contentDocument = doc;
-  frame.contentWindow = {
+  const frameWindow = {
     document: doc,
+    innerHeight: 800,
+    innerWidth: 400,
     addEventListener() {},
     removeEventListener() {},
   };
+  doc.defaultView = frameWindow;
+  // The reader asks the frame for the caret at the top of the page: the pages
+  // it split out live in this document, not in the one the shim runs in.
+  attachCaretModel(doc, html);
+  frame.contentWindow = frameWindow;
   return frame;
 }
 
@@ -1699,6 +1774,13 @@ async function testReaderTts() {
   check('the page it read and its place in the chapter are reported',
     String(flipSandbox.window.__stvDiag.text() || '').indexOf('pageflip page 2 of 3') >= 0,
     String(flipSandbox.window.__stvDiag.text() || '').slice(-260));
+  // No rendered-line table here, so WebKit has nothing to answer with: the
+  // reader must still read the page and must say which start it used, or a
+  // device log could not tell the two paths apart.
+  check('a start WebKit could not confirm is reported as the top of the page',
+    String(flipSandbox.window.__stvDiag.text() || '')
+      .indexOf('pageflip page 2 of 3, from the top of the page') >= 0,
+    String(flipSandbox.window.__stvDiag.text() || '').slice(-260));
 
   flipDisplay.currentPageId = 2;
   flipApp.tts.start();
@@ -1715,6 +1797,196 @@ async function testReaderTts() {
     flipPlayer.currentId === 0 && flipPlayer.sentences.length === 1,
     'currentId=' + String(flipPlayer.currentId)
       + ' sentences=' + String(flipPlayer.sentences.length));
+
+  // The page's own text is not the page's visible text. The splitter cuts a
+  // paragraph in two by CLONING it: the page that keeps the top gets a
+  // height-clipped copy, the next page a wrapper whose child is pulled up by a
+  // negative margin so the lines already shown start above its box
+  // (chapterdisplay.js splitPage 1095-1113). Both clones still hold the WHOLE
+  // paragraph, so a textContent read on the second page opens with the lines the
+  // reader finished on the previous one -- which is what the 2026-09-23 log
+  // described as playback starting a few lines early. The same page also opens
+  // with the fixed header the display stamps on every page (chapter name and
+  // clock, createPage 1142-1166), which is chrome, not text.
+  const chrome = makeContainer('div', 'chaptertopinfo', '第三章 休伤吾主20:07');
+  layoutLines(chrome.children[0],
+    [{ text: '第三章 休伤吾主20:07', top: 0, bottom: 14, left: 0, right: 180 }]);
+  const spill = makeElement('p');
+  spill.style.marginTop = '-20px';
+  const spillText = makeTextNode('上一页最后一行。第二页第一句。第二页第二句。');
+  spill.appendChild(spillText);
+  layoutLines(spillText, [
+    { text: '上一页最后一行。', top: -20, bottom: 0, left: 0, right: 160 },
+    { text: '第二页第一句。', top: 0, bottom: 20, left: 0, right: 140 },
+    { text: '第二页第二句。', top: 20, bottom: 40, left: 0, right: 140 },
+  ]);
+  const spillWrap = makeElement('div');
+  spillWrap.className = 'page';
+  spillWrap.style.overflow = 'hidden';
+  spillWrap.appendChild(spill);
+  const pageTwoBody = makeElement('div');
+  pageTwoBody.className = 'page';
+  pageTwoBody.appendChild(chrome);
+  pageTwoBody.appendChild(spillWrap);
+  pageTwoBody.appendChild(makeContainer('p', '', '第二页第三句。'));
+  pageTwoBody.__rect = { left: 0, top: 0, right: 400, bottom: 26, width: 400, height: 26 };
+  // The clone the third page gets from the same cut, plus a fresh paragraph.
+  const spillClone = makeElement('p');
+  spillClone.style.marginTop = '-20px';
+  spillClone.appendChild(makeTextNode('上一页最后一行。第二页第一句。第二页第二句。'));
+  const spillWrapTwo = makeElement('div');
+  spillWrapTwo.style.overflow = 'hidden';
+  spillWrapTwo.appendChild(spillClone);
+  const pageThreeBody = makeElement('div');
+  pageThreeBody.className = 'page';
+  pageThreeBody.appendChild(spillWrapTwo);
+  pageThreeBody.appendChild(makeContainer('p', '', '第三页第一句。'));
+  const pageOneBody = makeContainer('div', 'page', '第一页的内容。');
+
+  const lineFrame = makeFakeFrame([pageOneBody, pageTwoBody, pageThreeBody]);
+  const lineChapter = {
+    cid: '927797006',
+    pageElements: [pageOneBody, pageTwoBody, pageThreeBody],
+  };
+  const lineDisplay = {
+    innerWindow: lineFrame.contentWindow,
+    getCurrentWindow() { return lineFrame.contentWindow; },
+    getCurrentChapter() { return lineChapter; },
+    currentPageId: 1,
+    tokenizeSentence() { return []; },
+  };
+  const lineSandbox = makeSandbox();
+  const lineApp = installFakeApp(lineSandbox, { displayType: 'pageflip', display: lineDisplay });
+  lineSandbox.document.body.appendChild(lineFrame);
+  const linePlayer = {
+    sentences: [],
+    currentId: 0,
+    reset() { this.sentences = []; this.currentId = 0; },
+    generateSentences() { this.sentences = lineDisplay.tokenizeSentence(); this.currentId = 0; },
+  };
+  lineApp.tts.player = linePlayer;
+  lineApp.tts.start = function () { lineApp.tts.player = linePlayer; };
+  vm.runInContext(loadBlocks().join('\n'), lineSandbox);
+  await tick(250);
+  lineApp.tts.start();
+  await tick(20);
+  const lineText = linePlayer.sentences.map((s) => s.toText().slice(4)).join('|');
+  check('the reader starts at the first line on screen, not at the top of the node',
+    linePlayer.sentences.length === 4
+      && linePlayer.sentences[0].toText().slice(4) === '第二页第一句。',
+    lineText);
+  check('the lines the splitter clipped above the box are not read again',
+    lineText.indexOf('上一页最后一行。') < 0, lineText);
+  check('the fixed chapter header stamped on every page is not read out',
+    lineText.indexOf('20:07') < 0 && lineText.indexOf('第三章') < 0, lineText);
+  check('the spill the next page repeats is read once, from the page that showed it',
+    lineText.split('第二页第一句。').length === 2
+      && lineText.indexOf('第三页第一句。') >= 0, lineText);
+  check('the start of the reading is reported',
+    String(lineSandbox.window.__stvDiag.text() || '')
+      .indexOf('pageflip page 2 of 3, from the visible line') >= 0,
+    String(lineSandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // The scrolling display has no pages at all: the visible top is wherever the
+  // viewport was scrolled to, and the same question answers it.
+  const scrolledAway = makeElement('p');
+  const scrolledAwayText = makeTextNode('上面已经看过的一句。');
+  scrolledAway.appendChild(scrolledAwayText);
+  layoutLines(scrolledAwayText,
+    [{ text: '上面已经看过的一句。', top: -20, bottom: 0, left: 0, right: 160 }]);
+  const onScreen = makeElement('p');
+  const onScreenText = makeTextNode('现在屏幕上的第一句。');
+  onScreen.appendChild(onScreenText);
+  layoutLines(onScreenText,
+    [{ text: '现在屏幕上的第一句。', top: 0, bottom: 20, left: 0, right: 160 }]);
+  const scrollBody = makeElement('div');
+  scrollBody.className = 'contentcontainer';
+  scrollBody.appendChild(scrolledAway);
+  scrollBody.appendChild(onScreen);
+  scrollBody.__rect = { left: 0, top: -100, right: 400, bottom: 400, width: 400, height: 500 };
+  const scrollFrame = makeFakeFrame([scrollBody]);
+  const scrollView = {
+    cdata: { chaptername: 'Chương 1: 开局' },
+    q: (selector) => (selector === '.contentcontainer' ? scrollBody : null),
+  };
+  const scrollDisplay = {
+    innerWindow: scrollFrame.contentWindow,
+    getCurrentWindow() { return scrollFrame.contentWindow; },
+    getCurrentChapter() { return scrollView; },
+    tokenizeSentence() { return []; },
+  };
+  const scrollSandbox = makeSandbox();
+  const scrollApp = installFakeApp(scrollSandbox, { displayType: 'pageflip', display: scrollDisplay });
+  scrollSandbox.document.body.appendChild(scrollFrame);
+  const scrollPlayer = {
+    sentences: [],
+    currentId: 0,
+    reset() { this.sentences = []; this.currentId = 0; },
+    generateSentences() { this.sentences = scrollDisplay.tokenizeSentence(); this.currentId = 0; },
+  };
+  scrollApp.tts.player = scrollPlayer;
+  scrollApp.tts.start = function () { scrollApp.tts.player = scrollPlayer; };
+  vm.runInContext(loadBlocks().join('\n'), scrollSandbox);
+  await tick(250);
+  scrollApp.tts.start();
+  await tick(20);
+  check('the scrolling reader starts at the first line on screen too',
+    scrollPlayer.sentences.length === 1
+      && scrollPlayer.sentences[0].toText().slice(4) === '现在屏幕上的第一句。',
+    JSON.stringify(scrollPlayer.sentences.map((s) => s.toText())));
+  check('the scrolling reader reports where it started',
+    String(scrollSandbox.window.__stvDiag.text() || '')
+      .indexOf('scroll chapter, from the visible line') >= 0,
+    String(scrollSandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // The reader's own titlebar lives in the document that owns the frame (the
+  // RECT line in the device log puts it at 0..82) and can cover the top of the
+  // frame: rows under it are painted over, so the first row the reader can see
+  // is below it, and reading has to start there.
+  const bar = makeContainer('div', 'titlebar', '');
+  bar.__rect = { left: 0, top: 0, right: 400, bottom: 40, width: 400, height: 40 };
+  const coveredFrame = makeFakeFrame([]);
+  const behindP = makeElement('p');
+  const behind = makeTextNode('藏在页眉后面的字。页眉下面第一句。');
+  behindP.appendChild(behind);
+  layoutLines(behind, [
+    { text: '藏在页眉后面的字。', top: 0, bottom: 20, left: 0, right: 180 },
+    { text: '页眉下面第一句。', top: 40, bottom: 60, left: 0, right: 160 },
+  ]);
+  const coveredPage = makeElement('div');
+  coveredPage.className = 'page';
+  coveredPage.appendChild(behindP);
+  coveredPage.__rect = { left: 0, top: 0, right: 400, bottom: 200, width: 400, height: 200 };
+  coveredFrame.contentDocument.body.appendChild(coveredPage);
+  coveredFrame.contentWindow.frameElement = coveredFrame;
+  const coveredDisplay = {
+    innerWindow: coveredFrame.contentWindow,
+    getCurrentWindow() { return coveredFrame.contentWindow; },
+    getCurrentChapter() { return { cid: '1', pageElements: [coveredPage] }; },
+    currentPageId: 0,
+    tokenizeSentence() { return []; },
+  };
+  const coveredSandbox = makeSandbox();
+  const coveredApp = installFakeApp(coveredSandbox, { displayType: 'pageflip', display: coveredDisplay });
+  coveredSandbox.document.body.appendChild(bar);
+  coveredSandbox.document.body.appendChild(coveredFrame);
+  coveredFrame.contentWindow.parent = { document: coveredSandbox.document };
+  const coveredPlayer = {
+    sentences: [],
+    currentId: 0,
+    reset() { this.sentences = []; this.currentId = 0; },
+    generateSentences() { this.sentences = coveredDisplay.tokenizeSentence(); this.currentId = 0; },
+  };
+  coveredApp.tts.player = coveredPlayer;
+  coveredApp.tts.start = function () { coveredApp.tts.player = coveredPlayer; };
+  vm.runInContext(loadBlocks().join('\n'), coveredSandbox);
+  await tick(250);
+  coveredApp.tts.start();
+  await tick(20);
+  check('the reader starts below the titlebar that covers the top of the frame',
+    coveredPlayer.sentences.length === 1
+      && coveredPlayer.sentences[0].toText().slice(4) === '页眉下面第一句。',
+    JSON.stringify(coveredPlayer.sentences.map((s) => s.toText())));
 
   // app.tts.test() hardcodes "Xin chào, đây là chuyển văn bản thành giọng nói"
   // (app.v2.read.js:3174).

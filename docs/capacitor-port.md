@@ -2064,13 +2064,95 @@ app.api.queryLike = async function(list){          // app.v2.js:4865
 - 第 2 项：真机这一份日志里应出现 `[PATCH] dropped the site archive notice from the chapter body`
   至少一行。匹配仍只认用户给的那句原文（`bản lưu trong hệ thống`）；若还有别的写法（例如后面
   跟域名）会留在正文里，把原文发我按实际写法补。
+  *（第十九轮：`日志2.txt` 里 `[PATCH]` 仍是 0 行——那份日志从 20:07:31 才开始，启动的几行没被复制
+  进来；用户已确认正文里的声明消失，本项按结果关闭，不再挂。）*
 - 第 3 项：`pageElements` / `currentPageId` 是**站点自己的字段名**（未压缩的
   `app.v2.chapterdisplay.js`）。真机应出现 `fallback source [pageflip page N of M]`；若仍出现
   `fallback source [document body]`，说明取值链在真机上被站点改过，按新结构再对一次。
   滚动式显示器（没有「页」的概念）仍是「从本章开头读」——真机若是那个模式，日志会显示
   `fallback source [current chapter]`。
+  *（第十九轮定案：`[pageflip page N of M]` 出现且页码跟着翻页走，「读的是哪一页」这一层成立。
+  滚动式「从本章开头读」也在这一轮改成从可见行开始，见 §6.21。）*
 - 第 1 项：站点对书籍**是否真的完全没有取消路径**没有定案（`Không tìm thấy lịch sử` 提示这个
   端点找的是**历史记录 id**，例如书详情里的 `lid`）。用户说「不行就算了」，本轮不再试；
   若哪天想再试一次，最小实验是把 `lid` 传进去试一个请求，代价一行日志。
+
+### 6.21 第十九轮反馈（`日志2.txt`，905 行）：朗读起点改成「屏幕上看得到的那一行」
+
+这一轮用户只报了一件事，另两件是确认：正文里的 `@Bạn đang đọc bản lưu trong hệ thống` **已经没了**；
+但正文朗读「读的不是当前页面最开始的内容，而是**上一页最后几行**开始」，滚动模式要求「从屏幕可见的
+第一句开始」。
+
+#### 日志（905 行，20:07:31 起）
+
+```
+20:07:38 [TTS] fallback source [pageflip page 2 of 9]: 2532 chars -> 204 sentence(s), first=第三章 休伤吾主
+20:07:38 [TTS] reader TTS start: sentences=204 first=12 chars page=7594448741977817662#1 provider=ios
+20:08:21 [TTS] fallback source [pageflip page 3 of 9]: 2200 chars -> 182 sentence(s), first=第三章 休伤吾主
+20:08:21 [TTS] reader TTS start: sentences=182 first=12 chars page=7594448741977817662#2 provider=ios
+20:08:48 [TTS] fallback source [pageflip page 2 of 8]: 2360 chars -> 158 sentence(s), first=第四章 永恒传说
+20:10:30 [TTS] fallback source [pageflip page 3 of 8]: 1937 chars -> 137 sentence(s), first=第四章 永恒传说
+```
+
+- 上一轮的修复本身生效了：来源从 `[document body]` 变成 `[pageflip page N of M]`，页码键 `#1` → `#2`
+  跟着翻页变，说明「读的是哪一页」这一层已经对。这一份日志里 `[PATCH]` / `[LIKE]` 都是 **0 行**
+  （日志从 20:07:31 才开始，启动那几行没被复制进来）；声明消失是用户直接观察到的结论。
+- 根因是第二层：**页面的文本不是页面看得见的文本**。切分器 `splitPage`（`chapterdisplay.js`
+  1095-1113）切一段时**克隆两份**——保住上半的页拿一份 `height: clipHeight; overflow: hidden` 的副本，
+  下一页拿一个 `div`（同样 `overflow: hidden`）套住**同一段**、给子节点 `marginTop: -clipHeight`
+  把已经显示过的行推到盒子上方。两份的 `textContent` 都还是**整段**，所以第二页的文本开头正好是
+  上一页末尾那几行——用户的原话「从上一页最后几行开始读」说的就是这个形状，不是「切分不准」，
+  而是**读的是节点树，节点树里两半都在**。
+- `first=第三章 休伤吾主` 是第二个线索：`createPage()`（1142-1166）在每页盖了一个 `chaptertopinfo`
+  固定页眉（章节名 + 时钟，`position: absolute; top: 0; height: 14px`，正好压在正文第一行上），
+  它也在 `textContent` 里，于是每页的第一句都是「章节名 + 时间」。
+- 修法（`readerTts` 块）——起点不问节点树，直接问 WebKit：
+  1. `caretAtTop(doc, box)`：对**屏幕上那个盒子**的顶部做 `caretRangeFromPoint` 命中测试
+     （`webkitCaretRangeFromPoint` / `caretPositionFromPoint` 兜底），自上而下每 2px 扫一遍
+     （最多 320px）；命中落在 `.chaptertopinfo` 里的继续往下走，所以固定页眉既不会被读、也不会
+     把起点挡在它后面。`leftmostCaret()` 再用命中行的 rect 左沿重探一次，避免从一行中间开始念。
+  2. 取文改成**按块收集**（`blocksText` / `nodeText`）：跳过页眉块、块与块之间加换行、块内文本节点
+     之间不加（站点自己的 `<i>` 标注不能把句子切断），从可见的那个字开始，到本页末尾。
+  3. 后面的页只按块收集，并**跳过开头的负边距包壳**（`isSpillBlock`：DIV 且首个子元素
+     `marginTop < 0`）——那半段上一页已经交过，既不会念两遍也不会漏。
+  4. 滚动式显示器走同一条路：可见顶端就是视口滚到的位置（`.contentcontainer` 的 rect 与视口取交），
+     所以「从屏幕可见的第一句开始」在两种模式里是同一份代码。
+  5. 来源行写明起点取自哪里：`pageflip page 2 of 9, from the visible line`；WebKit 答不出来时退回
+     `, from the top of the page`（与上一轮行为一致，不会因为一次命中失败就静默或读空）。
+  6. `coveredTop(win)`：阅读器自己的标题栏在**宿主文档**里（RECT 日志把它量在 0..82），可能盖住
+     frame 的顶部——被盖住的行不算「看得见」，所以扫描起点再往下压 `barRect.bottom - frameRect.top`。
+     frame 本来就落在标题栏下面时这个值是 0，两种布局都安全。
+  - 顺带修的：`isChromeNode` 原来从文本节点起步时 `while (el && el.nodeType === 1)` 直接不进循环，
+    文本节点永远不算页眉——测试里就表现为「起点落在页眉上、然后整段被跳过、最后退回旧路径」。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 22 块 / 377037 字节 / **50** markers（`pageModelText` 换成
+  `visiblePageText`，新增 `caretRangeFromPoint`、`skipSpill`、`isSpillBlock`、`chaptertopinfo`）
+- `node scripts/test-site-patch.js` → **531 条断言**全过（上一轮 522）。新增：
+  - 桩里给文本节点加**渲染行表**（`layoutLines`）+ `caretRangeFromPoint`（`attachCaretModel`），
+    让「命中测试看不见被裁掉的那些行」这件事可以在测试里成立；元素的 `getBoundingClientRect()`
+    改成认 `__rect`（没给的照旧）；
+  - 起点：造一个「上一页最后一行」在盒子外的克隆 + 每页页眉 + 下一页重复的包壳，断言首句是
+    **可见行**（`第二页第一句。`）、被裁掉的那行不再出现、页眉不念、包壳只念一次；
+  - 标题栏遮挡：宿主文档里放一个 `.titlebar`（bottom 40）压住 frame 顶部，断言起点落在它下面的
+    那一行，被盖住的字不念；
+  - 滚动式：`.contentcontainer` 的 rect 顶部在视口之上，断言只有屏幕上那一句被读；
+  - 三条来源行各一条断言（两条 `, from the visible line`、一条退化的 `, from the top of the page`）。
+  - 旧的两条 pageflip 断言**没有改**：它们现在正好覆盖「WebKit 答不出来」的退化路径
+    （桩里那些页没有渲染行表），仍然从 `currentPageId` 那一页开始读。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
+
+**未证实项**：
+
+- 这一轮的起点精度**只能在真机上验证**：桩里的命中测试是我们自己写的模型，不是 WebKit。真机应出现
+  `fallback source [pageflip page N of M, from the visible line]`；若仍是
+  `, from the top of the page`，说明这台 WKWebView 没给 `caretRangeFromPoint`（或返回的 caret 不在
+  页面元素里），退化行为与上一轮相同、不会更差，但起点问题就还在，需要按新的日志再对一次。
+- 页眉（章节名 + 时钟）**故意不念**：它在屏幕上确实看得见，但每页都重复、还带当前时间，按「内容」处理
+  更合理。若用户希望连它也念，去掉 `isChromeNode` 的两处判断即可（一行）。
+- 滚动式显示器本轮仍只按「视口顶端」取起点；若阅读器在 frame 内还有自己的悬浮工具栏，起点会落在
+  它下面一行左右——真机若是这个形状，把日志给我，按工具栏的 rect 再收一次。
+- 第 1 项（取消点赞）与上一轮同：已经拆掉阶梯、只试站点契约那一种键，仍未定案，用户说「不行就算了」。
 
 

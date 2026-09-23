@@ -2931,26 +2931,228 @@ enum SitePatch {
         // so that renderer and the document body both hold leftovers rather
         // than what is on screen. The 2026-09-23 log caught exactly that:
         // "fallback source [document body]: 111 chars", the same 111 characters
-        // on every attempt, from a page nobody was looking at. The display
-        // already knows which page is on screen -- currentPageId indexes
-        // currentChapter.pageElements -- so read from there to the end of the
-        // chapter; the site's own queue carries on by itself (app.v2.read.js
-        // play() -> nextChapter(true) once the list runs out).
-        function pageModelText(display) {
+        // on every attempt, from a page nobody was looking at. Reading the page
+        // currentPageId names fixed that, and the next log exposed the rest of
+        // it: the page's own text is not the page's visible text.
+        //
+        // The splitter cuts a paragraph in two by CLONING it. The page that
+        // keeps the top gets a height-clipped copy; the next page gets a
+        // wrapper whose child is pulled up by a negative margin so that the
+        // lines already shown start above its box (chapterdisplay.js splitPage
+        // 1095-1113). Both copies still hold the WHOLE paragraph, so a plain
+        // textContent read on the second page opens with the lines the reader
+        // has finished -- which is what the second report described: playback
+        // starting a few lines before the page on screen. The same page also
+        // opens with the fixed header the display stamps on every page (chapter
+        // name and clock, createPage 1142-1166), which is chrome, not text.
+        //
+        // So the reading order is taken from the screen instead of the node
+        // tree: WebKit is asked for the caret at the top of the box that is on
+        // screen, and the text is collected from there. The same question
+        // answers for the scrolling display, where the visible top is simply
+        // wherever the viewport was scrolled to.
+        //
+        // The site's own queue carries on from there by itself (app.v2.read.js
+        // play() -> nextChapter(true) once the list runs out), which is why the
+        // rest of the chapter is appended page by page.
+        function isChromeNode(node) {
+            var el = node;
+            while (el) {
+                if (el.nodeType === 1) {
+                    var cls = ' ' + String(el.className || '') + ' ';
+                    if (cls.indexOf(' chaptertopinfo ') >= 0
+                        || cls.indexOf(' chapternamefixed ') >= 0
+                        || cls.indexOf(' currenttime ') >= 0) { return true; }
+                }
+                el = el.parentNode;
+            }
+            return false;
+        }
+
+        // The second half of a paragraph the splitter cut in two: a wrapper
+        // whose child is pulled up so the lines the previous page already
+        // showed sit outside the box.
+        function isSpillBlock(block) {
+            if (!block || block.nodeType !== 1) { return false; }
+            if (String(block.tagName).toUpperCase() !== 'DIV') { return false; }
+            var inner = (block.children && block.children[0]) || null;
+            if (!inner || !inner.style || !inner.style.marginTop) { return false; }
+            var margin = parseFloat(inner.style.marginTop);
+            return isFinite(margin) && margin < 0;
+        }
+
+        function boxOf(node) {
+            if (!node || typeof node.getBoundingClientRect !== 'function') { return null; }
+            var rect = null;
+            try { rect = node.getBoundingClientRect(); } catch (e) { return null; }
+            if (!rect || (!rect.height && !rect.width)) { return null; }
+            return rect;
+        }
+
+        function caretAt(doc, api, x, y) {
+            var range = null;
+            try { range = api.call(doc, x, y); } catch (e) { return null; }
+            if (!range) { return null; }
+            var node = range.startContainer || range.offsetNode || null;
+            var offset = (typeof range.startOffset === 'number') ? range.startOffset
+                : ((typeof range.offset === 'number') ? range.offset : -1);
+            if (!node || node.nodeType !== 3) { return null; }
+            if (!node.nodeValue || offset < 0 || offset > node.nodeValue.length) { return null; }
+            return { node: node, offset: offset, range: range };
+        }
+
+        // The reader's own titlebar is in the document that owns the frame and
+        // may cover the top of it (the RECT log shows it at 0..82). A row the
+        // titlebar paints over is not a row the reader can see, so the scan
+        // starts below it. Nothing to report when the frame already starts under
+        // the bar, which is the other layout the site uses.
+        function coveredTop(win) {
+            var top = null;
+            try {
+                top = (win && win.parent && win.parent !== win && win.parent.document)
+                    ? win.parent.document : null;
+            } catch (e) { top = null; }
+            if (!top || typeof top.querySelector !== 'function') { return 0; }
+            var bar = null;
+            var frame = null;
+            try { bar = top.querySelector('.titlebar'); } catch (e) { bar = null; }
+            try { frame = win.frameElement || null; } catch (e) { frame = null; }
+            if (!bar || !frame) { return 0; }
+            if (typeof bar.getBoundingClientRect !== 'function') { return 0; }
+            if (typeof frame.getBoundingClientRect !== 'function') { return 0; }
+            var barRect = null;
+            var frameRect = null;
+            try { barRect = bar.getBoundingClientRect(); } catch (e) { return 0; }
+            try { frameRect = frame.getBoundingClientRect(); } catch (e) { return 0; }
+            if (!barRect || !frameRect) { return 0; }
+            var covered = barRect.bottom - frameRect.top;
+            return covered > 0 ? covered : 0;
+        }
+
+        // The caret at the top of the box, walked down a few pixels at a time:
+        // the first line can sit under a fixed header or below a margin, and the
+        // answer has to be a character the reader can actually see.
+        function caretAtTop(doc, box) {
+            if (!doc || !box) { return null; }
+            var api = doc.caretRangeFromPoint || doc.webkitCaretRangeFromPoint
+                || doc.caretPositionFromPoint;
+            if (typeof api !== 'function') { return null; }
+            var win = doc.defaultView || {};
+            var top = Math.max(box.top, coveredTop(win), 0);
+            var bottom = Math.min(box.bottom, Math.min(win.innerHeight || box.bottom, top + 320));
+            var left = box.left;
+            var probes = [left + 3, left + (box.right - left) / 2];
+            for (var i = 0; i < probes.length; i++) {
+                for (var y = top + 1; y < bottom; y += 2) {
+                    var found = caretAt(doc, api, probes[i], y);
+                    if (!found || isChromeNode(found.node)) { continue; }
+                    return leftmostCaret(doc, api, found, box);
+                }
+            }
+            return null;
+        }
+
+        // The probe can land in the middle of a line; step to its first
+        // character so the reader hears the whole line rather than its second
+        // half. Text nodes split by the site's own <i> markers make the first
+        // character a different node, which is fine -- the new caret is the one
+        // the line starts with.
+        function leftmostCaret(doc, api, found, box) {
+            var range = found.range;
+            if (!range || typeof range.getBoundingClientRect !== 'function') { return found; }
+            var rect = null;
+            try { rect = range.getBoundingClientRect(); } catch (e) { return found; }
+            if (!rect || !rect.height) { return found; }
+            var again = caretAt(doc, api, Math.max(box.left + 1, rect.left + 1),
+                rect.top + rect.height / 2);
+            if (again && !isChromeNode(again.node)) { return again; }
+            return found;
+        }
+
+        function nodeText(node, options, started) {
+            if (node.nodeType === 3) {
+                var text = node.nodeValue || '';
+                if (!text) { return { text: '', started: started }; }
+                if (options.skipChrome && isChromeNode(node)) { return { text: '', started: started }; }
+                if (started) { return { text: text, started: true }; }
+                if (!options.from || node !== options.from.node) { return { text: '', started: false }; }
+                return { text: text.substring(options.from.offset), started: true };
+            }
+            var out = '';
+            var kids = node.childNodes || [];
+            for (var i = 0; i < kids.length; i++) {
+                var part = nodeText(kids[i], options, started);
+                started = part.started;
+                out += part.text;
+            }
+            return { text: out, started: started };
+        }
+
+        // The block's text, then the next block after a newline: the site builds
+        // every page and every chapter out of <p> elements, and a newline is
+        // what the sentence splitter wants between them.
+        function blocksText(root, options) {
+            var parts = [];
+            var started = !options.from;
+            var blocks = (root.children && root.children.length) ? root.children : [root];
+            for (var i = 0; i < blocks.length; i++) {
+                var block = blocks[i];
+                if (options.skipChrome && isChromeNode(block)) { continue; }
+                // The second half of a split paragraph repeats what the page
+                // before it already handed over. Only the page on screen needs
+                // that half, and it takes it from the caret.
+                if (i === 0 && options.skipSpill && isSpillBlock(block)) { continue; }
+                var part = nodeText(block, options, started);
+                started = part.started;
+                if (part.text) { parts.push(part.text); }
+            }
+            return parts.join(String.fromCharCode(10));
+        }
+
+        // What is on screen, in reading order: the visible part of the page the
+        // reader is on, then every page after it in the chapter.
+        function visiblePageText(display) {
+            var w = readerWindow(display);
             var chapter = chapterOf(display);
             var pages = chapter && chapter.pageElements;
-            if (!pages || !pages.length) { return null; }
-            var at = display.currentPageId;
-            if (typeof at !== 'number' || at < 0 || at >= pages.length) { at = 0; }
-            var parts = [];
-            for (var i = at; i < pages.length; i++) {
-                var piece = textOf(pages[i]);
-                if (piece) { parts.push(piece); }
+            if (pages && pages.length) {
+                var at = display.currentPageId;
+                if (typeof at !== 'number' || at < 0 || at >= pages.length) { at = 0; }
+                var onScreen = pages[at];
+                var doc = onScreen.ownerDocument || (w && w.document) || null;
+                var caret = caretAtTop(doc, boxOf(onScreen));
+                var text = caret ? blocksText(onScreen, { skipChrome: true, from: caret }) : '';
+                if (!text) {
+                    caret = null;
+                    text = blocksText(onScreen, { skipChrome: true });
+                }
+                var parts = [];
+                if (text) { parts.push(text); }
+                for (var i = at + 1; i < pages.length; i++) {
+                    var later = blocksText(pages[i], { skipChrome: true, skipSpill: true });
+                    if (later) { parts.push(later); }
+                }
+                if (!parts.length) { return null; }
+                return {
+                    text: parts.join(String.fromCharCode(10)),
+                    source: 'pageflip page ' + (at + 1) + ' of ' + pages.length
+                        + (caret ? ', from the visible line' : ', from the top of the page')
+                };
             }
-            if (!parts.length) { return null; }
+            var holder = chapterHolder(display);
+            if (!holder) { return null; }
+            var hdoc = holder.ownerDocument || (w && w.document) || null;
+            var hcaret = caretAtTop(hdoc, boxOf(holder));
+            var scroll = hcaret ? blocksText(holder, { skipChrome: true, from: hcaret }) : '';
+            if (!scroll) {
+                hcaret = null;
+                scroll = blocksText(holder, { skipChrome: true });
+            }
+            if (!scroll) { return null; }
             return {
-                text: parts.join(String.fromCharCode(10)),
-                source: 'pageflip page ' + (at + 1) + ' of ' + pages.length
+                text: scroll,
+                source: 'scroll chapter'
+                    + (hcaret ? ', from the visible line' : ', from the top of the chapter')
             };
         }
 
@@ -2983,7 +3185,7 @@ enum SitePatch {
             var doc = w.document;
             var text = '';
             var source = '';
-            var model = pageModelText(display);
+            var model = visiblePageText(display);
             if (model) { text = model.text; source = model.source; }
             if (!text) {
                 text = textOf(chapterHolder(display));
