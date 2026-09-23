@@ -100,14 +100,24 @@ enum SitePatch {
        * The user has to be able to get the text out. COPY puts the whole buffer
          on the iOS clipboard (with an execCommand fallback), which beats asking
          for a screenshot of a scrolling list.
-     Collapsed state is a 24px badge on the right edge showing the line count;
-     it turns red as soon as anything is logged with tag ERR. The badge stays
-     HIDDEN until the first ERR and can be dismissed again from the panel — the
-     reader turns pages by tapping the right third of the screen
-     (app.reader.menuTapMode == "centerlr"), so an always-visible badge would eat
-     page turns. Triple-tap the top-left corner opens the panel regardless. The
-     expanded panel is anchored to the TOP (42% height) and its title bar can be
-     dragged vertically, so the bottom 58% of the screen stays usable.
+     OFF by default, switched from 设置 -> 诊断 (that row is added by the
+     comment-translation block, which already owns the settings page). This is
+     what the reader asked for: with logging off there is no floating window at
+     all -- no badge, no panel, no tap or console capture -- and `log()` returns
+     immediately, so the buffer cannot grow. With logging on the badge is ALWAYS
+     visible (not only after an error, which was the old behaviour) and the panel
+     opens straight away. The choice survives a reinstall: it is mirrored into
+     the keychain backup alongside the other settings (settingsBackup, key
+     `stv.diag.settings`).
+
+     Collapsed state is a 24px badge on the right edge showing the line count; it
+     turns red as soon as anything is logged with tag ERR. The reader turns pages
+     by tapping the right third of the screen
+     (app.reader.menuTapMode == "centerlr"), so the panel keeps a HIDE button that
+     dismisses the badge. Triple-tap the top-left corner opens the panel
+     regardless. The expanded panel is anchored to the TOP (42% height) and its
+     title bar can be dragged vertically, so the bottom 58% of the screen stays
+     usable.
      */
     static let diag = """
     (function () {
@@ -116,6 +126,13 @@ enum SitePatch {
 
         var NL = String.fromCharCode(10);
         var MAX = 800;
+        // localStorage is the only store readable synchronously at document
+        // start. app.storage is Capacitor Preferences and resolves a tick later,
+        // which is too late to decide whether the floating window should exist.
+        // The second key is the mirror the keychain backup carries across a
+        // reinstall (settingsBackup mirrors every app.storage.set).
+        var FLAG_KEY = 'stv.diag';
+        var STORE_KEY = 'stv.diag.settings';
         var lines = [];
         var errors = 0;
         var root = null;
@@ -124,6 +141,24 @@ enum SitePatch {
         var badge = null;
         var badgeHidden = false;
         var open = false;
+        var enabled = readEnabled();
+
+        function readEnabled() {
+            try {
+                return !!(window.localStorage
+                    && window.localStorage.getItem(FLAG_KEY) === '1');
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function writeEnabled(on) {
+            try {
+                if (window.localStorage) {
+                    window.localStorage.setItem(FLAG_KEY, on ? '1' : '0');
+                }
+            } catch (e) {}
+        }
 
         function fmt(value) {
             try {
@@ -200,7 +235,7 @@ enum SitePatch {
                 badge.style.background = 'rgba(25,25,25,0.6)';
                 badge.style.color = '#cfc';
             }
-            badge.style.display = (errors > 0 && !badgeHidden) ? 'block' : 'none';
+            badge.style.display = (enabled && !badgeHidden) ? 'block' : 'none';
         }
 
         // ---- expanded panel --------------------------------------------------
@@ -264,6 +299,9 @@ enum SitePatch {
         }
 
         function show() {
+            // Showing a window that the switch has turned off would contradict
+            // the setting, so this is the one other place `enabled` is read.
+            if (!enabled) { return; }
             if (!buildPanel()) { return; }
             open = true;
             badgeHidden = false;
@@ -363,6 +401,10 @@ enum SitePatch {
         // ---- logging ---------------------------------------------------------
 
         function log(tag, msg) {
+            // The switch is checked here and nowhere else: every caller (all the
+            // other blocks, the console tee, the tap listeners) keeps working
+            // unchanged and pays one boolean while logging is off.
+            if (!enabled) { return; }
             lines.push(stamp() + ' [' + tag + '] ' + fmt(msg));
             while (lines.length > MAX) { lines.shift(); }
             if (tag === 'ERR') {
@@ -376,6 +418,61 @@ enum SitePatch {
             }
         }
 
+        // ---- the switch ------------------------------------------------------
+
+        function activate() {
+            if (!buildBadge()) { return false; }
+            paintBadge();
+            return true;
+        }
+
+        function persist(on) {
+            var app = window.app;
+            var storage = app && app.storage;
+            if (!storage || typeof storage.set !== 'function') { return; }
+            try {
+                var call = storage.set(STORE_KEY, JSON.stringify({ enabled: !!on }));
+                if (call && typeof call.catch === 'function') { call.catch(function () {}); }
+            } catch (e) {}
+        }
+
+        /**
+         Turn logging on or off. Off removes the badge and the panel and empties
+         the buffer; on builds them and shows the panel immediately ("启用后就一直
+         显示") -- the panel can still be closed with CLOSE/HIDE and reopened from
+         the badge or from 设置 -> 诊断.
+         */
+        function setEnabled(on) {
+            enabled = !!on;
+            writeEnabled(enabled);
+            persist(enabled);
+            if (!enabled) {
+                lines = [];
+                errors = 0;
+                badgeHidden = false;
+                open = false;
+                if (root && root.parentNode) { root.parentNode.removeChild(root); }
+                if (badge && badge.parentNode) { badge.parentNode.removeChild(badge); }
+                root = null;
+                listEl = null;
+                countEl = null;
+                badge = null;
+                return;
+            }
+            if (!activate()) {
+                // document.body does not exist yet at document start.
+                document.addEventListener('DOMContentLoaded', function () {
+                    if (!enabled) { return; }
+                    activate();
+                    show();
+                });
+                return;
+            }
+            show();
+            log('DIAG', 'logging on: the floating window stays until the switch is '
+                + 'turned off (设置 -> 诊断)');
+        }
+
         window.__stvDiag = {
             log: log,
             show: show,
@@ -383,7 +480,9 @@ enum SitePatch {
             toggle: toggle,
             copy: copyAll,
             text: function () { return lines.join(NL); },
-            lines: function () { return lines.slice(); }
+            lines: function () { return lines.slice(); },
+            enabled: function () { return enabled; },
+            setEnabled: setEnabled
         };
 
         window.addEventListener('error', function (e) {
@@ -396,6 +495,7 @@ enum SitePatch {
 
         function tee(orig, tag) {
             return function () {
+                if (!enabled) { return orig.apply(console, arguments); }
                 var parts = [];
                 for (var i = 0; i < arguments.length; i++) { parts.push(fmt(arguments[i])); }
                 log(tag, parts.join(' '));
@@ -410,6 +510,7 @@ enum SitePatch {
         // actually on top at that point when the two differ. That is what tells
         // "the handler never ran" apart from "something is covering the button".
         document.addEventListener('click', function (e) {
+            if (!enabled) { return; }
             if (isOurs(e.target)) { return; }
             var line = 'tap ' + describe(e.target);
             try {
@@ -424,6 +525,7 @@ enum SitePatch {
         var taps = 0;
         var lastTap = 0;
         document.addEventListener('touchstart', function (e) {
+            if (!enabled) { return; }
             var t = e.touches && e.touches[0];
             if (!t) { return; }
             if (t.clientX < 70 && t.clientY < 70) {
@@ -437,11 +539,159 @@ enum SitePatch {
             }
         }, true);
 
-        if (!buildBadge()) {
-            document.addEventListener('DOMContentLoaded', function () { buildBadge(); paintBadge(); });
-        } else {
-            paintBadge();
+        // A switch that was left on stays on across launches: the badge is
+        // always visible and the panel opens with it, which is the "启用后就一直
+        // 显示" the reader asked for. Everything stays off until then.
+        if (enabled) {
+            if (!activate()) {
+                document.addEventListener('DOMContentLoaded', function () {
+                    if (!enabled) { return; }
+                    activate();
+                    show();
+                });
+            } else {
+                show();
+            }
         }
+    })();
+    """
+
+    // MARK: - Activity log for the common flows
+
+    /**
+     The diagnostics buffer is only useful when the flows a bug report goes
+     through are in it. The other blocks each log their own subject (downloads,
+     translation, TTS, bookmarks, storage, the mirror failover, the reader
+     defaults); what was missing is the generic navigation surface every report
+     starts from:
+
+       * `[PAGE]` every page the app opens and every pop. `pushPage`
+         (_page_vip.html:3125) is the single funnel for opening, `popPage`
+         (:3238) the single exit, so the reader's path through the app becomes one
+         line per step.
+       * `[NAV]` every tab-bar tap, with the item's index and label. That is what
+         separates "the tab never switched" from "the pane was empty", and it is
+         the evidence for the download-list jump in `pageRepair`.
+       * `[MSG]` every `app.toast` / `app.context.info` (app.v2.js:616 / :2300).
+         Both are modal popups, and "what did the site say" is usually the whole
+         question in a report.
+       * `[BOOT]` when the app object appeared, so the buffer has a zero point.
+
+     Every line goes through `__stvDiag.log`, which returns immediately while the
+     logging switch is off, so this block costs one wrapped call per user action
+     and nothing else.
+     */
+    static let activityLog = """
+    (function () {
+        if (window.__stvActivityLogInstalled) { return; }
+        window.__stvActivityLogInstalled = true;
+
+        var NL = String.fromCharCode(10);
+        var TAB = String.fromCharCode(9);
+        var CR = String.fromCharCode(13);
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function tagOf(node) {
+            return String((node && node.tagName) || '').toLowerCase();
+        }
+
+        // A tabitem's label is <text>...</text> once the site has localised it
+        // (app.celoader.text), so read the text content and collapse runs of
+        // whitespace by hand -- a regex would need a backslash, which both the
+        // Swift literal and check-ios-shim.js forbid.
+        function label(node) {
+            var text = (node && node.textContent) ? String(node.textContent) : '';
+            var out = '';
+            var spaced = false;
+            for (var i = 0; i < text.length; i++) {
+                var ch = text.charAt(i);
+                var blank = (ch === ' ' || ch === NL || ch === TAB || ch === CR);
+                if (blank) {
+                    if (!spaced && out) { out += ' '; }
+                } else {
+                    out += ch;
+                }
+                spaced = blank;
+            }
+            return out;
+        }
+
+        function childIndex(node) {
+            var parent = node && node.parentNode;
+            var kids = (parent && parent.children) || [];
+            for (var i = 0; i < kids.length; i++) {
+                if (kids[i] === node) { return i; }
+            }
+            return -1;
+        }
+
+        // Wraps one method so the call is logged with what the caller passed and
+        // what came back. `this`, the arguments and the return value are all
+        // preserved exactly, including a thrown error.
+        function wrap(object, name, tag, describe) {
+            if (!object || typeof object[name] !== 'function') { return false; }
+            var flag = '__stvLogged_' + name;
+            if (object[flag]) { return true; }
+            object[flag] = true;
+            var original = object[name];
+            object[name] = function () {
+                var out = original.apply(this, arguments);
+                try { note(tag, describe(arguments, out)); } catch (e) {}
+                return out;
+            };
+            return true;
+        }
+
+        function install() {
+            var app = window.app;
+            if (!app) { return false; }
+            var ready = true;
+            if (!wrap(app, 'pushPage', 'PAGE', function (args) {
+                return 'open ' + args[0];
+            })) { ready = false; }
+            if (!wrap(app, 'popPage', 'PAGE', function () {
+                return 'back';
+            })) { ready = false; }
+            if (!wrap(app, 'toast', 'MSG', function (args) {
+                return 'toast: ' + args[0];
+            })) { ready = false; }
+            if (!wrap(app.context, 'info', 'MSG', function (args) {
+                return 'info: ' + args[0];
+            })) { ready = false; }
+            return ready;
+        }
+
+        // A tabitem is what a finger hits, so this reads the same event the site
+        // reads. Capture phase, so the line lands even when a handler stops
+        // propagation.
+        document.addEventListener('click', function (event) {
+            var node = event.target;
+            var item = null;
+            while (node && node.nodeType === 1) {
+                if (tagOf(node) === 'tabitem') { item = node; break; }
+                node = node.parentNode;
+            }
+            if (!item) { return; }
+            note('NAV', 'tab ' + childIndex(item) + ' ' + label(item));
+        }, true);
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            if (install()) {
+                clearInterval(timer);
+                note('BOOT', 'activity log attached (pages, tabs, popups)');
+                return;
+            }
+            if (attempts > 1500) {
+                clearInterval(timer);
+                note('BOOT', 'activity log attached without app.context.info'
+                    + ' (that method never appeared)');
+            }
+        }, 40);
     })();
     """
 
@@ -1369,7 +1619,8 @@ enum SitePatch {
         window.__stvSettingsBackupInstalled = true;
 
         var KEYS = ['config.reader', 'config.ux', 'config.comicReader', 'tts.setting',
-                    'readthemeset', 'offlineBook', 'stv.translate.settings'];
+                    'readthemeset', 'offlineBook', 'stv.translate.settings',
+                    'stv.diag.settings'];
         var PREFIXES = ['reader.style.'];
 
         function note(tag, message) {
@@ -1416,6 +1667,25 @@ enum SitePatch {
         var restored = false;
         var lastEntries = null;
         var restoredKeys = [];
+
+        // The logging switch (the diag block) is ours, not the site's, so it is
+        // applied to that block rather than to a config object. Only when this
+        // restore actually wrote the key: a value the store already held is newer
+        // than the backup, which is the same rule CONFIG_TARGETS follows.
+        var DIAG_KEY = 'stv.diag.settings';
+
+        function applyDiagSetting(entries, keys) {
+            if (!keys || keys.indexOf(DIAG_KEY) < 0) { return; }
+            var raw = entries[DIAG_KEY];
+            if (typeof raw !== 'string' || !raw) { return; }
+            var parsed = null;
+            try { parsed = JSON.parse(raw); } catch (e) { return; }
+            var diag = window.__stvDiag;
+            if (!diag || typeof diag.setEnabled !== 'function') { return; }
+            diag.setEnabled(!!(parsed && parsed.enabled));
+            note('SETTINGS', 'logging switch restored: '
+                + (parsed && parsed.enabled ? 'on' : 'off'));
+        }
 
         function restore() {
             var plugin = appPlugin();
@@ -1492,6 +1762,7 @@ enum SitePatch {
                         + mismatched.length + ' not-persisted [' + mismatched.join(' ') + '], '
                         + unusable.length + ' unusable [' + unusable.join(' ') + '], of '
                         + keys.length + ' backed-up key(s)');
+                    applyDiagSetting(entries, restoredKeys);
                 });
             }).catch(function (e) {
                 note('ERR', 'settingsRestore failed: ' + e);
@@ -2270,6 +2541,12 @@ enum SitePatch {
 
      So: resolve bookinfo on demand for the comment button, warm the cache for
      every downloaded book, and refuse to push a detail page with no data.
+
+     The block has since taken on the whole download flow, because that is where
+     the device reports landed: the range dialog (an end chapter instead of the
+     hard-coded count of 20), duplicate starts and duplicate rows, keeping a
+     running book out of the DOWNLOADED list, the missing delete button, and a
+     confirmation dialog whose button jumps to the download list.
      */
     static let pageRepair = """
     (function () {
@@ -2941,6 +3218,171 @@ enum SitePatch {
             });
         }
 
+        // ---- "download started" dialog and the jump to the download list ----
+
+        // "选好下载范围点击下载后，要有个提示窗口说明开始下载了，然后有按钮可以直接
+        // 跳转到下载界面". The site shows nothing: startdownload closes the range
+        // dialog and the job's row only appears inside 书架 -> 下载, which is two
+        // taps away and invisible while the reader is still on the detail page.
+        //
+        // The dialog reuses the site's own popup template (app.context.popup,
+        // app.v2.js:2195): `button` HTML whose elements carry an `action`
+        // attribute, dispatched to action[name](pop) at :2218-2243.
+        function dismissPopup(pop) {
+            var overlay = pop && pop.parentNode;
+            if (!overlay) { return; }
+            if (typeof overlay.hide === 'function') { overlay.hide(); return; }
+            if (overlay.removeChild) { overlay.removeChild(pop); }
+        }
+
+        function showStartedDialog(host, bookid, start, end, count, running) {
+            var app = window.app;
+            var ctx = app && app.context;
+            if (!ctx || typeof ctx.showPopup !== 'function') { return; }
+            var detail = running
+                ? '这本书已经在下载中，没有重复添加。'
+                : '第 ' + start + ' - ' + end + ' 章，共 ' + count + ' 章';
+            var template = {
+                title: running ? '已在下载' : '已开始下载',
+                body: '<center>' + host + ' / ' + bookid + '<br>' + detail + '</center>',
+                button: '<button action=stvclose>关闭</button>'
+                    + '<button action=stvqueue>查看下载</button>',
+                action: {
+                    stvclose: function (pop) { dismissPopup(pop); },
+                    stvqueue: function (pop) {
+                        dismissPopup(pop);
+                        openDownloadList();
+                    }
+                }
+            };
+            try {
+                ctx.showPopup(template);
+                note('DOWNLOAD', 'started dialog shown: ' + detail);
+            } catch (error) {
+                note('ERR', 'started dialog failed: ' + error);
+            }
+        }
+
+        function childrenWithTag(node, tag) {
+            var out = [];
+            var kids = (node && node.children) || [];
+            for (var i = 0; i < kids.length; i++) {
+                if (String(kids[i].tagName).toLowerCase() === tag) { out.push(kids[i]); }
+            }
+            return out;
+        }
+
+        // The items live in the <tabbar> inside the <tab>, not directly under it
+        // (_page_vip.html:140-146), so the bar is looked up first.
+        function tabItemsOf(tab) {
+            var direct = childrenWithTag(tab, 'tabitem');
+            if (direct.length) { return direct; }
+            var bars = childrenWithTag(tab, 'tabbar');
+            var out = [];
+            for (var i = 0; i < bars.length; i++) {
+                out = out.concat(childrenWithTag(bars[i], 'tabitem'));
+            }
+            return out;
+        }
+
+        // The tab framework lives in /stv.ui.js, which is not part of this repo,
+        // so the tab is driven the way a finger drives it -- a click on the
+        // tabitem -- and the result is verified afterwards.
+        function clickTabitem(item) {
+            if (!item || typeof item.dispatchEvent !== 'function') { return false; }
+            var event = null;
+            try {
+                event = new MouseEvent('click', { bubbles: true, cancelable: true });
+            } catch (e) {
+                event = null;
+            }
+            if (!event) {
+                try {
+                    event = document.createEvent('MouseEvents');
+                    event.initMouseEvent('click', true, true, window, 0, 0, 0, 0,
+                        false, false, false, false, 0, null);
+                } catch (e2) {
+                    return false;
+                }
+            }
+            item.dispatchEvent(event);
+            return true;
+        }
+
+        function currentTabIndex(tab) {
+            if (tab && typeof tab.current === 'function') {
+                try { return tab.current(); } catch (e) { return null; }
+            }
+            return null;
+        }
+
+        // The setter's name is unknown, so it is probed rather than assumed, and
+        // whichever path worked is written to the log -- the next device log
+        // settles the API question.
+        var TAB_SETTERS = ['select', 'go', 'switchTo', 'setIndex', 'activate', 'to'];
+
+        function forceTab(tab, index) {
+            if (!tab) { return ''; }
+            for (var i = 0; i < TAB_SETTERS.length; i++) {
+                var name = TAB_SETTERS[i];
+                if (typeof tab[name] !== 'function') { continue; }
+                try {
+                    tab[name](index);
+                    return name;
+                } catch (e) {}
+            }
+            return '';
+        }
+
+        // 书架 is the home tab, i.e. the first tabview of #mainview
+        // (_page_vip.html:135-166), and the download list is its fifth sub-tab
+        // (history / follow / bookmark / novel_owner / download, the list itself
+        // is <tabview id="downloadedlist"> at :162).
+        function selectDownloadTab() {
+            var tusach = document.getElementById('tabtusach');
+            var items = tabItemsOf(tusach);
+            var wanted = items.length - 1;
+            var navItems = childrenWithTag(document.getElementById('mainnavbar'), 'tabitem');
+            if (navItems.length) { clickTabitem(navItems[0]); }
+            if (!items.length) {
+                note('ERR', 'download list: 书架 has no tab to select');
+                return;
+            }
+            clickTabitem(items[wanted]);
+            setTimeout(function () {
+                var index = currentTabIndex(tusach);
+                if (index === wanted) {
+                    note('DOWNLOAD', 'download tab selected by click');
+                    return;
+                }
+                var via = forceTab(tusach, wanted);
+                note('DOWNLOAD', via
+                    ? 'download tab selected via ' + via + '()'
+                    : 'could not confirm the download tab (current=' + index
+                        + ', wanted=' + wanted + ')');
+            }, 300);
+        }
+
+        function openDownloadList() {
+            var app = window.app;
+            if (!app || typeof app.popPage !== 'function') { return; }
+            var popped = 0;
+            try {
+                var overlay = document.getElementById('overlay');
+                while (overlay && overlay.children && overlay.children.length > 0
+                    && popped < 20) {
+                    app.popPage();
+                    popped++;
+                }
+            } catch (error) {
+                note('ERR', 'closing pages before the download list failed: ' + error);
+            }
+            note('DOWNLOAD', 'download list: closed ' + popped + ' page(s)');
+            // popPage animates for 250ms and calls mainview.ontabchange() when the
+            // stack empties; switching the tab before that lands would be undone.
+            setTimeout(selectDownloadTab, 300);
+        }
+
         // The download dialog asks for a chapter COUNT and hard-codes 20 of them.
         // `showDownloadBook` (page-vip:4939-4953) fetches the book's
         // `chaptercount` into `ccount`, never uses it, and sets `total = 20`; the
@@ -3002,6 +3444,7 @@ enum SitePatch {
                 if (running) {
                     note('DOWNLOAD', 'a download for ' + host + '/' + bookid
                         + ' is already running; ignoring the second start');
+                    showStartedDialog(host, bookid, 0, 0, running.total, true);
                     return;
                 }
                 try {
@@ -3015,6 +3458,7 @@ enum SitePatch {
                         + ' -> ' + lists.length + ' chapter(s)');
                     var job = new app.BookDownloadManager(host, bookid, lists, book);
                     job.start();
+                    showStartedDialog(host, bookid, start, end, lists.length, false);
                 } catch (error) {
                     // getChapterList() is a top-level function in app.v2.js; if it
                     // ever stops being reachable, keep the site's own action.
@@ -4114,6 +4558,18 @@ enum SitePatch {
             });
         }
 
+        // The logging switch is rendered here rather than from the diag block:
+        // this block already owns the settings page, and the diag block has no
+        // way to know when that page exists. The state is read back from
+        // __stvDiag, so there is exactly one owner of the flag.
+        function paintLogState(node) {
+            var diag = window.__stvDiag;
+            var on = !!(diag && typeof diag.enabled === 'function' && diag.enabled());
+            node.textContent = on ? '已开启 · 点这里关闭' : '已关闭 · 点这里开启';
+            node.style.cssText = 'font-size:12px;opacity:0.9;'
+                + (on ? 'color:#7fdc7f;' : '');
+        }
+
         function onSettingsPage(page) {
             if (!page || page.nodeType !== 1) { return; }
             if (q(page, '.stv-translate-entry')) { return; }
@@ -4134,6 +4590,47 @@ enum SitePatch {
             host.appendChild(header);
             host.appendChild(item);
             note('TRANSLATE', 'settings entry added');
+
+            var logHeader = document.createElement('div');
+            logHeader.className = 'settingsection mt-3';
+            logHeader.textContent = '诊断';
+            var logItem = document.createElement('div');
+            logItem.className = 'settingitem stv-log-entry';
+            var logTitle = document.createElement('div');
+            logTitle.className = 'settingitemtitle';
+            logTitle.textContent = '日志（悬浮日志窗口）';
+            var logState = document.createElement('div');
+            logState.className = 'stv-log-state';
+            logItem.appendChild(logTitle);
+            logItem.appendChild(logState);
+            logItem.addEventListener('click', function (event) {
+                stop(event);
+                var diag = window.__stvDiag;
+                if (!diag || typeof diag.setEnabled !== 'function') { return; }
+                diag.setEnabled(!diag.enabled());
+                paintLogState(logState);
+            }, true);
+            var logOpen = document.createElement('div');
+            logOpen.className = 'settingitem stv-log-open';
+            logOpen.innerHTML = '<div class="settingitemtitle">查看/复制日志</div>'
+                + '<div class=""><i class="fas fa-chevron-right"></i></div>';
+            logOpen.addEventListener('click', function (event) {
+                stop(event);
+                var diag = window.__stvDiag;
+                if (!diag || typeof diag.show !== 'function') { return; }
+                // Asking to look at the log implies wanting it: turn the switch
+                // on first rather than opening nothing.
+                if (typeof diag.enabled === 'function' && !diag.enabled()) {
+                    diag.setEnabled(true);
+                }
+                diag.show();
+                paintLogState(logState);
+            }, true);
+            host.appendChild(logHeader);
+            host.appendChild(logItem);
+            host.appendChild(logOpen);
+            paintLogState(logState);
+            note('DIAG', 'logging switch added to 设置');
         }
 
         // ---- settings panel ---------------------------------------------
@@ -4709,7 +5206,7 @@ enum SitePatch {
 
     /// Injected in order; every block is independently guarded. `SiteI18nData`
     /// is generated from data/site-i18n.json by scripts/gen-site-i18n.js.
-    static let all: [String] = [compat, diag, tabProbe, storageAccessor,
+    static let all: [String] = [compat, diag, activityLog, tabProbe, storageAccessor,
                                 readerDefaults, ttsProvider, followFallback,
                                 safeArea, keyboardPopup, gridLayout, settingsBackup,
                                 domainFailover, bookmarkToggle, readerTts,

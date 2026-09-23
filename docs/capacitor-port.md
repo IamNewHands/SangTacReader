@@ -57,12 +57,13 @@
 3. `WebNativeView` 目前是占位实现 → 漫画/图片模块退化（小说正文不受影响）。
 4. `CapacitorSQLite`、`MlKit`/`MainClass`（OCR）、`AdMob` 未接 → 对应功能降级。
 5. ~~旧工程 `SangTacReader.xcodeproj` + `WebViewController.swift`（2410 行）~~ —— **已退役**（2026-09-22，新构建多轮真机验证通过后删除，含它打包的 `www/` 资源与 `tests/` 下的一次性探测脚本）。旧实现仍可从 git 历史取回。
-6. `__stvDiag` 诊断面板是临时设施，现场问题定性完成后应移除（`SitePatch.diag` 整块 + `SangTacHttpPlugin.report`）；`tabProbe` 同批退役，见 §6.11 (4)。
+6. ~~`__stvDiag` 诊断面板是临时设施，应移除~~ —— **改判为常设功能**（2026-09-23，用户要求）：面板由「设置 → 诊断」的开关控制，默认关闭（关着时不存在任何悬浮窗、不缓冲、不接管 console），开着时徽标常显 + 面板常驻，开关镜像进 Keychain 重装不丢，见 §6.15 (1)。`tabProbe` 仍是临时探针（它的 `TAB` 日志与 `activityLog` 的 `NAV` 并存），储物袋 tab 的成因已定性，见 §6.11 (4) / 本表第 8 条。
 7. 站点 `filterDownloadingChapters`（`read.js:3445`）参数遮蔽导致跨任务去重失效 —— 站点代码本身仍未改，但影响已被绕开：下载对话框现在拒绝为同一本**正在下载**的书起第二个任务（§6.14 (1)），所以那个「被过滤成空章节列表、永远停在 0/N」的任务不会再产生。
 8. ~~储物袋顶部 tab 的错位成因未定~~ —— **已定性**：不是位移错位，是末页「Đang kích hoạt」本来就没有数据（服务端 `act` 为空数组，见 §6.11/§6.12 (6)）。`tabProbe` 探针已补 `panes`/`activate`，若后续发现该有数据再收口。
 9. **系统离线翻译要 iOS 18+ 且语言包已下载**（见 §6.13）。iOS 15-17 上 `App.translationStatus` 如实回 `unsupported`，`commentTranslate` 会自动改用联网引擎（免密钥微软通道，或用户自备 Key），因此该功能在旧系统上不是不可用，只是必须联网。
 10. **自备 API Key 存在站点存储里**（`app.storage` → Capacitor Preferences → UserDefaults），并被 `settingsBackup` 一并镜像进 Keychain（`stv.translate.settings`）。日志只记引擎名，不打印 Key；但它不是独立的加密存储，介意的话请用可随时吊销的 Key。
 11. **社区里的 Cbox 板块翻译不了**：`page-pagecbox`（`_page_vip.html:982`）是一个跨域 iframe（`www6.cbox.ws`），父页面拿不到里面的 DOM；Facebook 的两个按钮是外部浏览器。其余板块（Kênh truyện / Kênh linh tinh / 势力 / 单帖 / 用户主页评论 / 广播）都已覆盖，见 §6.14 (7)。
+12. **标签栏切换的正式 API 未知**：`ui.smtab()` 来自 `/stv.ui.js`，该文件不在仓库里也拉不下来（本机 TLS 取不到），所以「跳转到下载页」是靠**在 tabitem 上派发 click**（和手指一样）+ 事后用 `tab.current()` 校验；校验不过才去探测 `select/go/switchTo/setIndex/activate/to` 这一组 setter 名字。走哪条路、`current()` 是否存在于 `#tabtusach`，都会写进 `[DOWNLOAD]` 日志，下一份真机日志即可定案，见 §6.15 (2)。
 
 ## 6. 真机问题档案
 
@@ -1377,3 +1378,78 @@ iframe，父页面取不到内部文字，**不支持**；两个 Facebook 按钮
 **未证实项**：`user-select: none` 与原生 `select` 的关系是从日志反推的（真机上点不到），
 自绘选择器绕开了这个不确定性；社区板块的真机布局（标题栏空间是否够放两个按钮）需要下一
 轮日志确认。
+
+### 6.15 第十三轮反馈（2026-09-23）：日志开关、下载开始提示与跳转
+
+两条新需求（原消息的第 3 条是误触的空行，已确认无内容）。
+
+#### (1) 「把日志打印的功能做到设置里，用开关控制……禁用后就不再有悬浮日志窗口，启用后就一直显示」
+
+改动在 `diag` 块 + `commentTranslate` 的设置页：
+
+- **默认关闭**。`enabled` 在 document start 从 `localStorage['stv.diag']` 同步读出——这是
+  唯一能在那一刻读到的地方，`app.storage`（Capacitor Preferences）要晚一拍才 resolve，等
+  它就来不及决定「悬浮窗到底要不要存在」。
+- 关着时：不建徽标、不建面板、不缓冲任何行（`log()` 第一行就 return，所以 800 行上限不会
+  被撑满），console 的 `tee` 直接透传原函数，click/touchstart 两个监听器第一行就 return。
+  整个功能在关闭状态下的成本是每次用户操作一个布尔判断。
+- 开着时：徽标**常显**（旧行为是「出现第一条 ERR 才冒出来」，也正是这次要去掉的那种「莫名
+  其妙多出来的窗」），面板随开关一起弹出；`HIDE` 仍然只收徽标，`CLOSE` 只收面板，连点左上
+  角三次照旧。
+- `setEnabled()` 是唯一入口：写 localStorage、写 `app.storage['stv.diag.settings']`（于是被
+  `settingsBackup` 自动镜像进 Keychain），关掉时还会清空缓冲区并**删除**两个 DOM 节点。
+  `show()` 里也判一次 `enabled`，否则「查看/复制日志」那一行会在开关关着时把面板重建出来。
+- 设置页加在 `commentTranslate` 块里（它本来就负责设置页）：`设置 → 诊断` 下两行——「日志
+  （悬浮日志窗口）」点一下开关，右侧实时显示 `已关闭 · 点这里开启` / `已开启 · 点这里关闭`；
+  「查看/复制日志」会先把开关打开再弹面板。
+- 重装后不丢：`settingsBackup` 的 `KEYS` 加了 `stv.diag.settings`，恢复链末尾用
+  `applyDiagSetting()` 把这个值直接交给 `__stvDiag.setEnabled()`（它是我们自己的设置，不是
+  站点的 config，所以不走 `CONFIG_TARGETS`）。规则与既有一致：只有**这次真的写进去了**才
+  应用，站点存储里已有的值更新，不覆盖。
+
+「常见的功能都加点日志」落在新的第 19 个块 `activityLog`：它只做站点自己不会记的那一层——
+`[PAGE]` 每次 `pushPage`/`popPage`、`[NAV]` 每次标签栏点击（序号 + 文案）、`[MSG]` 每次
+`app.toast` / `app.context.info`（两个都是模态弹窗，「站点到底弹了什么」通常就是整个问题）、
+`[BOOT]` app 对象就绪时刻。其余主题（下载、翻译、TTS、书签、存储、镜像失败转移、阅读器
+默认值）各自已经有 tag，不重复。包装函数一律 `apply(this, arguments)` 并原样返回，异常不
+吞。`app.pushPage` 被两个块先后包装，两层都保 `this`/返回值，互不影响。
+
+#### (2) 「点击下载后要有提示窗口说明开始下载了，然后有按钮直接跳转到下载界面」
+
+站点自己什么都不弹：`startdownload` 关掉范围对话框就结束了，任务行只出现在**书架 → 下载**
+里，而读者还停在详情页上。
+
+- 提示窗用站点自己的弹窗模板（`app.context.popup`，`app.v2.js:2195`）：`button` 里放带
+  `action` 属性的 `<button>`，站点在 `:2218-2243` 分派到 `action[name](pop)`。两个按钮：
+  「关闭」和「查看下载」。正文写清楚 `host / bookid` 和「第 a - b 章，共 n 章」。
+- 重复点同一本书时**也弹这个窗**，但标题是「已在下载」、正文说明没有重复添加——比静默忽略
+  好，用户至少知道为什么没反应。
+- 「查看下载」= `openDownloadList()`：先把 `#overlay` 里的页面全部 `popPage()` 掉（上限 20
+  次，避免任何情况下死循环），等 300ms（`popPage` 的 gsap 动画 250ms，动画结束时还会调
+  `mainview.ontabchange()`，抢在它前面切 tab 会被它抹掉），再 `selectDownloadTab()`。
+- 书架是**主标签栏的第 0 项**（`#mainnavbar` 的 home，`_page_vip.html:135-166`），下载列表是
+  书架的**第 5 个子 tab**（history / follow / bookmark / novel_owner / download，列表本身是
+  `:162` 的 `<tabview id="downloadedlist">`）。所以先点 `#mainnavbar` 的第 0 个 tabitem，再点
+  `#tabtusach` 的最后一个 tabitem。
+- tabitem 藏在 `<tab>` 里的 `<tabbar>` 中（`:140-146`），不是 `<tab>` 的直接子节点——第一版
+  就是直接找子节点所以一个都没找到，测试当场抓到了。
+- 切换方式：**在 tabitem 上派发 `MouseEvent('click')`**（`createEvent` 兜底），因为
+  `/stv.ui.js` 不在仓库里、本机也拉不下来，`ui.smtab()` 的 setter 名字无法查证。点完 300ms
+  后用 `tab.current()` 校验；对不上再按 `select/go/switchTo/setIndex/activate/to` 顺序探测
+  setter。**走了哪条路会写进日志**，所以下一份真机日志就能把 §5 第 12 条定案。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 19 块 / 260186 字节 / 21 markers
+- `node scripts/test-site-patch.js` → **350 条断言**全过。本轮新增/重写 4 组：诊断面板的
+  开/关两种状态（关着时无窗、无缓冲、console 不接管、`show()` 也建不出窗；开着时徽标常显、
+  面板在屏、`setEnabled(false)` 删窗清缓冲、`setEnabled(true)` 重建）、设置页两行与
+  Keychain 恢复（`logging switch restored: on`）、`activityLog` 的 `PAGE`/`NAV`/`MSG`/`BOOT`
+  四类行且包装后原调用仍到达站点、下载开始提示窗（标题/正文范围/两个按钮、重复启动改成
+  「已在下载」、点「查看下载」→ 关窗 → 关掉 3 个已推页面 → 主标签点 home、子标签点第 4 项 →
+  日志确认 `download tab selected by click`）
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
+
+**未证实项**：`ui.smtab()` 的 setter 名字、`#tabtusach.current()` 在真机上是否存在、以及
+真机点 tabitem 是否真的能触发框架切换（三者都由本轮日志自证）；「关闭日志后 tap 日志也停」
+这一点只在测试里断言了（真机上表现为「面板里不再出现新行」）。

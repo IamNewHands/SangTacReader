@@ -126,6 +126,12 @@ function makeElement(tagName) {
       const handlers = this.listeners[type] || [];
       for (const handler of handlers) { handler(event); }
     },
+    // The download-list jump drives the tab bar by dispatching a click on the
+    // tabitem, exactly as a finger would.
+    dispatchEvent(event) {
+      this.__fire(event && event.type, event);
+      return true;
+    },
     getBoundingClientRect() {
       return { left: 0, top: 0, width: 26, height: 26, right: 26, bottom: 26 };
     },
@@ -299,7 +305,8 @@ function makeContainer(tagName, className, text) {
   return element;
 }
 
-function makeSandbox() {
+function makeSandbox(options) {
+  const opts = options || {};
   const body = makeElement('body');
   const head = makeElement('head');
   const documentElement = makeElement('html');
@@ -318,6 +325,10 @@ function makeSandbox() {
   };
 
   const store = {};
+  // Logging is off unless the reader switches it on, and almost every assertion
+  // below reads __stvDiag.text(). The switch itself is tested with
+  // makeSandbox({ diag: false }), which leaves the flag genuinely absent.
+  if (opts.diag !== false) { store['stv.diag'] = '1'; }
   const localStorage = {
     getItem: (key) => (Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null),
     setItem: (key, value) => { store[key] = String(value); },
@@ -359,6 +370,9 @@ function makeSandbox() {
     }),
   };
   window.window = window;
+  // A browser exposes the same store on both; the diagnostics switch reads it
+  // through window.localStorage.
+  window.localStorage = localStorage;
 
   const sandbox = {
     window,
@@ -376,6 +390,16 @@ function makeSandbox() {
     // The mirror-failover block reads the origin of the URL bestDomain()
     // returned.
     URL: globalThis.URL,
+    // The download-list jump dispatches a click on a tabitem through the real
+    // constructor path first; the createEvent fallback stays untested on purpose
+    // (it is insurance for an older webview).
+    MouseEvent: class {
+      constructor(type, init) {
+        this.type = type;
+        this.bubbles = !!(init && init.bubbles);
+        this.cancelable = !!(init && init.cancelable);
+      }
+    },
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -584,6 +608,13 @@ function installFakeApp(sandbox, options) {
   app.net.get = (url) => app.net.getCacheLater(url);
   app.popPage = function () {
     stored.popPageCalls = (stored.popPageCalls || 0) + 1;
+    // The real popPage removes the top overlay page (page-vip:3238). Without
+    // this the download-list jump would pop until its own safety cap.
+    const overlay = sandbox.document.getElementById('overlay');
+    if (overlay && overlay.children.length) {
+      overlay.removeChild(overlay.children[overlay.children.length - 1]);
+      return;
+    }
     // The real popPage tears the page down; popping a sub-page the reader
     // pushed (the chapter list) leaves the reader mounted.
     if (options.popKeepsReader) { return; }
@@ -954,30 +985,204 @@ async function testReaderDefaults() {
 }
 
 async function testDiagPanel() {
-  console.log('diagnostics panel');
+  console.log('diagnostics panel and the logging switch');
+  // Off is the shipped default: no window, no buffer, no capture at all.
+  const off = makeSandbox({ diag: false });
+  installFakeApp(off, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), off);
+  await tick(300);
+  const offDiag = off.window.__stvDiag;
+  check('__stvDiag installed', !!offDiag);
+  check('logging is off until the switch is turned on', offDiag.enabled() === false);
+  check('no floating window exists while logging is off',
+    off.document.body.querySelectorAll('[data-stvdiag]').length === 0,
+    String(off.document.body.children.length) + ' child(ren) on <body>');
+  offDiag.log('Http', 'GET /x -> 200');
+  check('nothing is buffered while logging is off', offDiag.lines().length === 0);
+  offDiag.show();
+  check('show() cannot resurrect the window while logging is off',
+    off.document.body.querySelectorAll('[data-stvdiag]').length === 0);
+  off.console.log('must not be captured');
+  check('the console is not captured while logging is off', offDiag.lines().length === 0);
+
+  // On: the badge is always visible (not only after an error, which was the old
+  // behaviour) and the switch opens the panel itself.
   const sandbox = makeSandbox();
   installFakeApp(sandbox, { displayType: 'auto' });
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(300);
   const diag = sandbox.window.__stvDiag;
-  check('__stvDiag installed', !!diag);
-  check('badge appended to body', sandbox.document.body.children.length > 0);
-  const badge = sandbox.document.body.children[0];
-  check(
-    'badge stays hidden while nothing has errored',
-    badge.style.display === 'none',
-    `display=${badge.style.display} (the reader turns pages by tapping the right third of the screen)`
-  );
+  check('the switch reads the stored flag', diag.enabled() === true);
+  const badge = sandbox.document.body.querySelectorAll('[data-stvdiag=badge]')[0];
+  const panel = sandbox.document.body.querySelectorAll('[data-stvdiag=panel]')[0];
+  check('the badge and the panel are built', !!badge && !!panel);
+  check('the badge is visible before anything has errored',
+    !!badge && badge.style.display === 'block',
+    badge ? badge.style.display : 'no badge');
+  check('the panel is on screen while logging is on',
+    !!panel && panel.style.display === 'block',
+    panel ? panel.style.display : 'no panel');
+
   diag.log('Http', 'GET /x -> 200');
   diag.log('ERR', 'boom');
   const text = diag.text();
   check('lines are buffered', text.includes('GET /x -> 200') && text.includes('boom'));
   check('badge shows the line count', badge.textContent === String(diag.lines().length));
-  check('badge reveals itself on the first error', badge.style.display === 'block');
+  check('the badge turns red on the first error',
+    badge.style.background.indexOf('170,20,20') >= 0, badge.style.background);
   check('copy() returns the buffer', diag.copy() === text);
+  sandbox.console.log('hello from the site');
+  check('the console is captured while logging is on',
+    diag.text().includes('hello from the site'), diag.text().slice(-200));
   diag.hide();
+  check('hiding closes the panel', panel.style.display === 'none');
   diag.show();
-  check('show/hide are safe', true);
+  check('show/hide are safe', panel.style.display === 'block');
+
+  // Switching off takes the window away and empties the buffer.
+  diag.setEnabled(false);
+  check('the switch turns logging off', diag.enabled() === false);
+  check('the floating window is gone',
+    sandbox.document.body.querySelectorAll('[data-stvdiag]').length === 0,
+    String(sandbox.document.body.children.length) + ' child(ren)');
+  check('the buffer is emptied', diag.lines().length === 0);
+  check('the flag is written to localStorage',
+    sandbox.localStorage.getItem('stv.diag') === '0',
+    String(sandbox.localStorage.getItem('stv.diag')));
+  check('the flag is mirrored for the keychain backup',
+    sandbox.localStorage.getItem('stv.diag.settings')
+      === JSON.stringify({ enabled: false }),
+    String(sandbox.localStorage.getItem('stv.diag.settings')));
+
+  diag.setEnabled(true);
+  check('switching back on rebuilds the window',
+    sandbox.document.body.querySelectorAll('[data-stvdiag]').length === 2,
+    String(sandbox.document.body.querySelectorAll('[data-stvdiag]').length));
+  check('the new state is persisted',
+    sandbox.localStorage.getItem('stv.diag') === '1');
+}
+
+async function testLoggingSwitch() {
+  console.log('the logging switch in 设置');
+  const fixture = settingsPageFixture();
+  const sandbox = makeSandbox({ diag: false });
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    pages: { pagesetting: fixture.page },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+  app.pushPage('pagesetting', {});
+  await tick(60);
+
+  const diag = sandbox.window.__stvDiag;
+  const entry = fixture.content.querySelectorAll('.stv-log-entry')[0];
+  check('a 日志 row is added to 设置', !!entry);
+  const state = entry && entry.querySelectorAll('.stv-log-state')[0];
+  check('the row shows the current state',
+    !!state && state.textContent.indexOf('已关闭') >= 0,
+    state ? state.textContent : 'no state');
+
+  click(entry);
+  await tick(40);
+  check('tapping the row turns logging on', diag.enabled() === true);
+  check('the row now reads 已开启', state.textContent.indexOf('已开启') >= 0, state.textContent);
+  check('the window is on screen',
+    sandbox.document.body.querySelectorAll('[data-stvdiag]').length === 2,
+    String(sandbox.document.body.children.length) + ' child(ren)');
+  check('the switch is persisted',
+    sandbox.localStorage.getItem('stv.diag') === '1'
+      && sandbox.localStorage.getItem('stv.diag.settings')
+        === JSON.stringify({ enabled: true }),
+    String(sandbox.localStorage.getItem('stv.diag.settings')));
+
+  click(entry);
+  await tick(40);
+  check('tapping again turns it off', diag.enabled() === false);
+  check('and the window is gone again',
+    sandbox.document.body.querySelectorAll('[data-stvdiag]').length === 0);
+
+  const open = fixture.content.querySelectorAll('.stv-log-open')[0];
+  check('a 查看/复制日志 row is added', !!open);
+  click(open);
+  await tick(40);
+  check('asking to read the log turns logging on rather than opening nothing',
+    diag.enabled() === true);
+  check('and the state row agrees', state.textContent.indexOf('已开启') >= 0, state.textContent);
+  check('the panel is on screen',
+    sandbox.document.body.querySelectorAll('[data-stvdiag=panel]').length === 1);
+
+  // A keychain restore (a reinstall) has to bring the switch back.
+  const restored = makeSandbox({ diag: false });
+  installFakeApp(restored, {
+    displayType: 'auto',
+    keychain: { 'stv.diag.settings': JSON.stringify({ enabled: true }) },
+  });
+  vm.runInContext(loadBlocks().join('\n'), restored);
+  await tick(600);
+  check('the switch survives a reinstall through the keychain backup',
+    restored.window.__stvDiag.enabled() === true,
+    String(restored.window.__stvDiag.enabled()));
+  check('the restore is reported',
+    String(restored.window.__stvDiag.text() || '').indexOf('logging switch restored: on') >= 0,
+    String(restored.window.__stvDiag.text() || '').slice(-300));
+}
+
+async function testActivityLog() {
+  console.log('activity log for the common flows');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    pages: { pagesetting: settingsPageFixture().page },
+  });
+  app.context = {
+    menu: {
+      downloadchapter: {
+        body: '<input class="numstart"/><input class="numend"/>',
+        action: { startdownload: async function () {}, cancel: function () {} },
+      },
+    },
+    showPopup() { return makeContainer('div', 'popupedit'); },
+    info(msg) {
+      sandbox.__stored.infoCalls = (sandbox.__stored.infoCalls || []).concat([msg]);
+    },
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  app.pushPage('pagesetting', {});
+  app.popPage();
+  app.toast('Không thể đọc dữ liệu');
+  app.context.info('Bạn chưa đăng nhập');
+
+  const bar = makeContainer('tabbar', '');
+  const item = makeContainer('tabitem', '', 'download');
+  bar.appendChild(item);
+  sandbox.document.body.appendChild(bar);
+  sandbox.__dispatch('click', {
+    target: item,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  });
+
+  const text = String(sandbox.window.__stvDiag.text() || '');
+  check('opening a page is logged',
+    text.indexOf('[PAGE] open pagesetting') >= 0, text.slice(-400));
+  check('popping a page is logged', text.indexOf('[PAGE] back') >= 0, text.slice(-400));
+  check('a toast is logged',
+    text.indexOf('[MSG] toast: Không thể đọc dữ liệu') >= 0, text.slice(-400));
+  check('a site info popup is logged',
+    text.indexOf('[MSG] info: Bạn chưa đăng nhập') >= 0, text.slice(-400));
+  check('a tab tap is logged with its index and label',
+    text.indexOf('[NAV] tab 0 download') >= 0, text.slice(-400));
+  check('the block announces itself once attached',
+    text.indexOf('[BOOT] activity log attached') >= 0, text.slice(-400));
+  check('the wrapped calls still reach the site',
+    (sandbox.__stored.infoCalls || []).length === 1
+      && sandbox.__stored.pushed.length === 1,
+    JSON.stringify(sandbox.__stored.infoCalls) + ' / '
+      + JSON.stringify(sandbox.__stored.pushed));
 }
 
 async function testI18nOverlay() {
@@ -1755,6 +1960,164 @@ async function testStorageAccessor() {
     survivorDiag.indexOf('0 written, 1 kept') >= 0, survivorDiag.slice(-260));
 }
 
+/**
+ * The main shell the download-list jump drives: #mainview with #mainnavbar
+ * (home / search / community / user) and #tabtusach, whose last tabitem is the
+ * download list (_page_vip.html:135-166; the list itself is
+ * <tabview id="downloadedlist"> at :162). Each tab carries a `current()` like
+ * the one /stv.ui.js attaches, and the tabitems move it, so the jump can verify
+ * itself exactly the way it does on device.
+ */
+function shellFixture(pushedPages) {
+  const mainview = makeContainer('tab', '');
+  mainview.id = 'mainview';
+  const navbar = makeContainer('tabbar', '');
+  navbar.id = 'mainnavbar';
+  const clicks = [];
+  const navItems = ['home', 'search', 'community', 'user'].map((text, index) => {
+    const item = makeContainer('tabitem', '', text);
+    item.addEventListener('click', () => { clicks.push('main' + index); });
+    navbar.appendChild(item);
+    return item;
+  });
+
+  const tusach = makeContainer('tab', '');
+  tusach.id = 'tabtusach';
+  const subbar = makeContainer('tabbar', '');
+  let current = 0;
+  const subItems = ['history', 'follow', 'bookmark', 'novel_owner', 'download']
+    .map((text, index) => {
+      const item = makeContainer('tabitem', '', text);
+      item.addEventListener('click', () => {
+        clicks.push('sub' + index);
+        current = index;
+      });
+      subbar.appendChild(item);
+      return item;
+    });
+  tusach.current = () => current;
+  tusach.appendChild(subbar);
+  mainview.appendChild(navbar);
+  mainview.appendChild(tusach);
+
+  const overlay = makeContainer('div', '');
+  overlay.id = 'overlay';
+  for (let i = 0; i < (pushedPages || 0); i += 1) {
+    overlay.appendChild(makeContainer('div', 'pushed'));
+  }
+  return {
+    mainview,
+    navbar,
+    navItems,
+    tusach,
+    subbar,
+    subItems,
+    overlay,
+    clicks,
+    currentIndex: () => current,
+  };
+}
+
+async function testDownloadStartedDialog() {
+  console.log('the "download started" dialog and the jump to the download list');
+  const chapters = [];
+  for (let i = 1; i <= 12; i += 1) { chapters.push({ cid: 'c' + i }); }
+
+  const shell = shellFixture(3);
+  const sandbox = makeSandbox();
+  sandbox.document.body.appendChild(shell.mainview);
+  sandbox.document.body.appendChild(shell.overlay);
+  sandbox.getChapterList = async () => chapters;
+  // Hold the chapter requests open so the job stays in flight: the second
+  // confirm below has to find a live job.
+  const app = installFakeApp(sandbox, { displayType: 'auto', slowChapter: true });
+  app.context = {
+    menu: {
+      downloadchapter: {
+        body: '<input class="bookid"/><input class="bookhost"/>'
+          + '<input class="numstart"/><input class="numend"/>',
+        action: { startdownload: async function () {}, cancel: function () {} },
+      },
+    },
+    showPopup(template) {
+      (sandbox.__stored.popups = sandbox.__stored.popups || []).push(template);
+      return makeContainer('div', 'popupedit');
+    },
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  const menu = app.context.menu.downloadchapter;
+  const inputs = {
+    '.bookhost': { value: 'qidian' },
+    '.bookid': { value: '1034915599' },
+    '.numstart': { value: '1' },
+    '.numend': { value: '12' },
+  };
+  const popup = { q: (selector) => inputs[selector] || null };
+  await menu.action.startdownload.call({ cancel() {} }, popup);
+  await tick(60);
+
+  const popups = sandbox.__stored.popups || [];
+  const started = popups[popups.length - 1];
+  check('a confirmation dialog is shown after the download starts',
+    !!started && started.title === '已开始下载', started ? started.title : 'no dialog');
+  check('the dialog names the range that was queued',
+    !!started && started.body.indexOf('第 1 - 12 章') >= 0,
+    started ? started.body : 'no dialog');
+  check('the dialog offers a jump to the download list',
+    !!started && started.button.indexOf('action=stvqueue') >= 0
+      && started.button.indexOf('查看下载') >= 0,
+    started ? started.button : 'no dialog');
+  check('the dialog can also just be closed',
+    !!started && started.button.indexOf('action=stvclose') >= 0,
+    started ? started.button : 'no dialog');
+
+  // The site dispatches a button press to action[name](pop) (app.v2.js:2218).
+  const ctxOverlay = makeContainer('div', '');
+  ctxOverlay.id = 'ctxoverlay';
+  let hidden = 0;
+  ctxOverlay.hide = function () {
+    hidden += 1;
+    if (this.children.length) { this.removeChild(this.children[this.children.length - 1]); }
+    return true;
+  };
+  const fakePop = makeContainer('div', 'popupedit');
+  ctxOverlay.appendChild(fakePop);
+  sandbox.document.body.appendChild(ctxOverlay);
+
+  started.action.stvqueue(fakePop);
+  check('the dialog closes itself on the way out',
+    hidden === 1 && fakePop.parentNode === null,
+    'hidden=' + hidden);
+  check('every pushed page is closed first',
+    shell.overlay.children.length === 0, String(shell.overlay.children.length));
+  check('the pages are reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('download list: closed 3 page(s)') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  await tick(800);
+  check('the download tab ends up selected',
+    shell.currentIndex() === 4, String(shell.currentIndex()));
+  check('the home tab is selected first, then the download sub-tab',
+    shell.clicks.join(',') === 'main0,sub4', shell.clicks.join(','));
+  check('the jump is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('download tab selected by click') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // A second confirm for a book that is already downloading says so instead of
+  // queueing a duplicate.
+  await menu.action.startdownload.call({ cancel() {} }, popup);
+  await tick(60);
+  const again = (sandbox.__stored.popups || []).slice(-1)[0];
+  check('a duplicate start explains itself in the same dialog',
+    !!again && again.title === '已在下载', again ? again.title : 'no dialog');
+  check('the duplicate start added no job',
+    app.bookDownloaderList.length === 1, String(app.bookDownloaderList.length));
+}
+
 async function testDownloadRange() {
   console.log('download range dialog');
   const chapters = [];
@@ -1780,7 +2143,7 @@ async function testDownloadRange() {
       },
     },
     showPopup(template) {
-      sandbox.__stored.popup = template;
+      (sandbox.__stored.popups = sandbox.__stored.popups || []).push(template);
       return makeContainer('div', 'popupedit');
     },
   };
@@ -3162,6 +3525,8 @@ async function testCommentTranslateProviders() {
   await testReaderDefaults();
 await testChapterNamePlace();
   await testDiagPanel();
+  await testLoggingSwitch();
+  await testActivityLog();
   await testI18nOverlay();
   await testSafeArea();
   await testSafeAreaRespectsSiteValues();
@@ -3175,6 +3540,7 @@ await testBootShell();
   await testDownloadRowControls();
   await testStorageAccessor();
   await testDownloadRange();
+  await testDownloadStartedDialog();
   await testDownloadLifecycle();
   await testDownloadSources();
   await testDownloadCompletion();

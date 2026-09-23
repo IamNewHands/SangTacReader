@@ -52,13 +52,14 @@ SangTacReader/
 
 ## 站点补丁（`plugins/app/.../SitePatch.swift`）
 
-站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 18 个块，
+站点是远程页面，我们唯一的注入点是 `WKUserScript`（document start）。共 19 个块，
 每块独立守卫、互不依赖：
 
 | 块 | 作用 |
 |---|---|
 | `compat` | `nativeclick` 空实现 + `window.TTS` 门面（站点不调则整条点击链抛错） |
-| `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台） |
+| `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台）。**默认关闭**：关着时不存在任何悬浮窗、不缓冲、不接管 console；在「设置 → 诊断」打开后徽标常显、面板立即弹出，开关镜像进 Keychain，重装后仍然有效 |
+| `activityLog` | 常见流程的日志：`PAGE` 每个 `pushPage`/`popPage`、`NAV` 每次标签栏点击（含序号与文案）、`MSG` 每次 `app.toast` / `app.context.info`、`BOOT` app 对象就绪时刻 |
 | `tabProbe` | 临时：点 tab 时上报 tabbar 项宽、指针 transform/width、`tabdiv` transform、末页子节点数 |
 | `storageAccessor` | 替换站点坏掉的 `app.storage.get`（`await prefs.get({key}).value` 恒为 `undefined`），设置/下载记录/历史才读得回来 |
 | `readerDefaults` | iOS 上把阅读器 `display_type` 默认成左右翻页；修「静态章节名称」选过不显示后再也回不来的单程 bug |
@@ -71,7 +72,7 @@ SangTacReader/
 | `domainFailover` | 正文镜像故障转移：回过 `code 7` 的域名不再被选中，`getContent` 出口拦截并换镜像重取 |
 | `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关 |
 | `readerTts` | 正文朗读：句子来源取当前章、失败原因上报、测试语句改中文、退出正文自动停止 |
-| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载对话框「起始章→结束章 + 来源选择」；下载循环自持（无 3s 批间睡眠、失败退避重试、完成后归入已下载并给已下载行加删除按钮）；同一本书不会并发起两个任务，行渲染去重（同一任务只出现一行），未下完的书不再提前出现在「已下载」 |
+| `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载对话框「起始章→结束章 + 来源选择」；点下载后弹「已开始下载」确认窗（带「查看下载」按钮，直接回到书架→下载页；重复点则提示已在下载）；下载循环自持（无 3s 批间睡眠、失败退避重试、完成后归入已下载并给已下载行加删除按钮）；同一本书不会并发起两个任务，行渲染去重（同一任务只出现一行），未下完的书不再提前出现在「已下载」 |
 | `commentTranslate` | 评论 + 社区帖子翻译：标题栏「译全部」（无弹窗，按钮内联进度，评论没加载完就先记下、到了自动翻）、每条评论/每个帖子单独「译／原文」、发帖输入框「译成X」；覆盖书籍评论页与社区各板块（Kênh truyện / Kênh linh tinh / 势力 / 单帖 / 用户主页评论）；引擎按「系统离线 → 免密钥微软通道 → 自备 Key」降级；设置面板用自绘选择器（原生 `select` 在本 webview 里点不开），语言表 49 种可选可搜 |
 | `bootShell` | 首屏外壳：站点 CSS 到位前先把底部标签栏画出来（主题背景 + 载入提示），并记录启动时间线 |
 | `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（中文原名来自 `oridata`，含阅读器 iframe 兜底） |
@@ -110,10 +111,15 @@ node scripts/test-site-patch.js     # 在 stub DOM 里验证每个补丁的行�
 node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 ```
 
-## 诊断面板
+## 诊断面板（日志开关）
 
-侧载包看不到 console，所以出错都进页面面板：**连点左上角三次**打开，`COPY`
-把整个缓冲区放进剪贴板。徽标平时隐藏，出现第一条 `ERR` 才显示。
+**默认关闭**，此时页面上没有任何悬浮窗、不缓冲日志、也不接管 console。
+
+打开方式：**设置 → 诊断 → 日志（悬浮日志窗口）**，点一下那一行即可开关（右侧实时显示
+`已关闭 · 点这里开启` / `已开启 · 点这里关闭`）；下面那行「查看/复制日志」会顺带把开关
+打开并弹出面板。开着时：右侧 24px 徽标**常显**（不再只在出错时冒出来），面板随开关一起
+弹出，`COPY` 把整个缓冲区放进剪贴板，`HIDE` 只收徽标、`CLOSE` 只收面板；**连点左上角三次**
+仍然可以随时开关面板。开关存在 localStorage 并镜像进 Keychain，重装后保持。
 
 面板里的 tag 含义：`Http` 每条原生请求（含 `in <ms>ms` 耗时）、`TTS` 语音合成每次尝试
 与正文朗读的句子数/兜底来源、`FOLLOW` 关注接口探测、`SAFE` 安全区取值、`RECT` 阅读器
@@ -121,9 +127,10 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 遮挡、底栏穿透用）、`SETTINGS` 设置备份/恢复（逐键写出、保留、不可用的数量）、
 `BOOKMARK` 取消书签探测、`BOOKINFO` 评论/详情页缺数据时的补取与缓存预热、
 `COMMENT` 评论按钮拦截、`TITLE` 章节中文原名的获取结果、`DOWNLOAD` 下载限速与任务
-按钮（并发去重、已下载列表过滤）、`TRANSLATE` 评论/帖子翻译（引擎探测、逐条/整页
-结果、设置保存、等待列表加载）、`BOOT` 启动时间线
-（外壳释放时刻 + app/config/标签栏就绪时刻）、`ERR` 错误。
+按钮（并发去重、已下载列表过滤、开始提示窗与跳转下载页）、`TRANSLATE` 评论/帖子翻译
+（引擎探测、逐条/整页结果、设置保存、等待列表加载）、`PAGE` 页面打开/返回、`NAV` 标签栏
+点击、`MSG` 站点弹窗（`app.toast` / `app.context.info`）、`DIAG` 日志开关本身、
+`BOOT` 启动时间线（外壳释放时刻 + app/config/标签栏就绪时刻）、`ERR` 错误。
 
 ## 许可证
 
