@@ -2699,6 +2699,25 @@ async function testTranslateAllWaitsForTheList() {
   check('still no popup anywhere',
     (sandbox.__stored.toasts || []).length === 0,
     JSON.stringify(sandbox.__stored.toasts || []));
+
+  // Pressing it again must not translate the translation, and must not arm a
+  // pending request that would fire on the next unrelated mutation.
+  const before = calls.length;
+  click(all);
+  await tick(150);
+  sandbox.__flushObservers();
+  await tick(120);
+  check('pressing 译全部 again sends nothing new',
+    (sandbox.__stored.translationTranslate || []).length === before,
+    String((sandbox.__stored.translationTranslate || []).length));
+  check('the second press leaves the translation and its original alone',
+    block.querySelectorAll('.cmtcontent')[0].textContent === '【系统】Bình luận muộn'
+      && block.querySelectorAll('.cmtcontent')[0].getAttribute('stv-orig')
+        === 'Bình luận muộn',
+    block.querySelectorAll('.cmtcontent')[0].textContent + ' / '
+      + String(block.querySelectorAll('.cmtcontent')[0].getAttribute('stv-orig')));
+  check('the button does not stay on the waiting label',
+    all.textContent === '译全部', all.textContent);
 }
 
 async function testAutoTranslateWaitsForTheList() {
@@ -2741,6 +2760,17 @@ async function testAutoTranslateWaitsForTheList() {
     calls.length === 1
       && JSON.stringify(calls[0].texts) === JSON.stringify(['Nhận xét tự động']),
     JSON.stringify(calls));
+
+  // A comment pushed in later (the comment channel) is translated too, and the
+  // one already translated is not sent a second time.
+  addCommentBlock(fixture.view, 'Nhận xét muộn');
+  sandbox.__flushObservers();
+  await tick(220);
+  const later = sandbox.__stored.translationTranslate || [];
+  check('auto-translate picks up a comment that arrives later',
+    later.length === 2
+      && JSON.stringify(later[1].texts) === JSON.stringify(['Nhận xét muộn']),
+    JSON.stringify(later));
 }
 
 async function testCommunityBoardTranslate() {

@@ -3819,19 +3819,31 @@ enum SitePatch {
         // Written with single-class selectors on purpose: the site's own q()/qq()
         // (and the test stub that stands in for them) do not implement the
         // descendant or child combinators.
+        //
+        // A node that already carries `stv-orig` (translated, original kept) or
+        // `stv-tr-done` (already sent to an engine, even if the answer matched)
+        // is left alone. Without that, a second 译全部 -- or the auto setting
+        // firing again on a late comment -- would translate the translation and
+        // overwrite the stored original.
         function textTargets(scope) {
             var out = [];
             var blocks = qq(scope, '[view=commentblock]');
             for (var i = 0; i < blocks.length; i++) {
                 var content = q(blocks[i], '.cmtcontent');
-                if (!content) { continue; }
+                if (!content || !content.getAttribute) { continue; }
+                if (content.getAttribute('stv-orig') !== undefined
+                    && content.getAttribute('stv-orig') !== null) { continue; }
+                if (content.getAttribute('stv-tr-done')) { continue; }
                 var comment = textOf(content);
                 if (comment) { out.push({ node: content, kind: 'comment', text: comment }); }
             }
             var wraps = qq(scope, '.postcontent');
             for (var j = 0; j < wraps.length; j++) {
                 var body = q(wraps[j], '.content');
-                if (!body) { continue; }
+                if (!body || !body.getAttribute) { continue; }
+                if (body.getAttribute('stv-orig') !== undefined
+                    && body.getAttribute('stv-orig') !== null) { continue; }
+                if (body.getAttribute('stv-tr-done')) { continue; }
                 var post = textOf(body);
                 if (post) { out.push({ node: body, kind: 'post', text: post }); }
             }
@@ -3841,12 +3853,16 @@ enum SitePatch {
         function applyTranslations(targets, out) {
             var done = 0;
             for (var i = 0; i < targets.length; i++) {
+                var node = targets[i].node;
+                // Recorded even when the answer is unusable, so a page that is
+                // already in the target language is not re-sent on every sweep.
+                node.setAttribute('stv-tr-done', '1');
                 var piece = out[i];
                 if (typeof piece !== 'string' || !piece || piece === targets[i].text) {
                     continue;
                 }
-                targets[i].node.setAttribute('stv-orig', targets[i].node.innerHTML);
-                targets[i].node.textContent = piece;
+                node.setAttribute('stv-orig', node.innerHTML);
+                node.textContent = piece;
                 done++;
             }
             return done;
@@ -3858,6 +3874,12 @@ enum SitePatch {
         function translateAll(page, button) {
             var targets = textTargets(page);
             if (!targets.length) {
+                if (qq(page, '[stv-orig]').length) {
+                    // Nothing left to do: everything here is already translated.
+                    if (button) { button.textContent = '译全部'; }
+                    note('TRANSLATE', 'everything on this page is already translated');
+                    return;
+                }
                 page.__stvPendingAll = true;
                 if (button) { button.textContent = '等加载…'; }
                 note('TRANSLATE', 'nothing loaded yet; translating when it arrives');
@@ -4029,12 +4051,11 @@ enum SitePatch {
             if (!page || page.__stvSweep) { return page ? page.__stvSweep : null; }
             var sweep = function () {
                 decorateAll(page);
-                if (!page.__stvPendingAll && !page.__stvAutoPending) { return; }
+                if (!page.__stvPendingAll && !page.__stvAutoOn) { return; }
                 if (!textTargets(page).length) { return; }
-                var auto = !!page.__stvAutoPending;
+                var manual = !!page.__stvPendingAll;
                 page.__stvPendingAll = false;
-                page.__stvAutoPending = false;
-                var button = auto ? null : q(page, '.stv-translate-all');
+                var button = manual ? q(page, '.stv-translate-all') : null;
                 if (button) { button.textContent = '译全部'; }
                 translateAll(page, button);
             };
@@ -4085,8 +4106,10 @@ enum SitePatch {
                 if (!config.auto) { return; }
                 // The list is filled asynchronously, so arm the sweep rather
                 // than translating an empty page (the device log showed
-                // "还没有可翻译的评论" from exactly that race).
-                page.__stvAutoPending = true;
+                // "还没有可翻译的评论" from exactly that race). The flag stays on
+                // for the life of the page, so comments pushed in later are
+                // translated too -- textTargets() skips what is already done.
+                page.__stvAutoOn = true;
                 if (page.__stvSweep) { page.__stvSweep(); }
             });
         }

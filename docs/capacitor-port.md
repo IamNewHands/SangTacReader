@@ -1259,7 +1259,11 @@ JS 只会拿到一个不透明的桥接错误，没法判断该不该降级。
   文案上（`翻译中…`），结果写进诊断日志，另有自绘的非交互条 `hint()`。
 - **等列表加载**：`loadEmbed()` 是异步的，用户可能先点按钮。此时不再回「还没有可翻译的
   评论」，而是把请求挂起（`page.__stvPendingAll`），`MutationObserver` 一旦看到第一条
-  评论/帖子落地就自动执行。`auto`（自动翻译）同理：只在真正有内容时才发请求。
+  评论/帖子落地就自动执行。`auto`（自动翻译）同理，而且标记在页面存续期间一直有效 ——
+  之后被评论频道推进来的新评论也会被翻。
+- **幂等**：翻过的节点打 `stv-orig`（保留原文）或 `stv-tr-done`（已送过引擎，哪怕译文与
+  原文相同），`textTargets()` 跳过它们。否则再点一次「译全部」会把译文再翻一遍，并覆盖掉
+  存着的原文。
 - 评论是分两批到的：`loadEmbed()` 的首屏渲染，以及之后评论频道推来的新评论。只挂一次
   `MutationObserver` 才能覆盖第二批。
 - 发帖方向不能只写 `innerHTML` 就完事：站点在 `_page_vip.html:4586` 把
@@ -1279,7 +1283,7 @@ JS 只会拿到一个不透明的桥接错误，没法判断该不该降级。
 
 #### 验证
 
-`check-ios-shim`（18 块 / 239432 字节 / 21 markers）、`test-site-patch`（297 条断言，
+`check-ios-shim`（18 块 / 240958 字节 / 21 markers）、`test-site-patch`（301 条断言，
 其中 `comment translation (system offline engine)`、`comment translation without the system
 engine`、`comment translation provider request shapes`、`译全部 waits for the list and opens
 no popup`、`auto-translate waits for the comments to load`、`community boards are translatable`）、
@@ -1365,9 +1369,9 @@ iframe，父页面取不到内部文字，**不支持**；两个 Facebook 按钮
 
 #### 验证（本轮）
 
-- `node scripts/check-ios-shim.js` → 18 块 / 239432 字节 / 21 markers
-- `node scripts/test-site-patch.js` → 297 条断言全过（本轮新增 4 组：并发渲染去重、已下载
-  列表过滤、重复启动忽略、译全部等待 + 无弹窗 + 自动翻译等待 + 社区板块）
+- `node scripts/check-ios-shim.js` → 18 块 / 240958 字节 / 21 markers
+- `node scripts/test-site-patch.js` → 301 条断言全过（本轮新增 4 组：并发渲染去重、已下载
+  列表过滤、重复启动忽略、译全部等待 + 无弹窗 + 幂等 + 自动翻译等待与续翻 + 社区板块）
 - `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments
 
 **未证实项**：`user-select: none` 与原生 `select` 的关系是从日志反推的（真机上点不到），
