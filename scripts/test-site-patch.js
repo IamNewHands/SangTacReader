@@ -1341,6 +1341,19 @@ async function testI18nOverlay() {
   const frame = makeFakeFrame([pinned, frameLabel]);
   sandbox.document.body.appendChild(frame);
 
+  // The site appends its own archive notice to every chapter body. It is in the
+  // chapter text (the iframe for page-flip, the chapter container for scroll),
+  // so it has to come out of both, and nothing around it may move.
+  const frameNotice = makeContainer('p', '', 'Bạn đang đọc bản lưu trong hệ thống');
+  const frameNovel = makeContainer('p', '', 'Hắn quay đầu lại.');
+  const noticeFrame = makeFakeFrame([frameNotice, frameNovel]);
+  sandbox.document.body.appendChild(noticeFrame);
+  const inlineNotice = makeContainer('div', '', '@Bạn đang đọc bản lưu trong hệ thống.');
+  sandbox.document.body.appendChild(inlineNotice);
+  const mixedNotice = makeContainer('p', '',
+    '结尾一句。Bạn đang đọc bản lưu trong hệ thống');
+  sandbox.document.body.appendChild(mixedNotice);
+
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(60);
 
@@ -1378,6 +1391,25 @@ async function testI18nOverlay() {
     pinned.textContent === '第3章 Giao phong', JSON.stringify(pinned.textContent));
   check('only the title pass runs inside the iframe',
     frameLabel.textContent === 'Thêm name 1 nhấp', JSON.stringify(frameLabel.textContent));
+
+  // The archive notice goes, and nothing else does.
+  check('the site archive notice is removed from the chapter body',
+    frameNotice.textContent === '' && frameNotice.parentNode === null,
+    JSON.stringify(frameNotice.textContent) + ' parent='
+      + String(frameNotice.parentNode && frameNotice.parentNode.tagName));
+  check('the novel text next to it is untouched',
+    frameNovel.textContent === 'Hắn quay đầu lại.', JSON.stringify(frameNovel.textContent));
+  check('the notice is removed in the main document too',
+    inlineNotice.textContent === '', JSON.stringify(inlineNotice.textContent));
+  check('a notice appended to a real sentence takes only itself away',
+    mixedNotice.textContent === '结尾一句。', JSON.stringify(mixedNotice.textContent));
+  // The counter, not the panel line: the diagnostics buffer is emptied by the
+  // settings restore a moment after document start, so a line logged during the
+  // document-start sweep is not in it. The count is what proves every notice was
+  // taken exactly once.
+  check('every notice is removed and counted',
+    sandbox.window.__stvI18n.removed() === 3,
+    String(sandbox.window.__stvI18n.removed()));
 
   // Assigning srcdoc navigates the iframe and swaps its document out, so the
   // observer has to be re-armed on the new one or the pinned name stops being
@@ -1434,6 +1466,66 @@ async function testI18nOverlay() {
   check('a list without original names is reported as such',
     String(noOriginalDiag).indexOf('no original chapter names') >= 0,
     String(noOriginalDiag).slice(-200));
+}
+
+/**
+ * The site's settings page can hand its own language setter something that is
+ * not a language. Its language row carries the selection path
+ * "app.config.ux.app_language" together with the onchange
+ * "app.text.changeLanguage('value')" (page-vip:1464), and that onchange is
+ * eval'd with the picked value substituted (page-vip:3646-3649) -- the same code
+ * path the domain row goes through, so the domain's value reaches
+ * changeLanguage. Its failure path is one request to /mobile/lang/<value>.json:
+ * the 2026-09-23 log holds 25 of them, every one a 403, ~500ms apart, starting
+ * the moment the domain row was tapped.
+ */
+async function testLanguageGuard() {
+  console.log('language setter guard');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'auto' });
+  const loads = [];
+  app.lang = {
+    zh: { booklist: '小说列表' },
+    // The site's own loadOnline (app.v2.js:1876) -- one request per call.
+    loadOnline(code) {
+      loads.push(code);
+      return Promise.reject(new Error('403 Forbidden'));
+    },
+  };
+  // The site's own changeLanguage (app.v2.js:1942-1953): a code it does not have
+  // yet is fetched first, and the failure path is a toast.
+  app.text = {
+    changeLanguage(code) {
+      if (!app.lang[code]) {
+        return app.lang.loadOnline(code)
+          .then(() => this.changeLanguage(code))
+          .catch(() => 'toast: Không thể tải ngôn ngữ ' + code);
+      }
+      app.language = code;
+      return code;
+    },
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+  check('the language setter is guarded', app.text.__stvLangGuarded === true);
+
+  const refused = app.text.changeLanguage('https://sangtacviet.app');
+  await app.text.changeLanguage('https://sangtacviet.app');
+  await tick(40);
+  check('a domain is refused before it can become a language request',
+    loads.length === 0 && refused === null, loads.join('|'));
+  check('the refusal names the value that was refused',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('refused a language that is not one: https://sangtacviet.app') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-320));
+  check('the site language is left where it was',
+    app.language === 'vi', String(app.language));
+
+  await app.text.changeLanguage('en');
+  await tick(20);
+  check('a real language code still goes through untouched',
+    loads.join('|') === 'en', loads.join('|'));
 }
 
 async function testReaderTts() {
@@ -3399,7 +3491,7 @@ async function testLikeToggle() {
     String(counter.textContent));
   check('the cancellation is claimed only after the site agrees',
     String(sandbox.window.__stvDiag.text() || '')
-      .indexOf('after unlike: querylikestatus liked=false') >= 0,
+      .indexOf('after unlike(object): querylikestatus liked=false') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-300));
 
   // The site's own render pass still asks the aggregate, which says "liked".
@@ -3437,6 +3529,44 @@ async function testLikeToggle() {
     (stuck.__stored.toasts || []).join('|').indexOf('已取消点赞') < 0
       && String(stuck.window.__stvDiag.text() || '').indexOf('liked=true') >= 0,
     JSON.stringify(stuck.__stored.toasts));
+
+  // The 2026-09-23 log, replayed: unlike answers code 100, and one second later
+  // querylikestatus still lists two rows for the same book -- identical before
+  // and after. Each row carries the row's own id, which is the other key the
+  // endpoint could be deleting by, so the ladder tries those next. Only rows
+  // that are about this book may be used: a row id is a delete key.
+  const ladder = makeSandbox();
+  const ladderApp = installFakeApp(ladder, { displayType: 'auto' });
+  const attempts = [];
+  let rows = [{ type: 'qidian', objectid: '1034915599', id: '2541666' },
+    { type: 'qidian', objectid: '1034915599', id: '2541667' },
+    { type: 'qidian', objectid: '9999999999', id: '424242' }];
+  ladderApp.api.queryLike = () => Promise.resolve(rows.slice());
+  ladderApp.api.unlike = function (host, id) {
+    attempts.push(host + '/' + id);
+    // Only the row-id form deletes anything here, one row per call.
+    rows = rows.filter((row) => String(row.id) !== String(id));
+    return Promise.resolve({ code: 100 });
+  };
+  ladderApp.api.likeBook = () => Promise.resolve({ code: 100 });
+  vm.runInContext(loadBlocks().join('\n'), ladder);
+  await tick(250);
+  await ladderApp.api.likeBook(book);
+  await tick(150);
+  check('the unlike ladder tries the object id first, as the site itself does',
+    attempts[0] === 'qidian/1034915599', attempts.join('|'));
+  check('then every row id the account holds for this book',
+    attempts.join('|') === 'qidian/1034915599|qidian/2541666|qidian/2541667',
+    attempts.join('|'));
+  check('a row that belongs to another object is never used as a delete key',
+    attempts.indexOf('qidian/424242') < 0, attempts.join('|'));
+  check('each attempt is reported with the key it used',
+    String(ladder.window.__stvDiag.text() || '')
+      .indexOf('after unlike(row 2541666)') >= 0,
+    String(ladder.window.__stvDiag.text() || '').slice(-360));
+  check('the cancellation is claimed as soon as a row delete sticks',
+    (ladder.__stored.toasts || []).join('|').indexOf('已取消点赞') >= 0,
+    JSON.stringify(ladder.__stored.toasts));
 
   // The endpoint can be missing (an older mirror build): fall back to the site's
   // own extended status rather than deciding nothing.
@@ -3636,7 +3766,10 @@ async function testExportDownloadedBook() {
       // list's own order has to cover.
       chaptername: index === 2 ? 'Không có số hiệu'
         : 'Chương ' + (index + 1) + ': <mở đầu>',
-      data: '<p>第一段 &amp; 第二段</p><p>第三段</p>',
+      // Every body ends with the site's own archive notice, which must not
+      // reach the exported file.
+      data: '<p>第一段 &amp; 第二段</p><p>第三段</p>'
+        + '<p>@Bạn đang đọc bản lưu trong hệ thống</p>',
     });
   });
 
@@ -3722,6 +3855,9 @@ async function testExportDownloadedBook() {
   check('the chapter markup is reduced to text',
     txtBody.indexOf('第一段 & 第二段') >= 0 && txtBody.indexOf('<p>') < 0,
     txtBody.slice(0, 300));
+  check('the site archive notice is stripped from the exported text',
+    txtBody.indexOf('bản lưu') < 0 && txtBody.indexOf('第三段') >= 0,
+    txtBody.slice(0, 300));
   check('the export is reported to the panel',
     String(sandbox.window.__stvDiag.text() || '').indexOf('read 3 of 3 chapter(s)') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-260));
@@ -3778,6 +3914,17 @@ async function testExportDownloadedBook() {
     byName['OEBPS/chapter-0001.xhtml'].indexOf('第一段 &amp; 第二段') >= 0
       && byName['OEBPS/chapter-0001.xhtml'].indexOf('<h2>第1章 交锋</h2>') >= 0,
     byName['OEBPS/chapter-0001.xhtml'].slice(0, 400));
+  check('the archive notice is stripped from the epub too',
+    byName['OEBPS/chapter-0001.xhtml'].indexOf('bản lưu') < 0
+      && byName['OEBPS/chapter-0001.xhtml'].indexOf('第三段') >= 0,
+    byName['OEBPS/chapter-0001.xhtml'].slice(0, 400));
+  // The body and the headings are Chinese, so the package has to say so: a
+  // declared `vi` makes a reader lay the book out with Vietnamese rules.
+  check('the epub declares the language of the text it carries',
+    byName['OEBPS/content.opf'].indexOf('<dc:language>zh</dc:language>') >= 0
+      && byName['OEBPS/chapter-0001.xhtml'].indexOf('xml:lang="zh"') >= 0
+      && byName['OEBPS/content.opf'].indexOf('<dc:language>vi</dc:language>') < 0,
+    byName['OEBPS/content.opf'].slice(0, 520));
   check('both navigation files carry the Chinese headings',
     byName['OEBPS/nav.xhtml'].indexOf('第1章 交锋') >= 0
       && byName['OEBPS/toc.ncx'].indexOf('第3章 决战') >= 0,
@@ -4622,6 +4769,12 @@ async function testAssetCacheStabiliser() {
     cache.token);
 
   const stable = cache.token;
+  // The generation counter, and deliberately not the date: a date in the token
+  // changes every /asset/ URL at midnight UTC, so the first launch of every day
+  // re-downloads the boot-critical trio even though the server's own
+  // max-age=86400 would have served it from disk or revalidated it for a 304.
+  check('the token carries the generation and not the date',
+    /^stv[0-9]+$/.test(stable), stable);
   // The four cache-busted URLs the shell actually builds.
   check('a random query on a bundle is replaced with the stable token',
     cache.stabilize('/asset/app.v2.js?0.84921') === '/asset/app.v2.js?' + stable,
@@ -4690,6 +4843,20 @@ async function testAssetCacheStabiliser() {
   check('a forced refresh changes the token',
     after.window.__stvAssetCache.token !== stable,
     after.window.__stvAssetCache.token + ' vs ' + stable);
+
+  // The same generation on a later day is the same URL, which is what makes the
+  // second-day cold start hit the disk cache instead of the network.
+  const nextDay = makeSandbox();
+  // Stubbed inside the context: the sandbox's globe is its own realm, so the
+  // host's Date is not the one the blocks call.
+  vm.runInContext('Date.now = function () { return ' + (Date.now() + 3 * 86400000)
+    + '; };', nextDay);
+  installFakeApp(nextDay, { appLanguage: 'zh' });
+  vm.runInContext(loadBlocks().join('\n'), nextDay);
+  await tick(60);
+  check('a later day produces the same token',
+    nextDay.window.__stvAssetCache.token === stable,
+    nextDay.window.__stvAssetCache.token + ' vs ' + stable);
 }
 
 /**
@@ -4865,6 +5032,7 @@ await testChapterNamePlace();
   await testLoggingSwitch();
   await testActivityLog();
   await testI18nOverlay();
+await testLanguageGuard();
   await testSafeArea();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();

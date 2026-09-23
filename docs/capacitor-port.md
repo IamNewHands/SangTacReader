@@ -68,7 +68,10 @@
 14. 站点还有两处「只实现一半」的地方，同样只在我们的包装里补（见 §6.17）：详情页的点赞按钮只发 `ajax=like`（`_page_vip.html:4220` / `app.v2.js:4914`），而取消用的 `app.api.unlike`（`:4917`）没有任何调用方；站点的 `app.v2.css` 只写了无前缀的 `user-select: none`（`body:28` / `.booksquare:89` / `.bookrow:156`），没有 `-webkit-user-select` 也没有 `-webkit-touch-callout`，所以长按弹菜单时 iOS 的选中/放大镜手势仍然生效。范围下载也从不检查磁盘上已有的章节（`clist.slice(start-1, end)` 直接交新任务），重复下一个区间会整段重下并把限速节奏打坏。
 15. **「我赞过这本书吗」这个问题，站点自己也问错了接口**（见 §6.18 (1)）：`updateBookPage`（`app.v2.js:4932`）用 `queryBookExtStatus`（`ajax=querybookmarkstatus`，带 `bookname`/`author`，返回的是**书自己的记录**，同一回复还喂书签和关注）的 `like` 字段当「我的状态」，于是 unlike 成功后它仍会重新点亮按钮。真正对口的接口是 `querylikestatus`（`app.v2.js:4865`，键是 `type:id`，与 `like`/`unlike` 同一套）。我们的包装已改用它并在调用后复查，`updateBookPage` 的判定也换成复查值——站点自身没改。
 16. **「已下载」列表的重复行是我们自己造成的**（见 §6.18 (2)）：任务完成后 `moveJobToDownloaded` 无条件往列表里 `appendChild`，而站点渲染列表用的是按 `(host,id)` 去重的 `store.data`，所以同一本书下第二次就会多一行。已改成按 `data-stvbook` 键先摘旧行、读列表时再折叠一次。
-17. **导出的章节名只有越南语机翻可用，除非去问章节列表**（见 §6.18 (3)）：`readchapter` 不带原名，`oridata` 只在 `getChapterListOnline`（`app.v2.js:270`）出现。导出已改为复用阅读器那套映射；EPUB 的 `dc:language` 仍是 `vi`，未动。
+17. **导出的章节名只有越南语机翻可用，除非去问章节列表**（见 §6.18 (3)）：`readchapter` 不带原名，`oridata` 只在 `getChapterListOnline`（`app.v2.js:270`）出现。导出已改为复用阅读器那套映射；EPUB 的 `dc:language` / `xml:lang` 已在第十七轮改成 `zh`（正文与标题都是中文），见 §6.19 (1)。
+18. **「书本的取消点赞」很可能在站点侧根本不存在**（见 §6.19 (3)）：`app.api.unlike` 全站只有一个调用方，而且是社区帖子（`app.v2.js:5239`）；书籍这条路上站点自己只会 `like`。真机日志显示服务端收下 `ajax=unlike`（`code 100`）却一行都没删，而同一本书的 like 记录有两行。我们的包装已改成阶梯（对象 id → 逐行 id，每条复查），若行 id 也删不动，就只能如实提示失败——或者干脆不让赞加上去（按钮只读），这属于产品取舍，需要用户定。
+19. **每章正文末尾的存档声明是服务端加的**（见 §6.19 (2)）：`Bạn đang đọc bản lưu trong hệ thống` 不在客户端任何文件里，只能在消费正文处剥掉（阅读器 iframe + 导出，共用 `__stvI18n.stripNotice`）。匹配按用户给出的句子做，别的写法会漏。
+20. **冷启动的剩余时间在站点自己的串行链上**（见 §6.19 (4)）：外壳 HTML 的 TTFB ~1.2s，`app.v2.js`（59KB）在它后面，实测站点 UI 到 +2.9s、首页数据到 +10s 才齐。本轮修掉的是我们自己的两处浪费（资源 URL 每天换一次、设置页一次点错连发 25 个 403 的 `/mobile/lang/<域名>.json`）；要再往下压只有把静态资源搬进本地 origin（`docs/optimization-plan-2026-09-23.md` §3/P2），工作量大且回归面广，尚未做。
 
 ## 6. 真机问题档案
 
@@ -1792,5 +1795,157 @@ app.api.queryLike = async function(list){          // app.v2.js:4865
   `[TITLE] export: N of M chapter names for host/id`，下一份日志直接给出命中率；
 - 导出的 EPUB 仍写 `xml:lang="vi"` / `<dc:language>vi`（正文与标题其实都是中文），本轮没动：
   超出本轮反馈范围，且改了会影响越南语读者的排版。
+  → **第十七轮已改**，见 §6.19 (1)。
+
+### 6.19 第十七轮反馈（`日志.txt`，141 行）：导出语言、站点存档声明、取消点赞、首屏慢
+
+本轮日志只有 141 行（18:22:43–18:23:19），但正好压着两件事：一次冷启动的完整时间线，和一次
+被点坏的设置页。
+
+#### 1. 导出的 EPUB 声明成越南语
+
+- 上下文：`buildEpub()` 里 `var lang = 'vi';`，于是 `<dc:language>vi</dc:language>` 与每个
+  XHTML 的 `xml:lang="vi"` 都是越南语，而正文与标题（第十六轮起）都是中文。
+- 影响：iOS 图书这类阅读器会按声明语言排版、断词、选词典和朗读发音。
+- 修法：`lang` 改成 `zh`（站点自己的语言代码就是 `zh`，`/mobile/lang/zh.json`）。
+- 证据：产物复核见下（用 .NET 的 `ZipFile` 打开导出的 EPUB 逐条读）。
+
+#### 2. 正文里站点自己加的存档声明
+
+- 现象：每章正文都带一句 `@Bạn đang đọc bản lưu trong hệ thống`（「你正在阅读系统里的存档副本」），
+  导出的 TXT/EPUB 里也有。
+- 定性：这句话**不在客户端的任何文件里**（`grep` 过仓库里全部 js/html/json 与站点下载下来的
+  `_dl_*`），是服务端塞进 `readchapter` 正文的，所以只能在「消费正文」的两处去掉：阅读器
+  （正文在阅读器的同源 srcdoc iframe 里，主文档的替换扫描进不去）与导出。
+- 修法：**一份定义两处用**。`SiteI18nData.script`（生成物）里加 `stripNotice(text)` +
+  `stripNotices(root)`，主文档 `sweep()`、iframe 的 `sweepFrame()`、以及 iframe 的
+  MutationObserver 回调都调它；导出块调 `window.__stvI18n.stripNotice`，自己不再抄一份规则。
+  只删这一句：句子本身、可选的 `Bạn đang đọc ` 引导语、前面的装饰性 `@`、后面的句读；
+  段落其余部分原样不动，删空了的段落才连元素一起删（否则留一个空行）。
+  这个 pass **不受 SKIP 限制**（站点正文本来就在 SKIP 里、翻译表必须绕开它），但它只认那一句，
+  所以不会把中文原文换成别的字。
+- 验证：桩里三个位置各放一句（iframe 里整段、主文档带 `@` 前缀、`结尾一句。Bạn đang đọc ...`
+  粘在真实句子上），断言前两句清空、第三句只剩 `结尾一句。`、计数 `removed() === 3`；
+  导出的 TXT 与 EPUB 里都不再出现 `bản lưu`，而 `第三段` 仍在。
+
+#### 3. 取消点赞还是失败（这次是「站点没删」）
+
+- 本轮的日志把上一轮的两种可能收窄成了一种。时间线（同一本书 `qidian/1034915599`）：
+  ```
+  18:23:12  querylikestatus → {"list":[{...id:2541666},{...id:2541667}],"code":100}   ← 两行
+  18:23:12  [LIKE] qidian/1034915599 status querylikestatus liked=true raw=[...]
+  18:23:12  unlike → {"status":"success","code":100}
+  18:23:13  querylikestatus → 与上面**逐字节相同**的两行
+  18:23:13  [LIKE] ... after unlike: querylikestatus liked=true raw=[...]
+  18:23:13  取消失败，详见日志
+  ```
+- 两个结论：
+  1. 上一轮改的**状态来源是对的**：`querylikestatus` 返回的是「我赞过的对象」，键是
+     `type:id`——站点自己的社区代码就是这么用的（`app.socialpost.queryLikeStatus`，
+     `app.v2.js:5252-5270`：把 `down.list` 里每个 `objectid` 对应的按钮点亮）。
+  2. 服务端**收下了删除请求却一行都没删**：前后两次查询的行数、行 id 完全一样。
+     注意 `unlike` 自己返回的是 `{"status":"success","code":100}`，也就是说「成功」不等于「删掉了」。
+- 另一个事实：这本书有**两行** like 记录（`id` 2541666 / 2541667）。站点的点赞按钮没有防重复，
+  历史上多轮反复点击就会留下多行。
+- 站点的契约：`app.api.unlike(type,id)` 只有社区在用（`app.v2.js:5239`，
+  `unlike(type, topic.id)`），**书籍这条路上站点自己从不取消**，所以「书本 unlike 该用哪个键」
+  没有任何站点内证据。
+- 修法（阶梯，全部是「有证据才试」的键）：
+  1. 先用站点契约里的**对象 id**（`unlike(host, bookId)`）——这是唯一确定只作用于这本书的形式；
+  2. 复查仍是 liked 时，拿 `querylikestatus` 刚返回的每一行 `id`（上限 3 个）逐条 `unlike`，
+     **每条之后都复查**；
+  3. 只有当行的 `objectid` 确实是这本书（或 `type:id` 键相等）时，那一行的 `id` 才会被当作
+     删除键——行 id 是删除键，不能拿别的对象的行来猜；不是自己的行最多是个 no-op；
+  4. 全都不生效就如实提示 `取消失败：站点没有删除这个赞（见日志）`，绝不谎报。
+  每一次尝试都写一行 `[LIKE] unlike(<object|row NNN>) host/id -> code N raw=...` 与
+  `[LIKE] host/id after unlike(<...>): <来源> liked=<bool> raw=...`，下一份日志能直接看出
+  哪个键真的删得动、还是要认账「站点对书籍没有取消路径」。
+
+#### 4. 首次进入应用仍然慢
+
+日志里的冷启动时间线（这台设备）：
+```
+18:22:43  [BOOT] +10ms document start: app=no config=no navbar=absent
+18:22:44  [BOOT] +1001ms stylesheet: app=no config=no navbar=49px
+18:22:46  [BOOT] shell released at +2889ms (app.v2.css at +2889ms (link load))
+18:22:47  warp.php ×3（721 / 862 / 1217ms）+ bookinfo.php 676ms + lang/zh.json 1265ms
+18:22:47  booklist.php?method=history 1295ms
+18:22:53  searchBooks 1959ms → 首页书单落地
+```
+也就是说：**站点 UI 在 +2.9s 才可用，首页数据在 +10s 才齐**。这一轮能确定并修掉的是两处
+「我们自己的浪费」，剩下的属于站点自身的串行链（外壳 HTML 的 TTFB ~1.2s，`app.v2.js` 59KB
+在它后面；当前能做的结构性解法只有把静态资源搬进本地 origin，工作量大、风险高，见
+`docs/optimization-plan-2026-09-23.md` §3/P2）。
+
+**(a) 资源 token 里的日期**：`assetCache` 的 token 原本是
+`'stv' + generation() + '-' + Math.floor(Date.now() / DAY)`，也就是**每天换一次 URL**。
+后果：每天第一次启动，启动关键路径上的三个文件（`app.v2.js` 59KB + `app.v2.css` 10KB +
+`app.v2.bookdisplay.js` 5KB）必然是全新 URL、必然整包重下；而服务器自己发的是
+`max-age=86400`，本来可以让 WebKit 当天直接读盘、隔天只花一个 304 的代价去校验。
+**日期这一项不但没有收益，还正好把「每天第一次启动」变成最慢的那次。**
+修法：token 只留 `generation`（`stv1`），过期/更新由服务器自己的 `max-age=86400` 兜底，
+站点改版而文件名不变时用设置页「强制刷新站点资源」立刻换代。
+- 测试：桩里把上下文的 `Date.now` 往后推 3 天，token 必须与今天**完全一致**；
+  换 generation 必须变。
+
+**(b) 一次点错设置换来 25 个 403**：
+```
+18:22:58  [TAP] contextmenu → [TAP] div.contextmenuitem → [LOG] app.config.ux.app_domain
+18:23:04  [TAP] contextmenu → [TAP] div.contextmenuitem → [LOG] app.config.ux.app_domain
+18:23:07→19  GET https://sangtacviet.app/mobile/lang/https://sangtacviet.app.json → 403 ×25
+```
+- 链路：站点设置页的语言行是
+  `<contextmenu value="app.config.ux.app_language" onchange="app.text.changeLanguage('value')">`
+  （`_page_vip.html:1464`），而这个 `onchange` 是被 **eval** 出来的：
+  `eval(data.onchange.replace("value", d.value))`（`_page_vip.html:3646-3649`）。日志里
+  `console.log(menu.selection)` 打出的是 `app.config.ux.app_domain`（同一个函数 `:2051`），
+  紧接着 `changeLanguage` 收到的却是域名的值——即被点的那个 `<contextmenu>` 上，
+  `value` 来自域名行、`onchange` 来自语言行。
+- `changeLanguage` 的失败路径是**一次网络请求**（`/mobile/lang/<值>.json`，
+  `app.v2.js:1876/1944`），值不是语言就必然 403：日志里 25 次、每次 ~500ms、串着发。
+- 修法：给 `app.text.changeLanguage` 加一道闸——**不是语言代码就直接拒，不发请求**，
+  并记一行 `[PATCH] refused a language that is not one: <值>`。语言代码的定义按站点自己的三个
+  代码（vi/en/zh）收：字母开头，只允许字母/数字/`-`/`_`，最长 12。
+  这是**不改站点代码**的前提下唯一能落在「坏值进入网络之前」的位置。
+- 测试：模拟站点自己的 `changeLanguage`（`app.v2.js:1942-1953`），连调 3 次域名值 →
+  `loadOnline` 调用次数必须是 0、站点语言不变；再调 `en` → 必须照常发一次请求。
+
+#### 验证（本轮）
+
+- `node scripts/check-ios-shim.js` → 22 块 / 362208 字节 / **42** markers（新增 `rowIds`、
+  `stripNotice`、`bản lưu trong hệ thống`、`refused a language that is not one`；
+  上一轮的 `after unlike:` 标记随日志文案改成 `'unlike(' + label`）
+- `node scripts/test-site-patch.js` → **516 条断言**全过（上一轮 496）。新增/改写：
+  - 存档声明：iframe 内整段被删且元素被摘掉、旁边的正文不动、主文档带 `@` 前缀的也删、
+    粘在真实句子后的只删自己那句、计数 3；
+  - 导出：TXT 与 EPUB 都不含 `bản lưu` 且 `第三段` 仍在；`<dc:language>zh</dc:language>`、
+    `xml:lang="zh"`，且不再出现 `<dc:language>vi</dc:language>`；
+  - 取消点赞阶梯：先对象 id、再逐行 id、**别的对象的行 id 不许当删除键**、每一次都有带键名的
+    日志、行删除生效即提示成功；
+  - 资源 token：`/^stv[0-9]+$/`、把 `Date.now` 推后 3 天 token 不变、换 generation 会变；
+  - 语言闸：域名值三次调用 0 次请求 + 拒绝日志 + 站点语言不变，`en` 仍然照发。
+- `node scripts/gen-site-i18n.js --check` → 458 labels / 35 fragments（生成器模板已同步，
+  `SiteI18nData.swift` 重新生成）
+- 产物复核：`STV_EXPORT_DUMP=1` 后用 .NET `ZipFile` 独立打开 `book.epub` —— 11 个条目、
+  `mimetype` 第 0 个且 `CompressedLength == Length`、`content.opf` 里
+  `<dc:language>zh</dc:language>`、`chapter-0001.xhtml` 的 `xml:lang="zh"` 且正文是
+  `<h2>第1章 交锋</h2><p>第一段 &amp; 第二段</p><p>第三段</p>`（存档声明不在），
+  整个压缩包里搜不到 `bản lưu`；TXT 头部仍是书名/作者/来源，也没有那句话。
+
+**未证实项**：
+
+- 第 3 项：`unlike` 用**行 id** 是否真能删掉，只有真机能回答（本机 `sangtacviet.com` 解析到
+  非公网地址，连不上）。阶梯已经把所有「有依据的键」都试过并逐条复查，下一份日志会给出结论：
+  若出现某一行 `unlike(row NNNN) ... code 100` 之后 `liked=false`，就是行 id 生效；若三次之后
+  仍是 `liked=true`，则站点对「书籍」这一类对象根本没有取消路径（按源码看，站点自己也只在
+  社区帖子上调 `unlike`），届时要么接受「如实提示失败」，要么把点赞按钮改成只读。
+- 第 4 项：**(a)** 的收益需要跨天的两次冷启动对比才能量化（本机看不到 WebKit 的网络层日志，
+  只能看 `[BOOT] shell released at +Nms` 前移多少）；**(b)** 只是把这一次 403 风暴的成因修掉，
+  风暴本身由站点设置页的 onchange 串行引发，若真机日志里出现别的 `refused a language` 行，
+  说明还有别的入口，但代价已被限成一行日志。
+- 「正文里的存档声明」只按用户给的句子做匹配（`bản lưu trong hệ thống`，前缀引导语与 `@`
+  一并吃掉）。若那句话还有别的写法（例如后面跟域名），会留在正文里——`[PATCH] dropped the
+  site archive notice from the chapter body` 这行只代表**至少删掉一条**，看到日志却还残留就
+  把原文发我，按实际写法补。
 
 

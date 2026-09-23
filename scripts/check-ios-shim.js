@@ -52,7 +52,17 @@ const REQUIRED_MARKERS = [
   // like()/unlike() (`querylikestatus`), and the call has to be verified: the
   // aggregate reply re-lights the button and made "已取消点赞" a lie.
   'querylikestatus',
-  'after unlike:',
+  "'unlike(' + label",
+  // The unlike ladder: one key is not enough, so the object id is tried first
+  // and then the row ids querylikestatus hands back, verified after each.
+  'rowIds',
+  // The site's own archive notice is stripped where the chapter text is
+  // consumed -- reader and exporter share the one definition of it.
+  'stripNotice',
+  'bản lưu trong hệ thống',
+  // The settings page can hand changeLanguage a domain instead of a language,
+  // which costs a 403 per call; a value that is not a language is refused.
+  'refused a language that is not one',
   // One DOWNLOADED row per novel: the row is stamped and the finished job drops
   // the row it would otherwise duplicate.
   'data-stvbook',

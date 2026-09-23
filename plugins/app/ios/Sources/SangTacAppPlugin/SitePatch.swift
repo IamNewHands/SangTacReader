@@ -137,11 +137,16 @@ enum SitePatch {
      finished evaluating at +8s -- is refetched over a 300-900ms-TTFB link on
      every cold start.
 
-     This block swaps the random token for a stable one. The lifetime is not
-     invented: max-age=86400 is exactly what the server asked for, and the URL
-     now expresses it. `generation` is bumped by the "强制刷新站点资源" row on the
-     settings page, which changes every URL at once without waiting for the day
-     to roll over.
+     This block swaps the random token for a stable one. The token carries the
+     generation counter and deliberately *not* the date: a date in the token
+     changes every `/asset/` URL at midnight UTC, so the first launch of every
+     day is a guaranteed cold fetch of the whole boot-critical trio (app.v2.js
+     59KB + app.v2.css 10KB + app.v2.bookdisplay.js 5KB) -- while the server's
+     own `max-age=86400` would have let WebKit serve the entry from disk inside
+     the day and revalidate it for the price of a 304 after it. Staleness is
+     bounded by that same 24h, and the "强制刷新站点资源" row on the settings page
+     moves every URL to a new generation at once, which is the escape hatch for
+     a site update that keeps its file names.
 
      Deliberately narrow: only `/asset/` URLs, and only a random-looking
      `?<value>` / `?r=<value>` / `?nocache=<value>` parameter. Real version
@@ -152,7 +157,6 @@ enum SitePatch {
     (function () {
         if (window.__stvAssetCache) { return; }
 
-        var DAY = 86400000;
         var GEN_KEY = 'stv.asset.generation';
 
         function readLocal(key) {
@@ -173,8 +177,9 @@ enum SitePatch {
         }
 
         // One token per page load: every asset in a load has to agree, or the
-        // same file ends up cached under two names.
-        var TOKEN = 'stv' + generation() + '-' + Math.floor(Date.now() / DAY);
+        // same file ends up cached under two names. No date: see the note above
+        // the block -- a daily token is a daily cache miss on the boot path.
+        var TOKEN = 'stv' + generation();
 
         // No backslashes anywhere in these blocks: they are Swift multiline
         // strings, and a backslash reaches JavaScript as a literal backslash.
@@ -2558,35 +2563,44 @@ enum SitePatch {
         // and is never turned into a guess.
         var likedState = {};
 
+        /**
+         The rows behind the answer are returned as well as the answer: when a
+         cancellation does not stick, the row ids are the only other key the
+         unlike endpoint could be deleting by, and guessing one is not an option.
+         */
         function readLiked(book) {
             var api = window.app.api;
             var key = book.host + ':' + book.id;
             if (typeof api.queryLike === 'function') {
                 return Promise.resolve(api.queryLike([key])).then(function (list) {
                     var entries = list && list.length ? list : [];
+                    var rows = [];
                     var liked = false;
                     for (var i = 0; i < entries.length; i++) {
                         var objectid = entries[i] && entries[i].objectid !== undefined
                             ? String(entries[i].objectid) : '';
                         if (!objectid || objectid === String(book.id)
-                            || objectid === key) { liked = true; break; }
+                            || objectid === key) {
+                            liked = true;
+                            rows.push(entries[i]);
+                        }
                     }
-                    return { liked: liked, source: 'querylikestatus',
+                    return { liked: liked, source: 'querylikestatus', rows: rows,
                              raw: String(JSON.stringify(entries)).slice(0, 200) };
                 }, function (error) {
-                    return { liked: null, source: 'querylikestatus',
+                    return { liked: null, source: 'querylikestatus', rows: [],
                              raw: 'rejected: ' + error };
                 });
             }
             if (typeof api.queryBookExtStatus !== 'function') {
-                return Promise.resolve({ liked: null, source: 'none', raw: '' });
+                return Promise.resolve({ liked: null, source: 'none', rows: [], raw: '' });
             }
             return Promise.resolve(api.queryBookExtStatus(book)).then(function (status) {
                 return { liked: status ? !!status.like : null,
-                         source: 'querybookmarkstatus',
+                         source: 'querybookmarkstatus', rows: [],
                          raw: String(JSON.stringify(status)).slice(0, 200) };
             }, function (error) {
-                return { liked: null, source: 'querybookmarkstatus',
+                return { liked: null, source: 'querybookmarkstatus', rows: [],
                          raw: 'rejected: ' + error };
             });
         }
@@ -2673,35 +2687,98 @@ enum SitePatch {
                     });
                 }
 
+                /**
+                 The site's own unlike takes the *object* id (app.v2.js:5239,
+                 socialpost.likeBtnEvent) -- and that is what the sixteenth round
+                 sent. The 2026-09-23 log answers it with code 100 and then shows
+                 the same two rows for the same book still in place, on the
+                 query one second later: accepted, applied to nothing.
+
+                 Every row querylikestatus returns carries the row's own `id`,
+                 which is the other key this endpoint could be deleting by. So
+                 the ladder tries the object id first -- the documented contract,
+                 and the only form that is certainly scoped to this book -- and
+                 then each row the account holds *for this book*, verifying after
+                 every attempt and only claiming the cancellation once the site
+                 agrees. A row id that is not mine can only be a no-op; a delete
+                 that hits a row of mine is exactly what the tap asked for.
+                 */
+                function attempt(id, label) {
+                    return Promise.resolve(api.unlike(book.host, String(id)))
+                        .then(function (down) {
+                            note('LIKE', 'unlike(' + label + ') ' + key + ' -> code '
+                                + (down && down.code) + ' raw='
+                                + String(JSON.stringify(down)).slice(0, 200));
+                            return down;
+                        });
+                }
+
+                function verify(label) {
+                    return readLiked(book).then(function (state) {
+                        note('LIKE', key + ' after ' + label + ': ' + state.source
+                            + ' liked=' + state.liked + ' raw=' + state.raw);
+                        return state;
+                    });
+                }
+
+                function rowIds(state) {
+                    var ids = [];
+                    var rows = (state && state.rows) || [];
+                    for (var i = 0; i < rows.length && ids.length < 3; i++) {
+                        var row = rows[i] || {};
+                        var id = row.id === undefined ? '' : String(row.id);
+                        var objectid = row.objectid === undefined
+                            ? '' : String(row.objectid);
+                        // Only a row that is about this book: a row id is a
+                        // delete key, and borrowing one from another object's row
+                        // is not something this button may do.
+                        if (!id || id === String(book.id)) { continue; }
+                        if (objectid && objectid !== String(book.id)
+                            && objectid !== key) { continue; }
+                        ids.push(id);
+                    }
+                    return ids;
+                }
+
+                function report(state) {
+                    if (state.liked) {
+                        likedState[key] = true;
+                        applyLiked(true);
+                        if (app.toast) { app.toast('取消失败：站点没有删除这个赞（见日志）'); }
+                        return false;
+                    }
+                    likedState[key] = false;
+                    applyLiked(false);
+                    bumpLikedCount(-1);
+                    note('LIKE', 'unliked ' + key);
+                    if (app.toast) { app.toast('已取消点赞'); }
+                    return true;
+                }
+
                 function remove(book) {
                     note('LIKE', key + ' is liked; unliking');
-                    return Promise.resolve(api.unlike(book.host, book.id)).then(function (down) {
-                        note('LIKE', 'unlike ' + key + ' -> code ' + (down && down.code)
-                            + ' raw=' + String(JSON.stringify(down)).slice(0, 200));
+                    return attempt(book.id, 'object').then(function (down) {
                         if (!(down && down.code == 100)) {
                             note('LIKE', 'the server refused the unlike for ' + key
                                 + '; the button is left as the site drew it');
                             return down;
                         }
-                        // Accepted is not the same as done. Ask again, and only
-                        // claim the cancellation once the site agrees -- the
-                        // unconditional toast is what made the reader report
-                        // "提示取消，但是实际没有取消".
-                        return readLiked(book).then(function (state) {
-                            note('LIKE', key + ' after unlike: ' + state.source + ' liked='
-                                + state.liked + ' raw=' + state.raw);
-                            if (state.liked) {
-                                likedState[key] = true;
-                                applyLiked(true);
-                                if (app.toast) { app.toast('取消失败，详见日志'); }
-                                return down;
+                        return verify('unlike(object)').then(function (state) {
+                            if (!state.liked) { report(state); return down; }
+                            var ids = rowIds(state);
+                            var at = 0;
+                            function next() {
+                                if (at >= ids.length) { report(state); return down; }
+                                var rowId = ids[at++];
+                                return attempt(rowId, 'row ' + rowId).then(function () {
+                                    return verify('unlike(row ' + rowId + ')');
+                                }).then(function (again) {
+                                    if (again.liked) { return next(); }
+                                    report(again);
+                                    return down;
+                                });
                             }
-                            likedState[key] = false;
-                            applyLiked(false);
-                            bumpLikedCount(-1);
-                            note('LIKE', 'unliked ' + key);
-                            if (app.toast) { app.toast('已取消点赞'); }
-                            return down;
+                            return next();
                         });
                     }, function (error) {
                         note('ERR', 'unlike failed for ' + book.host + '/' + book.id
@@ -4500,6 +4577,18 @@ enum SitePatch {
         // stores the raw response string). Tags are dropped rather than
         // re-emitted: the source is not well-formed XML, and one stray <br>
         // would make the whole XHTML document unreadable in a strict reader.
+        // The site appends its own archive notice to every chapter body
+        // ("Bạn đang đọc bản lưu trong hệ thống" -- you are reading the copy kept
+        // in the system). It is not ours to keep in an exported book, and it is
+        // not ours to define twice: the reader's copy of this rule lives in the
+        // i18n block, and this asks it. No owner means no stripping rather than
+        // a crash, and the injection order makes the owner present.
+        function stripNotice(text) {
+            var i18n = window.__stvI18n;
+            if (i18n && typeof i18n.stripNotice === 'function') { return i18n.stripNotice(text); }
+            return text;
+        }
+
         function chapterParagraphs(html) {
             var text = String(html === undefined || html === null ? '' : html);
             text = text.replace(BREAK_RE, LF);
@@ -4509,7 +4598,10 @@ enum SitePatch {
             var lines = text.split(LF);
             var out = [];
             for (var i = 0; i < lines.length; i++) {
-                var line = lines[i].replace(TRIM_RE, '');
+                // Stripped before the trim, because the notice is normally a
+                // paragraph of its own and has to disappear whole: a blank line
+                // left behind in the .txt is a visible artefact.
+                var line = stripNotice(lines[i]).replace(TRIM_RE, '');
                 if (line) { out.push(line); }
             }
             return out;
@@ -4855,7 +4947,12 @@ enum SitePatch {
         function buildEpub(book, chapters, cover) {
             var title = titleOf(book);
             var author = book.author || '';
-            var lang = 'vi';
+            // The text this file carries is the translated side of the site:
+            // chapter bodies arrive in Chinese, and since the sixteenth round so
+            // do the headings. Declaring `vi` made a reader such as iOS Books lay
+            // the whole book out with Vietnamese hyphenation, dictionary and
+            // speech rules while showing Chinese characters.
+            var lang = 'zh';
             var manifest = [];
             var spine = [];
             var navPoints = [];

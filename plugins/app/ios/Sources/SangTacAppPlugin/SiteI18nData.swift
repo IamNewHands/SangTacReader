@@ -682,6 +682,81 @@ enum SiteI18nData {
             for (var i = 0; i < nodes.length; i++) { applyChapterTitle(nodes[i]); }
         }
 
+        /**
+         Every chapter body the site hands out ends with the site's own archive
+         notice ("Bạn đang đọc bản lưu trong hệ thống" -- you are reading the copy
+         kept in the system). It is not in any file the client owns: it arrives
+         inside the chapter payload, so the only places to take it out are the two
+         that consume the payload -- here, for the reader, and the same function
+         through window.__stvI18n for the exporter. One definition of what the
+         notice is, not two.
+
+         Only the notice goes: the sentence, an optional "Bạn đang đọc " lead-in, a
+         decorative "@" in front of it and the punctuation behind it. The rest of
+         the paragraph is left exactly as it was, and a second pass is a no-op
+         because the marker is gone.
+         */
+        var NOTICE = 'bản lưu trong hệ thống';
+        var NOTICE_LEAD = 'bạn đang đọc';
+        var removed = 0;
+
+        function stripNotice(text) {
+            var source = String(text === undefined || text === null ? '' : text);
+            var lower = source.toLowerCase();
+            var at = lower.indexOf(NOTICE);
+            if (at < 0) { return source; }
+            var start = at;
+            var lead = lower.lastIndexOf(NOTICE_LEAD, at);
+            if (lead >= 0 && trimText(source.substring(lead + NOTICE_LEAD.length, at)) === '') {
+                start = lead;
+            }
+            while (start > 0) {
+                var before = source.charCodeAt(start - 1);
+                if (before === 64 || before === 32 || before === 9 || before === 160) { start--; }
+                else { break; }
+            }
+            var end = at + NOTICE.length;
+            while (end < source.length) {
+                var after = source.charAt(end);
+                if (after === '.' || after === '!' || after === '。' || after === '！'
+                    || after === ' ') { end++; } else { break; }
+            }
+            return source.substring(0, start) + source.substring(end);
+        }
+
+        function stripNoticeNode(node) {
+            var text = node.nodeValue || '';
+            var next = stripNotice(text);
+            if (next === text) { return; }
+            node.nodeValue = next;
+            removed++;
+            if (removed === 1) {
+                note('PATCH', 'dropped the site archive notice from the chapter body');
+            }
+            // The notice is normally a paragraph of its own, and leaving an empty
+            // one behind would show up as a blank line: drop the element only when
+            // this pass emptied it completely and there is no image inside it.
+            var parent = node.parentNode;
+            if (next || !parent || parent.nodeType !== 1 || parent.textContent) { return; }
+            if (parent.querySelector && parent.querySelector('img')) { return; }
+            if (parent.parentNode) { parent.parentNode.removeChild(parent); }
+        }
+
+        // Walks text nodes only, and deliberately ignores SKIP: the notice lives in
+        // chapter text, which the translation pass is required to stay out of.
+        function stripNotices(root) {
+            if (!root || root.nodeType !== 1) { return; }
+            var children = root.childNodes || [];
+            for (var i = children.length - 1; i >= 0; i--) {
+                var node = children[i];
+                if (node.nodeType === 3) { stripNoticeNode(node); continue; }
+                if (node.nodeType !== 1) { continue; }
+                var tag = node.tagName ? node.tagName.toLowerCase() : '';
+                if (tag === 'script' || tag === 'style' || tag === 'textarea') { continue; }
+                stripNotices(node);
+            }
+        }
+
         function walk(node) {
             if (!node) { return; }
             if (node.nodeType === 3) {
@@ -722,6 +797,7 @@ enum SiteI18nData {
             try {
                 walk(document.body || document.documentElement);
                 fixChapterTitles(document.documentElement);
+                stripNotices(document.documentElement);
             } catch (e) {
                 if (window.__stvDiag) { window.__stvDiag.log('ERR', 'i18n sweep failed: ' + e); }
             }
@@ -729,9 +805,10 @@ enum SiteI18nData {
 
         // The chapter text -- and therefore the pinned chapter name -- lives in a
         // same-origin srcdoc iframe, not in this document, so the main sweep can
-        // never reach it. Only the title pass runs inside frames: walking the whole
-        // frame would put the fragment table on top of novel text, and that table is
-        // only meant for the site's own UI strings.
+        // never reach it. Inside frames only two passes run, neither of which
+        // rewrites the novel: the title pass, and the notice pass. The translation
+        // pass stays out, because putting the fragment table on top of novel text
+        // is exactly what it is not meant for.
         function frameDocument(frame) {
             var doc = null;
             try { doc = frame.contentDocument; } catch (e) { doc = null; }
@@ -743,6 +820,7 @@ enum SiteI18nData {
             if (!doc || !doc.documentElement) { return; }
             try {
                 fixChapterTitles(doc.documentElement);
+                stripNotices(doc.documentElement);
             } catch (e) {
                 if (window.__stvDiag) { window.__stvDiag.log('ERR', 'i18n frame sweep failed: ' + e); }
             }
@@ -753,6 +831,7 @@ enum SiteI18nData {
                 var record = records[i];
                 if (record.target && record.target.nodeType === 1) {
                     fixChapterTitles(record.target);
+                    stripNotices(record.target);
                 }
             }
         }
@@ -1054,6 +1133,44 @@ enum SiteI18nData {
             return true;
         }
 
+        /**
+         The site's settings page can hand its own language setter something that is
+         not a language. Its language row carries the selection path
+         "app.config.ux.app_language" and the onchange
+         "app.text.changeLanguage('value')" (page-vip:1464), and that onchange is
+         eval'd with the picked value substituted (page-vip:3646-3649) -- the same
+         handler stack the domain row goes through, so the domain's value has been
+         seen arriving here: the 2026-09-23 log is 25 requests to
+         /mobile/lang/https://sangtacviet.app.json, ~500ms each, all 403, starting
+         the moment the domain row was tapped.
+
+         changeLanguage's failure path is one request to /mobile/lang/<value>.json,
+         so a value that cannot be a language is refused before it can reach the
+         network. Language codes are letters, digits, "-" and "_": the site's own
+         three are vi, en and zh.
+         */
+        var LANG_CODE = new RegExp('^[A-Za-z][A-Za-z0-9_-]{0,11}$');
+
+        function installLanguageGuard() {
+            var app = window.app;
+            if (!app || !app.text || typeof app.text.changeLanguage !== 'function') { return false; }
+            if (app.text.__stvLangGuarded) { return true; }
+            app.text.__stvLangGuarded = true;
+            var original = app.text.changeLanguage;
+            app.text.changeLanguage = function (langCode) {
+                var code = String(langCode === undefined || langCode === null ? '' : langCode);
+                if (!LANG_CODE.test(code)) {
+                    note('PATCH', 'refused a language that is not one: '
+                        + code.substring(0, 60) + ' (the site stays on '
+                        + (app.language || 'vi') + ')');
+                    return null;
+                }
+                return original.apply(this, arguments);
+            };
+            note('PATCH', 'language setter guarded');
+            return true;
+        }
+
         window.__stvI18n = {
             translate: translate,
             sweep: sweep,
@@ -1061,8 +1178,10 @@ enum SiteI18nData {
             fixChapterTitle: fixChapterTitle,
             chineseChapterName: chineseChapterName,
             chapterNames: chapterNames,
+            stripNotice: stripNotice,
             size: EXACT.length,
-            rewritten: function () { return rewritten; }
+            rewritten: function () { return rewritten; },
+            removed: function () { return removed; }
         };
 
         if (window.MutationObserver) {
@@ -1098,13 +1217,23 @@ enum SiteI18nData {
         // change, so re-scan a handful of times instead of trusting one pass.
         var FRAME_DELAYS = [0, 300, 1000, 2000, 4000, 8000];
         for (var f = 0; f < FRAME_DELAYS.length; f++) {
-            setTimeout(function () { sweep(); attachFrames(); attachContent(); }, FRAME_DELAYS[f]);
+            setTimeout(function () {
+                sweep(); attachFrames(); attachContent(); installLanguageGuard();
+            }, FRAME_DELAYS[f]);
         }
 
         var contentAttempts = 0;
         var contentTimer = setInterval(function () {
             contentAttempts++;
             if (attachContent() || contentAttempts > 600) { clearInterval(contentTimer); }
+        }, 200);
+
+        // app.text.changeLanguage is created with app.text, which can land after
+        // this block: poll for it rather than assume the order.
+        var langAttempts = 0;
+        var langTimer = setInterval(function () {
+            langAttempts++;
+            if (installLanguageGuard() || langAttempts > 600) { clearInterval(langTimer); }
         }, 200);
 
         if (window.__stvDiag) {

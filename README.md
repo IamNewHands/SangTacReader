@@ -59,6 +59,7 @@ SangTacReader/
 | 块 | 作用 |
 |---|---|
 | `compat` | `nativeclick` 空实现 + `window.TTS` 门面（站点不调则整条点击链抛错） |
+| `assetCache` | 站点给 `/asset/*.js|css` 发 `max-age=86400`，却在 URL 上拼 `Math.random()`，于是每次冷启动都是全新 URL、磁盘缓存永不命中。这里把随机串换成稳定 token（`stv<代>`，**不含日期**：带日期等于每天第一次启动强制重下启动关键路径上的 74KB），拦截 `script.src` / `link.href` / `img.src` 的 setter 与 `setAttribute`；`?v=1.360` 这类真版本号一律不动。设置页「强制刷新站点资源」换一代并 reload |
 | `diag` | 页面内诊断面板 `window.__stvDiag`（侧载包没有可读控制台）。**默认关闭**：关着时不存在任何悬浮窗、不缓冲、不接管 console；在「设置 → 诊断」打开后徽标常显、面板立即弹出，开关镜像进 Keychain，重装后仍然有效 |
 | `activityLog` | 常见流程的日志：`PAGE` 每个 `pushPage`/`popPage`、`NAV` 每次标签栏点击（含序号与文案）、`MSG` 每次 `app.toast` / `app.context.info`、`BOOT` app 对象就绪时刻 |
 | `tabProbe` | 临时：点 tab 时上报 tabbar 项宽、指针 transform/width、`tabdiv` transform、末页子节点数 |
@@ -71,13 +72,13 @@ SangTacReader/
 | `gridLayout` | 书架网格：格子不再被强制成第一格的高度、标题两行截断；历史网格换成与书签 tab 同款的 auto-fill 列（1 行 4 个）+ 行不再被拉伸；列表单元与长按菜单补 `-webkit-user-select` / `-webkit-touch-callout`（站点只写了无前缀的 `user-select`，长按弹选项时会顺带选中文字） |
 | `settingsBackup` | 设置与下载记录镜像进 Keychain；等 `storageAccessor` 修好后才恢复，并把值回灌运行中的 `app.config` / `offlineBook.store.data` |
 | `domainFailover` | 正文镜像故障转移：回过 `code 7` 的域名不再被选中，`getContent` 出口拦截并换镜像重取 |
-| `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关；点赞按钮同理——站点有 `ajax=unlike` 却从不调用，这里**改用 `querylikestatus`（与 like/unlike 同一套 `type:id` 键）读状态、调用后再复查一次才敢提示成功**，并把 `updateBookPage` 的 `active` 判定换成复查过的值（它问的 `queryBookExtStatus` 是这本书自己的记录，取消成功后仍是 `like=true`，会把按钮重新点亮——这正是「提示取消但实际没取消」的来源），同时同步 `.liked` 计数 |
+| `bookmarkToggle` | 已收藏时探测取消接口，把书签按钮变成真开关；点赞按钮同理——站点有 `ajax=unlike` 却从不调用，这里**改用 `querylikestatus`（与 like/unlike 同一套 `type:id` 键）读状态、调用后再复查一次才敢提示成功**，并把 `updateBookPage` 的 `active` 判定换成复查过的值（它问的 `queryBookExtStatus` 是这本书自己的记录，取消成功后仍是 `like=true`，会把按钮重新点亮——这正是「提示取消但实际没取消」的来源），同时同步 `.liked` 计数。取消走**阶梯**：先按站点自己的契约用书 id 调 `unlike`，复查仍是 liked 时，再拿 `querylikestatus` 返回的每一行 `id`（本轮的日志里同一本书有两行）逐条重试并逐条复查——只有**属于这本书**的行才会被当作删除键；仍不生效就如实提示，绝不谎报已取消 |
 | `readerTts` | 正文朗读：句子来源取当前章、失败原因上报、测试语句改中文、退出正文自动停止 |
 | `pageRepair` | 评论按钮按需补 `bookinfo`；下载书籍详情页不再空白；下载对话框「起始章→结束章 + 来源选择」；**重复区间只下缺的**（先读 `getChapterDownloaded()`，已下的跳过、全都有就不建任务）；点下载后弹「已开始下载」确认窗（带「查看下载」按钮，直接回到书架→下载页；重复点则提示已在下载）；下载循环自持（无 3s 批间睡眠、失败退避重试、完成后归入已下载并给已下载行加删除/导出按钮）；同一本书不会并发起两个任务，行渲染去重（同一任务只出现一行），未下完的书不再提前出现在「已下载」；**「已下载」按小说维度去重——每行带 `data-stvbook` 键，完成后端进来的行会先摘掉同一本书的旧行，读列表时也按 host/id 折叠记录，所以同一本书永远只有一行、只有一个导出入口**；删除真落盘（站点 `store.remove` 拿的是书对象包装、而 `data` 里存的是记录本体，恒删不掉，这里拆包后再删，并清掉书的单例缓存；章节文件按副本遍历删，避开 `deleteAll` 边遍历边 splice 只删一半的坑；同一本书的残留记录一并清掉）；暂停/继续可用（暂停在重试退避里就生效并保留未下章节，继续会就地解暂停而不是被去重守卫吞掉，重放不会重复插入已下载行） |
-| `downloadExport` | 已下载行的「导出」：TXT（书名/作者/来源 + **中文章节名与序号**）或 EPUB（同样的文字转 XHTML，带封面图、`nav.xhtml` 与 `toc.ncx`，只存不压的 ZIP 写入器），字节交给原生 `App.exportFile` 写进临时目录并弹出系统分享面板；标题来自章节列表的 `oridata`（`readchapter` 只给越南语机翻），无编号时按书内章节位次补 `第N章`，绝不用导出序号（下 15-30 章不会被编成 1-16） |
+| `downloadExport` | 已下载行的「导出」：TXT（书名/作者/来源 + **中文章节名与序号**）或 EPUB（同样的文字转 XHTML，带封面图、`nav.xhtml` 与 `toc.ncx`，只存不压的 ZIP 写入器），字节交给原生 `App.exportFile` 写进临时目录并弹出系统分享面板；标题来自章节列表的 `oridata`（`readchapter` 只给越南语机翻），无编号时按书内章节位次补 `第N章`，绝不用导出序号（下 15-30 章不会被编成 1-16）；正文里站点自己加的存档声明（`bản lưu trong hệ thống`）逐行剥掉，规则与阅读器共用 `__stvI18n.stripNotice`；EPUB 的 `dc:language` / `xml:lang` 是 `zh`（正文与标题都是中文，声明 `vi` 会让阅读器按越南语排版断词） |
 | `commentTranslate` | 评论 + 社区帖子翻译：标题栏「译全部」（无弹窗，按钮内联进度，评论没加载完就先记下、到了自动翻）、每条评论/每个帖子单独「译／原文」、发帖输入框「译成X」；覆盖书籍评论页与社区各板块（Kênh truyện / Kênh linh tinh / 势力 / 单帖 / 用户主页评论）；引擎按「系统离线 → 免密钥微软通道 → 自备 Key」降级；设置面板用自绘选择器（原生 `select` 在本 webview 里点不开），语言表 49 种可选可搜 |
 | `bootShell` | 首屏外壳：站点 CSS 到位前先把底部标签栏画出来（主题背景 + 载入提示），并记录启动时间线 |
-| `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（中文原名来自 `oridata`，含阅读器 iframe 兜底）；另导出 `chapterNames(host,id)` / `chineseChapterName` 供导出复用（`readchapter` 不带原名，只有章节列表有） |
+| `SiteI18nData.script` | 生成物：站点文案中译 + 章节名在 `app.reader.getContent` 源头改写（中文原名来自 `oridata`，含阅读器 iframe 兜底）；另导出 `chapterNames(host,id)` / `chineseChapterName` / `stripNotice` 供导出复用（`readchapter` 不带原名，只有章节列表有）。正文里站点自己加的存档声明在主文档与阅读器 iframe 两处剥掉（只删这一句，段落其余部分不动，空掉的段落才连元素一起删）。另给 `app.text.changeLanguage` 加一道闸：不是语言代码（字母/数字/`-`/`_`，站点只有 vi/en/zh）的值直接拒掉并不发请求——设置页的语言行带着 `onchange="app.text.changeLanguage('value')"`，而那个 onchange 是 eval 出来的（`page-vip:3646`），域名行的值会从这条路进来，一次 `/mobile/lang/https://sangtacviet.app.json` 就是一次 403 |
 
 ## 中文字典流水线
 
@@ -127,9 +128,11 @@ node scripts/gen-site-i18n.js --check   # 生成的中译块与 JSON 同步
 与正文朗读的句子数/兜底来源、`FOLLOW` 关注接口探测、`SAFE` 安全区取值、`RECT` 阅读器
 菜单与页面顶栏的实际几何量 + `#overlay` / `#mainnavbar` 高度 + `--vh100`（定位灵动岛
 遮挡、底栏穿透用）、`SETTINGS` 设置备份/恢复（逐键写出、保留、不可用的数量）、
-`BOOKMARK` 取消书签探测、`LIKE` 点赞状态来源与 like/unlike 结果及复查结论、
+`BOOKMARK` 取消书签探测、`LIKE` 点赞状态来源与 like/unlike 结果及复查结论（每一次阶梯尝试都带用的哪个键）、
 `BOOKINFO` 评论/详情页缺数据时的补取与缓存预热、
 `COMMENT` 评论按钮拦截、`TITLE` 章节中文原名的获取结果（阅读器与导出各一条）、
+`ASSET` 站点资源 URL 稳定化（token 与拦截到的钩子数）、
+`PATCH` 站点文案中译层自己的动作（存档声明剥掉、非语言值被拒），
 `DOWNLOAD` 下载限速与任务
 按钮（并发去重、已下载章节跳过、已下载列表过滤、同一本书的重复行/记录清理、开始提示窗与跳转下载页、删除落盘、
 暂停/继续）、`EXPORT` 导出（读了多少章、跳过了多少、中文章节名的命中数、产物字节数与文件名、交给系统）、
