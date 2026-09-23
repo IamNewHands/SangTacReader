@@ -2131,7 +2131,7 @@ app.api.queryLike = async function(list){          // app.v2.js:4865
 
 #### 验证（本轮）
 
-- `node scripts/check-ios-shim.js` → 22 块 / 377037 字节 / **50** markers（`pageModelText` 换成
+- `node scripts/check-ios-shim.js` → 22 块 / 378919 字节 / **50** markers（`pageModelText` 换成
   `visiblePageText`，新增 `caretRangeFromPoint`、`skipSpill`、`isSpillBlock`、`chaptertopinfo`）
 - `node scripts/test-site-patch.js` → **531 条断言**全过（上一轮 522）。新增：
   - 桩里给文本节点加**渲染行表**（`layoutLines`）+ `caretRangeFromPoint`（`attachCaretModel`），
