@@ -2538,9 +2538,17 @@ async function testDomainFailover() {
     stallFirst === null && stallServed.length === 1 && stallServed[0] === slow
       && stallApp.net.networkManager.bestDomain() === good,
     JSON.stringify([stallServed, stallApp.net.networkManager.bestDomain()]));
+  // Parse before comparing, same as the code-7 case above: the entry is a JSON
+  // object whose `name` field must not equal the banned mirror, and a substring
+  // test could be fooled by the rejected URL appearing inside an unrelated
+  // field or host (CodeQL js/incomplete-url-substring-sanitization).
+  const stallRememberedRaw = stall.localStorage.getItem('stv.domain.good');
+  const stallRememberedName = stallRememberedRaw
+    ? JSON.parse(stallRememberedRaw).name
+    : null;
   check('the stalled mirror is dropped from the remembered entry',
-    String(stall.localStorage.getItem('stv.domain.good') || '').indexOf(slow) < 0,
-    String(stall.localStorage.getItem('stv.domain.good')));
+    stallRememberedName !== slow,
+    String(stallRememberedRaw));
   check('and the panel says what happened',
     /banned: get failed:/.test(stall.window.__stvDiag.text()),
     stall.window.__stvDiag.text().slice(-300));
