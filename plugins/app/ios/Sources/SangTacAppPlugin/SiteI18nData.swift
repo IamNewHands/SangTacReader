@@ -1189,6 +1189,21 @@ enum SiteI18nData {
             try { return String(window.app.reader.getPCN().current.cid); } catch (e) { return ''; }
         }
 
+        // The name the bottom bar should show for the chapter on screen when the
+        // display has none of its own: the original title the chapter list carries,
+        // keyed by cid. Empty when that list is not loaded (a vi/en reader never asks
+        // for it) or the cid is not in it.
+        function originalNameFor(view) {
+            if (!view) { return ''; }
+            var cid = view.cid ? String(view.cid) : '';
+            if (!cid || cid === '0') { return ''; }
+            var app = window.app;
+            var map = titleMaps[app.reader.host + '/' + app.reader.id];
+            if (!map || !map[cid]) { return ''; }
+            var vietnamese = (view.cdata && view.cdata.chaptername) || '';
+            return chineseChapterName(vietnamese, map[cid]) || '';
+        }
+
         // Called once the list arrives: the chapter is already on screen with its
         // Vietnamese name, so rewrite the rendered title and the chapter's own
         // cdata. Keeping cdata in step is what stops updateFixedChapterName()'s
@@ -1252,6 +1267,10 @@ enum SiteI18nData {
                 note('TITLE', 'original chapter names for ' + key + ': ' + usable + ' of '
                     + Object.keys(map).length + ', sample=' + firstChinese(map));
                 applyTitles(host, id);
+                // The bar may already be blank -- it was drawn while the chapter had
+                // no name to give. This is the moment the fallback becomes possible,
+                // so ask the site to draw it again.
+                try { window.app.reader.updateCnameAndProgress(); } catch (e) {}
             }, function (error) {
                 note('ERR', 'chapter name lookup failed for ' + key + ': ' + error);
             });
@@ -1528,6 +1547,19 @@ enum SiteI18nData {
                 }
                 return result;
             };
+            // A display is built in exactly one place (app.v2.read.js:400-416, called
+            // from the reader's own init at :357 and from changeDisplay at :423), so
+            // hooking the builder covers both, and covers a display type the reader
+            // switches to later. The 200ms poll is the belt to this brace.
+            var loadChapterDisplay = app.reader.loadChapterDisplay;
+            if (typeof loadChapterDisplay === 'function' && !app.reader.__stvDisplayNameHook) {
+                app.reader.__stvDisplayNameHook = true;
+                app.reader.loadChapterDisplay = function () {
+                    var display = loadChapterDisplay.apply(this, arguments);
+                    installDisplayName(display);
+                    return display;
+                };
+            }
             note('PATCH', 'reader alert and failed-chapter navigator hooked');
             return true;
         }
@@ -1599,6 +1631,45 @@ enum SiteI18nData {
             return true;
         }
 
+        function currentDisplay() {
+            try { return window.app.reader.getDisplay(); } catch (e) { return null; }
+        }
+
+        // The bar's chapter name comes from the active display and from nowhere else:
+        // app.v2.read.js:877-883 writes .line2 .chaptername with whatever
+        // getChapterNameAndProgress answers. Every display answers with an empty name
+        // while its chapter has no content -- app.v2.chapterdisplay.js:1999-2010
+        // returns "" without cdata, :942 and :3882 do the same for the frame displays
+        // -- and a chapter that needs unlocking never gets cdata, because its body
+        // never arrives. So the bar goes blank on exactly the chapters where it is
+        // the only proof that a < or > tap moved: every locked chapter renders the
+        // same alert page. The 2026-10-03 report is that, verbatim: < switched (the
+        // drawer agreed) but nothing on the reading screen said so.
+        //
+        // Patch the answer, not the DOM: the site keeps its own writer, and the name
+        // it then shows is the original chapter title the overlay has already fetched
+        // for this book (titleMaps, from getchapterlist), so the bar, the drawer and
+        // the exported file agree on one name.
+        function installDisplayName(display) {
+            if (!display) { return false; }
+            var proto = display.constructor && display.constructor.prototype;
+            if (!proto || typeof proto.getChapterNameAndProgress !== 'function') { return false; }
+            if (proto.__stvNameFallback) { return true; }
+            proto.__stvNameFallback = true;
+            var own = proto.getChapterNameAndProgress;
+            proto.getChapterNameAndProgress = function () {
+                var answer = own.apply(this, arguments);
+                if (answer && answer.name) { return answer; }
+                var view = null;
+                try { view = this.getCurrentChapter(); } catch (e) { view = null; }
+                var name = originalNameFor(view);
+                if (!name) { return answer; }
+                return { name: name, progress: answer ? answer.progress : 0 };
+            };
+            note('PATCH', 'the chapter bar keeps a name while the chapter has no content');
+            return true;
+        }
+
         window.__stvI18n = {
             translate: translate,
             sweep: sweep,
@@ -1615,6 +1686,7 @@ enum SiteI18nData {
             sweepAlerts: sweepAlertsIn,
             installReaderFunnels: installReaderFunnels,
             unloadGuard: installChapterUnloadGuard,
+            displayName: installDisplayName,
             size: EXACT.length,
             rewritten: function () { return rewritten; },
             removed: function () { return removed; }
@@ -1670,6 +1742,7 @@ enum SiteI18nData {
             setTimeout(function () {
                 sweep(); attachFrames(); attachContent(); installLanguageGuard();
                 syncSettingLanguage(); installReaderFunnels(); installChapterUnloadGuard();
+                installDisplayName(currentDisplay());
             }, FRAME_DELAYS[f]);
         }
 
@@ -1710,12 +1783,18 @@ enum SiteI18nData {
         // app.reader.showAlert / handlingException are created with app.reader in
         // app.v2.read.js, which the reader prefetch loads once the home screen has
         // painted -- long before a reader is opened, so this lands in time. The
-        // chapter class arrives with app.v2.chapterdisplay.js, right behind it.
+        // chapter class arrives with app.v2.chapterdisplay.js, right behind it, and
+        // the reader's display only exists once a chapter is opened, so both are
+        // retried here until they are hooked.
         var funnelAttempts = 0;
         var funnelTimer = setInterval(function () {
             funnelAttempts++;
-            if ((installReaderFunnels() && installChapterUnloadGuard())
-                || funnelAttempts > 600) { clearInterval(funnelTimer); }
+            var funnels = installReaderFunnels();
+            var unload = installChapterUnloadGuard();
+            var names = installDisplayName(currentDisplay());
+            if ((funnels && unload && names) || funnelAttempts > 600) {
+                clearInterval(funnelTimer);
+            }
         }, 200);
 
         if (window.__stvDiag) {

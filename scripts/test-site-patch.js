@@ -2078,6 +2078,122 @@ async function testChapterUnloadGuard() {
     vm.runInContext('Object.prototype.remove === undefined', frames) === true);
 }
 
+/**
+ * The bottom bar's chapter name is whatever the active display answers
+ * (app.v2.read.js:877-883 writes .line2 .chaptername with it), and every display
+ * answers with an empty name while its chapter has no content -- the page-flip
+ * one at app.v2.chapterdisplay.js:1999-2010, the frame ones at :942 and :3882. A
+ * chapter that needs unlocking never gets content, so the bar went blank on
+ * exactly the chapters where it is the only proof that a < or > tap moved: every
+ * locked chapter renders the same alert page. That is the 2026-10-03 report --
+ * < switched, the drawer agreed, and nothing on the reading screen said so.
+ * Patching the answer rather than the DOM keeps the site's own writer, and the
+ * name it then shows comes from the chapter list the overlay already fetched.
+ */
+async function testChapterBarName() {
+  console.log('chapter bar name while a chapter is locked');
+  const sandbox = makeSandbox();
+  // The class the site builds and hands to app.reader.loadChapterDisplay
+  // (app.v2.read.js:400-416). One class, a factory for it, so that a second
+  // instance shares the prototype the overlay patches.
+  vm.runInContext([
+    'class Display {',
+    '  constructor(v) { this.view = v; }',
+    '  getCurrentChapter() { return this.view; }',
+    '  getChapterNameAndProgress() {',
+    '    if (this.view && this.view.cdata) {',
+    '      return { name: this.view.cdata.chaptername, progress: 5 };',
+    '    }',
+    '    return { name: "", progress: 0 };',
+    '  }',
+    '}',
+    'window.__mkDisplay = function (view) {',
+    '  return new Display(view);',
+    '};',
+  ].join('\n'), sandbox);
+  const display = sandbox.window.__mkDisplay({ cid: '931290000', cdata: null });
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    appLanguage: 'zh',
+    display,
+    oridata: '1-/-931167438-/- 第640章 ta cũng có thể họ Tạ (4k3)'
+      + '-//-1-/-931290000-/- 第641章 京城备战（4k）',
+  });
+  // The site's own writer, minus the element lookup the harness cannot answer
+  // (its querySelectorAll does not resolve descendant selectors). What matters
+  // here is that the bar ends up carrying the name the display answers with.
+  const bar = makeContainer('div', 'chaptername', '');
+  let barUpdates = 0;
+  app.reader.updateCnameAndProgress = function () {
+    barUpdates++;
+    bar.textContent = this.getDisplay().getChapterNameAndProgress().name;
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('the display answer is patched',
+    display.constructor.prototype.__stvNameFallback === true);
+  check('the display is reached through the reader, not a hard-coded class',
+    sandbox.window.__stvI18n.displayName(display) === true);
+
+  // Nothing to say yet: the chapter list has not been asked for, so the site's
+  // own empty answer stands.
+  check('without the chapter list the site answer is left alone',
+    display.getChapterNameAndProgress().name === '',
+    JSON.stringify(display.getChapterNameAndProgress()));
+
+  // Reading the locked chapter is what pulls the list in.
+  await app.reader.getContent('qidian', '1034915599', '931290000');
+  await tick(300);
+  check('a locked chapter now answers with the original title from the list',
+    display.getChapterNameAndProgress().name === '第641章 京城备战（4k）',
+    JSON.stringify(display.getChapterNameAndProgress()));
+  check('the list landing redraws the bar on its own',
+    barUpdates === 1, String(barUpdates));
+  check('the chapter bar carries that name',
+    bar.textContent === '第641章 京城备战（4k）', JSON.stringify(bar.textContent));
+
+  // A chapter that did load keeps the name the site produced for it.
+  display.view = { cid: '931167438', cdata: { chaptername: '第640章 ta cũng có thể họ Tạ (4k3)' } };
+  check('a chapter with content keeps the site name',
+    display.getChapterNameAndProgress().name === '第640章 ta cũng có thể họ Tạ (4k3)',
+    JSON.stringify(display.getChapterNameAndProgress()));
+
+  // The patch is on the class, so a display built later -- a display-type change
+  // builds a new one (app.v2.read.js:420-434) -- answers the same way.
+  const later = sandbox.window.__mkDisplay({ cid: '931290000', cdata: null });
+  check('a display built later answers with the name too',
+    later.getChapterNameAndProgress().name === '第641章 京城备战（4k）',
+    JSON.stringify(later.getChapterNameAndProgress()));
+
+  // A reader whose language never asks for the chapter list keeps the site's
+  // own answer: no invented name.
+  const viSandbox = makeSandbox();
+  vm.runInContext([
+    'class Display {',
+    '  constructor(v) { this.view = v; }',
+    '  getCurrentChapter() { return this.view; }',
+    '  getChapterNameAndProgress() { return { name: "", progress: 0 }; }',
+    '}',
+    'window.__mkDisplay = function (view) {',
+    '  return new Display(view);',
+    '};',
+  ].join('\n'), viSandbox);
+  const viDisplay = viSandbox.window.__mkDisplay({ cid: '931290000', cdata: null });
+  const viApp = installFakeApp(viSandbox, {
+    displayType: 'pageflip',
+    appLanguage: 'vi',
+    display: viDisplay,
+    oridata: '1-/-931290000-/- 第641章 京城备战（4k）',
+  });
+  vm.runInContext(loadBlocks().join('\n'), viSandbox);
+  await tick(400);
+  await viApp.reader.getContent('qidian', '1034915599', '931290000');
+  await tick(300);
+  check('a Vietnamese reader gets no invented name',
+    viDisplay.getChapterNameAndProgress().name === '',
+    JSON.stringify(viDisplay.getChapterNameAndProgress()));
+}
+
 
 /**
  * The reader's error alert -- the unlock message with its "Tải lại" button -- is
@@ -6632,6 +6748,7 @@ await testLanguageGuard();
   await testReaderAlert();
   await testReaderFunnels();
   await testChapterUnloadGuard();
+  await testChapterBarName();
   await testSafeArea();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();

@@ -115,6 +115,10 @@ const REQUIRED_MARKERS = [
   // moved and the body did not.
   'function installChapterUnloadGuard(',
   'chapter unload keeps a real chapter while its own chapter is still loading',
+  // A chapter that needs unlocking never gets cdata, so the display answers the
+  // bottom bar with an empty name -- blanking the only proof that < or > moved.
+  'function installDisplayName(',
+  'the chapter bar keeps a name while the chapter has no content',
   // One DOWNLOADED row per novel: the row is stamped and the finished job drops
   // the row it would otherwise duplicate.
   'data-stvbook',

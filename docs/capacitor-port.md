@@ -3132,6 +3132,77 @@ if (menu.onchange) { menu.onchange(this.data) }  // -> app.text.changeLanguage('
   现在是否一步到位地显示下一章的提示。
 
 
+### 6.30 第二十八轮（真机反馈：`<` 正常了，但待解锁章节底部没有章节名）
+
+用户的输入是同一份日志（353 行，12:19:37–12:20:57）加一句：
+「最新的日志，`<` 切换正常了，待解锁的章节底部不会显示章节名称，`>` 往下切换也是需要解锁的章节时，
+因为底部没章节名，所以不确定到底切换成功了没有，看目录是 `>` 是正常切换的」。
+
+#### (1) 日志先把「修好了什么」和「还缺什么」分开
+
+| 事实 | 证据 |
+|---|---|
+| 装的是上一轮的包，两个补丁都在 | `12:19:37 [PATCH] reader alert and failed-chapter navigator hooked` + `12:19:37 [PATCH] chapter unload keeps a real chapter while its own chapter is still loading` |
+| `<` 现在一次退一章 | `12:19:55` 点 `<` → `previd: 0, prev cid: 931037660` → `preload prev` → `931037660` 拿到 `code 0`；`12:19:58` 再点 → `930925242` 拿到 `code 0`。两次都是一章，且正文都换了 |
+| `>` 一次进一章（连过四个要解锁的章） | `12:20:06` → 当前章 `931535596`、`12:20:10` → `931896641`、`12:20:13` → `932311003`，每步都先 `preload next` 再等 `code 1`；用户自己也说「看目录是 `>` 是正常切换的」 |
+| 失败章的 `previd/nextid` 不再停在 0 | 入口就是解锁章那次：`12:19:52 previd: 0, prev cid: 931167438` → `preload prev`，紧接着 `nextid: 0, nexid: 931535596` → `preload next`（上一轮之前这里永远不会发生） |
+| 名字其实**已经拿到了**，只是又被抹掉 | `12:19:52 [TITLE] original chapter names for qidian/1044096078: 698 of 698` + `[TITLE] chapter 931290000 -> 第641章 京城备战（4k）` —— 覆盖层从章节列表里解出了原名，并且写进了 `.chaptername` |
+
+#### (2) 底栏为什么是空的
+
+底栏的章节名**只有一个写入口**：`app.reader.updateCnameAndProgress()`（`app.v2.read.js:877-883`）
+把 `display.getChapterNameAndProgress().name` 写进 `.line2 .chaptername`。而每个显示器在**自己这一章没有正文**
+时都回答空字符串：
+
+```js
+getChapterNameAndProgress() {                     // PageFlipChapterDisplay，:1999-2010
+    if (this.currentChapter.cdata) { return { name: cdata.chaptername, progress: … }; }
+    return { name: "", progress: 0 };
+}
+```
+
+要解锁的章节**永远拿不到 `cdata`**（`{"code":"1"}` 走 `handlingException` → `showAlert`，从不 `setContent`），
+所以底栏恰好在「它是唯一证据」的那些章节上变空：每一个需要解锁的章节渲染的都是**同一张**提示页，
+正文本身不区分章。旧的那行 `[TITLE]` 写完名字之后，站点自己的下一次
+`updateCnameAndProgress()`（`recycle()` 在每次翻页都会调，`:1768`）又用 `""` 覆盖回去了。
+
+修法：**改答案，不改 DOM**（站点的写入口保持原样，它写什么由显示器的回答决定）：
+
+| 缝 | 位置 | 做什么 |
+|---|---|---|
+| 显示器的回答 | `display.constructor.prototype.getChapterNameAndProgress` | 站点自己回答为空时，用**这一章 cid** 去覆盖层已经拿到的章节列表（`titleMaps`，来自 `getchapterlist`）里取原名；有正文的章节、以及没拉过列表的 vi/en 读者，回答原样透传（`progress` 也照传） |
+| 显示器构建 | `app.reader.loadChapterDisplay`（`:400-416`，被阅读器 init `:357` 与 `changeDisplay` `:423` 调用） | 这是显示器唯一的构造点，挂上它就同时覆盖首开与切换阅读模式；另外 200ms 轮询再兜一次 |
+| 名字到位的时刻 | `chapterTitleMap()` 的成功回调 | 列表落地后主动 `app.reader.updateCnameAndProgress()` 重画一次底栏，否则底栏要等到用户下一次翻页才更新 |
+
+于是底栏、目录、导出文件名用的是**同一份原名**。`app.v2.read.js:2840` 的 TTS/锁屏标题读的也是
+`prog.name`，所以顺带不再是空串。
+
+#### (3) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **455172 字节** / **82 个标记**（新增 `function installDisplayName(`、`the chapter bar keeps a name while the chapter has no content`） |
+| `scripts/test-site-patch.js` | **656 条断言**（上一轮 647，新增 9） |
+| `scripts/gen-site-i18n.js --check` | 459 labels / 40 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言：显示器的回答被打了补丁且**是类级**的（同类的第二个实例也带补丁，覆盖 `changeDisplay`
+造新显示器的情况）；走 `app.reader.getDisplay()` 拿到（不是写死类名）；列表没到之前站点自己的空回答
+原样保留；列表到达后解锁章回答 `第641章 京城备战（4k）`；**列表落地那一下底栏自己就重画了一次**，
+且底栏元素上确实是这个名字；有正文的章节保持站点给的名字；vi 读者不会凭空多出一个名字。
+
+#### 未证实项（下一轮的输入）
+
+- **真机判据**：新包在待解锁章节上底栏应显示该章原名（如 `第641章 京城备战（4k）`），并且连续点 `>`
+  时**每章一个不同的名字**——这就是用户要的「看得出切换成功」。面板里应出现
+  `[PATCH] the chapter bar keeps a name while the chapter has no content`。
+- **底栏与目录同源但不是同一段代码**：两边现在都取 `titleMaps`（同名），但底栏的刷新依赖站点自己的
+  `updateCnameAndProgress()` 被调用；测试只证明了「列表落地会重画 + 每次翻页会重画」，真机上
+  「不动手指时底栏是否立即出现」还没看到。
+- **TTS/锁屏标题**（`app.v2.read.js:2840` 取 `prog.name`）会跟着显示原名，未在真机上确认。
+
+
+
 
 
 
