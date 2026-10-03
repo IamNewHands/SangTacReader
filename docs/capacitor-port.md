@@ -3201,6 +3201,79 @@ getChapterNameAndProgress() {                     // PageFlipChapterDisplay，:1
   「不动手指时底栏是否立即出现」还没看到。
 - **TTS/锁屏标题**（`app.v2.read.js:2840` 取 `prog.name`）会跟着显示原名，未在真机上确认。
 
+### 6.31 第二十九轮（真机反馈两条：Bing TTS 不能用；用户页菜单加右滑退出）
+
+用户的输入是同一份日志（882 行，13:03:38–13:04:37）加两条：
+「Bing TTS 现在不能用，是要做什么配置吗」「储物袋、购买章节记录、设置（含二级设置页）、我的页面等
+都增加往右侧滑退出页面的功能」。
+
+#### (1) Bing TTS：不是配置问题，是 iOS WebKit 播不动它的音频格式
+
+日志里每次点朗读都是同一条异常，一分钟内重复了 40+ 次：
+
+```text
+13:03:38 [ERR] unhandledrejection _initializeFromRetryArgs@…/bingtts.js:318:48
+              startStream@…/bingtts.js:50  speak@…/bingtts.js:387
+13:03:38 [MSG] info: TTS error: TTS request failed(Provider: BingTts, …
+13:04:20 [MSG] info: TTS error: TTS request timeout(Provider: BingTts, …
+```
+
+`bingtts.js:318`（从 `sangtacviet.app` 抓回的站点原文件比对确认）是 `this._mediaSource = new MediaSource`，
+`:239` 是 `addSourceBuffer("audio/webm; codecs=opus")`。**iOS 的 WebKit 没有可用的 MSE + WebM/Opus 解码**，
+流还没建立就在 `new MediaSource` 上死了——之后 WebSocket 永远连不上，30 秒后报 `TTS request timeout`。
+这条路径在安卓 Chrome 上能走，在 iOS 上**整条不可用**；修它等于替站点重写一整套微软混淆流客户端加
+Opus 解码器，不做。按用户要求**去掉**：
+
+| 缝 | 位置 | 做什么 |
+|---|---|---|
+| 引擎列表 | 既有 `ttsProvider` 块的 `installEngineList`（`app.tts.engineList` 包装） | 过滤掉 `value === 'bing'` 的项（过滤在加入 `ios` 项之前，顺序不变） |
+| 旧选择治愈 | 同块的 `tts.setting` 存档读取 | 已存的 `"provider":"bing"` 一次性治愈成 `ios`（日志 `tts provider bing -> ios (no MediaSource on iOS)`）；存档里存了其他 provider 的照旧不动 |
+| 默认值 | 原有逻辑 | 新装机的默认 provider 本来就是 `ios`（iOS 语音（本机），§6.x 引入），不受影响 |
+
+Zalo / FPT / Viettel / 本站语音这四个网络 provider 是普通 HTTPS 请求 + Blob 播放，不走 MSE，保留。
+
+#### (2) 右滑退出：站点自己的 swipe 语义只给了一半页面
+
+站点的页面推入（`app.pushPage`，`app.v2.php` 内联 `:3125-3211`）**已经带**手势钩子：
+模板首元素有 `swipe` 属性时调 `applyDragOut`（`:3173-3180`）→ `ui.dragOut`（`stv.ui.js`）。
+但用户点名的页面里，**储物袋 `pageinventory`、设置 `pagesetting`、购买记录 `buyhistory`、
+阅读/漫画设置 `pagereadersetting`/`pagecomicsetting`、改名包 `pagernamepage` 等模板首元素都没有
+`swipe` 属性**（逐一核对 `_page_vip.html` 的 `<template id="page-*">`），而用户页
+`pageuserhome`、书单 `booklist` 等有——所以是「有的页面能滑、有的不能」，观感就是「没有这功能」。
+
+新 `swipeDismiss` 注入块（独立于站点实现，不依赖模板属性）：
+
+| 关注点 | 做法 |
+|---|---|
+| 挂载点 | 包装 `app.pushPage(name)`：每个推入的页面装一套 touch 手势；启动时对 overlay 里已有的页面补装 |
+| 排除阅读器 | `readchapter`/`readcomic` 与 `chapterview` 容器一律不装，正文左右滑动翻页不受影响 |
+| 不打架的水平滑动 | 储物袋 `<tabdiv>` 分类、tabbar、主题选择条上从**屏幕左缘 80px 内或标题栏**起手才接管，其余位置让给站点自己的横滑 |
+| 滑块保护 | `input[type=range]`（音量/语速/字号）起手直接取消 |
+| 方向判定 | 横向位移 > 8px 且大于纵向才进入拖拽；纵向滚动、向左滑立即放掉 |
+| 跟手与退出 | 拖拽中 `translate3d` 跟手（`preventDefault` 阻止页面横滚）；位移超屏宽 32% 或快速轻拂（速度 > 0.35 px/ms）滑出并 `app.goback()`，否则弹回 |
+| 可观测 | 每次退出日志 `[PAGE] swipe dismiss: <页面名>`；装好时 `[PAGE] swipe-to-dismiss handler ready` |
+
+#### (3) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 24 块 / **464351 字节** / **83 个标记**（新增 `tts provider bing -> ios (no MediaSource on iOS)`） |
+| `scripts/test-site-patch.js` | **665 条断言**（上一轮 656，新增 9） |
+| `scripts/gen-site-i18n.js --check` | 459 labels / 40 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言：`engineList` 不再含 bing（且列表长度 3→2）；存了 `zalo` 的用户选择原样保留；
+存了 `bing` 的被治愈成 `ios` 且补上 `setting.ios` 子对象；右滑手势装到了推入的页面上、
+阅读器页面不装、拖拽跟手、过阈值触发 `app.goback()`。
+
+#### 未证实项（下一轮的输入）
+
+- **真机判据（TTS）**：朗读设置里不再出现 Bing TTS；之前存过 Bing 的设备首次进入朗读设置后
+  面板出现 `tts provider bing -> ios (no MediaSource on iOS)`，朗读直接出声（走 iOS 本机语音）。
+- **真机判据（右滑）**：储物袋、购买记录、设置及二级页、我的页面从屏幕左缘向右滑能退出；
+  储物袋中间区域左右滑仍切换分类；小说正文内左右滑不受影响。
+- 右滑与站点自带 `swipe` 页面（用户主页等）叠加后是否有双触发，未在真机看过。
+
 
 
 

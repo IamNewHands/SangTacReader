@@ -119,6 +119,10 @@ const REQUIRED_MARKERS = [
   // bottom bar with an empty name -- blanking the only proof that < or > moved.
   'function installDisplayName(',
   'the chapter bar keeps a name while the chapter has no content',
+  // Bing TTS speaks through MediaSource with a WebM/Opus buffer, which WebKit
+  // on iOS cannot play -- the entry is dropped and a stored bing choice is
+  // healed to the native provider.
+  'tts provider bing -> ios (no MediaSource on iOS)',
   // One DOWNLOADED row per novel: the row is stamped and the finished job drops
   // the row it would otherwise duplicate.
   'data-stvbook',

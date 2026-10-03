@@ -1620,7 +1620,10 @@ enum SitePatch {
      app.tts.engineList() hands Android a native engine as its first entry
      ("Android TextToSpeech" / value "google") and hands iOS only network
      providers (Bing / Zalo / FPT / Viettel / Sáng Tác Việt). We add the
-     equivalent iOS entry and register a matching provider with ttsEngine.
+     equivalent iOS entry, register a matching provider with ttsEngine, and
+     drop the Bing entry: its /bingtts.js speaks through MediaSource with a
+     WebM/Opus SourceBuffer, which WebKit on iOS does not support, so the
+     provider fails at new MediaSource before any audio.
 
      The provider contract comes from /stv.tts.js: `props` for the settings UI
      and `async speak(text, options)` returning an audio Blob that
@@ -1755,7 +1758,7 @@ enum SitePatch {
             var originalList = app.tts.engineList;
             // The list is a fresh array literal on every call, so renaming in
             // place is safe. Only the Vietnamese-branded entries are renamed;
-            // Bing / Zalo / FPT are brand names either way.
+            // Zalo / FPT are brand names either way.
             var RENAMES = {
                 'Sáng Tác Việt': '本站语音',
                 'Viettelgroup TextToSpeech': 'Viettel 语音'
@@ -1765,6 +1768,17 @@ enum SitePatch {
                 for (var i = 0; i < list.length; i++) {
                     if (list[i] && RENAMES[list[i].name]) { list[i].name = RENAMES[list[i].name]; }
                 }
+                // Bing TTS is dropped, not renamed: the site's /bingtts.js
+                // plays its answer through MediaSource with a WebM/Opus
+                // SourceBuffer, and WebKit ships neither MediaSource for
+                // this use nor a WebM decoder, so every speak() dies at
+                // new MediaSource (bingtts.js:318) before a byte is spoken.
+                var kept = [];
+                for (var k = 0; k < list.length; k++) {
+                    if (list[k] && list[k].value === 'bing') { continue; }
+                    kept.push(list[k]);
+                }
+                list = kept;
                 for (var j = 0; j < list.length; j++) {
                     if (list[j] && list[j].value === 'ios') { return list; }
                 }
@@ -1776,13 +1790,28 @@ enum SitePatch {
             if (setting && setting.provider !== 'ios') {
                 try {
                     app.storage.cache.getFile('tts.setting').then(function (stored) {
-                        if (stored) { return; }
-                        setting.provider = 'ios';
-                        if (!setting.ios) { setting.ios = {}; }
-                        if (typeof setting.set === 'function') { setting.set('provider', 'ios'); }
-                        if (window.__stvDiag) {
-                            window.__stvDiag.log('PATCH', 'tts provider default -> ios');
+                        if (!stored) {
+                            setting.provider = 'ios';
+                            if (!setting.ios) { setting.ios = {}; }
+                            if (typeof setting.set === 'function') { setting.set('provider', 'ios'); }
+                            if (window.__stvDiag) {
+                                window.__stvDiag.log('PATCH', 'tts provider default -> ios');
+                            }
+                            return;
                         }
+                        // A choice of bing saved earlier can never play: heal
+                        // it to the native provider the same way.
+                        try {
+                            var parsed = JSON.parse(stored);
+                            if (parsed && parsed.provider === 'bing') {
+                                setting.provider = 'ios';
+                                if (!setting.ios) { setting.ios = {}; }
+                                if (typeof setting.set === 'function') { setting.set('provider', 'ios'); }
+                                if (window.__stvDiag) {
+                                    window.__stvDiag.log('PATCH', 'tts provider bing -> ios (no MediaSource on iOS)');
+                                }
+                            }
+                        } catch (e) {}
                     }).catch(function () {});
                 } catch (e) {}
             }
@@ -8483,6 +8512,214 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Swipe right to dismiss page
+
+    /**
+     Pushed pages on SangTacViet (such as user settings, inventory, buy history,
+     and other overlay views) are displayed via `app.pushPage(pagename)`. They
+     originally lack any horizontal swipe gesture to exit, forcing users to reach
+     for top back buttons.
+
+     This block hooks `app.pushPage` and adds touch handlers that support:
+       - Edge swiping or titlebar dragging to dismiss.
+       - Smooth translate3d animation and threshold detection.
+       - Disables dismiss gesture on reader pages (`readchapter`, `readcomic`) to
+         preserve book page-turning.
+       - Disables in horizontal scroll tabs (unless dragging from left edge or titlebar).
+     */
+    static let swipeDismiss = """
+    (function () {
+        if (window.__stvSwipeDismissInstalled) { return; }
+        window.__stvSwipeDismissInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        var EXCLUDED = ['readchapter', 'readcomic'];
+
+        function isExcluded(name, page) {
+            if (!name && !page) { return true; }
+            if (name && EXCLUDED.indexOf(name) >= 0) { return true; }
+            if (page && (page.id === 'chapterview' || page.id === 'chapterviewpholder')) { return true; }
+            return false;
+        }
+
+        function installSwipeOnPage(page, pageName) {
+            if (!page || page.nodeType !== 1) { return; }
+            if (page.__stvSwipeDismissInstalled) { return; }
+            page.__stvSwipeDismissInstalled = true;
+
+            if (isExcluded(pageName, page)) { return; }
+
+            var startX = 0;
+            var startY = 0;
+            var startTime = 0;
+            var isDragging = false;
+            var isCancelled = false;
+
+            page.addEventListener('touchstart', function (event) {
+                if (!event.touches || event.touches.length !== 1) {
+                    isCancelled = true;
+                    return;
+                }
+                var touch = event.touches[0];
+                startX = touch.clientX;
+                startY = touch.clientY;
+                startTime = Date.now();
+                isDragging = false;
+                isCancelled = false;
+
+                var target = event.target;
+                var tag = target && target.tagName ? String(target.tagName).toLowerCase() : '';
+                var inputType = target && target.getAttribute ? target.getAttribute('type') : '';
+                if (tag === 'input' && inputType === 'range') {
+                    isCancelled = true;
+                    return;
+                }
+
+                var node = target;
+                var onTitlebar = false;
+                var isHScroll = false;
+                while (node && node !== page && node.nodeType === 1) {
+                    var nodeTag = String(node.tagName || '').toLowerCase();
+                    var nodeClass = String(node.className || '');
+                    if (nodeClass.indexOf('titlebar') >= 0) {
+                        onTitlebar = true;
+                    }
+                    if (nodeTag === 'tabdiv' || nodeTag === 'tabbar' || nodeClass.indexOf('themesetchoose') >= 0) {
+                        isHScroll = true;
+                    }
+                    node = node.parentElement || node.parentNode;
+                }
+
+                var isEdge = (startX <= 80);
+
+                if (isHScroll && !isEdge && !onTitlebar) {
+                    isCancelled = true;
+                    return;
+                }
+
+                var screenW = window.innerWidth || 375;
+                if (!isEdge && !onTitlebar && startX > screenW * 0.45) {
+                    isCancelled = true;
+                    return;
+                }
+            }, { passive: true });
+
+            page.addEventListener('touchmove', function (event) {
+                if (isCancelled || !event.touches || event.touches.length !== 1) { return; }
+                var touch = event.touches[0];
+                var dx = touch.clientX - startX;
+                var dy = touch.clientY - startY;
+
+                if (!isDragging) {
+                    var absDx = Math.abs(dx);
+                    var absDy = Math.abs(dy);
+
+                    if (absDy > absDx && absDy > 8) {
+                        isCancelled = true;
+                        return;
+                    }
+
+                    if (dx < -8) {
+                        isCancelled = true;
+                        return;
+                    }
+
+                    if (dx > 8 && dx > absDy) {
+                        isDragging = true;
+                    }
+                }
+
+                if (isDragging) {
+                    if (event.cancelable) { event.preventDefault(); }
+                    event.stopPropagation();
+
+                    var offset = Math.max(0, dx);
+                    page.style.transform = 'translate3d(' + offset + 'px,0,0)';
+                    page.style.transition = 'none';
+                }
+            }, { passive: false });
+
+            function onTouchFinish(event) {
+                if (!isDragging) { return; }
+                isDragging = false;
+
+                var touch = (event.changedTouches && event.changedTouches[0])
+                    || (event.touches && event.touches[0]);
+                var currentX = touch ? touch.clientX : startX;
+                var dx = currentX - startX;
+                var elapsed = Date.now() - startTime;
+                var velocity = elapsed > 0 ? (dx / elapsed) : 0;
+                var screenW = window.innerWidth || document.body.scrollWidth || 375;
+                var threshold = screenW * 0.32;
+
+                var shouldExit = (dx > threshold) || (dx > 45 && velocity > 0.35);
+
+                if (shouldExit) {
+                    var remaining = screenW - dx;
+                    var duration = Math.min(0.24, Math.max(0.12, remaining / 1200));
+                    page.style.transition = 'transform ' + duration + 's cubic-bezier(0.2, 0.9, 0.3, 1)';
+                    page.style.transform = 'translate3d(100vw,0,0)';
+                    note('PAGE', 'swipe dismiss: ' + (pageName || 'page'));
+                    setTimeout(function () {
+                        var app = window.app;
+                        if (app && typeof app.goback === 'function') {
+                            app.goback();
+                        } else if (app && typeof app.popPage === 'function') {
+                            app.popPage();
+                        }
+                    }, Math.floor(duration * 1000));
+                } else {
+                    page.style.transition = 'transform 0.2s ease-out';
+                    page.style.transform = 'translate3d(0,0,0)';
+                    setTimeout(function () {
+                        page.style.transition = '';
+                        page.style.transform = '';
+                    }, 200);
+                }
+            }
+
+            page.addEventListener('touchend', onTouchFinish, { passive: true });
+            page.addEventListener('touchcancel', onTouchFinish, { passive: true });
+        }
+
+        function hookPushPage() {
+            var app = window.app;
+            if (!app || typeof app.pushPage !== 'function') { return false; }
+            if (app.__stvSwipeDismissHooked) { return true; }
+            app.__stvSwipeDismissHooked = true;
+            var original = app.pushPage;
+            app.pushPage = function (name) {
+                var page = original.apply(this, arguments);
+                try {
+                    installSwipeOnPage(page, name);
+                } catch (error) {
+                    note('ERR', 'swipe dismiss hook: ' + (error && error.message));
+                }
+                return page;
+            };
+
+            var overlay = document.getElementById('overlay') || window.overlay;
+            if (overlay && overlay.children) {
+                for (var i = 0; i < overlay.children.length; i++) {
+                    installSwipeOnPage(overlay.children[i], '');
+                }
+            }
+            note('PAGE', 'swipe-to-dismiss handler ready');
+            return true;
+        }
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            var ready = hookPushPage();
+            if (ready || attempts > 2500) { clearInterval(timer); }
+        }, 20);
+    })();
+    """
+
     // MARK: - Reader module prefetch
 
     /**
@@ -8598,5 +8835,5 @@ enum SitePatch {
                                 keyboardPopup, gridLayout, settingsBackup,
                                 bookmarkToggle, readerTts,
                                 pageRepair, downloadExport, commentTranslate,
-                                readerPrefetch]
+                                swipeDismiss, readerPrefetch]
 }

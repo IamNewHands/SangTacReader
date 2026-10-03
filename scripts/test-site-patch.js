@@ -1190,13 +1190,31 @@ async function testCompatAndTtsProvider() {
 
   const list = sandbox.app.tts.engineList();
   check('engineList lists iOS first', list[0].value === 'ios', JSON.stringify(list));
-  check('engineList keeps the network providers', list.length === 3);
+  check('engineList keeps the network providers', list.length === 2);
+  check('engineList drops the Bing entry', list.every((entry) => entry.value !== 'bing'),
+    JSON.stringify(list));
   check('setting.ios exists (loadProviderOption dereferences it)', !!sandbox.app.tts.setting.ios);
   check('provider defaulted to ios on a fresh install', sandbox.app.tts.setting.provider === 'ios');
 }
 
 async function testTtsProviderRespectsStoredChoice() {
-  console.log('tts provider respects an existing choice');
+  console.log('tts provider respects a stored non-bing choice');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    provider: 'zalo',
+    storedTtsSetting: '{"provider":"zalo","rate":1.5,"zalo":{}}',
+  });
+  sandbox.ttsEngine = { createProvider() {} };
+  sandbox.window.ttsEngine = sandbox.ttsEngine;
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('stored provider untouched', sandbox.app.tts.setting.provider === 'zalo');
+  check('ios still offered in engineList', sandbox.app.tts.engineList()[0].value === 'ios');
+}
+
+async function testTtsProviderHealsStoredBing() {
+  console.log('tts provider heals a stored bing choice');
   const sandbox = makeSandbox();
   installFakeApp(sandbox, {
     displayType: 'pageflip',
@@ -1207,8 +1225,10 @@ async function testTtsProviderRespectsStoredChoice() {
   sandbox.window.ttsEngine = sandbox.ttsEngine;
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(400);
-  check('stored provider untouched', sandbox.app.tts.setting.provider === 'bing');
-  check('ios still offered in engineList', sandbox.app.tts.engineList()[0].value === 'ios');
+  check('stored bing provider is healed to ios', sandbox.app.tts.setting.provider === 'ios');
+  check('healed setting exposes the ios sub-object', !!sandbox.app.tts.setting.ios);
+  check('bing no longer offered in engineList',
+    sandbox.app.tts.engineList().every((entry) => entry.value !== 'bing'));
 }
 
 async function testReaderDefaults() {
@@ -6734,9 +6754,65 @@ async function testNativeDiagnosticsBridge() {
     String(diag.text()).slice(-200));
 }
 
+async function testSwipeDismiss() {
+  console.log('swipe right to dismiss page');
+
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { appLanguage: 'zh' });
+
+  let gobackCalled = false;
+  sandbox.window.app.goback = () => { gobackCalled = true; };
+  sandbox.window.app.pushPage = (name) => {
+    const page = makeElement('page');
+    page.id = name;
+    return page;
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  check('app.pushPage is wrapped for swipe dismiss',
+    sandbox.window.app.__stvSwipeDismissHooked === true);
+
+  const invPage = sandbox.window.app.pushPage('pageinventory');
+  check('pushed page receives touchstart listener',
+    Boolean(invPage.listeners.touchstart && invPage.listeners.touchstart.length));
+
+  const readerPage = sandbox.window.app.pushPage('readchapter');
+  check('excluded reading page does not install swipe handlers',
+    !readerPage.listeners.touchstart || !readerPage.listeners.touchstart.length);
+
+  invPage.dispatchEvent({
+    type: 'touchstart',
+    touches: [{ clientX: 20, clientY: 100 }],
+    target: invPage,
+  });
+
+  invPage.dispatchEvent({
+    type: 'touchmove',
+    touches: [{ clientX: 180, clientY: 105 }],
+    cancelable: true,
+    preventDefault: () => {},
+    stopPropagation: () => {},
+  });
+
+  check('swipe drag updates transform translate3d',
+    String(invPage.style.transform).indexOf('translate3d') >= 0);
+
+  invPage.dispatchEvent({
+    type: 'touchend',
+    changedTouches: [{ clientX: 200, clientY: 105 }],
+  });
+
+  await tick(300);
+  check('swiping past threshold triggers app.goback()',
+    gobackCalled === true);
+}
+
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
+  await testTtsProviderHealsStoredBing();
   await testReaderDefaults();
 await testChapterNamePlace();
   await testDiagPanel();
@@ -6786,6 +6862,7 @@ await testBootShell();
   await testTranslateKeyStorage();
   await testAssetCacheStabiliser();
   await testAssetMirror();
+  await testSwipeDismiss();
   testInjectionOrder();
   await testReaderPrefetch();
   await testNativeDiagnosticsBridge();
