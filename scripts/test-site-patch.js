@@ -1664,6 +1664,19 @@ async function testI18nOverlay() {
   const notifyPlain = makeContainer('div', 'content', 'Bạn đã thay đổi mật khẩu');
   sandbox.document.body.appendChild(notifyPlain);
 
+  // The 修炼 row of the user page prints the server's danh hào
+  // (/mobile/userinfo.php `danhhao`), which is a Vietnamese realm name plus a
+  // layer. The site never sends the Chinese: the pairs below were taken from
+  // live userinfo.php responses and each Chinese side was confirmed character
+  // by character against the site's own Chinese -> Han-Viet dictionary
+  // (site-assets/hanviet.js), so the mapping is a reading, not a guess.
+  const danhhao = makeContainer('div', 'value danhhao', 'Thông Thần Tứ Trọng');
+  sandbox.document.body.appendChild(danhhao);
+  const danhhaoFull = makeContainer('div', 'value danhhao', 'Hiển Thánh Viên Mãn');
+  sandbox.document.body.appendChild(danhhaoFull);
+  const danhhaoLow = makeContainer('div', 'value danhhao', 'Phàm nhân');
+  sandbox.document.body.appendChild(danhhaoLow);
+
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(60);
 
@@ -1683,6 +1696,15 @@ async function testI18nOverlay() {
   check('the same notice without the IP is translated too',
     notifyPlain.childNodes[0].nodeValue === '您已修改密码',
     JSON.stringify(notifyPlain.childNodes[0].nodeValue));
+  check('a realm plus a numbered layer is translated',
+    danhhao.childNodes[0].nodeValue === '通神四重',
+    JSON.stringify(danhhao.childNodes[0].nodeValue));
+  check('a realm plus a 圆满 layer is translated',
+    danhhaoFull.childNodes[0].nodeValue === '显圣圆满',
+    JSON.stringify(danhhaoFull.childNodes[0].nodeValue));
+  check('the base realm is translated',
+    danhhaoLow.childNodes[0].nodeValue === '凡人',
+    JSON.stringify(danhhaoLow.childNodes[0].nodeValue));
   check('placeholder attribute translated', input.getAttribute('placeholder') === '标题',
     JSON.stringify(input.getAttribute('placeholder')));
   check('chapter title numbering translated', chapterName.textContent === '第1章 Uống thuốc',

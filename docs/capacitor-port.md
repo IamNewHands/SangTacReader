@@ -3465,3 +3465,70 @@ buffer 再播一次**——而那个播放图已经不出声了。
 - 站点 tokenizer 生效的章节若再产生同类碎片，原生那层会保留中文发音人，但**那个引号仍会被念一声**——
   要彻底消掉得在站点 tokenizer 的出口也过滤，本轮没动它。
 
+### 6.35 第三十三轮（真机反馈两条：通知列表里的越南语；用户页「修炼」那行的名号）
+
+用户的输入是一条文字加一张截图：① 用户页铃铛打开的通知列表「里面的内容还是越南语」；
+② 用户页「修炼」那一行「没有翻译修炼对应的值，中文语言时还是显示越南语」，并确认
+左边已经是「修炼」、右边是越南语名号。
+
+#### (1) 通知列表：站点自己写的提示不在 notificationReplace 的四类模板里
+
+`app.fun.showNotify()`（page-vip:4607）取 `/mobile/jsonify.php?ajax=getnotify`，每条 content 只过
+`app.text.notificationReplace`（app.v2.js:1913）——那个函数只认四类模板（章节更新、三种评论回复），
+命中的走 `app.text.f.*`，所以截图里章节更新那几条已经是中文（`《{0}》来自{1}有{2}个新章节`）。
+其余 content 原样进 DOM，中译层里没有对应词条，于是「Bạn đã thay đổi mật khẩu, IP: …」整条还是越南语。
+
+修法：`data/site-i18n.json` 的 fragments 加两条（带 IP 的在前，长串先命中）：
+
+| vi | zh |
+| --- | --- |
+| `Bạn đã thay đổi mật khẩu, IP: ` | `您已修改密码，IP：` |
+| `Bạn đã thay đổi mật khẩu` | `您已修改密码` |
+
+通知正文进的是 `.notify > .content`，不在 SKIP 名单里，主文档的 walk 能覆盖，不需要新钩子。
+
+#### (2)「修炼」那行的名号：站点发的是越南语，中文只能反推
+
+`view-usermeinfo` 里 `<div class="sectionname"><text>cv_level</text></div>` 由站点自己的
+`/mobile/lang/zh.json` 翻成「修炼」（标签本来就是对的）；右边 `<div class="value danhhao">` 由
+`app.render` → `app.assign`（page-vip:3455 起）按类名从 `app.user.info` 取 `danhhao`，
+而 `danhhao` 来自 `/mobile/userinfo.php`，是**服务器写好的越南语**，客户端拿不到中文原文。
+
+所以只有一条路：把越南语名号映射回中文。名号 = `<境界> <层>`，两层都是有限集合，于是先取证：
+
+| 取证 | 做法 |
+| --- | --- |
+| 名号实际取值 | 逐个拉 `https://sangtacviet.com/mobile/userinfo.php?target=<uid>`（`app.user.getUser` 用的同一个口）取 `danhhao` |
+| 中文写法 | 站点自带 `hanviet.js`（16838 条 汉字→Hán Việt）。候选中文串逐字查它，读音与服务器发来的越南语逐音节比对；**21 条里 20 条完全吻合** |
+
+实测到的境界：`Phàm nhân`(凡人)、`Phong Vương`(封王)、`Hiển Thánh`(显圣)、`Chúa Tể Lĩnh Vực`(主宰领域)、
+`Đạo Tôn`(道尊)、`Thư Đạo Chí Tôn`(书道至尊)、`Vạn Đạo Vô Ngân`(万道无垠)、`Thông Thần`(通神)；
+层：`Nhất..Cửu Trọng`(一重..九重)、`Sơ/Trung/Hậu Kỳ`(初/中/后期)、`Viên Mãn`(圆满)。
+
+修法：fragments 加 8 条境界 + 13 条层。层的词条**带前导空格**（`' Tứ Trọng'`），
+因为服务器发的是「境界 + 空格 + 层」，带空格的词条把那个空格一起吃掉，输出才是「通神四重」而不是「通神 四重」。
+
+唯一没被词典证实的是 `Chúa Tể Lĩnh Vực`：`hanviet.js` 给 `主宰领域` 的读音是 `Chủ Tể Lĩnh Vực`，
+服务器发的是 `Chúa Tể`——那是越南语**意译**（chúa tể = 主宰），不是读音。按语义取 `主宰领域`。
+
+#### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **686 条断言**（上一轮 681，新增 5：通知带 IP / 不带 IP、名号三段） |
+| `scripts/check-ios-shim.js` | 24 块 / 479677 字节 / 83 标记 |
+| `scripts/gen-site-i18n.js --check` | 459 标签 / **63 片段** |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+#### 未证实项
+
+- 真机复测：通知列表里「修改密码」那条是否变中文；用户页「修炼」右边的名号是否变中文。
+- **境界表可能不全**：8 条境界是从 uid 1 / 2 / 1000 / 20000 / 25000 / 50000 / 60000 / 100000 / 120000 /
+  150000 / 220000 / 250000 / 300000 / 350000 的 `danhhao` 里收的；uid 与修为不相关
+  （349080 只读 3562 章却是 `Đạo Tôn Sơ Kỳ`），所以没法按 uid 系统采样。若真机上名号仍是越南语，
+  把原文发过来加一条 fragment 即可。
+- 站点自己的 `manhtan.pdf`（萌新指南 §5）列的**境界**是另一套（Võ Đồ / Võ Sư / … / Thái Thượng，12 阶），
+  与名号这套不重合，指南里也没有名号，那张表帮不上忙。
+- 服务器偶尔发双空格（实测 `"Đạo Tôn  Sơ Kỳ"`）：带前导空格的词条只吃掉一个，那条会剩一个空格。
+
+

@@ -528,7 +528,28 @@ enum SiteI18nData {
             ['Mở khóa chương này', '解锁本章'],
             ['truy cập cài đặt để xem chi tiết', '请进入设置查看详情'],
             ['Bạn đã thay đổi mật khẩu, IP: ', '您已修改密码，IP：'],
-            ['Bạn đã thay đổi mật khẩu', '您已修改密码']
+            ['Bạn đã thay đổi mật khẩu', '您已修改密码'],
+            ['Thư Đạo Chí Tôn', '书道至尊'],
+            ['Vạn Đạo Vô Ngân', '万道无垠'],
+            ['Chúa Tể Lĩnh Vực', '主宰领域'],
+            ['Phong Vương', '封王'],
+            ['Hiển Thánh', '显圣'],
+            ['Thông Thần', '通神'],
+            ['Phàm nhân', '凡人'],
+            ['Đạo Tôn', '道尊'],
+            [' Viên Mãn', '圆满'],
+            [' Nhất Trọng', '一重'],
+            [' Nhị Trọng', '二重'],
+            [' Tam Trọng', '三重'],
+            [' Tứ Trọng', '四重'],
+            [' Ngũ Trọng', '五重'],
+            [' Lục Trọng', '六重'],
+            [' Thất Trọng', '七重'],
+            [' Bát Trọng', '八重'],
+            [' Cửu Trọng', '九重'],
+            [' Sơ Kỳ', '初期'],
+            [' Trung Kỳ', '中期'],
+            [' Hậu Kỳ', '后期']
         ];
 
         // [viPrefix, viSuffix, zhPrefix, zhSuffix] for messages whose middle part is
