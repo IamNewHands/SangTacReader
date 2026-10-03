@@ -84,6 +84,27 @@ const REQUIRED_MARKERS = [
   // The settings page can hand changeLanguage a domain instead of a language,
   // which costs a 403 per call; a value that is not a language is refused.
   'refused a language that is not one',
+  // ...and the overlay itself is a Vietnamese -> Chinese layer, so it may only
+  // rewrite anything while the reader has actually asked for Chinese. The
+  // language is resolved from the site's own "lang" cookie first.
+  'function chineseUi(',
+  'function currentLanguage(',
+  // Switching language has to re-render the page from the new cookie, or the
+  // strings the overlay already rewrote stay Chinese and the page is left
+  // half-translated -- which is the report this round answers.
+  'function reloadForLanguage(',
+  'language switched to ',
+  // The first launch adopts the device's language, which the web view cannot
+  // know (its navigator.language is the app's localisation, and the Capacitor
+  // template ships English only), so native hands it down.
+  'window.__stvDeviceLang',
+  'first launch: language seeded to ',
+  // The reader's error alert (the unlock message with its "Tải lại" button) is
+  // built inside the chapter frame or inside .contentcontainer, neither of
+  // which the general translation pass may enter -- so it gets its own,
+  // alert-scoped pass.
+  'function sweepAlertsIn(',
+  'function walkAlert(',
   // One DOWNLOADED row per novel: the row is stamped and the finished job drops
   // the row it would otherwise duplicate.
   'data-stvbook',

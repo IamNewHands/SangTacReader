@@ -98,6 +98,136 @@ ${data.patterns
         return false;
     }
 
+    // ------------------------------------------------------------------ language
+    //
+    // This whole block is a Vietnamese -> Chinese layer, so every pass in it is
+    // only correct while the reader has actually asked for Chinese. The site's
+    // own <text> i18n follows the "lang" cookie (app.v2.js:1887 reads it,
+    // app.v2.js:1959-1961 applies it) and the settings row writes both that
+    // cookie and app.config.ux.app_language (page-vip:1464), so the cookie is
+    // both the live answer and the value the site will read on the next load --
+    // it is read first.
+    var SITE_LANGUAGES = { vi: true, en: true, zh: true };
+
+    function isLanguageCode(value) {
+        return typeof value === 'string' && SITE_LANGUAGES[value] === true;
+    }
+
+    function cookieValue(name) {
+        var raw = '';
+        try { raw = String(document.cookie || ''); } catch (e) { raw = ''; }
+        var parts = raw.split(';');
+        var head = name + '=';
+        for (var i = 0; i < parts.length; i++) {
+            var item = parts[i];
+            while (item.length && item.charCodeAt(0) === 32) { item = item.substring(1); }
+            if (item.indexOf(head) !== 0) { continue; }
+            var value = item.substring(head.length);
+            try { return decodeURIComponent(value); } catch (e) { return value; }
+        }
+        return '';
+    }
+
+    // The site's own setCookie (app.v2.js:222) is a top-level function in
+    // app.v2.js, so it does not exist yet at document start; this writes the
+    // same cookie without it.
+    function writeLanguageCookie(code) {
+        var expires = '';
+        try {
+            var date = new Date();
+            date.setTime(date.getTime() + 365 * 24 * 60 * 60 * 1000);
+            expires = '; expires=' + date.toUTCString();
+        } catch (e) { expires = ''; }
+        try { document.cookie = 'lang=' + code + expires + '; path=/'; } catch (e) {}
+    }
+
+    // The cookie first, then the site's own live value: app.language starts as
+    // "vi" (app.v2.js:1886) and only becomes the cookie's language once
+    // changeLanguage has loaded that language file, so a cookie that already
+    // says zh is both earlier and more reliable than app.language.
+    function currentLanguage() {
+        var cookie = cookieValue('lang');
+        if (isLanguageCode(cookie)) { return cookie; }
+        var app = window.app;
+        if (app && isLanguageCode(app.language)) { return app.language; }
+        return 'vi';
+    }
+
+    // True while this overlay may rewrite anything at all.
+    function chineseUi() {
+        return currentLanguage() === 'zh';
+    }
+
+    // ------------------------------------------------- first launch picks a language
+    //
+    // Nothing on the site chooses a language by itself: with no "lang" cookie it
+    // boots in Vietnamese (app.v2.js:1886) and the settings row keeps showing
+    // app.config.ux.app_language's "vi" default (app.v2.config.js:36). iOS knows
+    // which language the reader reads, and the web view cannot: WKWebView's
+    // navigator.language is the *app's* localisation, and the Capacitor template
+    // ships English only -- so the native side passes Locale.preferredLanguages
+    // down as window.__stvDeviceLang and the first launch adopts it. Once the
+    // cookie exists the reader's own choice wins, permanently.
+    function deviceLanguage() {
+        if (typeof window.__stvDeviceLang === 'string' && window.__stvDeviceLang) {
+            return window.__stvDeviceLang;
+        }
+        var nav = window.navigator;
+        if (nav && typeof nav.language === 'string' && nav.language) { return nav.language; }
+        return '';
+    }
+
+    // zh-Hans / zh-Hant / zh-CN all mean the same thing to a site with one
+    // Chinese file. Anything the site does not publish (it has vi, en and zh)
+    // gets its English UI rather than a language the reader never asked for.
+    function mapDeviceLanguage(raw) {
+        var text = String(raw === undefined || raw === null ? '' : raw).toLowerCase();
+        if (text.indexOf('zh') === 0) { return 'zh'; }
+        if (text.indexOf('vi') === 0) { return 'vi'; }
+        if (text.indexOf('en') === 0) { return 'en'; }
+        return 'en';
+    }
+
+    var seededLanguage = '';
+
+    function seedLanguage() {
+        if (cookieValue('lang')) { return false; }
+        var device = deviceLanguage();
+        if (!device) { return false; }
+        seededLanguage = mapDeviceLanguage(device);
+        writeLanguageCookie(seededLanguage);
+        note('PATCH', 'first launch: language seeded to ' + seededLanguage
+            + ' from device ' + device);
+        return true;
+    }
+
+    // The settings row reads app.config.ux.app_language (page-vip:1464), so the
+    // seeded language has to land there too or the row would claim Vietnamese
+    // while the page is Chinese. Written through the site's own setter, which is
+    // what persists it with the rest of the UX settings (app.v2.config.js:77-82).
+    //
+    // The caller keeps calling this for a minute rather than until the first
+    // success: settingsBackup restores config.ux from the Keychain a few seconds
+    // in (it waits for the site's own store round trip), so a restored
+    // app_language can land *after* the first write and would otherwise leave the
+    // row claiming a language the page is not in. The cookie is the language the
+    // page is actually rendering in, so the row follows it -- see the doc's
+    // unproven list for what that costs on the reinstall path.
+    function syncSettingLanguage() {
+        if (!seededLanguage) { return true; }
+        var app = window.app;
+        if (!app || !app.config || !app.config.ux) { return false; }
+        try {
+            if (app.config.ux.app_language !== seededLanguage) {
+                app.config.ux.app_language = seededLanguage;
+                note('PATCH', 'settings row language set to ' + seededLanguage);
+            }
+        } catch (e) {
+            note('ERR', 'could not store the seeded language: ' + e);
+        }
+        return true;
+    }
+
     function translate(value) {
         if (!value) { return null; }
         var trimmed = value.trim();
@@ -224,6 +354,9 @@ ${data.patterns
 
     function fixChapterTitles(root) {
         if (!root || root.nodeType !== 1) { return; }
+        // "Chương 03:" -> "第3章" is Chinese scaffolding, so a reader who asked
+        // for Vietnamese keeps the site's own title.
+        if (!chineseUi()) { return; }
         if (root.classList && (root.classList.contains('chaptername')
             || root.classList.contains('chapternamefixed'))) { applyChapterTitle(root); }
         if (!root.querySelectorAll) { return; }
@@ -308,6 +441,9 @@ ${data.patterns
 
     function walk(node) {
         if (!node) { return; }
+        // The overlay exists for a Chinese reader only; every other language
+        // gets the site's own text untouched.
+        if (!chineseUi()) { return; }
         if (node.nodeType === 3) {
             var current = node.nodeValue || '';
             var next = translate(current);
@@ -342,11 +478,50 @@ ${data.patterns
         for (var i = 0; i < children.length; i++) { walk(children[i]); }
     }
 
+    // ------------------------------------------------------- the reader's alert
+    //
+    // The reader's error alert -- the unlock message with its "Tải lại" button --
+    // is built inside the chapter frame, or inside .contentcontainer, which the
+    // translation pass skips on purpose because the chapter text lives there too
+    // (app.v2.chapterdisplay.js:873 showAlert writes into the frame's
+    // #maincontent, :1967 writes a page of its own, :3816 writes into
+    // .contentcontainer). So neither the message nor the button was ever walked,
+    // and both stayed Vietnamese inside a Chinese UI. Only the alert subtree is
+    // walked here: it never holds novel text, so the skip list does not apply.
+    var ALERT_SELECTOR = '.erroralert';
+
+    function walkAlert(node) {
+        if (!node) { return; }
+        if (node.nodeType === 3) {
+            var current = node.nodeValue || '';
+            var next = translate(current);
+            if (next === null && current.length >= 5) { next = translateFragments(current); }
+            if (next !== null && next !== current) { node.nodeValue = next; rewritten++; }
+            return;
+        }
+        if (node.nodeType !== 1) { return; }
+        var children = node.childNodes || [];
+        for (var i = 0; i < children.length; i++) { walkAlert(children[i]); }
+    }
+
+    // Works for a document and for an element. querySelectorAll does not match
+    // the node itself, so a subtree that *is* the alert is walked directly.
+    function sweepAlertsIn(root) {
+        if (!chineseUi()) { return; }
+        if (!root || root.nodeType !== 1) { return; }
+        if (root.classList && root.classList.contains('erroralert')) { walkAlert(root); }
+        if (typeof root.querySelectorAll !== 'function') { return; }
+        var found = null;
+        try { found = root.querySelectorAll(ALERT_SELECTOR); } catch (e) { found = null; }
+        for (var i = 0; found && i < found.length; i++) { walkAlert(found[i]); }
+    }
+
     function sweep() {
         try {
             walk(document.body || document.documentElement);
             fixChapterTitles(document.documentElement);
             stripNotices(document.documentElement);
+            sweepAlertsIn(document.documentElement);
         } catch (e) {
             if (window.__stvDiag) { window.__stvDiag.log('ERR', 'i18n sweep failed: ' + e); }
         }
@@ -354,10 +529,11 @@ ${data.patterns
 
     // The chapter text -- and therefore the pinned chapter name -- lives in a
     // same-origin srcdoc iframe, not in this document, so the main sweep can
-    // never reach it. Inside frames only two passes run, neither of which
-    // rewrites the novel: the title pass, and the notice pass. The translation
-    // pass stays out, because putting the fragment table on top of novel text
-    // is exactly what it is not meant for.
+    // never reach it. Inside frames only three passes run, none of which rewrites
+    // the novel: the title pass, the notice pass, and the alert pass (whose
+    // selector is the only thing it touches). The general translation pass stays
+    // out, because putting the fragment table on top of novel text is exactly
+    // what it is not meant for.
     function frameDocument(frame) {
         var doc = null;
         try { doc = frame.contentDocument; } catch (e) { doc = null; }
@@ -370,6 +546,7 @@ ${data.patterns
         try {
             fixChapterTitles(doc.documentElement);
             stripNotices(doc.documentElement);
+            sweepAlertsIn(doc.documentElement);
         } catch (e) {
             if (window.__stvDiag) { window.__stvDiag.log('ERR', 'i18n frame sweep failed: ' + e); }
         }
@@ -381,6 +558,7 @@ ${data.patterns
             if (record.target && record.target.nodeType === 1) {
                 fixChapterTitles(record.target);
                 stripNotices(record.target);
+                sweepAlertsIn(record.target);
             }
         }
     }
@@ -454,6 +632,9 @@ ${data.patterns
 
     function fixChapterData(cdata) {
         if (!cdata || typeof cdata !== 'object') { return cdata; }
+        // The chapter name is rewritten to the Chinese scaffolding here, at the
+        // single source every consumer reads; a Vietnamese reader keeps it.
+        if (!chineseUi()) { return cdata; }
         for (var i = 0; i < CONTENT_FIELDS.length; i++) {
             var field = CONTENT_FIELDS[i];
             var raw = cdata[field];
@@ -580,6 +761,10 @@ ${data.patterns
     // deliberately not awaited: the first chapter of a book must not wait for a
     // 100 KB chapterlist response, so the title is corrected a moment later.
     function chapterTitleMap(host, id) {
+        // The Chinese original is only wanted by the Chinese reader, and this is
+        // where the 100 KB chapterlist request is paid for: a reader on vi/en
+        // never sends it.
+        if (!chineseUi()) { return null; }
         var key = host + '/' + id;
         if (titleMaps[key]) { return titleMaps[key]; }
         if (titleTried[key]) { return null; }
@@ -716,6 +901,28 @@ ${data.patterns
      */
     var LANG_CODE = new RegExp('^[A-Za-z][A-Za-z0-9_-]{0,11}$');
 
+    // Switching language has to re-render the page from the new cookie. The
+    // site's own changeLanguage only swaps the app.text table and re-runs the
+    // <text> nodes (app.v2.js:1952-1956), which leaves every hardcoded string it
+    // already rendered in the old language -- and, with this overlay, every
+    // string already rewritten to Chinese still Chinese while the strings that
+    // must now be rewritten are still Vietnamese. That half-translated page is
+    // exactly the report. A reload is also what the rest of the site's settings
+    // UI needs, so it is done once, from the cookie the site has already written.
+    //
+    // No loop is possible: the reloaded page reads the cookie the switch just
+    // wrote, so the site's own boot call re-applies the language it is already
+    // in and the difference test above is false. The one-shot flag only covers a
+    // reload that never happened.
+    var reloadedFor = '';
+
+    function reloadForLanguage(code) {
+        if (reloadedFor === code) { return; }
+        reloadedFor = code;
+        note('PATCH', 'language switched to ' + code + '; reloading so the page re-renders');
+        try { window.location.reload(); } catch (e) {}
+    }
+
     function installLanguageGuard() {
         var app = window.app;
         if (!app || !app.text || typeof app.text.changeLanguage !== 'function') { return false; }
@@ -727,10 +934,15 @@ ${data.patterns
             if (!LANG_CODE.test(code)) {
                 note('PATCH', 'refused a language that is not one: '
                     + code.substring(0, 60) + ' (the site stays on '
-                    + (app.language || 'vi') + ')');
+                    + currentLanguage() + ')');
                 return null;
             }
-            return original.apply(this, arguments);
+            var before = currentLanguage();
+            var result = original.apply(this, arguments);
+            // The site's own boot call re-applies the cookie it just read, so
+            // the two agree there and no reload is triggered.
+            if (isLanguageCode(code) && code !== before) { reloadForLanguage(code); }
+            return result;
         };
         note('PATCH', 'language setter guarded');
         return true;
@@ -744,6 +956,12 @@ ${data.patterns
         chineseChapterName: chineseChapterName,
         chapterNames: chapterNames,
         stripNotice: stripNotice,
+        // The language this overlay resolved, and whether it is allowed to
+        // rewrite anything: one definition, read by the tests and by anything
+        // that needs to know whether the page is Chinese.
+        language: currentLanguage,
+        chineseUi: chineseUi,
+        sweepAlerts: sweepAlertsIn,
         size: EXACT.length,
         rewritten: function () { return rewritten; },
         removed: function () { return removed; }
@@ -768,6 +986,8 @@ ${data.patterns
                         // not only on a timer and not only when the added node
                         // is itself an iframe.
                         stripNotices(node);
+                        // The reader's error alert is inserted the same way.
+                        sweepAlertsIn(node);
                         if (node.nodeType === 1) { attachFramesIn(node); }
                     }
                 }
@@ -781,6 +1001,10 @@ ${data.patterns
         observer.observe(document, { childList: true, subtree: true, characterData: true });
     }
 
+    // Before the first sweep, and before any site script can read the cookie:
+    // the very first launch adopts the device's language (see seedLanguage).
+    seedLanguage();
+
     if (document.body) {
         sweep();
     } else {
@@ -792,6 +1016,7 @@ ${data.patterns
     for (var f = 0; f < FRAME_DELAYS.length; f++) {
         setTimeout(function () {
             sweep(); attachFrames(); attachContent(); installLanguageGuard();
+            syncSettingLanguage();
         }, FRAME_DELAYS[f]);
     }
 
@@ -823,9 +1048,20 @@ ${data.patterns
         if (installLanguageGuard() || langAttempts > 600) { clearInterval(langTimer); }
     }, 200);
 
+    // app.config.ux is built by app.v2.config.js, which is a separate request
+    // from the shell, and the settings backup restores it a few seconds after
+    // that: keep the row in step for a minute, not until the first success.
+    var settingAttempts = 0;
+    var settingTimer = setInterval(function () {
+        settingAttempts++;
+        if (!seededLanguage || settingAttempts > 300) { clearInterval(settingTimer); return; }
+        syncSettingLanguage();
+    }, 200);
+
     if (window.__stvDiag) {
         window.__stvDiag.log('PATCH', 'i18n overlay ready: ' + EXACT.length + ' labels, '
-            + FRAGMENTS.length + ' fragments, ' + PATTERNS.length + ' patterns, chapter titles on');
+            + FRAGMENTS.length + ' fragments, ' + PATTERNS.length + ' patterns, language '
+            + currentLanguage() + ', rewriting ' + (chineseUi() ? 'on' : 'off'));
     }
 })();`;
 

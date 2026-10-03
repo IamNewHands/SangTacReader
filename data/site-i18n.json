@@ -1034,6 +1034,10 @@
       "上下文菜单"
     ],
     [
+      "Mở khóa chương này cần cho phép sử dụng thần thạch, truy cập cài đặt để xem chi tiết.",
+      "解锁本章需要使用神石，请进入设置查看详情。"
+    ],
+    [
       "Mới cập nhật",
       "最新更新"
     ],
@@ -1974,6 +1978,26 @@
     [
       " phút",
       " 分钟"
+    ],
+    [
+      "Mở khóa chương này cần cho phép sử dụng thần thạch, truy cập cài đặt để xem chi tiết.",
+      "解锁本章需要使用神石，请进入设置查看详情。"
+    ],
+    [
+      "Mở khóa chương này cần cho phép sử dụng thần thạch",
+      "解锁本章需要使用神石"
+    ],
+    [
+      "Mở khóa chương này cần cho phép sử dụng",
+      "解锁本章需要使用"
+    ],
+    [
+      "Mở khóa chương này",
+      "解锁本章"
+    ],
+    [
+      "truy cập cài đặt để xem chi tiết",
+      "请进入设置查看详情"
     ]
   ],
   "patterns": [

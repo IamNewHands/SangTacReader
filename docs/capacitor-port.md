@@ -2753,6 +2753,146 @@ name=<名>&author=<作者>`（`app.v2.js:4848-4864`）。两个入口都走它�
 - 日志里 2 次 `[ERR] unhandledrejection setContent@…chapterdisplay:1643:46 /
   preload@…:1816:28`（正文落地瞬间）不是本轮的慢，**留作单独一轮排查**。
 
+### 6.26 第二十四轮（用户报三条）：解锁提示没翻译、选越南语还有中文、首次启动要跟系统语言
+
+用户原话三条：①「在小说正文读到最新几章需要解锁时，在中文语言下，解锁的语言没有翻译成中文
+`Mở khóa chương này cần cho phép sử dụng thần thạch, truy cập cài đặt để xem chi tiết.` `Tải lại`」；
+②「应用设置里的语言选项选择越南语时有部分文字被翻译成中文，需要还原回越南语」；
+③「应用第一次进入时，需要根据 iOS 系统当前的语言自动选择符合的语言选项，即 iOS 是中文，
+则第一次进入应用自动选择中文，后续一直保持，除非人为去改语言设置」。
+
+三条是**同一个根因的三个面**：`SiteI18nData` 这一层**根本没有语言概念**——它是一层
+「越南语 → 简体中文」的覆盖层，却无条件地、永远地改写。②是它的正面（选了越南语也照样中文化），
+①是它的反面（该翻的地方它进不去），③是它缺的那一半（谁来决定该不该开）。
+
+#### (1) ② 选越南语还是中文：覆盖层没有任何语言闸门
+
+`SiteI18nData.script`（生成源 `scripts/gen-site-i18n.js`）从 `sweep()`、`MutationObserver`、
+`fixChapterTitles()`、`fixChapterData()`、`chapterTitleMap()` 五条路改写 DOM 与 cdata，
+**没有一处读过 `app.language`**（`grep` 全块零命中）。站点的语言状态有两个面：
+
+| 面 | 谁写 | 谁读 |
+|---|---|---|
+| `lang` cookie（365 天） | `app.text.changeLanguage` → `setCookie("lang", …)`（`app.v2.js:1951`） | 站点自己在启动时 `getCookie("lang")`（`:1887`、`:1959-1961`） |
+| `app.config.ux.app_language` | 设置页语言行 `<contextmenu value="app.config.ux.app_language" onchange="app.text.changeLanguage('value')">`（`_page_vip.html:1462-1469`） | 同一行的显示值 |
+
+站点自己的 `<text>key</text>` 标签（`/mobile/lang/zh.json`，188 键）跟着 cookie 走，所以选越南语时
+那些标签**确实是越南语**——而覆盖层改的是站点硬编码的那些字面量，它们**永远**是中文。
+「一半越南语一半中文」就是这么来的，不是数据脏，是这一层没有开关。
+
+**修法：把闸门放在这一层唯一的语言事实上。** 新增 `currentLanguage()`（**先 cookie 后
+`app.language`**：`app.language` 初值是 `"vi"`，要等 `changeLanguage` 把语言文件加载完才变成
+cookie 的值，所以 cookie 更早也更可靠）与 `chineseUi()`，然后在**五个输出入口**各加一行早退：
+`walk()`（DOM 文本与 placeholder/title）、`fixChapterTitles()`（`Chương 03:` → `第3章`）、
+`fixChapterData()`（cdata.chaptername）、`chapterTitleMap()`（**顺带省掉一次 100KB 的
+`getchapterlist`**——vi/en 读者不再为中文原名付这次请求）、`sweepAlertsIn()`（见下）。
+**没有**改 `fixChapterTitle()` / `chineseChapterName()` 这两个纯函数：导出那条路仍按中文名出 EPUB
+（`downloadExport` 自己声明 `dc:language = zh`），本轮不动它。
+
+**切换语言时 reload 一次**（`reloadForLanguage`，挂在已有的 `installLanguageGuard` 上）：
+站点自己的 `changeLanguage` 只换 `app.text` 表并重跑 `<text>` 节点（`app.v2.js:1952-1956`），
+**不会**重渲染任何已经画出来的硬编码文案——也就是说，不做这件事的话，从中文切到越南语会留下
+一层已经改成中文的旧节点（正是②），从越南语切到中文则相反。reload 让页面从新 cookie 重新渲染，
+一次到位；站点自己的启动调用（`changeLanguage(cookie)`）里 `code === before`，所以**不会**触发，
+`sessionStorage` 里记一个「已经为这个目标 reload 过」只用于「cookie 万一没写成功」时不至于循环。
+
+#### (2) ① 解锁提示没翻译：它生在两个翻译层都不进的地方
+
+提示本身**不在仓库里任何文件里**——`Mở khóa chương này …` 是服务端在 `readchapter` 的失败回答
+（`x.err` / `x.info`）里给的，走 `app.reader.showAlert(msg, view)`（`app.v2.read.js:747-791`）。
+三个 `showAlert` 实现（`app.v2.chapterdisplay.js:873` / `:1967` / `:3816`）都往 `.erroralert`
+里塞 `${msg}` 加一个写死的 `Tải lại`，落点是：
+
+| 显示器 | 落点 | 通用翻译层进得去吗 |
+|---|---|---|
+| 滚动式 `:3816` | `.contentcontainer` | **不**：`contentcontainer` 在 `SKIP_NAMES` 里（正文就住在里面） |
+| 翻页式 `:873` | frame 的 `#maincontent` | **不**：frame 里只跑标题与存档声明两趟 |
+| 翻页式 `:1967` | `chapter.setPages([[mct]])` | **不**：同上 |
+
+所以 `Tải lại` 明明早就在字典里（`['Tải lại', '重新加载']`）却一次都没被用上，而消息本身
+**从来就不在字典里**。两件事都要修：
+
+1. 字典加 **1 条 exact + 5 条 fragment**（`data/site-i18n.json`）：整句、整句去掉句号、
+   `…thần thạch` 前缀、`…sử dụng` 前缀、`Mở khóa chương này`、`truy cập cài đặt để xem chi tiết`。
+   分片是**按顺序**做子串替换，长的在前，所以服务端在句子外面套了 `@` 或别的字也仍然能翻
+   （测试里就有这条 `@Mở khóa…` 的用例）。
+2. 新增**只认 `.erroralert` 子树**的一趟：`walkAlert()` + `sweepAlertsIn(root)`，挂在
+   `sweep()`、`sweepFrame()`、`frameRecords()`（frame 自己的 observer）与主文档 observer 的
+   added-nodes 分支上。它**故意忽略 `SKIP`**——`.erroralert` 里只有提示与按钮，没有正文；
+   而通用那一趟仍然一个字都不许进 `.contentcontainer` / frame。这是「进得去该进的、进不去不该进的」
+   的边界，不是把通用层放进去。
+
+#### (3) ③ 首次启动跟随系统语言：网页侧问不出来，只能由原生交下来
+
+站点**没有**任何「自己挑语言」的逻辑：没有 cookie 时 `app.language = "vi"`（`app.v2.js:1886`），
+`app.config.uxDefault.app_language = "vi"`（`app.v2.config.js:36`）。而 webview 也**问不出来**：
+WKWebView 的 `navigator.language` 是**应用自己的**本地化（Capacitor 模板只有英文），不是设备语言。
+所以：
+
+- 原生侧（`SangTacAppPlugin.installDocumentStartScripts`）新增一个 document-start 脚本：
+  `window.__stvDeviceLang = <Locale.preferredLanguages.first 的 JSON 字面量>`，用
+  `JSONSerialization` 转义（`jsStringLiteral`），不手写转义——与 `SiteAssets` 同一个理由。
+- 覆盖层在**第一次 sweep 之前**调 `seedLanguage()`：**cookie 不存在才动**，
+  `zh*` → `zh`、`vi*` → `vi`、`en*` → `en`、其它 → `en`（站点只发布 vi/en/zh 三个文件，
+  给一个读者没要过的语言不如给英文），写 `lang` cookie（自带 365 天过期，与站点自己的
+  `setCookie` 同形）并打一行 `[PATCH] first launch: language seeded to …`。
+- 设置页那一行读的是 `app.config.ux.app_language`，所以种子语言还要**写进设置**，否则页面是中文、
+  行上写着越南语。`syncSettingLanguage()` 等 `app.config.ux` 出现后写一次，并且**继续盯一分钟**
+  （不是「成功一次就停」）：`settingsBackup` 是等站点自己的存储往返之后才从 Keychain 回灌
+  `config.ux` 的（几秒之后），回灌进来的 `app_language` 会落在第一次写入**之后**，只写一次的话
+  就会留下「页面中文、行上越南语」的长期错位。判据是 cookie——它是页面**实际正在用的**语言，
+  所以行跟着 cookie 走。**这就同时满足「后续一直保持」**：cookie 在，第二次启动就再也不种了，
+  读者在设置里改过的值也不会被设备语言盖掉（测试里专门有一条：cookie=vi + 设备=zh → 保持 vi）。
+
+#### (4) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **437691 字节** / **75 个标记**（新增 `function chineseUi(`、`function currentLanguage(`、`function reloadForLanguage(`、`language switched to `、`window.__stvDeviceLang`、`first launch: language seeded to `、`function sweepAlertsIn(`、`function walkAlert(`） |
+| `scripts/test-site-patch.js` | **625 条断言**（上一轮 599，新增 26） |
+| `scripts/gen-site-i18n.js --check` | 459 labels / 40 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言覆盖：语言闸门（vi/en 下设置标签、章节标题脚手架、解锁提示都保持原文，**但存档声明照旧剥掉**
+——那是站点的水印，不是翻译）、种子的四种输入（zh 设备 → cookie+设置行都变成 zh；ja 设备 → en 且
+不改写；cookie=vi + 设备=zh → 保持 vi；无设备语言 → 不种）、`chineseUi()` 的取值、
+**vi 读者不再发 `sajax=getchapterlist`**、解锁提示在 frame 里 / 在 `.contentcontainer` 里 /
+带装饰的变体 / 文档启动之后才到达（走 observer 的 added-nodes 分支）四条路径都被翻成中文、
+按钮 `Tải lại` → `重新加载`、以及切换语言 reload 一次而重复应用同一语言**不** reload。
+
+桩这一轮补了两处（都是「真 DOM 有、桩里没有」的东西）：`document.cookie` 的真 jar（覆盖层既读又写
+它），以及 **`window.MutationObserver`**——覆盖层是唯一从 `window` 上取
+构造函数的块（其它块用裸全局），所以在此之前它的两个 observer 在测试里**根本没装上**；同时把
+`__flushObservers()` 从「回调不带参数」改成带一个空数组（好几个块的 observer 会遍历这个列表），
+并新增 `__emitMutation(record)` 来喂一条合成变更。
+
+CI 的二进制 strings 检查没法证明原生那一句（它只是一个 document-start 赋值，会被别的字符串掩盖），
+所以按 §6.23 改动 B 的先例**改成查源码**：`SangTacAppPlugin.swift` 里必须有
+`window.__stvDeviceLang = `。
+
+#### 未证实项（下一轮的输入）
+
+- **首次启动的种子只能在真机上确认**。期望：全新安装（没有任何 cookie）后第一次启动，
+  `[PATCH] first launch: language seeded to zh from device zh-Hans-CN`，且设置页语言行显示「中文」；
+  第二次启动**不应**再有这一行。
+- **切换语言的那次 reload 也只在真机上能看**：期望 `[PATCH] language switched to vi; reloading so
+  the page re-renders` 紧跟一次页面重载。若读者看到「切了没反应」或者反复重载，把面板那两行给我。
+- **vi/en 读者现在看不到中文覆盖层了，这是本轮最大的行为改变**（也是②要求的）。副作用有两处
+  已确认、一处刻意：①章节标题回到站点的越南语机翻（`Chương 03:. Giao phong`），②vi/en 不再请求
+  `oridata`；③**导出仍是中文名**（`chapterNames`/`chineseChapterName` 与 `dc:language=zh` 没动）。
+  如果读者希望「越南语界面也导出越南语标题」，那是单独一轮（要改 `downloadExport` 的语言判断）。
+- **「不支持的系统语言 → 英文」是选的，不是站点规定的**：站点只有 vi/en/zh 三个语言文件。
+  若读者在日语系统上更希望看到中文，把 `mapDeviceLanguage()` 的兜底改成 `zh` 即可（一行）。
+- **重装那条路上「读者原来选的语言」会让位给设备语言**：`settingsBackup` 会把 `config.ux`
+  从 Keychain 回灌（这正是「设置跨重装保留」），而重装后 cookie 与 localStorage 都空了，
+  于是种子按设备语言写了一次；回灌进来的 `app_language` 落在之后，被 `syncSettingLanguage`
+  按 cookie 纠回去。取舍是明确的：**宁可让行与页面一致**（否则会长期停在「行上越南语、页面中文」，
+  那正是②的形状），代价是这条路上读者要重选一次语言。要反过来（让回灌的选择赢）就得能区分
+  「存的是选择」和「存的是默认值」——站点的 `saveUxSetting` 每次写的是整个 `_ux`，两者同形，
+  本轮没有可靠判据，所以不做。
+- **解锁提示的原文来自用户粘贴**，服务端实际串可能带别的标点或前后缀；exact 一条 + 5 条 fragment
+  是按「整句/前缀/后缀」三种形状铺的，仍可能有一种没覆盖到——真机若还看到越南语，把那一行原文给我。
+
 
 
 

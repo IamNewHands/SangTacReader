@@ -93,6 +93,23 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
     private func installDocumentStartScripts() {
         var scripts: [WKUserScript] = []
 
+        // The site never chooses a language by itself: with no `lang` cookie it
+        // boots in Vietnamese (app.v2.js:1886) and its settings row keeps the
+        // "vi" default (app.v2.config.js:36). The reader's device does know, and
+        // the web view cannot tell us: WKWebView's navigator.language is the
+        // app's own localisation, and the Capacitor template ships English only.
+        // So the device's preferred language is handed down here and the
+        // overlay adopts it on the first launch only -- once the cookie exists
+        // the reader's own choice wins for good.
+        let deviceLanguage = Locale.preferredLanguages.first ?? ""
+        if !deviceLanguage.isEmpty {
+            scripts.append(WKUserScript(
+                source: "window.__stvDeviceLang = \(SangTacAppPlugin.jsStringLiteral(deviceLanguage));",
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true))
+            CAPLog.print("[SangTacApp] device language: \(deviceLanguage)")
+        }
+
         // The mirrored site assets go in before every site patch, because both
         // `assetCache` (which installs the URL hooks) and `assetMirror` (which
         // wraps them) read `window.__stvSiteAssets`, and the parser starts
@@ -139,6 +156,18 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
         attach(20)
+    }
+
+    /// A JavaScript string literal, so a device language such as "zh-Hans-CN"
+    /// reaches the page quoted and escaped without hand-rolled escaping.
+    /// Foundation does the work, exactly as it does for the asset mirror.
+    private static func jsStringLiteral(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value], options: []),
+              let text = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        // ["zh-Hans-CN"] -> "zh-Hans-CN"
+        return String(text.dropFirst().dropLast())
     }
 
     deinit {

@@ -427,6 +427,10 @@ function makeSandbox(options) {
   };
 
   const listeners = {};
+  // The site keeps its UI language in a `lang` cookie (app.v2.js:1951), and the
+  // overlay both reads it and, on a first launch, writes it -- so the stub needs
+  // a real jar, not a missing property.
+  const cookies = {};
   const document = {
     body,
     head,
@@ -441,6 +445,15 @@ function makeSandbox(options) {
     querySelector: (selector) => documentElement.querySelectorAll(selector)[0] || null,
     querySelectorAll: (selector) => documentElement.querySelectorAll(selector),
     styleSheets: [],
+    get cookie() {
+      return Object.keys(cookies).map((name) => name + '=' + cookies[name]).join('; ');
+    },
+    set cookie(value) {
+      const pair = String(value).split(';')[0];
+      const eq = pair.indexOf('=');
+      if (eq < 0) { return; }
+      cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+    },
     elementFromPoint() {
       return null;
     },
@@ -499,6 +512,7 @@ function makeSandbox(options) {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   sandbox.__dom = { byId, store, head };
+  sandbox.__cookies = cookies;
   // The page-repair block installs a capture-phase click listener on document;
   // the tests need to be able to fire it. Window listeners are fired too, so a
   // `load`-driven block can be exercised.
@@ -520,8 +534,18 @@ function makeSandbox(options) {
     observe(node) { this.nodes.push(node); }
     disconnect() {}
   };
+  // A browser exposes the constructor on the window too, and the i18n overlay is
+  // the one block that reaches for it there rather than as a bare global.
+  window.MutationObserver = sandbox.MutationObserver;
+  // An empty batch, not `undefined`: several blocks iterate the record list.
   sandbox.__flushObservers = () => {
-    for (const observer of observers) { observer.callback(); }
+    for (const observer of observers) { observer.callback([]); }
+  };
+  // One synthesized browser mutation, handed to every observer. The stub cannot
+  // observe real DOM writes, so this is how a block's own mutation path is
+  // exercised.
+  sandbox.__emitMutation = (record) => {
+    for (const observer of observers) { observer.callback([record]); }
   };
   return sandbox;
 }
@@ -1406,7 +1430,9 @@ async function testActivityLog() {
 async function testI18nOverlay() {
   console.log('i18n overlay');
   const sandbox = makeSandbox();
-  installFakeApp(sandbox, { displayType: 'auto' });
+  // The overlay is a Vietnamese -> Chinese layer and only runs for a Chinese
+  // reader; this suite is about what it rewrites when it does run.
+  installFakeApp(sandbox, { displayType: 'auto', appLanguage: 'zh' });
 
   const settings = makeContainer('div', 'settingitem');
   const label = makeContainer('div', 'settingitemtitle', 'Thêm name 1 nhấp');
@@ -1574,6 +1600,7 @@ async function testI18nOverlay() {
   const titled = makeSandbox();
   installFakeApp(titled, {
     displayType: 'auto',
+    appLanguage: 'zh',
     oridata: '1-/-865875696-/- 交锋-//-1-/-855899892-/- 弱点',
   });
   vm.runInContext(loadBlocks().join('\n'), titled);
@@ -1590,7 +1617,7 @@ async function testI18nOverlay() {
     String(diagText).indexOf('original chapter names') >= 0, String(diagText).slice(-200));
 
   const noOriginal = makeSandbox();
-  installFakeApp(noOriginal, { displayType: 'auto' });
+  installFakeApp(noOriginal, { displayType: 'auto', appLanguage: 'zh' });
   vm.runInContext(loadBlocks().join('\n'), noOriginal);
   await tick(250);
   const plain = await noOriginal.app.reader.getContent('qidian', '1', '9');
@@ -1621,6 +1648,7 @@ async function testLanguageGuard() {
   const loads = [];
   app.lang = {
     zh: { booklist: '小说列表' },
+    vi: { booklist: 'Danh sách truyện' },
     // The site's own loadOnline (app.v2.js:1876) -- one request per call.
     loadOnline(code) {
       loads.push(code);
@@ -1661,6 +1689,229 @@ async function testLanguageGuard() {
   await tick(20);
   check('a real language code still goes through untouched',
     loads.join('|') === 'en', loads.join('|'));
+
+  // The site's own changeLanguage only swaps the app.text table and re-runs the
+  // <text> nodes (app.v2.js:1952-1956), which leaves every hardcoded string it
+  // already rendered -- and everything this overlay already rewrote -- in the old
+  // language. Switching therefore reloads once, from the cookie the site wrote.
+  sandbox.window.location = { reload() { sandbox.__reloaded = true; } };
+  await app.text.changeLanguage('zh');
+  await tick(20);
+  check('switching to a different language reloads the page',
+    sandbox.__reloaded === true, String(sandbox.__reloaded));
+  check('and the site language really changed',
+    app.language === 'zh', String(app.language));
+  sandbox.__reloaded = false;
+  await app.text.changeLanguage('zh');
+  await tick(20);
+  check('re-applying the language it is already in does not reload',
+    sandbox.__reloaded === false, String(sandbox.__reloaded));
+  // ...and the one-shot guard is per target, not per page: a later switch to a
+  // third language still reloads.
+  await app.text.changeLanguage('vi');
+  await tick(20);
+  check('a later switch to a different language reloads again',
+    sandbox.__reloaded === true && app.language === 'vi',
+    String(sandbox.__reloaded) + ' / ' + String(app.language));
+  // ...and the guard does not accumulate across a round trip: zh -> vi -> zh -> vi
+  // still reloads on the last one (a session-wide memory of the target would not).
+  sandbox.__reloaded = false;
+  await app.text.changeLanguage('zh');
+  await tick(20);
+  check('switching back to Chinese reloads',
+    sandbox.__reloaded === true, String(sandbox.__reloaded));
+  sandbox.__reloaded = false;
+  await app.text.changeLanguage('vi');
+  await tick(20);
+  check('and the next switch back to Vietnamese reloads as well',
+    sandbox.__reloaded === true && app.language === 'vi',
+    String(sandbox.__reloaded) + ' / ' + String(app.language));
+}
+
+/**
+ * The overlay is a Vietnamese -> Chinese layer, so it may only rewrite anything
+ * while the reader has actually asked for Chinese -- otherwise the settings page
+ * is left half Vietnamese and half Chinese, which is the report this answers.
+ *
+ * Nothing on the site picks a language by itself: with no `lang` cookie it boots
+ * in Vietnamese (app.v2.js:1886) and its settings row keeps the "vi" default
+ * (app.v2.config.js:36). The device does know, and the web view cannot be asked:
+ * WKWebView's navigator.language is the app's own localisation, and the
+ * Capacitor template ships English only. So native hands the device's preferred
+ * language down as window.__stvDeviceLang and the first launch adopts it.
+ */
+async function testLanguageSelection() {
+  console.log('language selection');
+
+  // A Chinese device, nothing chosen yet: the cookie is seeded from the device,
+  // the settings row is brought in line, and the overlay is allowed to run.
+  const first = makeSandbox();
+  first.window.__stvDeviceLang = 'zh-Hans-CN';
+  const firstApp = installFakeApp(first, { displayType: 'auto' });
+  firstApp.config.ux = { app_language: 'vi' };
+  const firstLabel = makeContainer('div', 'settingitemtitle', 'Cài đặt');
+  first.document.body.appendChild(firstLabel);
+  vm.runInContext(loadBlocks().join('\n'), first);
+  await tick(400);
+  check('the first launch writes the language the device asked for',
+    first.__cookies.lang === 'zh', JSON.stringify(first.__cookies));
+  check('the seeded language is stored in the settings row too',
+    firstApp.config.ux.app_language === 'zh', String(firstApp.config.ux.app_language));
+  check('and the overlay is allowed to run for it',
+    firstLabel.textContent === '设置', JSON.stringify(firstLabel.textContent));
+  check('the resolved language is reported',
+    first.window.__stvI18n.language() === 'zh',
+    String(first.window.__stvI18n.language()));
+  // The settings backup restores config.ux from the Keychain a few seconds in, so
+  // a restored app_language lands *after* the first write; the row has to be
+  // brought back in line with the cookie the page is actually rendering in.
+  firstApp.config.ux.app_language = 'vi';
+  await tick(400);
+  check('a setting restored late is brought back in line with the page',
+    firstApp.config.ux.app_language === 'zh', String(firstApp.config.ux.app_language));
+
+  // A language the site does not publish (it has vi, en and zh) gets the English
+  // UI, and English is not Chinese, so nothing is rewritten.
+  const other = makeSandbox();
+  other.window.__stvDeviceLang = 'ja-JP';
+  installFakeApp(other, { displayType: 'auto' });
+  const otherLabel = makeContainer('div', 'settingitemtitle', 'Cài đặt');
+  other.document.body.appendChild(otherLabel);
+  vm.runInContext(loadBlocks().join('\n'), other);
+  await tick(400);
+  check('an unpublished device language falls back to the site English file',
+    other.__cookies.lang === 'en', JSON.stringify(other.__cookies));
+  check('and nothing is rewritten for it',
+    otherLabel.textContent === 'Cài đặt', JSON.stringify(otherLabel.textContent));
+
+  // A language the reader already chose is never overwritten, even when the
+  // device disagrees: the cookie is the choice.
+  const chosen = makeSandbox();
+  chosen.window.__stvDeviceLang = 'zh-Hans-CN';
+  chosen.document.cookie = 'lang=vi; path=/';
+  installFakeApp(chosen, { displayType: 'auto' });
+  const chosenLabel = makeContainer('div', 'settingitemtitle', 'Cài đặt');
+  chosen.document.body.appendChild(chosenLabel);
+  vm.runInContext(loadBlocks().join('\n'), chosen);
+  await tick(400);
+  check('a stored choice wins over the device language',
+    chosen.__cookies.lang === 'vi', JSON.stringify(chosen.__cookies));
+  check('and the overlay stays off for it',
+    chosenLabel.textContent === 'Cài đặt', JSON.stringify(chosenLabel.textContent));
+
+  // Vietnamese with no cookie at all (the site's own default): the site's text
+  // survives -- including the chapter-title scaffolding, which is Chinese-only --
+  // but the archive notice still comes out, because that is the site's watermark
+  // rather than a translation.
+  const vietnamese = makeSandbox();
+  installFakeApp(vietnamese, { displayType: 'auto', appLanguage: 'vi' });
+  const viLabel = makeContainer('div', 'settingitemtitle', 'Cài đặt');
+  vietnamese.document.body.appendChild(viLabel);
+  const viTitle = makeContainer('div', 'chaptername', 'Chương 03:. Giao phong');
+  vietnamese.document.body.appendChild(viTitle);
+  const viNotice = makeContainer('p', '', '@Bạn đang đọc bản lưu trong hệ thống');
+  vietnamese.document.body.appendChild(viNotice);
+  const viAlert = makeContainer('div', 'erroralert');
+  viAlert.appendChild(makeContainer('div', '',
+    'Mở khóa chương này cần cho phép sử dụng thần thạch, truy cập cài đặt để xem chi tiết.'));
+  viAlert.appendChild(makeContainer('div', 'btn', 'Tải lại'));
+  vietnamese.document.body.appendChild(viAlert);
+  vm.runInContext(loadBlocks().join('\n'), vietnamese);
+  await tick(400);
+  check('a Vietnamese reader keeps the site text',
+    viLabel.textContent === 'Cài đặt', JSON.stringify(viLabel.textContent));
+  check('and keeps the Vietnamese chapter title',
+    viTitle.textContent === 'Chương 03:. Giao phong', JSON.stringify(viTitle.textContent));
+  check('and keeps the site alert',
+    viAlert.childNodes[1].textContent === 'Tải lại',
+    JSON.stringify(viAlert.textContent));
+  check('the archive notice still comes out',
+    viNotice.textContent === '', JSON.stringify(viNotice.textContent));
+  await vietnamese.app.reader.getContent('qidian', '1', '2');
+  await tick(60);
+  check('no chapter-list request is paid for a reader who is not Chinese',
+    (vietnamese.__stored.cacheLater || [])
+      .filter((url) => url.indexOf('sajax=getchapterlist') >= 0).length === 0,
+    JSON.stringify(vietnamese.__stored.cacheLater || []));
+}
+
+/**
+ * The reader's error alert -- the unlock message with its "Tải lại" button -- is
+ * built inside the chapter frame (app.v2.chapterdisplay.js:873 showAlert writes
+ * into the frame's #maincontent) or inside .contentcontainer (:3816), and the
+ * general translation pass may enter neither: the chapter text lives in both.
+ * So the alert gets its own, alert-scoped pass, and the novel text beside it has
+ * to stay exactly as it was.
+ */
+async function testReaderAlert() {
+  console.log('reader alert translation');
+  const unlock = 'Mở khóa chương này cần cho phép sử dụng thần thạch, '
+    + 'truy cập cài đặt để xem chi tiết.';
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto', appLanguage: 'zh' });
+
+  const frameAlert = makeContainer('div', 'erroralert');
+  frameAlert.appendChild(makeContainer('div', '', unlock));
+  frameAlert.appendChild(makeContainer('div', 'btn', 'Tải lại'));
+  const frameNovel = makeContainer('p', '', 'Hắn quay đầu lại.');
+  const frame = makeFakeFrame([frameAlert, frameNovel]);
+  sandbox.document.body.appendChild(frame);
+
+  const container = makeContainer('div', 'contentcontainer');
+  const scrollerAlert = makeContainer('div', 'erroralert');
+  scrollerAlert.appendChild(makeContainer('div', '', unlock));
+  scrollerAlert.appendChild(makeContainer('div', 'btn', 'Tải lại'));
+  container.appendChild(scrollerAlert);
+  sandbox.document.body.appendChild(container);
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  check('the unlock message is translated inside the reader frame',
+    frameAlert.childNodes[0].textContent === '解锁本章需要使用神石，请进入设置查看详情。',
+    JSON.stringify(frameAlert.childNodes[0].textContent));
+  check('and so is its reload button',
+    frameAlert.childNodes[1].textContent === '重新加载',
+    JSON.stringify(frameAlert.childNodes[1].textContent));
+  check('the novel text next to the alert is untouched',
+    frameNovel.textContent === 'Hắn quay đầu lại.', JSON.stringify(frameNovel.textContent));
+  check('the alert inside .contentcontainer is translated, although the general '
+    + 'pass skips that container',
+    scrollerAlert.childNodes[0].textContent === '解锁本章需要使用神石，请进入设置查看详情。'
+      && scrollerAlert.childNodes[1].textContent === '重新加载',
+    JSON.stringify(scrollerAlert.textContent));
+
+  // The server sends the sentence, so a variant that carries something else
+  // around it still has to come out Chinese: the fragments cover the two halves.
+  const variant = makeContainer('div', 'erroralert');
+  variant.appendChild(makeContainer('div', '',
+    '@Mở khóa chương này cần cho phép sử dụng thần thạch, truy cập cài đặt để xem chi tiết.'));
+  sandbox.document.body.appendChild(variant);
+  sandbox.window.__stvI18n.sweepAlerts(sandbox.document.body);
+  check('a decorated variant of the message is translated too',
+    variant.childNodes[0].textContent === '@解锁本章需要使用神石，请进入设置查看详情。',
+    JSON.stringify(variant.childNodes[0].textContent));
+
+  // The alert arrives long after document start -- the reader is minutes into a
+  // session when a chapter turns out to need unlocking -- and the fixed delay
+  // list has run out by then, so the mutation path has to catch it. Only the
+  // overlay block runs in this sandbox, so the synthesized record reaches no
+  // other block's observer.
+  const late = makeSandbox();
+  installFakeApp(late, { displayType: 'auto', appLanguage: 'zh' });
+  vm.runInContext(
+    loadBlocks().filter((block) => block.indexOf('window.__stvI18nInstalled') >= 0).join('\n'),
+    late);
+  await tick(60);
+  const lateAlert = makeContainer('div', 'erroralert');
+  lateAlert.appendChild(makeContainer('div', '', unlock));
+  lateAlert.appendChild(makeContainer('div', 'btn', 'Tải lại'));
+  late.document.body.appendChild(lateAlert);
+  late.__emitMutation({ type: 'childList', target: late.document.body, addedNodes: [lateAlert] });
+  check('an alert that arrives later is translated by the mutation pass',
+    lateAlert.childNodes[0].textContent === '解锁本章需要使用神石，请进入设置查看详情。'
+      && lateAlert.childNodes[1].textContent === '重新加载',
+    JSON.stringify(lateAlert.textContent));
 }
 
 async function testReaderTts() {
@@ -6133,6 +6384,8 @@ await testChapterNamePlace();
   await testActivityLog();
   await testI18nOverlay();
 await testLanguageGuard();
+  await testLanguageSelection();
+  await testReaderAlert();
   await testSafeArea();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();

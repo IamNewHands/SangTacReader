@@ -237,6 +237,16 @@ jobs:
               exit 1
             fi
           done
+          # 首次启动的语言选择只能由原生提供：WKWebView 的 navigator.language 是
+          # **应用自己的**本地化（Capacitor 模板只有英文），不是设备语言，所以原生
+          # 必须把 Locale.preferredLanguages 交给页面。**这一条只能查源码**：它只是
+          # 一个 document start 的赋值语句，产物里有没有都被别的字符串掩盖。
+          if grep -q -F 'window.__stvDeviceLang = ' plugins/app/ios/Sources/SangTacAppPlugin/SangTacAppPlugin.swift; then
+            echo "✓ 设备语言已从原生交给页面"
+          else
+            echo "::error::设备语言未从原生交给页面（首次启动的语言选择会退回 navigator.language）"
+            exit 1
+          fi
           # 系统离线翻译的三个桥接方法名。iOS 15-17 上它们也必须在（返回
           # "unsupported" 让 JS 换联网引擎），缺了会变成不透明的桥接错误。
           for marker in translationStatus translationPrepare translationTranslate; do
