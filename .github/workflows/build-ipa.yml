@@ -79,6 +79,28 @@ jobs:
       - name: Sync web assets and Capacitor plugins
         run: npx cap sync ios
 
+      # 锁屏后 TTS 还能继续念，前提之一是应用声明了后台音频模式。
+      # ios/ 由 `cap add ios` 生成、故意不入库，Capacitor 模板的 Info.plist 不带
+      # UIBackgroundModes，所以这一条只能在 macOS runner 上补。
+      # 用「存在则跳过、追加到数组末尾」而不是 Delete+Add：将来模板或插件自己
+      # 加了别的后台模式时，这里不能把它删掉。
+      - name: Enable background audio mode
+        run: |
+          set -euo pipefail
+          plist=ios/App/App/Info.plist
+          if /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$plist" 2>/dev/null | grep -q 'audio'; then
+            echo "UIBackgroundModes 已含 audio，跳过"
+          else
+            /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$plist" 2>/dev/null || true
+            index=0
+            while /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:$index" "$plist" >/dev/null 2>&1; do
+              index=$((index + 1))
+            done
+            /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:$index string audio" "$plist"
+          fi
+          echo "=== UIBackgroundModes ==="
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$plist"
+
       - name: Verify generated SPM manifest
         run: |
           set -euo pipefail
@@ -131,6 +153,22 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
             2>&1 | tee xcodebuild.log | tail -80
+
+      # 后台音频模式必须真的进产物。缺了不会崩，表现只是「锁屏就停读」，而这
+      # 正好是本轮要分开验证的两个根因之一——所以构建必须在这里红，不能靠真机
+      # 反复试。plutil 直接读产物里的 plist（可能是二进制格式），比 strings 可靠。
+      - name: Verify background audio mode is in the built app
+        run: |
+          set -euo pipefail
+          app="$(find ios/App/build/Build/Products -maxdepth 3 -name '*.app' -type d | head -1)"
+          plist="$app/Info.plist"
+          echo "plist: $plist"
+          modes="$(plutil -extract UIBackgroundModes json -o - "$plist" 2>/dev/null || true)"
+          echo "UIBackgroundModes = ${modes:-<缺失>}"
+          case "$modes" in
+            *'"audio"'*) echo "✓ 后台音频模式已编入产物" ;;
+            *) echo "::error::产物 Info.plist 缺少 UIBackgroundModes=audio（锁屏后应用会被立刻挂起）"; exit 1 ;;
+          esac
 
       - name: Verify native plugins are linked into the binary
         run: |
