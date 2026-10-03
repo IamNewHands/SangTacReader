@@ -188,42 +188,46 @@ ${data.patterns
         return 'en';
     }
 
-    var seededLanguage = '';
-
     function seedLanguage() {
         if (cookieValue('lang')) { return false; }
         var device = deviceLanguage();
         if (!device) { return false; }
-        seededLanguage = mapDeviceLanguage(device);
-        writeLanguageCookie(seededLanguage);
-        note('PATCH', 'first launch: language seeded to ' + seededLanguage
+        var seeded = mapDeviceLanguage(device);
+        writeLanguageCookie(seeded);
+        note('PATCH', 'first launch: language seeded to ' + seeded
             + ' from device ' + device);
         return true;
     }
 
-    // The settings row reads app.config.ux.app_language (page-vip:1464), so the
-    // seeded language has to land there too or the row would claim Vietnamese
-    // while the page is Chinese. Written through the site's own setter, which is
-    // what persists it with the rest of the UX settings (app.v2.config.js:77-82).
+    // The settings row reads app.config.ux.app_language (page-vip:1464), and the
+    // cookie is the language the page is actually rendering in -- so the row is
+    // kept equal to the cookie, not only while a fresh seed is being placed. Two
+    // things make the standing check necessary:
     //
-    // The caller keeps calling this for a minute rather than until the first
-    // success: settingsBackup restores config.ux from the Keychain a few seconds
-    // in (it waits for the site's own store round trip), so a restored
-    // app_language can land *after* the first write and would otherwise leave the
-    // row claiming a language the page is not in. The cookie is the language the
-    // page is actually rendering in, so the row follows it -- see the doc's
-    // unproven list for what that costs on the reinstall path.
+    //   * the site writes the pick and *then* runs the row's onchange in the same
+    //     click (app.v2.js:2049-2054): assigning app.config.ux.app_language goes
+    //     through the setter into app.storage, an async bridge call
+    //     (app.v2.config.js:77-82, :101-108), and only then does changeLanguage
+    //     run -- which is what reloads the page. A write still in flight when the
+    //     page goes away is simply lost, so the reloaded page reads the old value
+    //     back and shows the language the reader just left while the whole UI is
+    //     already in the new one. That is the report.
+    //   * settingsBackup restores config.ux from the Keychain a few seconds in
+    //     (it waits for the site's own store round trip), which can put an older
+    //     value back after the row was already right.
+    //
+    // The compare keeps it to one write per disagreement.
     function syncSettingLanguage() {
-        if (!seededLanguage) { return true; }
         var app = window.app;
         if (!app || !app.config || !app.config.ux) { return false; }
+        var live = currentLanguage();
         try {
-            if (app.config.ux.app_language !== seededLanguage) {
-                app.config.ux.app_language = seededLanguage;
-                note('PATCH', 'settings row language set to ' + seededLanguage);
+            if (app.config.ux.app_language !== live) {
+                app.config.ux.app_language = live;
+                note('PATCH', 'settings row language set to ' + live);
             }
         } catch (e) {
-            note('ERR', 'could not store the seeded language: ' + e);
+            note('ERR', 'could not store the language in the settings row: ' + e);
         }
         return true;
     }
@@ -920,7 +924,15 @@ ${data.patterns
         if (reloadedFor === code) { return; }
         reloadedFor = code;
         note('PATCH', 'language switched to ' + code + '; reloading so the page re-renders');
-        try { window.location.reload(); } catch (e) {}
+        // A moment, not immediately: the row's own write goes through
+        // app.storage (an async bridge call) and the site runs it in the same
+        // click as this changeLanguage, so navigating away in the same turn
+        // drops it -- the reloaded page would then show the language the reader
+        // just left. syncSettingLanguage repairs that too, but not losing the
+        // write in the first place is the cheaper half of the fix.
+        setTimeout(function () {
+            try { window.location.reload(); } catch (e) {}
+        }, 300);
     }
 
     function installLanguageGuard() {
@@ -1026,11 +1038,17 @@ ${data.patterns
     // mutation this document can see. Attaching is what arms the notice pass
     // for the chapter text the frame is about to hold. An hour is longer than
     // any reading session and keeps the timer from outliving the page.
+    //
+    // The settings row rides along on this tick: a language switch reloads the
+    // page, and the row's own persisted value can be lost in that navigation or
+    // put back by the Keychain restore, so the row is re-checked against the
+    // cookie once a second for as long as the page lives.
     var frameAttempts = 0;
     var frameTimer = setInterval(function () {
         frameAttempts++;
         attachFrames();
         stripNotices(document.documentElement);
+        syncSettingLanguage();
         if (frameAttempts > 3600) { clearInterval(frameTimer); }
     }, 1000);
 
@@ -1046,16 +1064,6 @@ ${data.patterns
     var langTimer = setInterval(function () {
         langAttempts++;
         if (installLanguageGuard() || langAttempts > 600) { clearInterval(langTimer); }
-    }, 200);
-
-    // app.config.ux is built by app.v2.config.js, which is a separate request
-    // from the shell, and the settings backup restores it a few seconds after
-    // that: keep the row in step for a minute, not until the first success.
-    var settingAttempts = 0;
-    var settingTimer = setInterval(function () {
-        settingAttempts++;
-        if (!seededLanguage || settingAttempts > 300) { clearInterval(settingTimer); return; }
-        syncSettingLanguage();
     }, 200);
 
     if (window.__stvDiag) {

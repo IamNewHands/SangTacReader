@@ -1264,6 +1264,20 @@ async function testDiagPanel() {
   check('the panel is on screen while logging is on',
     !!panel && panel.style.display === 'block',
     panel ? panel.style.display : 'no panel');
+  // The web view runs edge to edge (`viewport-fit=cover`), so a panel anchored at
+  // top:0 puts its button bar under the status bar / Dynamic Island, where a tap
+  // belongs to the system and never reaches the page -- HIDE and CLOSE were
+  // unreachable on device. The panel has to start below the safe area, from the
+  // same two sources the reader bars use.
+  check('the panel starts below the status bar, not at the very top',
+    !!panel && panel.style.cssText.indexOf('--status-bar-height') >= 0
+      && panel.style.cssText.indexOf('safe-area-inset-top') >= 0
+      && panel.style.cssText.indexOf('top:0;') < 0,
+    panel ? panel.style.cssText : 'no panel');
+  check('the button bar is tall enough to be a tap target',
+    !!panel && panel.childNodes[0].style.cssText.indexOf('height:36px') >= 0
+      && panel.childNodes[1].style.cssText.indexOf('top:36px') >= 0,
+    panel ? panel.childNodes[0].style.cssText : 'no panel');
 
   diag.log('Http', 'GET /x -> 200');
   diag.log('ERR', 'boom');
@@ -1693,23 +1707,32 @@ async function testLanguageGuard() {
   // The site's own changeLanguage only swaps the app.text table and re-runs the
   // <text> nodes (app.v2.js:1952-1956), which leaves every hardcoded string it
   // already rendered -- and everything this overlay already rewrote -- in the old
-  // language. Switching therefore reloads once, from the cookie the site wrote.
+  // language. Switching therefore reloads once, from the cookie the site wrote --
+  // a moment later, so the row's own async persistence is not dropped by the
+  // navigation.
+  sandbox.__reloaded = false;
   sandbox.window.location = { reload() { sandbox.__reloaded = true; } };
   await app.text.changeLanguage('zh');
-  await tick(20);
+  // Not in the same turn: the row writes app.config.ux.app_language through
+  // app.storage (an async bridge call) and the site runs that write and this
+  // switch in one click (app.v2.js:2049-2054), so navigating away here would drop
+  // it -- and the reloaded page would show the language the reader just left.
+  check('the reload is deferred, so the row write can land',
+    sandbox.__reloaded === false, String(sandbox.__reloaded));
+  await tick(600);
   check('switching to a different language reloads the page',
     sandbox.__reloaded === true, String(sandbox.__reloaded));
   check('and the site language really changed',
     app.language === 'zh', String(app.language));
   sandbox.__reloaded = false;
   await app.text.changeLanguage('zh');
-  await tick(20);
+  await tick(600);
   check('re-applying the language it is already in does not reload',
     sandbox.__reloaded === false, String(sandbox.__reloaded));
   // ...and the one-shot guard is per target, not per page: a later switch to a
   // third language still reloads.
   await app.text.changeLanguage('vi');
-  await tick(20);
+  await tick(600);
   check('a later switch to a different language reloads again',
     sandbox.__reloaded === true && app.language === 'vi',
     String(sandbox.__reloaded) + ' / ' + String(app.language));
@@ -1717,12 +1740,12 @@ async function testLanguageGuard() {
   // still reloads on the last one (a session-wide memory of the target would not).
   sandbox.__reloaded = false;
   await app.text.changeLanguage('zh');
-  await tick(20);
+  await tick(600);
   check('switching back to Chinese reloads',
     sandbox.__reloaded === true, String(sandbox.__reloaded));
   sandbox.__reloaded = false;
   await app.text.changeLanguage('vi');
-  await tick(20);
+  await tick(600);
   check('and the next switch back to Vietnamese reloads as well',
     sandbox.__reloaded === true && app.language === 'vi',
     String(sandbox.__reloaded) + ' / ' + String(app.language));
@@ -1766,9 +1789,26 @@ async function testLanguageSelection() {
   // a restored app_language lands *after* the first write; the row has to be
   // brought back in line with the cookie the page is actually rendering in.
   firstApp.config.ux.app_language = 'vi';
-  await tick(400);
+  await tick(1200);
   check('a setting restored late is brought back in line with the page',
     firstApp.config.ux.app_language === 'zh', String(firstApp.config.ux.app_language));
+
+  // The reported state, with no seed involved at all: the page is already Chinese
+  // (the cookie says so) but the row still shows the language the reader just
+  // left, because the row's own write was lost in the reload. The row follows the
+  // cookie for the whole session, so it corrects itself.
+  const stale = makeSandbox();
+  stale.document.cookie = 'lang=zh; path=/';
+  const staleApp = installFakeApp(stale, { displayType: 'auto' });
+  staleApp.config.ux = { app_language: 'vi' };
+  const staleLabel = makeContainer('div', 'settingitemtitle', 'Cài đặt');
+  stale.document.body.appendChild(staleLabel);
+  vm.runInContext(loadBlocks().join('\n'), stale);
+  await tick(400);
+  check('a row left on the old language is corrected to the page language',
+    staleApp.config.ux.app_language === 'zh', String(staleApp.config.ux.app_language));
+  check('and that page really is Chinese',
+    staleLabel.textContent === '设置', JSON.stringify(staleLabel.textContent));
 
   // A language the site does not publish (it has vi, en and zh) gets the English
   // UI, and English is not Chinese, so nothing is rewritten.

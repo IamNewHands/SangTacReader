@@ -901,19 +901,30 @@ enum SitePatch {
             var host = document.body || document.documentElement;
             if (!host) { return false; }
 
-            root = make('div', 'position:fixed;left:0;top:0;width:100%;height:42%;display:none;'
+            // Not `top:0`. The web view runs edge to edge (the safe-area block
+            // adds `viewport-fit=cover`), so a bar pinned to the very top sits
+            // under the status bar / Dynamic Island -- where a tap belongs to the
+            // system and never reaches the page, which is why HIDE and CLOSE were
+            // unreachable on device. The panel starts below the safe area, from
+            // the same two sources the reader bars use (site-computed
+            // `--status-bar-height`, then the web view's own `env()` inset).
+            root = make('div', 'position:fixed;left:0;'
+                + 'top:max(var(--status-bar-height, 0px), env(safe-area-inset-top, 0px));'
+                + 'width:100%;height:42%;display:none;'
                 + 'z-index:2147483646;background:rgba(10,10,10,0.94);color:#7f7;'
                 + 'font:11px/1.35 Menlo,monospace;box-shadow:0 3px 12px rgba(0,0,0,0.6);');
             root.setAttribute('data-stvdiag', 'panel');
 
-            var bar = make('div', 'position:absolute;top:0;left:0;right:0;height:30px;'
+            // 36px, not 30px: the buttons are the only way to close the panel, and
+            // the smaller bar left them at roughly half a comfortable tap target.
+            var bar = make('div', 'position:absolute;top:0;left:0;right:0;height:36px;'
                 + 'background:#1d1d1d;display:flex;align-items:center;padding:0 4px;'
-                + 'color:#ddd;font:11px/30px Menlo,monospace;');
+                + 'color:#ddd;font:11px/36px Menlo,monospace;');
             countEl = make('span', 'flex:1;padding-left:6px;overflow:hidden;white-space:nowrap;', 'stvdiag');
             bar.appendChild(countEl);
 
             function barButton(label, handler) {
-                var b = make('button', 'font:11px Menlo,monospace;padding:3px 8px;margin-left:4px;'
+                var b = make('button', 'font:11px Menlo,monospace;padding:6px 10px;margin-left:4px;'
                     + 'background:#333;color:#eee;border:1px solid #555;border-radius:3px;', label);
                 b.addEventListener('click', function (e) { stopEvent(e); handler(); }, true);
                 return b;
@@ -932,7 +943,7 @@ enum SitePatch {
             bar.appendChild(barButton('CLOSE', function () { hide(); }));
             root.appendChild(bar);
 
-            listEl = make('div', 'position:absolute;top:30px;left:0;right:0;bottom:0;'
+            listEl = make('div', 'position:absolute;top:36px;left:0;right:0;bottom:0;'
                 + 'overflow:auto;-webkit-overflow-scrolling:touch;padding:4px 6px 10px;'
                 + 'white-space:pre-wrap;word-break:break-all;'
                 + '-webkit-user-select:text;user-select:text;');

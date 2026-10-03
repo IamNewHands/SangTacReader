@@ -2893,6 +2893,80 @@ CI 的二进制 strings 检查没法证明原生那一句（它只是一个 docu
 - **解锁提示的原文来自用户粘贴**，服务端实际串可能带别的标点或前后缀；exact 一条 + 5 条 fragment
   是按「整句/前缀/后缀」三种形状铺的，仍可能有一种没覆盖到——真机若还看到越南语，把那一行原文给我。
 
+### 6.27 第二十五轮（真机反馈两条）：诊断悬浮窗顶栏点不到 + 切中文后设置行还显示越南语
+
+§6.26 的真机反馈，两条都成立。
+
+#### (1) 诊断悬浮窗的按钮栏在状态栏底下，点不到
+
+`diag` 块的面板是 `position:fixed;left:0;top:0;width:100%;height:42%`（`SitePatch.swift:904`），
+按钮栏又钉在面板的 `top:0`，于是 COPY / CLEAR / HIDE / CLOSE 正好落在状态栏 / 灵动岛那一条上——
+那里的事件归系统，**根本到不了网页**，所以 HIDE 点不动。安全区块已经给页面加了
+`viewport-fit=cover`（`SitePatch.swift:1981`），也就是网页确实铺满整屏，这个位置不是巧合而是必然。
+
+修法：面板改成从安全区下面开始，用阅读器自己的那对同源取值（与 `INSET_TOP` 同一个写法）：
+
+```
+top:max(var(--status-bar-height, 0px), env(safe-area-inset-top, 0px))
+```
+
+两个来源都要，因为设备上 `App.getSafeArea` 报的是 `top:0`（§6.24 (2)），真正非零的那个是
+**站点自己**量出来的 `--status-bar-height`（62px）；`env()` 只是站点还没写变量时的兜底。
+顺带把按钮栏 30px → 36px、按钮内边距 `3px 8px` → `6px 10px`：原来的按钮实际只有 ~19px 高，
+是舒适点击区的一半，而这是唯一能关掉面板的入口。
+
+#### (2) 切中文后设置行还写「Tiếng Việt」：写入与重载在同一个 click 里
+
+站点的设置行在 `app.v2.js:2048-2054` 是**一个 click 里两步**：
+
+```
+eval(menu.selection + "='" + this.value + "'")   // app.config.ux.app_language = 'zh'
+if (menu.onchange) { menu.onchange(this.data) }  // -> app.text.changeLanguage('zh')
+```
+
+第一步走 `app.config.ux` 的 setter → `saveUxSetting()` → `app.storage.cache.setFile(...)`，
+是 **Capacitor Preferences 的异步桥调用**（`app.v2.config.js:77-82`、`:101-108`）；第二步就是
+§6.26 加的 reload。原来的 reload 是**同步**的，于是那次存储写入还在飞、页面已经导航走了——
+写丢了。重载后行读到的是旧值（`vi`），而页面整体已经是中文（语言真正的来源是 `lang` cookie，
+它由 `setCookie` 同步写入，所以没丢）。再点一次中文不重载也对：`code === before`，语言本来
+就是中文；**但行还是旧的**，因为没有任何东西再去写它。
+
+两处修：
+
+1. **reload 延后 300ms**（`reloadForLanguage`）：让那笔异步写入落地。这是「不丢写入」的一半。
+2. **设置行在整个会话里跟着 cookie 走**（`syncSettingLanguage`）：判据是 `currentLanguage()`
+   ——它是页面**实际正在用的**语言（先 cookie 后 `app.language`）。挂在已有的 1 秒 `frameTimer`
+   上（另在启动后的 0/300/1000/2000/4000/8000ms 采样点各跑一次，让重载后尽快对齐），
+   有差异才写，所以一次分歧只写一次。原来的「只在种子之后写一次」的 200ms 轮询删掉了——
+   它既管不到这次重载（`seededLanguage` 在重载后是空的），也管不到几秒后回灌的设置。
+
+第二条同时兜住 §6.26 未证实项里那条「重装后 Keychain 回灌的旧值」：现在无论旧值从哪来，
+只要与 cookie 不一致就会被纠回去，行与页面不会再长期错位。
+
+#### (3) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **439183 字节** / 75 个标记（标记数不变，没有新块） |
+| `scripts/test-site-patch.js` | **630 条断言**（上一轮 625，新增 5） |
+| `scripts/gen-site-i18n.js --check` | 459 labels / 40 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言：面板的 `top` 取自安全区两个来源且**不再是 `top:0`**、按钮栏 36px 与列表 `top:36px` 对齐、
+**reload 不在同一个 turn 里发生**（这是「写入不丢」的可测判据）、以及那条真机状态
+（cookie=zh + 行上 vi + 无种子 → 行被纠正成 zh，页面确实是中文）。原来那几条 reload 断言
+相应改成等 600ms（reload 现在是延后的）。
+
+#### 未证实项
+
+- **面板顶栏的位置只能在真机上确认**：期望打开诊断面板后按钮栏完整落在状态栏/灵动岛**下面**，
+  HIDE 与 CLOSE 都能点到。若这台设备的 `--status-bar-height` 与 `env(safe-area-inset-top)`
+  都是 0（§6.24 (2) 里 `App.getSafeArea` 报过 `top:0`），面板仍会顶到最上面——那就得让
+  原生把真实 inset 交下来（`getSafeArea` 现在回的就是 `safeAreaInsets`，需要看那一行的实际值）。
+- **reload 的 300ms 与 1 秒的对账周期都是取值，不是实测**：真机上应看到切语言后**一次**重载，
+  且重载后设置页语言行与页面语言一致；`[PATCH] settings row language set to zh` 最多出现一次。
+  若写入仍然丢（面板里出现这行），说明 300ms 不够，可以加长——但行也会被 1 秒的对账纠回来。
+
 
 
 
