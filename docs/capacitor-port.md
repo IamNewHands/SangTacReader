@@ -3279,3 +3279,64 @@ Zalo / FPT / Viettel / 本站语音这四个网络 provider 是普通 HTTPS 请�
 
 
 
+
+### 6.32 第三十轮（真机反馈两条：TTS 朗读不跟翻页；储物袋右滑失效）
+
+来源：`新建 文本文档 (3).txt`（2026-10-03 14:15–14:19，766 行）。第一条：翻页模式下朗读从第一页开始，
+念完整章但屏幕一直停在起始页。第二条：储物袋从左缘右滑无反应，其他页面正常（同一日志 14:18:58
+`[PAGE] open pageinventory` 后从未出现 `[PAGE] swipe dismiss`）。
+
+#### 证据
+
+| 时间 | 日志 | 说明 |
+| --- | --- | --- |
+| 14:17:07 | `fallback source [pageflip page 1 of 22, from the visible line]: 4694 chars -> 492 sentence(s)` | 492 句一次入队 |
+| 14:17:07– | `speak result ... (reader sentence, mark stripped)` 连续 | 句子逐个正常合成播放 |
+| （无） | `page turn -> ...` / 翻页相关任何日志 | 功能当时不存在 |
+| 14:18:58 | `[PAGE] open pageinventory` | 打开储物袋 |
+| 14:18:59–14:19:01 | 无 `swipe dismiss`，最后靠 `tap button.go-back` 退出 | 右滑未生效 |
+
+#### 根因
+
+1. **TTS 不跟翻页**：站点播放链是 `player.play() -> sen.play() -> playAndWait() -> sen.after() ->
+   player.moveNext()`（`app.v2.read.js:79605` 起），推进句子的唯一信号是站点自己的 `Sentence`
+   对象；翻页只发生在队列耗尽后 `play() -> app.reader.nextChapter(true)` 跳下一章
+   （`app.v2.read.js:86110` 附近）。pageflip 显示层翻页的真实入口是
+   `jumpToNextPage()/jumpToPrevPage()`（`chapterdisplay.js:111548/111640`），终点点在
+   `pushPageToScreen()` 上，后者写 `currentPageId`（`chapterdisplay.js:66514`）。而注入的
+   fallback 句子一直是 `highlightOn: noop`（6.24 起），显示层收不到任何"念到哪了"的信号，
+   所以屏幕不动。
+2. **储物袋右滑失效**：储物袋模板是六分类 `<tab>`（`_page_vip.html` 的 `page-pageinventory`），
+   由 `ui.smtab()`（`stv.ui.js:40444`）驱动。smtab 在 `tabdivcontainer` 上以**冒泡阶段**挂
+   `touchstart` 且第一行就 `eve.stopPropagation()`（`stv.ui.js:49560` 附近），`touchmove` 同样
+   `stopPropagation()`。上一轮的手势挂在 page 的冒泡监听上，事件还没冒到 page 就被吃掉了。
+   其他页面没有 smtab，所以正常。
+
+#### 修复
+
+| 位置 | 改动 |
+| --- | --- |
+| `SitePatch.swift` ttsProvider 块 `visiblePageText()` | 返回值新增 `segments`：每页一段 `{el, text}`，屏幕页起手段来自可见行 |
+| 同块新增 `makeSentence()` | fallback 句子改为工厂生成：`highlightOn` 时往阅读器 iframe document 派发 `{type:'stvspeak', target:页元素}` |
+| 同块新增 `turnToPage()` | 目标页属于三章页列表且 `currentPageId` 不同才调 `display.jumpToPage(page)`；日志 `page turn -> page N` |
+| 同块新增 `attachPageTurn()`，由 `patchDisplay()` 调用 | 在阅读器 iframe document 上挂**捕获阶段** `stvspeak` 监听，从 event.target 向上走到页元素 |
+| 同块 swipeDismiss | 三个 touch 监听全部改 `{capture:true}`（捕获先于 smtab 的冒泡拦截执行）；拖拽中的 `event.stopPropagation()` 删除——自己已是捕获层，无需再拦别人 |
+| `scripts/test-site-patch.js` | 假件 addEventListener 支持三参与 capture 桶；`__capture:true` 派发；假 frame document 支持 addEvent/dispatchEvent；makeElement 增加 ownerDocument（makeFakeFrame 反向填充） |
+
+#### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `test-site-patch.js` | 674 断言全过（新增 6 条：捕获阶段注册、拖拽、过阈值 goback、离缘不拖、翻页句子带页归属、跨页 highlight 触发 jumpToPage[1,2] + 日志） |
+| `check-ios-shim.js` | 24 块 / 470016 字节 / 83 标记 |
+| `gen-site-i18n.js --check` | 459 标签 / 40 片段 |
+| `gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+#### 未证实项
+
+- 真机上朗读跨页时屏幕是否真的翻过去（本地假件只能证明调用链通）。
+- `page turn -> page N` 与站点自身高亮滚动（`Sentence.highlight` 里 animate scrollTop）在滚动
+  模式下是否互扰——滚动模式没有 pageElements，走不到新代码。
+- 右滑改为捕获后，smtab 自己的横滑切分类在真机上是否依旧正常（捕获层只在 dx>8 且横向占优时
+  preventDefault，且仅左缘 80px 内起手；真机待验）。
+

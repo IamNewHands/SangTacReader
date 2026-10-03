@@ -101,6 +101,10 @@ function makeElement(tagName) {
     value: '',
     nodeValue: null,
     parentNode: null,
+    // The page-turn highlight walks target.parentElement up to a page element
+    // and then dispatches `stvspeak` on that element's ownerDocument; makeFake
+    // Frame fills this in for the elements it places in its document.
+    ownerDocument: null,
     children: [],
     style: makeStyle(),
     attributes: {},
@@ -138,18 +142,27 @@ function makeElement(tagName) {
       delete this.attributes[name];
     },
     listeners: {},
-    addEventListener(type, handler) {
-      this.listeners[type] = (this.listeners[type] || []).concat([handler]);
+    captureListeners: {},
+    // The swipe-dismiss block registers its touch handlers with
+    // `{ capture: true }` because ui.smtab()'s bubble-phase touchstart on the
+    // inventory tab stops propagation; the stub keeps the two phases apart the
+    // same way a real target would run them (capture first).
+    addEventListener(type, handler, options) {
+      const capture = Boolean(options && typeof options === 'object' && options.capture);
+      const bucket = capture ? this.captureListeners : this.listeners;
+      bucket[type] = (bucket[type] || []).concat([handler]);
     },
     removeEventListener() {},
     // The injected blocks attach click handlers to buttons they create, so the
     // stub has to be able to fire them.
     __fire(type, event) {
-      const handlers = this.listeners[type] || [];
+      const capture = Boolean(event && typeof event === 'object' && event.__capture);
+      const handlers = (capture ? this.captureListeners : this.listeners)[type] || [];
       for (const handler of handlers) { handler(event); }
     },
     // The download-list jump drives the tab bar by dispatching a click on the
-    // tabitem, exactly as a finger would.
+    // tabitem, exactly as a finger would. Set `__capture: true` on the event to
+    // run the capture-phase listeners (the swipe-dismiss touch handlers).
     dispatchEvent(event) {
       this.__fire(event && event.type, event);
       return true;
@@ -436,6 +449,15 @@ function makeSandbox(options) {
     head,
     documentElement,
     createElement: (tag) => makeElement(tag),
+    // The page-turn hook dispatches a `stvspeak` event on the READER frame's
+    // document (a plain object with .dispatchEvent below in makeFakeFrame);
+    // this main-document stub keeps parity for blocks that fire on the outer
+    // document.
+    dispatchEvent(event) {
+      const handlers = listeners[event && event.type] || [];
+      for (const handler of handlers) { handler(event); }
+      return true;
+    },
     addEventListener(type, handler) {
       listeners[type] = listeners[type] || [];
       listeners[type].push(handler);
@@ -575,6 +597,20 @@ function makeFakeFrame(contentElements) {
     documentElement: html,
     body: frameBody,
     getElementById: byId,
+    docEventListeners: {},
+    // The page-turn hook listens for `stvspeak` on the reader document in the
+    // capture phase and makeSentence() fires the same event with the page
+    // element as its target; both halves need this stub to route the event to
+    // the installed listener so a test can watch the display turn.
+    addEventListener(type, handler) {
+      this.docEventListeners[type] = (this.docEventListeners[type] || []).concat([handler]);
+    },
+    removeEventListener() {},
+    dispatchEvent(event) {
+      const handlers = this.docEventListeners[event && event.type] || [];
+      for (const handler of handlers) { handler(event); }
+      return true;
+    },
     // The injected frame scan looks for frames inside frames, and
     // querySelectorAll is what it delegates to; a real frame document answers
     // this, so the stub has to as well.
@@ -589,6 +625,21 @@ function makeFakeFrame(contentElements) {
     removeEventListener() {},
   };
   doc.defaultView = frameWindow;
+  // The page-turn highlight dispatches `stvspeak` on the page element's
+  // ownerDocument; hand every element placed in this document the link.
+  const linkOwner = (node) => {
+    if (node && node.nodeType === 1 && !node.ownerDocument) {
+      node.ownerDocument = doc;
+      for (const child of node.children || []) { linkOwner(child); }
+    }
+  };
+  linkOwner(html);
+  const originalAppendChild = frameBody.appendChild.bind(frameBody);
+  frameBody.appendChild = function (child) {
+    const result = originalAppendChild(child);
+    linkOwner(child);
+    return result;
+  };
   // The reader asks the frame for the caret at the top of the page: the pages
   // it split out live in this document, not in the one the shim runs in.
   attachCaretModel(doc, html);
@@ -2449,6 +2500,63 @@ async function testReaderTts() {
     flipPlayer.currentId === 0 && flipPlayer.sentences.length === 1,
     'currentId=' + String(flipPlayer.currentId)
       + ' sentences=' + String(flipPlayer.sentences.length));
+
+  // The device report that opened this round (2026-10-03 14:17) was the NEXT
+  // step missing: the voice read the chapter to the end but the screen stayed
+  // on page 1, because the fallback sentences the shim hands the site carry
+  // `highlightOn: noop` and the site's queue only moves the pageflip display
+  // through the highlight it receives (playQueue -> currentChapter.highlightOn,
+  // app.v2.read.js:91136; jumpToNextPage walks the frames and lands on
+  // pushPageToScreen, chapterdisplay.js:111548). The sentence now announces its
+  // page as a `stvspeak` event and a capture listener turns the display.
+  const turnPageOne = makeContainer('div', 'pageparent', '翻页测试第一页第一句。翻页测试第一页第二句。');
+  const turnPageTwo = makeContainer('div', 'pageparent', '翻页测试第二页第一句。');
+  const turnPageThree = makeContainer('div', 'pageparent', '翻页测试第三页第一句。');
+  const turnFrame = makeFakeFrame([makeContainer('div', 'maincontent', '')]);
+  const turnChapter = { cid: '927797007', pageElements: [turnPageOne, turnPageTwo, turnPageThree] };
+  const turnDisplay = {
+    innerWindow: turnFrame.contentWindow,
+    getCurrentWindow() { return turnFrame.contentWindow; },
+    getCurrentChapter() { return turnChapter; },
+    currentPageId: 0,
+    tokenizeSentence() { return []; },
+  };
+  const turnCalls = [];
+  turnDisplay.jumpToPage = function (page) {
+    turnCalls.push(turnChapter.pageElements.indexOf(page));
+    this.currentPageId = turnChapter.pageElements.indexOf(page);
+  };
+  const turnSandbox = makeSandbox();
+  const turnApp = installFakeApp(turnSandbox, { displayType: 'pageflip', display: turnDisplay });
+  turnSandbox.document.body.appendChild(turnFrame);
+  const turnPlayer = {
+    sentences: [],
+    currentId: 0,
+    reset() { this.sentences = []; this.currentId = 0; },
+    generateSentences() { this.sentences = turnDisplay.tokenizeSentence(); this.currentId = 0; },
+  };
+  turnApp.tts.player = turnPlayer;
+  turnApp.tts.start = function () { turnApp.tts.player = turnPlayer; };
+  vm.runInContext(loadBlocks().join('\n'), turnSandbox);
+  await tick(250);
+
+  turnApp.tts.start();
+  await tick(20);
+  check('page-turn sentences know which page they came from',
+    turnPlayer.sentences.length === 4,
+    JSON.stringify(turnPlayer.sentences.map((s) => s.toText())));
+  // Sentences 0/1 live on page 1 (already on screen -- no call), 2 turns to
+  // page 2, 3 turns to page 3.
+  turnPlayer.sentences[0].highlightOn('red');
+  turnPlayer.sentences[2].highlightOn('red');
+  turnPlayer.sentences[3].highlightOn('red');
+  check('the voice crossing onto a later page turns the display to it',
+    JSON.stringify(turnCalls) === '[1,2]',
+    'jumpToPage calls: ' + JSON.stringify(turnCalls)
+      + ' currentPageId=' + String(turnDisplay.currentPageId));
+  check('the page turn is reported for the device log',
+    String(turnSandbox.window.__stvDiag.text() || '').indexOf('page turn -> page 2') >= 0,
+    String(turnSandbox.window.__stvDiag.text() || '').slice(-200));
 
   // The page's own text is not the page's visible text. The splitter cuts a
   // paragraph in two by CLONING it: the page that keeps the top gets a
@@ -6776,20 +6884,34 @@ async function testSwipeDismiss() {
 
   const invPage = sandbox.window.app.pushPage('pageinventory');
   check('pushed page receives touchstart listener',
-    Boolean(invPage.listeners.touchstart && invPage.listeners.touchstart.length));
+    Boolean((invPage.captureListeners.touchstart && invPage.captureListeners.touchstart.length)
+      || (invPage.listeners.touchstart && invPage.listeners.touchstart.length)),
+    'capture or bubble, the page must be wired for touch');
 
   const readerPage = sandbox.window.app.pushPage('readchapter');
   check('excluded reading page does not install swipe handlers',
     !readerPage.listeners.touchstart || !readerPage.listeners.touchstart.length);
 
-  invPage.dispatchEvent({
-    type: 'touchstart',
+  // ui.smtab() (stv.ui.js) puts a bubble-phase touchstart on the inventory's
+  // tabdivcontainer that calls eve.stopPropagation(), which is exactly what ate
+  // the first attempt's bubble listeners on the device (the 2026-10-03 log
+  // opened pageinventory at 14:18:58 and never logged a swipe). The handlers
+  // must be capture-phase to run before that.
+  check('the inventory touchstart is registered in the capture phase',
+    Boolean(invPage.captureListeners.touchstart && invPage.captureListeners.touchstart.length),
+    'bubble listeners are unreachable behind smtab stopPropagation');
+  check('the inventory touchmove is registered in the capture phase',
+    Boolean(invPage.captureListeners.touchmove && invPage.captureListeners.touchmove.length));
+
+  const invDispatch = (type, extra) => invPage.dispatchEvent(Object.assign(
+    { type, __capture: true }, extra || {}));
+
+  invDispatch('touchstart', {
     touches: [{ clientX: 20, clientY: 100 }],
     target: invPage,
   });
 
-  invPage.dispatchEvent({
-    type: 'touchmove',
+  invDispatch('touchmove', {
     touches: [{ clientX: 180, clientY: 105 }],
     cancelable: true,
     preventDefault: () => {},
@@ -6799,14 +6921,25 @@ async function testSwipeDismiss() {
   check('swipe drag updates transform translate3d',
     String(invPage.style.transform).indexOf('translate3d') >= 0);
 
-  invPage.dispatchEvent({
-    type: 'touchend',
+  invDispatch('touchend', {
     changedTouches: [{ clientX: 200, clientY: 105 }],
   });
 
   await tick(300);
   check('swiping past threshold triggers app.goback()',
     gobackCalled === true);
+
+  // A horizontal category swipe must NOT dismiss the page: the drag gate only
+  // takes over from the left edge, and a start further in is cancelled.
+  const plainPage = sandbox.window.app.pushPage('pagesetting');
+  plainPage.dispatchEvent({ type: 'touchstart', __capture: true,
+    touches: [{ clientX: 200, clientY: 100 }], target: plainPage });
+  plainPage.dispatchEvent({ type: 'touchmove', __capture: true,
+    touches: [{ clientX: 380, clientY: 100 }],
+    cancelable: true, preventDefault: () => {}, stopPropagation: () => {} });
+  check('a horizontal swipe away from the left edge does not drag the page',
+    String(plainPage.style.transform).indexOf('translate3d') < 0,
+    'tab category swipes must keep working');
 }
 
 (async () => {

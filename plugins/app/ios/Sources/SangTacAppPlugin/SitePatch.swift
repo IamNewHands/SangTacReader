@@ -3969,6 +3969,28 @@ enum SitePatch {
             return function () { return value; };
         }
 
+        // A sentence object the site's queue accepts: toText() feeds the engine
+        // (with the stv0 marker the ASCII filter needs), and highlightOn
+        // dispatches `stvspeak` on the reader document with the sentence's page
+        // element as its target -- the hook attachPageTurn listens for, in the
+        // capture phase, to turn the pageflip display while the voice moves.
+        function makeSentence(text, pageEl, doc) {
+            return {
+                toText: toTextFor(text),
+                highlightOn: function () {
+                    if (!pageEl) { return; }
+                    // The document is the one the sentence list was built from
+                    // (the reader iframe's); pageEl.ownerDocument would be the
+                    // same object, but the site keeps its page elements
+                    // attached to nothing it exposes, so take it from here.
+                    var target = doc || pageEl.ownerDocument;
+                    if (!target || typeof target.dispatchEvent !== 'function') { return; }
+                    try { target.dispatchEvent({ type: 'stvspeak', target: pageEl }); } catch (e) {}
+                },
+                highlightOff: noop
+            };
+        }
+
         function readerWindow(display) {
             var w = null;
             try {
@@ -4036,6 +4058,55 @@ enum SitePatch {
         // The site's own queue carries on from there by itself (app.v2.read.js
         // play() -> nextChapter(true) once the list runs out), which is why the
         // rest of the chapter is appended page by page.
+
+        // The display's own page turn (jumpToNextPage, chapterdisplay.js
+        // ~111548) walks currentFrame.nextElementSibling and lands on
+        // pushPageToScreen, which is what advances currentPageId. jumpToPage
+        // accepts any element of the three chapters, and turning to the page
+        // already on screen is a cheap early return for the site.
+        function turnToPage(display, page) {
+            if (!display || !page) { return; }
+            var chapter = chapterOf(display);
+            var pages = chapter && chapter.pageElements;
+            if (!pages) { return; }
+            var at = pages.indexOf(page);
+            if (at < 0 || display.currentPageId === at) { return; }
+            if (typeof display.jumpToPage === 'function') {
+                try {
+                    display.jumpToPage(page);
+                    note('TTS', 'page turn -> page ' + (at + 1));
+                } catch (e) {
+                    note('ERR', 'page turn failed: ' + e);
+                }
+            }
+        }
+
+        // Turn the display as the voice moves: one capture-phase listener on
+        // the reader iframe walks up from the highlighted node to its page
+        // element. Capture (not bubble) because the same touch stream is what
+        // the site's own swipe path eats on other pages.
+        function attachPageTurn(display) {
+            var w = readerWindow(display);
+            var chapter = chapterOf(display);
+            var pages = chapter && chapter.pageElements;
+            if (!w || !w.document || !pages || !pages.length) { return; }
+            if (w.__stvPageTurnInstalled) { return; }
+            w.__stvPageTurnInstalled = true;
+            w.document.addEventListener('stvspeak', function (event) {
+                try {
+                    var node = event.target;
+                    while (node && node.nodeType === 1) {
+                        if (pages.indexOf(node) >= 0) {
+                            turnToPage(display, node);
+                            return;
+                        }
+                        node = node.parentElement || node.parentNode;
+                    }
+                } catch (e) {}
+            }, true);
+            note('TTS', 'page turn listener installed');
+        }
+
         function isChromeNode(node) {
             var el = node;
             while (el) {
@@ -4214,15 +4285,25 @@ enum SitePatch {
                     caret = null;
                     text = blocksText(onScreen, { skipChrome: true });
                 }
+                // Each later page keeps its own element: the queue has to turn
+                // the display to it when the voice gets there (turnToPage).
                 var parts = [];
-                if (text) { parts.push(text); }
+                var segments = [];
+                if (text) {
+                    parts.push(text);
+                    segments.push({ el: onScreen, text: text });
+                }
                 for (var i = at + 1; i < pages.length; i++) {
                     var later = blocksText(pages[i], { skipChrome: true, skipSpill: true });
-                    if (later) { parts.push(later); }
+                    if (later) {
+                        parts.push(later);
+                        segments.push({ el: pages[i], text: later });
+                    }
                 }
                 if (!parts.length) { return null; }
                 return {
                     text: parts.join(String.fromCharCode(10)),
+                    segments: segments,
                     source: 'pageflip page ' + (at + 1) + ' of ' + pages.length
                         + (caret ? ', from the visible line' : ', from the top of the page')
                 };
@@ -4270,8 +4351,7 @@ enum SitePatch {
         function fallbackSentences(display) {
             var w = readerWindow(display);
             if (!w || !w.document) { return []; }
-            var doc = w.document;
-            var text = '';
+            var doc = w.document;            var text = '';
             var source = '';
             var model = visiblePageText(display);
             if (model) { text = model.text; source = model.source; }
@@ -4288,8 +4368,29 @@ enum SitePatch {
             text = stripNoticeText(text);
             var pieces = splitSentences(text);
             var list = [];
+            // Map each piece back to the page element it came from so the
+            // highlight can turn the display (attachPageTurn). Text matching is
+            // done with indexOf on the remaining tail, not a hard offset: the
+            // piece may start mid-segment. Reference identity of the page
+            // element is what turns the page, so a mismatch here only costs a
+            // page turn, never a wrong page.
+            var segments = (model && model.segments) ? model.segments : null;
+            var segIdx = 0;
+            var segPos = 0;
             for (var i = 0; i < pieces.length; i++) {
-                list.push({ toText: toTextFor(MARK + pieces[i]), highlightOn: noop, highlightOff: noop });
+                if (segments) {
+                    while (segIdx < segments.length
+                        && segPos >= segments[segIdx].text.length) {
+                        segIdx++;
+                        segPos = 0;
+                    }
+                    if (segIdx < segments.length) {
+                        var at2 = segments[segIdx].text.indexOf(pieces[i], segPos);
+                        if (at2 >= 0) { segPos = at2 + pieces[i].length; }
+                    }
+                }
+                var pageEl = segments ? segments[segIdx].el : null;
+                list.push(makeSentence(MARK + pieces[i], pageEl, doc));
             }
             note('TTS', 'fallback source [' + source + ']: ' + text.length + ' chars -> '
                 + pieces.length + ' sentence(s), first='
@@ -4300,6 +4401,7 @@ enum SitePatch {
         function patchDisplay(display) {
             if (!display || display.__stvTtsPatched) { return; }
             display.__stvTtsPatched = true;
+            attachPageTurn(display);
             var original = display.tokenizeSentence;
             display.tokenizeSentence = function () {
                 ensureSpeaker(this);
@@ -8558,6 +8660,11 @@ enum SitePatch {
             var isDragging = false;
             var isCancelled = false;
 
+            // Capture phase on purpose: ui.smtab() (stv.ui.js) puts a
+            // touchstart on the inventory's tabdivcontainer that calls
+            // eve.stopPropagation() to keep its own tab drag exclusive, so a
+            // bubble listener on the page never sees the touch. Capture runs
+            // first and the site's handler keeps working below.
             page.addEventListener('touchstart', function (event) {
                 if (!event.touches || event.touches.length !== 1) {
                     isCancelled = true;
@@ -8605,8 +8712,11 @@ enum SitePatch {
                     isCancelled = true;
                     return;
                 }
-            }, { passive: true });
+            }, { passive: true, capture: true });
 
+            // Same capture reason for touchmove: smtab's own touchmove handler
+            // stops propagation too, and the drag needs preventDefault to beat
+            // the browser scroll.
             page.addEventListener('touchmove', function (event) {
                 if (isCancelled || !event.touches || event.touches.length !== 1) { return; }
                 var touch = event.touches[0];
@@ -8634,13 +8744,12 @@ enum SitePatch {
 
                 if (isDragging) {
                     if (event.cancelable) { event.preventDefault(); }
-                    event.stopPropagation();
 
                     var offset = Math.max(0, dx);
                     page.style.transform = 'translate3d(' + offset + 'px,0,0)';
                     page.style.transition = 'none';
                 }
-            }, { passive: false });
+            }, { passive: false, capture: true });
 
             function onTouchFinish(event) {
                 if (!isDragging) { return; }
@@ -8681,8 +8790,8 @@ enum SitePatch {
                 }
             }
 
-            page.addEventListener('touchend', onTouchFinish, { passive: true });
-            page.addEventListener('touchcancel', onTouchFinish, { passive: true });
+            page.addEventListener('touchend', onTouchFinish, { passive: true, capture: true });
+            page.addEventListener('touchcancel', onTouchFinish, { passive: true, capture: true });
         }
 
         function hookPushPage() {
