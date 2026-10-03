@@ -2485,6 +2485,31 @@ async function testReaderTts() {
   check('the marker is not part of the sentence text the site would speak',
     produced[0].toText().slice(4) === '第一句。', JSON.stringify(produced[0].toText()));
 
+  // A closing quote sitting between two break characters became a sentence of
+  // its own. The stv0 marker is an ASCII word, so the site's filter let it
+  // through, and the native side -- finding no CJK in it -- called the fragment
+  // Vietnamese and read a lone quote with the Vietnamese voice. On the device
+  // that is exactly the stray Vietnamese sentence heard after "…看景？".
+  const quoted = makeContainer('div', 'maincontent', '他说：“怎么有空散步看景？”，然后走了。');
+  quoted.id = 'maincontent';
+  const quotedFrame = makeFakeFrame([quoted]);
+  const quotedDisplay = {
+    innerWindow: quotedFrame.contentWindow,
+    getCurrentWindow() { return quotedFrame.contentWindow; },
+    tokenizeSentence() { return []; },
+  };
+  const quotedSandbox = makeSandbox();
+  installFakeApp(quotedSandbox, { displayType: 'pageflip', display: quotedDisplay });
+  quotedSandbox.document.body.appendChild(quotedFrame);
+  vm.runInContext(loadBlocks().join('\n'), quotedSandbox);
+  await tick(250);
+  const quotedSpoken = quotedDisplay.tokenizeSentence().map((s) => s.toText().slice(4));
+  check('a punctuation-only fragment is not a sentence of its own',
+    quotedSpoken.indexOf('”') < 0, JSON.stringify(quotedSpoken));
+  check('the dialogue around it is still read',
+    quotedSpoken.length === 2 && quotedSpoken[0] === '他说：“怎么有空散步看景？'
+      && quotedSpoken[1] === '然后走了。', JSON.stringify(quotedSpoken));
+
   // The reader iframe has no #maincontent -- the pageflip template builds only
   // .chaptertopinfo, #mainscroller and #dragbar -- and the scroller holds the
   // previous, current and next chapter side by side. Reading the document reads

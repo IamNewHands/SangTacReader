@@ -104,6 +104,28 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         return "vi-VN"
     }
 
+    /// A fragment with nothing to pronounce -- a lone closing quote, say -- says
+    /// nothing about which language it belongs to. `scriptLanguage` answers
+    /// "vi-VN" for it, because it finds no CJK, which used to hand a single
+    /// closing quote to the Vietnamese voice in the middle of a Chinese chapter.
+    private static func hasSpokenScript(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if (0x30...0x39).contains(value)          // 0-9
+                || (0x41...0x5A).contains(value)      // A-Z
+                || (0x61...0x7A).contains(value)      // a-z
+                || (0x00C0...0x024F).contains(value)  // Latin-1 + Latin Extended (Vietnamese)
+                || (0x3040...0x30FF).contains(value)  // kana
+                || (0x3400...0x4DBF).contains(value)  // CJK ext A
+                || (0x4E00...0x9FFF).contains(value)  // CJK unified
+                || (0xF900...0xFAFF).contains(value)  // compatibility ideographs
+                || (0x20000...0x2FA1F).contains(value) {
+                return true
+            }
+        }
+        return false
+    }
+
     /// A requested voice is honoured only when it can actually pronounce the
     /// text: the setting stores one identifier, but the reader switches between
     /// Chinese chapters and Vietnamese UI strings.
@@ -111,9 +133,13 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         let language = NativeSpeech.scriptLanguage(for: text)
         let prefix = String(language.prefix(2))
         if let identifier = identifier, !identifier.isEmpty,
-           let resolved = AVSpeechSynthesisVoice(identifier: identifier),
-           resolved.language.lowercased().hasPrefix(prefix) {
-            return resolved
+           let resolved = AVSpeechSynthesisVoice(identifier: identifier) {
+            // Text carrying no script at all keeps the reader's own voice
+            // instead of being classified as whatever the fallback language is.
+            if !NativeSpeech.hasSpokenScript(text)
+                || resolved.language.lowercased().hasPrefix(prefix) {
+                return resolved
+            }
         }
         if let matched = AVSpeechSynthesisVoice(language: language) {
             return matched

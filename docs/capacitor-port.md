@@ -3409,3 +3409,59 @@ buffer 再播一次**——而那个播放图已经不出声了。
 - 解锁后的兜底 `play()` 是否真被触发、是否会被误触发（只在站点自己的 `isPlaying === true` 且元素 paused 时动手）。
 - 句速（`playbackSetting.rate`）改走媒体元素的 `playbackRate` 后，真机上语速与旧 WebAudio 路径是否一致。
 
+### 6.34 第三十二轮（真机反馈：锁屏已修好；中文朗读里夹进越南语句）
+
+§6.33 的播放改动真机验证通过：**锁屏后朗读继续**。新反馈是朗读时夹进两句越南语，位置很具体——
+「有空散步看景」之后一句、「没说我会准时赴约」之后一句。
+
+#### 证据
+
+日志里那两句的上下文长得一模一样：
+
+| 行 | 内容 |
+| --- | --- |
+| itemid 32 | `{"text":"stv0怎么有空散步看景？", …}` → 下一句 `[TTS] speakToFile 1 chars` |
+| — | `[TTS] attempt 1/3 [own-session+voice] voice=com.apple.voice.compact.vi-VN.Linh` |
+| — | `[TTS] attempt 1 ok: 76606 bytes, 1.74s` |
+| itemid 33 | `{"text":"stv0”", …}` —— 整句只有一个右引号 |
+
+「没说我会准时赴约啊。」之后是同样的第二次（itemid 36 → `stv0”` → 同样 76606 bytes）。
+也就是说：用户听到的「越南语句」是**一个引号被越南语发音人念了 1.74 秒**。
+
+#### 根因
+
+三层叠在一起，缺一层都不会出声：
+
+1. `readerTts` 的 fallback 切句器把 `”` 切成了独立的一句：`？` 是断句符，断完之后
+   `”` 进入缓冲，紧接着的又是断句符（换行或逗号），于是 `”` 单独成句。
+2. 站点自己的过滤器 `hasText()`（`ASCII_WORD`）本来会把它丢掉，但每句前面都加了 `stv0`
+   标记——标记就是那个 ASCII 词，于是碎片被放行。
+3. 原生 `scriptLanguage(for:)` 在 `”` 里找不到任何 CJK，返回 `vi-VN`；`voice(for:identifier:text:)`
+   随即发现用户选的 Tingting 是 `zh-CN`、不带 `vi` 前缀，于是换成 Linh。
+
+#### 修复
+
+两层，各堵一条路：
+
+| 位置 | 改动 |
+| --- | --- |
+| `SitePatch.swift` readerTts 块 | 新增 `hasSpokenContent(piece)`（数字 / A-Z / a-z / Latin-1+Extended / 假名 / CJK / 全角字母数字 / 代理对算有内容）；`splitSentences` 的两个出句点都过一遍，纯标点碎片直接不进队列 |
+| `NativeSpeech.swift` | 新增 `hasSpokenScript(_:)`；`voice(for:identifier:text:)` 里「文本完全无字」时**保留用户选的发音人**，不再按 fallback 语言改派 |
+
+第 2 层是给站点自己的 tokenizer 留的后路：这一章它返回空、走了 fallback，但别的章节它可能生效并产生同类碎片。
+
+#### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `test-site-patch.js` | 681 断言全过（上一轮 679，新增 2 条：纯标点碎片不再单独成句、同一段对话其余两句照读） |
+| `check-ios-shim.js` | 24 块 / 478838 字节 / 83 标记 |
+| `gen-site-i18n.js --check` | 459 标签 / 40 片段 |
+| `gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+#### 未证实项
+
+- 真机复测这两处是否安静了（本地假件只证明碎片不再进队列）。
+- 站点 tokenizer 生效的章节若再产生同类碎片，原生那层会保留中文发音人，但**那个引号仍会被念一声**——
+  要彻底消掉得在站点 tokenizer 的出口也过滤，本轮没动它。
+

@@ -4065,6 +4065,40 @@ enum SitePatch {
             return false;
         }
 
+        // Does this piece have anything a voice can actually pronounce?
+        //
+        // The chapter text ends dialogue with a closing quote, and when that
+        // quote sits between two break characters the splitter cut it into a
+        // sentence of its own. The site's own filter (hasText, ASCII_WORD) would
+        // have dropped it, but the stv0 marker below IS an ASCII word, so it got
+        // carried through -- and the native side, finding no CJK in it, called
+        // the fragment Vietnamese and read a lone quote with the Vietnamese
+        // voice. That is what the reader heard as a stray Vietnamese sentence
+        // after "…看景？" and after "…准时赴约啊。".
+        //
+        // Surrogates count as content: dropping half of a real character would
+        // be worse than reading a stray mark.
+        function hasSpokenContent(piece) {
+            for (var i = 0; i < piece.length; i++) {
+                var c = piece.charCodeAt(i);
+                if ((c >= 0x30 && c <= 0x39)             // 0-9
+                    || (c >= 0x41 && c <= 0x5a)          // A-Z
+                    || (c >= 0x61 && c <= 0x7a)          // a-z
+                    || (c >= 0x00c0 && c <= 0x024f)      // Latin-1 + Latin Extended (Vietnamese)
+                    || (c >= 0x3040 && c <= 0x30ff)      // kana
+                    || (c >= 0x3400 && c <= 0x4dbf)      // CJK ext A
+                    || (c >= 0x4e00 && c <= 0x9fff)      // CJK unified
+                    || (c >= 0xf900 && c <= 0xfaff)      // compatibility ideographs
+                    || (c >= 0xff10 && c <= 0xff19)      // fullwidth digits
+                    || (c >= 0xff21 && c <= 0xff3a)      // fullwidth A-Z
+                    || (c >= 0xff41 && c <= 0xff5a)      // fullwidth a-z
+                    || (c >= 0xd800 && c <= 0xdfff)) {   // surrogate half
+                    return true;
+                }
+            }
+            return false;
+        }
+
         function splitSentences(text) {
             var out = [];
             var buffer = '';
@@ -4073,12 +4107,12 @@ enum SitePatch {
                 buffer += ch;
                 if (isBreak(ch)) {
                     var piece = trim(buffer);
-                    if (piece) { out.push(piece); }
+                    if (piece && hasSpokenContent(piece)) { out.push(piece); }
                     buffer = '';
                 }
             }
             var rest = trim(buffer);
-            if (rest) { out.push(rest); }
+            if (rest && hasSpokenContent(rest)) { out.push(rest); }
             return out;
         }
 
