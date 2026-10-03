@@ -105,6 +105,11 @@ const REQUIRED_MARKERS = [
   // alert-scoped pass.
   'function sweepAlertsIn(',
   'function walkAlert(',
+  // ...and the message is translated at the funnel that produces it, because the
+  // display classes that render it are mirrored site assets we may not edit.
+  'function installReaderFunnels(',
+  'function translateAlertMessage(',
+  'reader alert and failed-chapter navigator hooked',
   // One DOWNLOADED row per novel: the row is stamped and the finished job drops
   // the row it would otherwise duplicate.
   'data-stvbook',

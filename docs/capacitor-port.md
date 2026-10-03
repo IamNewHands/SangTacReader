@@ -2967,6 +2967,97 @@ if (menu.onchange) { menu.onchange(this.data) }  // -> app.text.changeLanguage('
   且重载后设置页语言行与页面语言一致；`[PATCH] settings row language set to zh` 最多出现一次。
   若写入仍然丢（面板里出现这行），说明 300ms 不够，可以加长——但行也会被 1 秒的对账纠回来。
 
+### 6.28 第二十六轮（真机反馈：底栏 `<` `>` 切章）：解锁章上的第一次点击丢了，再点跳两章
+
+用户的输入是 `新建 文本文档 (3).txt`（270 行，10:39:45–10:41:15）加一句描述：
+「在小说正文中点击底部的 `<>` 切换上一章下一章，日志中 641 是需要解锁的章节，此时点击 `<` ……没翻译，
+再点一下 `<` 会切换到前两章，优化下」。
+
+#### (1) 日志先把事实钉住
+
+| 事实 | 证据 |
+|---|---|
+| 第 641 章（cid `931290000`）就是需要解锁的那一章 | `10:40:20 [Http] …c=931290000… 150b {"code":"1","err":"Mở khóa chương này…"}`；`[TITLE] chapter 931290000 -> 第641章 京城备战（4k）` |
+| 服务端那句原文与字典**逐字节相同** | `err` 与 `data/site-i18n.json` 的 exact 键都是 85 字符，尾部 hex 都是 `207469e1babf742e`（`" tiết."`） |
+| 站点 UI 是中文 → `lang` cookie 是 `zh` → 覆盖层的语言闸门是开的 | `[NAV] tab 0 首页` / `1 关注` / `2 书签` / `3 我的小说` / `4 下载`（站点自己的 `/mobile/lang/zh.json` 驱动） |
+| 覆盖层确实在跑 | `10:40:45 [PATCH] dropped the site archive notice from the chapter body` |
+| 这份日志**无法**判断装的是哪一版 | 面板是 10:39:54 才打开的（`[DIAG] logging on`），而页面在 `+0ms` 就起来了（`10:39:54 [BOOT] +10004ms`），所以 document-start 那行 `[PATCH] i18n overlay ready: … language zh, rewriting on` 不可能在缓冲里 |
+
+#### (2) 切章为什么「第一次没反应、再点跳两章」
+
+**根因在站点自己的失败分支上，两段代码咬在一起：**
+
+1. `preload()` 的成功分支会 `await this.assignNavigator(...)`，而 `assignNavigator`
+   （`app.v2.chapterdisplay.js:1834-1861`，另两份在 `:803`、`:3701`）是**唯一**填
+   `chapterObj.previd / nextid` 的地方。正文拿不回来时走的是另一条路：
+
+   ```
+   } else {
+       this.setNotLoading(view);
+       app.reader.handlingException(cdata, view);   // :1829-1832，:800，:3697
+   }
+   ```
+
+   也就是说**解锁章永远没有 previd/nextid**，它们停在 `"0"`。
+
+2. `ensurePreload()`（`:1657-1683`）把那个 `"0"` 当成「没有相邻章」：
+
+   ```
+   } else if (current.previd == "0") { prev.remove(); }
+   … else if (current.nextid == "0") { next.remove(); }
+   ```
+
+   而 `PageClipChapter.remove()`（`:1236-1240`）只清 `pages` 与 `pageElements`，
+   **`cid` 留着**。
+
+3. 于是 `goPrevChapter()`（`:1913-1925`）的守卫 `prevChapter.cid != "0"` 放行，
+   它把 `currentChapter` 换成那个**已经被清空的**对象，然后
+   `jumpToPage(currentChapter.firstPage())` 拿到 `undefined`，`jumpToPage` 在
+   `:1776-1784` 直接 return。
+
+   结果：**章指针动了，屏幕没动**。用户看到的是「点了没反应」；再点一次，指针又走一格，
+   屏幕这才跳到两章之前——正是「再点一下 `<` 会切换到前两章」。
+   日志里同步可见：`10:41:11` 连点两次 `>`，第二次的
+   `previd: 931167438, prev cid: 0` / `nextid: 0, nexid: 0` 说明当前章的 previd/nextid 都是 0。
+
+**为什么改在这里而不是改站点文件**：`site-assets/` 是逐字节镜像，`gen-site-assets.js --check`
+按 sha256 盯着它，不能改。所以两个补丁都挂在站点自己的**唯一漏斗**上：
+
+| 漏斗 | 位置 | 做什么 |
+|---|---|---|
+| `app.reader.showAlert` | `app.v2.read.js:790-792` | 在**消息进入阅读器的地方**翻译它——三个显示器各自的模板（`:873` 写 frame 的 `#maincontent`、`:1967` 自建一页、`:3816` 写 `.contentcontainer`）都不再是翻译的必要条件；同一个调用里再跑一次已有的 `sweepAlertsIn`（主文档 + `attachFrames()`）来收模板里写死的 `Tải lại` |
+| `app.reader.handlingException` | `app.v2.read.js:729` | 失败分支本就不走 `assignNavigator`，这里补一次：读 `view.cid`，用**显示器自己的** `assignNavigator(host, id, cid, x, view)` 去问 `getChapterNavigator`（站点自己的 `updateOldLink` 接口），拿到 prev/next 后由它自己的 `ensurePreload()` 重新接上链 |
+
+两条都是 `typeof` 守卫 + `__stvReaderFunnels` 幂等标记 + 200ms 轮询安装（`app.v2.read.js`
+由 `readerPrefetch` 在首屏之后预取，远早于打开阅读器）。
+
+#### (3) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **444749 字节** / **78 个标记**（新增 `function installReaderFunnels(`、`function translateAlertMessage(`、`reader alert and failed-chapter navigator hooked`） |
+| `scripts/test-site-patch.js` | **638 条断言**（上一轮 630，新增 8） |
+| `scripts/gen-site-i18n.js --check` | 459 labels / 40 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言：漏斗装上了；解锁消息在**产生处**就变成中文；模板里的 `Tải lại` 在同一次调用里变
+`重新加载`；字典不认识的串原样透传；**frame 里的提示**也被同一次调用扫到；拿不回正文的章节
+仍然拿到 navigator（`qidian/1034915599/931290000` 被问过）；vi 读者两个漏斗照样装上、但消息
+保持原文。
+
+#### 未证实项（下一轮的输入）
+
+- **新构建有一个可判据的标记**：面板里应出现
+  `[PATCH] reader alert and failed-chapter navigator hooked`（安装时打一次）。**这一轮之前装的包
+  没有这一行**——如果读者在旧包上，上一轮的提示翻译本来就已经在包里了，这一行的有无能直接
+  区分「没装新包」和「装了但没生效」，下一份日志请先看它。
+- **解锁章的提示是否已翻译，这份日志判定不了**（原因见 (1) 最后一行）。新包上应在拿到
+  `{"code":"1","err":…}` 的同一秒看到提示是中文；若仍是越南语，说明消息不是经
+  `app.reader.showAlert` 显示的，把那一屏连同 `[PATCH]` 行一起给我。
+- **「一次一章」也只在真机上能确认**：期望在解锁章上点 `<` 就回到上一章（而不是先没反应再跳两章），
+  且日志里解锁章的 `previd`/`nextid` 不再是 `0`。代价是每个打不开的章节多一次
+  `updateOldLink` POST（站点自己的接口，成功路径本来也会问）。
+
 
 
 

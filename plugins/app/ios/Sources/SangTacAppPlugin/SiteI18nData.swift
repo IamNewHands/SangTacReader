@@ -1417,6 +1417,91 @@ enum SiteI18nData {
             return true;
         }
 
+        // ------------------------------------------------ the reader's two funnels
+        //
+        // Both repairs below hang off a funnel the site itself owns, because the
+        // display classes live in site-assets/ (verbatim mirrors: editing them would
+        // break gen-site-assets.js --check) and because each of these is the single
+        // point every display implementation passes through.
+        //
+        // 1. app.reader.showAlert (app.v2.read.js:790) is where an alert message
+        //    enters the reader: every exc[] handler funnels through it and it then
+        //    calls the active display's own showAlert, each of which bakes the text
+        //    into its own template (app.v2.chapterdisplay.js:873 writes into the
+        //    frame's #maincontent, :1967 sets a page of its own, :3816 writes into
+        //    .contentcontainer). Translating at that funnel does not depend on
+        //    reaching any of those DOM shapes; the alert-scoped pass below still runs
+        //    for the literal "Tải lại" inside the template.
+        //
+        // 2. app.reader.handlingException (app.v2.read.js:729) is where a chapter
+        //    that could NOT be loaded ends up. All three displays take the same
+        //    failure branch -- setNotLoading(view) then
+        //    app.reader.handlingException(cdata, view)
+        //    (app.v2.chapterdisplay.js:1829-1832, :800, :3697) -- and never reach
+        //    assignNavigator(...), which is the only place
+        //    previd/nextid are filled in. So the failed chapter keeps "0" for both,
+        //    and the page-flip chain reads that "0" as "there is no neighbour":
+        //    ensurePreload calls prev.remove()/next.remove()
+        //    (app.v2.chapterdisplay.js:1663-1665, :1679-1681), which EMPTIES that
+        //    neighbour's pages (PageClipChapter.remove, :1236) while leaving its cid
+        //    set. goPrevChapter then passes its cid != "0" guard, swaps
+        //    currentChapter to the emptied object, and jumpToPage(firstPage()) gets
+        //    undefined and returns early (:1776-1784): the chapter pointer moves and
+        //    the screen does not. The next tap therefore looks like a two-chapter
+        //    jump -- exactly the 2026-10-03 report, "再点一下< 会切换到前两章".
+        //    Asking for the same navigator the success path asks for makes the failed
+        //    chapter a first-class link in that chain, so < and > move one chapter.
+        function translateAlertMessage(msg) {
+            if (typeof msg !== 'string' || !msg || !chineseUi()) { return msg; }
+            var direct = translate(msg);
+            if (direct !== null) { return direct; }
+            return translateFragments(msg);
+        }
+
+        function installReaderFunnels() {
+            var app = window.app;
+            if (!app || !app.reader) { return false; }
+            if (typeof app.reader.showAlert !== 'function'
+                || typeof app.reader.handlingException !== 'function') { return false; }
+            if (app.reader.__stvReaderFunnels) { return true; }
+            app.reader.__stvReaderFunnels = true;
+
+            var showAlert = app.reader.showAlert;
+            app.reader.showAlert = function (msg, view) {
+                var result = showAlert.call(this, translateAlertMessage(msg), view);
+                // The display templates carry a literal "Tải lại". The alert subtree
+                // is the one place the translation pass may touch inside a frame, so
+                // run it now instead of waiting for the observer or the 1s timer.
+                try {
+                    sweepAlertsIn(document.documentElement);
+                    attachFrames();
+                } catch (e) {}
+                return result;
+            };
+
+            var handlingException = app.reader.handlingException;
+            app.reader.handlingException = function (x, view) {
+                var result = handlingException.apply(this, arguments);
+                // The failure branch skips assignNavigator, so the chapter that could
+                // not be opened would keep previd/nextid "0" -- and the chain would
+                // drop its real neighbours. Ask for them the same way the success
+                // path does; the display's own ensurePreload() re-arms the chain.
+                try {
+                    var display = app.reader.getDisplay();
+                    if (display && typeof display.assignNavigator === 'function'
+                        && view && view.cid && app.reader.host && app.reader.id) {
+                        display.assignNavigator(app.reader.host, app.reader.id,
+                                                view.cid, x || {}, view);
+                    }
+                } catch (e) {
+                    note('ERR', 'failed-chapter navigator: ' + e);
+                }
+                return result;
+            };
+            note('PATCH', 'reader alert and failed-chapter navigator hooked');
+            return true;
+        }
+
         window.__stvI18n = {
             translate: translate,
             sweep: sweep,
@@ -1431,6 +1516,7 @@ enum SiteI18nData {
             language: currentLanguage,
             chineseUi: chineseUi,
             sweepAlerts: sweepAlertsIn,
+            installReaderFunnels: installReaderFunnels,
             size: EXACT.length,
             rewritten: function () { return rewritten; },
             removed: function () { return removed; }
@@ -1485,7 +1571,7 @@ enum SiteI18nData {
         for (var f = 0; f < FRAME_DELAYS.length; f++) {
             setTimeout(function () {
                 sweep(); attachFrames(); attachContent(); installLanguageGuard();
-                syncSettingLanguage();
+                syncSettingLanguage(); installReaderFunnels();
             }, FRAME_DELAYS[f]);
         }
 
@@ -1521,6 +1607,15 @@ enum SiteI18nData {
         var langTimer = setInterval(function () {
             langAttempts++;
             if (installLanguageGuard() || langAttempts > 600) { clearInterval(langTimer); }
+        }, 200);
+
+        // app.reader.showAlert / handlingException are created with app.reader in
+        // app.v2.read.js, which the reader prefetch loads once the home screen has
+        // painted -- long before a reader is opened, so this lands in time.
+        var funnelAttempts = 0;
+        var funnelTimer = setInterval(function () {
+            funnelAttempts++;
+            if (installReaderFunnels() || funnelAttempts > 600) { clearInterval(funnelTimer); }
         }, 200);
 
         if (window.__stvDiag) {

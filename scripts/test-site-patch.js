@@ -1876,6 +1876,108 @@ async function testLanguageSelection() {
 }
 
 /**
+ * Two repairs hang off funnels the site owns, because the display classes that
+ * render the alert and run the chapter chain are mirrored site assets we may not
+ * edit (gen-site-assets.js --check owns their bytes).
+ *
+ *   app.reader.showAlert (app.v2.read.js:790) is where an alert message enters
+ *   the reader; translating it there does not depend on reaching whichever DOM
+ *   shape the active display builds.
+ *
+ *   app.reader.handlingException (app.v2.read.js:729) is where a chapter that
+ *   could not be loaded ends up. Every display takes that failure branch and
+ *   never reaches assignNavigator -- the only place previd/nextid are filled --
+ *   so the failed chapter keeps "0" for both, ensurePreload reads that as "no
+ *   neighbour" and empties the real one (PageClipChapter.remove), and the next
+ *   < / > tap swaps the chapter pointer to a chapter with no pages: the screen
+ *   does not move, so the tap after that looks like a two-chapter jump.
+ */
+async function testReaderFunnels() {
+  console.log('reader alert and failed-chapter navigator');
+  const unlock = 'Mở khóa chương này cần cho phép sử dụng thần thạch, '
+    + 'truy cập cài đặt để xem chi tiết.';
+
+  const sandbox = makeSandbox();
+  const alerts = [];
+  const navigators = [];
+  const display = {
+    // Stands in for the page-flip template: an .erroralert with the message and
+    // the literal button the site bakes in.
+    showAlert(msg) {
+      const box = makeContainer('div', 'erroralert');
+      box.appendChild(makeContainer('div', '', msg));
+      box.appendChild(makeContainer('div', 'btn', 'Tải lại'));
+      sandbox.document.body.appendChild(box);
+    },
+    assignNavigator(host, id, cid, x, view) {
+      navigators.push(host + '/' + id + '/' + cid);
+      if (view) { view.previd = '931167438'; view.nextid = '0'; }
+      return Promise.resolve();
+    },
+  };
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip', appLanguage: 'zh', display,
+  });
+  // The site's own funnel delegates to the display (app.v2.read.js:790-792).
+  app.reader.showAlert = function (msg, view) {
+    alerts.push(msg);
+    display.showAlert(msg, view);
+  };
+  app.reader.handlingException = function () { return 'handled'; };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('the reader funnels are hooked', app.reader.__stvReaderFunnels === true);
+
+  app.reader.showAlert(unlock, {});
+  check('the unlock message is translated where it is produced',
+    alerts[0] === '解锁本章需要使用神石，请进入设置查看详情。', JSON.stringify(alerts[0]));
+  const box = sandbox.document.body.querySelectorAll('.erroralert')[0];
+  check('and the template button is translated in the same call',
+    !!box && box.childNodes[1].textContent === '重新加载',
+    box ? JSON.stringify(box.textContent) : 'no alert');
+  check('a message the dictionary does not know is passed through',
+    app.reader.showAlert('Một câu không có trong từ điển', {}) === undefined
+      && alerts[1] === 'Một câu không có trong từ điển',
+    JSON.stringify(alerts[1]));
+
+  // The page-flip display builds its alert inside the reader frame, so the same
+  // call has to sweep a frame too.
+  const frameBox = makeContainer('div', 'erroralert');
+  frameBox.appendChild(makeContainer('div', '', 'Hệ thống đang bận, hãy thử lại sau'));
+  frameBox.appendChild(makeContainer('div', 'btn', 'Tải lại'));
+  const frame = makeFakeFrame([frameBox]);
+  sandbox.document.body.appendChild(frame);
+  app.reader.showAlert('Lỗi không xác định', {});
+  check('an alert inside the reader frame is swept by the same call',
+    frameBox.childNodes[0].textContent === '系统繁忙，请稍后重试'
+      && frameBox.childNodes[1].textContent === '重新加载',
+    JSON.stringify(frameBox.textContent));
+
+  app.reader.handlingException({ code: '1' }, { cid: '931290000' });
+  await tick(60);
+  check('a chapter that could not load still gets its navigator resolved',
+    navigators.indexOf('qidian/1034915599/931290000') >= 0, JSON.stringify(navigators));
+
+  // A Vietnamese reader gets the site's own message, untouched.
+  const viSandbox = makeSandbox();
+  const viAlerts = [];
+  const viDisplay = { showAlert(msg) { viAlerts.push(msg); }, assignNavigator() {} };
+  const viApp = installFakeApp(viSandbox, {
+    displayType: 'pageflip', appLanguage: 'vi', display: viDisplay,
+  });
+  viApp.reader.showAlert = function (msg) { viAlerts.push(msg); };
+  viApp.reader.handlingException = function () {};
+  vm.runInContext(loadBlocks().join('\n'), viSandbox);
+  await tick(400);
+  check('the funnels are hooked for a Vietnamese reader too',
+    viApp.reader.__stvReaderFunnels === true);
+  viApp.reader.showAlert(unlock, {});
+  check('but the message is left as the site wrote it',
+    viAlerts[0] === unlock, JSON.stringify(viAlerts[0]));
+}
+
+/**
  * The reader's error alert -- the unlock message with its "Tải lại" button -- is
  * built inside the chapter frame (app.v2.chapterdisplay.js:873 showAlert writes
  * into the frame's #maincontent) or inside .contentcontainer (:3816), and the
@@ -6426,6 +6528,7 @@ await testChapterNamePlace();
 await testLanguageGuard();
   await testLanguageSelection();
   await testReaderAlert();
+  await testReaderFunnels();
   await testSafeArea();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();
