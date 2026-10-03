@@ -994,6 +994,31 @@ ${data.patterns
     //    jump -- exactly the 2026-10-03 report, "再点一下< 会切换到前两章".
     //    Asking for the same navigator the success path asks for makes the failed
     //    chapter a first-class link in that chain, so < and > move one chapter.
+    //    The argument matters: assignNavigator only asks the server when it was
+    //    handed a zero (:1848), and the failure response has no prev/next at all,
+    //    so undefined would pass that gate as false and silently skip the lookup
+    //    -- the "no reaction at all" half of the 2026-10-03 report (a chapter
+    //    opened straight onto the locked one keeps previd/nextid "0", so both
+    //    nav buttons are dead until the reader is left and re-entered).
+    //
+    // 3. Resolving that navigator is not enough on its own. A chapter enters the
+    //    chain with its cid already set: preload assigns it before the answer
+    //    comes back (:1806), so tapping < or > onto a locked chapter runs
+    //    ensurePreload while that chapter still reports previd/nextid "0" -- read
+    //    as "there is no neighbour" -- and the chain calls
+    //    prev.remove()/next.remove() (:1663-1665, :1679-1681).
+    //    PageClipChapter.remove() (:1236) empties pages and pageElements but
+    //    keeps cid, and goPrevChapter's only guard is cid (:1917), so the tap
+    //    swaps the chapter pointer to an object with nothing to render: the
+    //    chapter name in the bar moves and the body does not. The response that
+    //    would have said otherwise arrives afterwards, so the damage is already
+    //    done; the unload itself has to ask whether the chapter that ordered it
+    //    knew anything. A chapter with content has had setContent run and
+    //    assignNavigator follow it (:1815-1821); a chapter whose load failed, or
+    //    has not answered yet, has no cdata at all. Only the second kind gets its
+    //    real neighbours kept -- a stub neighbour, built with cid "0" (:992), is
+    //    still unloaded exactly as before, and so is any neighbour of a chapter
+    //    that did load.
     function translateAlertMessage(msg) {
         if (typeof msg !== 'string' || !msg || !chineseUi()) { return msg; }
         var direct = translate(msg);
@@ -1018,6 +1043,7 @@ ${data.patterns
             try {
                 sweepAlertsIn(document.documentElement);
                 attachFrames();
+                installChapterUnloadGuard(view);
             } catch (e) {}
             return result;
         };
@@ -1029,12 +1055,16 @@ ${data.patterns
             // not be opened would keep previd/nextid "0" -- and the chain would
             // drop its real neighbours. Ask for them the same way the success
             // path does; the display's own ensurePreload() re-arms the chain.
+            // The zeros are what makes the display ask at all: the failure
+            // response carries neither prev nor next, and undefined fails the
+            // == 0 gate it checks.
             try {
+                installChapterUnloadGuard(view);
                 var display = app.reader.getDisplay();
                 if (display && typeof display.assignNavigator === 'function'
                     && view && view.cid && app.reader.host && app.reader.id) {
                     display.assignNavigator(app.reader.host, app.reader.id,
-                                            view.cid, x || {}, view);
+                                            view.cid, { prev: 0, next: 0 }, view);
                 }
             } catch (e) {
                 note('ERR', 'failed-chapter navigator: ' + e);
@@ -1042,6 +1072,73 @@ ${data.patterns
             return result;
         };
         note('PATCH', 'reader alert and failed-chapter navigator hooked');
+        return true;
+    }
+
+    // The page-flip chapter objects are the only ones this overlay touches, and
+    // they are identified by shape rather than by name alone: the class is a
+    // global binding created by a mirrored site script, so a bare reference is
+    // the cheapest route, with the live instance as a fallback. A frame-based
+    // display keeps its chapters as DOM elements, whose remove() is the native
+    // Element method and must never be wrapped.
+    function isClipChapter(v) {
+        return !!v && !v.nodeType
+            && typeof v.remove === 'function'
+            && v.pages && typeof v.pages.length === 'number'
+            && v.pageElements && typeof v.pageElements.length === 'number';
+    }
+
+    function clipChapterProto(view) {
+        try {
+            if (typeof PageClipChapter === 'function') {
+                var named = PageClipChapter.prototype;
+                if (named && typeof named.remove === 'function') { return named; }
+            }
+        } catch (e) {}
+        var candidates = [];
+        if (isClipChapter(view)) { candidates.push(view); }
+        var display = null;
+        try {
+            display = window.app && window.app.reader && window.app.reader.getDisplay
+                ? window.app.reader.getDisplay() : null;
+        } catch (e2) { display = null; }
+        if (display && isClipChapter(display.currentChapter)) {
+            candidates.push(display.currentChapter);
+        }
+        for (var i = 0; i < candidates.length; i++) {
+            var proto = candidates[i].constructor && candidates[i].constructor.prototype;
+            if (proto && typeof proto.remove === 'function') { return proto; }
+        }
+        return null;
+    }
+
+    // remove() is only ever called by ensurePreload's "the current chapter says
+    // there is no neighbour" branch, so the order is trustworthy exactly when
+    // that current chapter has content: setContent fills cdata and
+    // assignNavigator follows it (:1815-1821). No cdata means the chapter is
+    // still loading or failed, and its "0" is a placeholder, not a fact.
+    function unloadOrderIsUninformed() {
+        var display = null;
+        try {
+            display = window.app && window.app.reader && window.app.reader.getDisplay
+                ? window.app.reader.getDisplay() : null;
+        } catch (e) { display = null; }
+        var current = display && display.currentChapter;
+        return !!current && !current.cdata;
+    }
+
+    function installChapterUnloadGuard(view) {
+        var proto = clipChapterProto(view);
+        if (!proto) { return false; }
+        if (proto.__stvUnloadGuard) { return true; }
+        var remove = proto.remove;
+        proto.remove = function () {
+            // A chapter that knows its id is real content, not a spent worker.
+            if (this.cid && this.cid !== '0' && unloadOrderIsUninformed()) { return; }
+            return remove.apply(this, arguments);
+        };
+        proto.__stvUnloadGuard = true;
+        note('PATCH', 'chapter unload keeps a real chapter while its own chapter is still loading');
         return true;
     }
 
@@ -1060,6 +1157,7 @@ ${data.patterns
         chineseUi: chineseUi,
         sweepAlerts: sweepAlertsIn,
         installReaderFunnels: installReaderFunnels,
+        unloadGuard: installChapterUnloadGuard,
         size: EXACT.length,
         rewritten: function () { return rewritten; },
         removed: function () { return removed; }
@@ -1114,7 +1212,7 @@ ${data.patterns
     for (var f = 0; f < FRAME_DELAYS.length; f++) {
         setTimeout(function () {
             sweep(); attachFrames(); attachContent(); installLanguageGuard();
-            syncSettingLanguage(); installReaderFunnels();
+            syncSettingLanguage(); installReaderFunnels(); installChapterUnloadGuard();
         }, FRAME_DELAYS[f]);
     }
 
@@ -1154,11 +1252,13 @@ ${data.patterns
 
     // app.reader.showAlert / handlingException are created with app.reader in
     // app.v2.read.js, which the reader prefetch loads once the home screen has
-    // painted -- long before a reader is opened, so this lands in time.
+    // painted -- long before a reader is opened, so this lands in time. The
+    // chapter class arrives with app.v2.chapterdisplay.js, right behind it.
     var funnelAttempts = 0;
     var funnelTimer = setInterval(function () {
         funnelAttempts++;
-        if (installReaderFunnels() || funnelAttempts > 600) { clearInterval(funnelTimer); }
+        if ((installReaderFunnels() && installChapterUnloadGuard())
+            || funnelAttempts > 600) { clearInterval(funnelTimer); }
     }, 200);
 
     if (window.__stvDiag) {

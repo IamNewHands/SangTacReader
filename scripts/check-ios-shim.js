@@ -110,6 +110,11 @@ const REQUIRED_MARKERS = [
   'function installReaderFunnels(',
   'function translateAlertMessage(',
   'reader alert and failed-chapter navigator hooked',
+  // A chapter that failed to load would otherwise be unloaded by name only
+  // (PageClipChapter.remove keeps cid, goPrevChapter checks cid), so the bar
+  // moved and the body did not.
+  'function installChapterUnloadGuard(',
+  'chapter unload keeps a real chapter while its own chapter is still loading',
   // One DOWNLOADED row per novel: the row is stamped and the finished job drops
   // the row it would otherwise duplicate.
   'data-stvbook',

@@ -1900,6 +1900,7 @@ async function testReaderFunnels() {
   const sandbox = makeSandbox();
   const alerts = [];
   const navigators = [];
+  const lookups = [];
   const display = {
     // Stands in for the page-flip template: an .erroralert with the message and
     // the literal button the site bakes in.
@@ -1911,6 +1912,12 @@ async function testReaderFunnels() {
     },
     assignNavigator(host, id, cid, x, view) {
       navigators.push(host + '/' + id + '/' + cid);
+      // The real display asks the server only when it was handed a zero
+      // (app.v2.chapterdisplay.js:1848). An undefined prev/next passes that gate
+      // as false and silently skips the lookup, leaving the failed chapter with
+      // no usable neighbours -- so the test has to watch the argument, not just
+      // the call (that is how the first version of this repair shipped broken).
+      if (x.prev == 0 || x.next == 0) { lookups.push(cid); }
       if (view) { view.previd = '931167438'; view.nextid = '0'; }
       return Promise.resolve();
     },
@@ -1954,10 +1961,14 @@ async function testReaderFunnels() {
       && frameBox.childNodes[1].textContent === '重新加载',
     JSON.stringify(frameBox.textContent));
 
-  app.reader.handlingException({ code: '1' }, { cid: '931290000' });
+  // The failure response carries no prev/next, so the chapter has to be handed
+  // the zeros that make the display ask the server for them.
+  app.reader.handlingException({ code: '1', err: unlock }, { cid: '931290000' });
   await tick(60);
   check('a chapter that could not load still gets its navigator resolved',
     navigators.indexOf('qidian/1034915599/931290000') >= 0, JSON.stringify(navigators));
+  check('and it is resolved by asking, not by an undefined that skips the ask',
+    lookups.indexOf('931290000') >= 0, JSON.stringify(navigators));
 
   // A Vietnamese reader gets the site's own message, untouched.
   const viSandbox = makeSandbox();
@@ -1976,6 +1987,97 @@ async function testReaderFunnels() {
   check('but the message is left as the site wrote it',
     viAlerts[0] === unlock, JSON.stringify(viAlerts[0]));
 }
+
+/**
+ * ensurePreload unloads the neighbour it believes does not exist with
+ * PageClipChapter.remove() (app.v2.chapterdisplay.js:1663-1665, :1679-1681),
+ * and that method empties pages/pageElements while leaving cid set (:1236).
+ * goPrevChapter's only guard is cid (:1917), so unloading a chapter that is in
+ * fact a real neighbour is what makes a < tap swap the pointer to an object with
+ * nothing to render: the chapter name in the bar moves, the body does not. It
+ * happens whenever the reader reaches a chapter whose response has not arrived
+ * yet, which is exactly the locked-chapter case: its previd/nextid are still the
+ * "0" placeholder, so the order to unload comes from a chapter that knows
+ * nothing. The guard keeps such a chapter's pages and stays out of the way in
+ * every other case.
+ */
+async function testChapterUnloadGuard() {
+  console.log('chapter unload guard');
+  // The class is a global binding created by a mirrored site script, not a
+  // window property -- the same bare reference the overlay makes.
+  const sandbox = makeSandbox();
+  vm.runInContext([
+    'class PageClipChapter {',
+    '  constructor(cid) {',
+    '    this.cid = cid;',
+    '    this.pages = [{}];',
+    '    this.pageElements = [{}];',
+    '  }',
+    '  firstPage() { return this.pageElements[0]; }',
+    '  remove() { this.pageElements = []; this.pages = []; }',
+    '}',
+    'window.__clips = {',
+    '  real: new PageClipChapter("931167438"),',
+    '  stub: new PageClipChapter("0"),',
+    '};',
+  ].join('\n'), sandbox);
+  const display = { showAlert() {}, assignNavigator() {}, currentChapter: null };
+  installFakeApp(sandbox, { displayType: 'pageflip', appLanguage: 'zh', display });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  const clips = sandbox.window.__clips;
+  check('the chapter unload guard is installed',
+    sandbox.window.__stvI18n.unloadGuard() === true);
+  check('and it is installed only once',
+    clips.real.constructor.prototype.__stvUnloadGuard === true);
+
+  // The reader is on a chapter that has not answered yet: no cdata.
+  display.currentChapter = { cid: '931290000', cdata: null };
+  clips.real.remove();
+  check('a real chapter keeps its pages when a chapter with no content unloads it',
+    clips.real.pageElements.length === 1 && clips.real.firstPage() !== undefined,
+    JSON.stringify(clips.real.pageElements.length));
+  clips.stub.remove();
+  check('a stub neighbour (cid "0") is still unloaded',
+    clips.stub.pageElements.length === 0, JSON.stringify(clips.stub.pageElements.length));
+
+  // The same call from a chapter that did load is a real end-of-book answer.
+  display.currentChapter = { cid: '931167438', cdata: { chaptername: 'Chương 640' } };
+  clips.real.remove();
+  check('a loaded chapter keeps its neighbour unloadable',
+    clips.real.pageElements.length === 0, JSON.stringify(clips.real.pageElements.length));
+
+  // A frame-based display keeps its chapters as DOM elements whose remove() is
+  // the native Element method: the guard must reach the class through the live
+  // instance, and never through Object.prototype.
+  const frames = makeSandbox();
+  vm.runInContext([
+    'window.__mkClip = function (cid) {',
+    '  class Clip {',
+    '    constructor(c) { this.cid = c; this.pages = [{}]; this.pageElements = [{}]; }',
+    '    remove() { this.pageElements = []; this.pages = []; }',
+    '  }',
+    '  return new Clip(cid);',
+    '};',
+  ].join('\n'), frames);
+  const frameDisplay = { showAlert() {}, assignNavigator() {} };
+  frameDisplay.currentChapter = frames.window.__mkClip('931167438');
+  installFakeApp(frames, { displayType: 'pageflip', appLanguage: 'zh', display: frameDisplay });
+  vm.runInContext(loadBlocks().join('\n'), frames);
+  await tick(400);
+  check('the guard also reaches the class through the reader display',
+    frames.window.__stvI18n.unloadGuard() === true);
+  frames.window.__mkClip('0');
+  frameDisplay.currentChapter.cdata = null;
+  frameDisplay.currentChapter.remove();
+  check('and leaves that class loaded by way of a live instance',
+    frameDisplay.currentChapter.pageElements.length === 1,
+    JSON.stringify(frameDisplay.currentChapter.pageElements.length));
+  check('the guard never lands on Object.prototype',
+    vm.runInContext('Object.prototype.remove === undefined', frames) === true);
+}
+
 
 /**
  * The reader's error alert -- the unlock message with its "Tải lại" button -- is
@@ -6529,6 +6631,7 @@ await testLanguageGuard();
   await testLanguageSelection();
   await testReaderAlert();
   await testReaderFunnels();
+  await testChapterUnloadGuard();
   await testSafeArea();
   await testSafeAreaRespectsSiteValues();
   await testSettingsBackup();

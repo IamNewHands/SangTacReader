@@ -3059,5 +3059,79 @@ if (menu.onchange) { menu.onchange(this.data) }  // -> app.text.changeLanguage('
   `updateOldLink` POST（站点自己的接口，成功路径本来也会问）。
 
 
+### 6.29 第二十七轮（真机反馈：解锁章上点 `<`，底栏章名变 640 但正文还是 641）
+
+用户装了上一轮的包后回话：「装了最新的 ipa，在待解锁的小说那一章点 `<` 底部显示章节名已经是 640，
+但是正文没刷新，还是显示的要解锁的 641」，并重新给了同一份日志文件（279 行，11:56:57–11:58:25）。
+
+#### (1) 这份日志先解决了上一轮的悬案，再钉住新症状
+
+| 事实 | 证据 |
+|---|---|
+| **装的就是上一轮的包** | `11:56:57 [PATCH] reader alert and failed-chapter navigator hooked`（`ed61913` 才有的行） |
+| 第 641 章（cid `931290000`）仍是要解锁的那一章 | `11:58:07 …c=931290000… 150b {"code":"1","err":"Mở khóa chương này…"}`；`[TITLE] chapter 931290000 -> 第641章 京城备战（4k）` |
+| 站点的 `ensurePreload` 日志把「谁在卸谁」说清了 | `11:58:06 previd: 931167438, prev cid: 0` + `nextid: 0, nexid: 0`。站点自己把这两行写反了：`prev.cid` 在前、`current.previd` 在后 → **当前（解锁）章的 previd/nextid 都是 0** → 下一行就是 `prev.remove()` / `next.remove()` |
+| **上一轮的补丁调用到了、但没问到人** | 失败响应之后**没有** `[Http] POST …/updateOldLink`，也没有新的 `previd:` 行：`assignNavigator` 的门是 `if (chapterObj.previd == 0 || chapterObj.nextid == 0)`（`:1848`），而失败响应只有 `code/err/userid`，`x.prev`/`x.next` 是 `undefined`，`undefined == 0` 为 **false** → 直接跳过查询。这也解释了第一次会话里 `11:57:11` 点 `<` **一行日志都没有**：入口章就是解锁章，两个邻居槽位还是 `cid "0"`，`goPrevChapter` 的门直接拦住 |
+| 新症状就是「指针走了、正文没走」 | `11:57:28` 点 `<` → `previd: 0, prev cid: 931037660` → 说明 `currentChapter` 被换成 **931167438（640，已被清空）** 的对象；底栏章名于是显示 640，而屏幕上还是 641 的解锁页 |
+
+#### (2) 根因：数据迟到，而破坏已经发生
+
+上一轮把「失败章没有 navigator」修在了漏斗上，但**只修了一半**：
+
+1. **参数错了**。`assignNavigator` 只在被喂 0 的时候才去问服务端（`:1848`），而失败响应里没有
+   `prev`/`next`；`x || {}` 让两个字段变成 `undefined`，`undefined == 0` 为假 → 查询被静默跳过。
+   改成 `{ prev: 0, next: 0 }`（显式表达「未知」，而不是「没有」）。
+2. **光有数据也不够**。章对象是**先拿到 `cid` 再拿到正文**的：`preload()` 第一行就把
+   `view.cid = c`（`:1806`）。所以「点 `>` 进入一个正在加载的解锁章」时，`ensurePreload()` 是在
+   它的 `previd/nextid` 还停在 `"0"` 的时刻跑的 → `prev.remove()`（`:1663-1665`）**当场**把真正的
+   上一章清空。等 `code 1` 回来、navigator 补上时，640 的 `pages`/`pageElements` 已经是空数组，
+   而它 `cid` 还在 → `goPrevChapter`（`:1917` 只看 `cid`）照样放行 → `jumpToPage(undefined)`
+   在 `:1776-1784` 提前 return。**指针动了，屏幕没动。**
+
+修法（仍只在注入层，`site-assets/` 是逐字节镜像）：
+
+| 缝 | 位置 | 做什么 |
+|---|---|---|
+| 漏斗参数 | `app.reader.handlingException` 包装里 | `{ prev: 0, next: 0 }` 取代 `x || {}`，让显示器自己的 `getChapterNavigator`（站点 `updateOldLink` 接口）真的被问到，再由它自己的 `ensurePreload()` 把链接回来 |
+| 新的卸载守卫 | `PageClipChapter.prototype.remove`（`:1236`） | `remove()` **只**由 `ensurePreload()` 的「当前章说没有邻居」这一支调用，所以它的话什么时候可信是可判定的：`setContent` 填 `cdata`、`assignNavigator` 紧跟其后（`:1815-1821`）。当前章**有 cdata** → 照旧卸载；**没有 cdata**（加载中或失败）→ 那条 `"0"` 只是占位符 → **保留**这个还知道自己 `cid` 的章。`cid "0"` 的空壳邻居（`:992`）以及任何一个已加载章的邻居，卸载行为完全不变 |
+
+`remove()` 的定位按形状而不是只按名字：先试全局词法绑定 `PageClipChapter`（镜像脚本里的
+`class`，不是 `window` 属性），再退回**活动实例**的 `constructor.prototype`；形状闸门是
+`!nodeType && pages.length && pageElements.length`，所以换成 frame 布局时命中的 `remove()`
+是原生的 `Element.remove()`，**绝不会**被包上。安装与漏斗共用同一个 200ms 轮询，多了
+`__stvUnloadGuard` 幂等标记。
+
+**改在这个缝而不是改站点文件**：`gen-site-assets.js --check` 按 sha256 盯着 `site-assets/**`，
+一个字都动不了；而这两个点分别是「失败章的链数据」和「唯一会清空章的地方」，都在注入层够得着。
+
+#### (3) 守卫与产物
+
+| 守卫 | 结果 |
+|---|---|
+| `scripts/check-ios-shim.js` | 23 块 / **450564 字节** / **80 个标记**（新增 `function installChapterUnloadGuard(`、`chapter unload keeps a real chapter while its own chapter is still loading`） |
+| `scripts/test-site-patch.js` | **647 条断言**（上一轮 638，新增 9） |
+| `scripts/gen-site-i18n.js --check` | 459 labels / 40 fragments |
+| `scripts/gen-site-assets.js --check` | 8 files / 906296 bytes |
+
+新增断言：失败章的 navigator **是被问出来的**（假显示器照抄 `:1848` 的 `== 0` 门，专门盯参数，
+上一轮就是这里放过了 `undefined`）；卸载守卫装上了且只装一次；**没有 cdata 的当前章**卸邻居时，
+真章的 `pages`/`pageElements` 留下来、`firstPage()` 仍然有效；`cid "0"` 的空壳邻居照旧被清空；
+**已加载章**的邻居照旧可卸载（守卫没有越界）；没有全局类时能从 `display.currentChapter` 找到
+该类；`Object.prototype.remove` 没被碰过。
+
+#### 未证实项（下一轮的输入）
+
+- **真机判据**：新包在解锁章上点 `<` 应当**一次只退一章并且正文跟着换**；日志里解锁章的
+  `previd`/`nextid` 不再是 `0`，并应出现
+  `[PATCH] chapter unload keeps a real chapter while its own chapter is still loading`
+  （与上一轮那行 `reader alert and failed-chapter navigator hooked` 同屏）。
+- **代价是「一个邻居章留在内存里」**：被跳过的卸载只发生在当前章没有正文的窗口内，页数受站点自己
+  3 帧条带限制，未在真机上量化过内存差。
+- **`>` 方向**：同一套逻辑（`nextid` + `next.remove()`）也在修复范围内，但这一轮日志里
+  `11:58:09` 的 `>` 因为 `nextid` 还是 0 而完全没反应，需要真机确认「解锁章 → 下一章（同样要解锁）」
+  现在是否一步到位地显示下一章的提示。
+
+
+
 
 
