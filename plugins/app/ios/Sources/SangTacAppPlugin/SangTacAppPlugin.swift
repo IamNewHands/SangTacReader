@@ -225,8 +225,12 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
     /**
      Cordova's `TTS.speak(options)` plays immediately; `TTS.speakToFile(options)`
      returns the audio bytes. The site's iOS path only ever needs speakToFile —
-     it hands the bytes to ttsEngine, which decodes them and plays through its
-     own WebAudio graph so the equaliser and per-sentence pacing keep working.
+     it hands the bytes to ttsEngine, which plays them through a media element
+     (SitePatch's installPlayback; the WebAudio graph it used to use stops dead
+     the moment the screen locks).
+
+     The clip length travels with the bytes so the page never has to decode the
+     WAV through WebAudio just to learn how long it is.
      */
     @objc func speak(_ call: CAPPluginCall) {
         guard let text = call.getString("text"), !text.isEmpty else {
@@ -262,10 +266,17 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
             self?.report("TTS", message)
         }) { [weak self] result in
             switch result {
-            case .success(let data):
-                CAPLog.print("[SangTacApp:tts] synthesised \(data.count) bytes")
-                self?.report("TTS", "synthesised \(data.count) bytes")
-                call.resolve(["data": data.base64EncodedString(), "mime": "audio/wav"])
+            case .success(let clip):
+                let seconds = String(format: "%.2f", clip.duration)
+                CAPLog.print("[SangTacApp:tts] synthesised \(clip.data.count) bytes, \(seconds)s")
+                self?.report("TTS", "synthesised \(clip.data.count) bytes, \(seconds)s")
+                call.resolve([
+                    "data": clip.data.base64EncodedString(),
+                    "mime": "audio/wav",
+                    // The site paces its sentences with this number; it used to
+                    // take it off the decoded WebAudio buffer.
+                    "duration": clip.duration
+                ])
             case .failure(let error):
                 CAPLog.print("[SangTacApp:tts] failed: \(error.localizedDescription)")
                 self?.report("ERR", "TTS failed: \(error.localizedDescription)")

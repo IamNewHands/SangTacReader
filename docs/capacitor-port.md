@@ -3340,3 +3340,72 @@ Zalo / FPT / Viettel / 本站语音这四个网络 provider 是普通 HTTPS 请�
 - 右滑改为捕获后，smtab 自己的横滑切分类在真机上是否依旧正常（捕获层只在 dx>8 且横向占优时
   preventDefault，且仅左缘 80px 内起手；真机待验）。
 
+### 6.33 第三十一轮（真机反馈：锁屏立刻停读，解锁后 TTS 彻底不发声）
+
+上一轮给产物补了 `UIBackgroundModes=audio`（单独一次提交，`e7835a1`），真机复测的结果是**两条不同的缺陷**，
+不是一条。
+
+#### 证据
+
+`UIBackgroundModes` 确实进了产物：下载滚动 Release 的 IPA，用 `plistlib` 读 `Payload/App.app/Info.plist`，
+得到 `['audio']`。但真机行为是：
+
+1. 锁屏 → 朗读**立刻**停止。
+2. 解锁 → 不恢复；点 TTS 播放**完全没反应**；只有杀掉整个应用重开才能再出声。
+
+设备日志（`__stvDiag` 导出）把两半都钉住了：
+
+| 时刻 | 日志 |
+| --- | --- |
+| 15:57:35–15:57:54 | `speakToFile` → `attempt 1 ok` → `speak result kind=object`，逐句正常推进 |
+| 15:57:55 | **13 条** `unhandledrejection The operation was aborted.` —— 锁屏那一刻 |
+| 15:58:15 起 | `reader TTS start` 反复出现，但**再也没有一条 `speakToFile`** |
+
+最后一行是关键：队列里的句子 `haveMp3: true` 且已缓存 `audioBuffer`，站点不会重新合成，只会把**已经解码好的
+buffer 再播一次**——而那个播放图已经不出声了。
+
+#### 根因
+
+两条，互相独立：
+
+1. **锁屏即挂起**：页面里唯一可能持有后台断言的路径没有被用上。站点播放走
+   `ttsEngine.playWithEq()` → `webeq.setAudio()` → `AudioContext.createBufferSource()`，全程 WebAudio；
+   WebEq 图本身建在一个**没有 src 的 `Audio()`** 上（`_dl_stv.tts.js:952`），站点的 `mdAudio.play()`
+   保活对无源元素是空操作。WebKit 不为 WebAudio 取后台断言，于是锁屏即挂起，buffer source 停在半句上。
+2. **解锁后 AudioContext 再也不可用**：挂起把它留在一个回不来的状态，`decodeAudioData` 与
+   `createBufferSource` 都成了哑的；而站点因为 `haveMp3` 为真不会重新合成，于是「点播放没反应」。
+
+#### 修复
+
+把**播放**从 WebAudio 搬到引擎自带的媒体元素上（`<audio>` 是 iOS 为声明了 `UIBackgroundModes=audio`
+的应用唯一会保活的音频路径），并把句长从原生侧直接带过来，让热路径完全不碰 WebAudio。
+
+| 位置 | 改动 |
+| --- | --- |
+| `NativeSpeech.swift` | 新增 `Clip { data, duration }`；`synthesize` / `run` 的 completion 由 `Result<Data, _>` 改为 `Result<Clip, _>`；新增 `clipDuration(samples:sampleRate:channels:)`（帧数 ÷ 采样率） |
+| `SangTacAppPlugin.swift` | `speakToFile` 的 resolve 增加 `duration` |
+| `SitePatch.swift` ttsProvider 块 | `IosTts.speak()` 把原生 `duration` 挂到 Blob 上（`blob.__stvDuration`，赋值包 try/catch：Blob 拒收就退回旧路径） |
+| 同块新增 `installPlayback()` | ① `decodeAudio` 对带 `__stvDuration` 的 clip 直接返回 `{duration}`，不解码；② `playWithEq` 换成媒体元素播放（`URL.createObjectURL` → `audio.src` → `audio.play()`），**刻意不复用站点的 `play()`**——它在 `rate == 1` 时会回调 `playWithEq`，会无限递归；③ `play()` 被拒时回退到原 WebAudio 实现，保证不退化 |
+| 同块 | 回前台兜底：`visibilitychange` / `pageshow` 时若站点自己的 `app.tts.player.isPlaying === true` 而元素是 paused，补一次 `play()` |
+| `scripts/test-site-patch.js` | 假插件 `speakToFile` 增加 `duration`；新增 `testTtsBackgroundPlayback()` |
+| `.github/workflows/build-ipa.yml` | 产物标记校验增加 `stvTtsPlaybackInstalled` |
+
+站点自己的队列、预取、句间节奏、`onSentenceEnd` 推进全部不动。
+
+#### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `test-site-patch.js` | 679 断言全过（上一轮文档记 674，按 665 + 新增 6 推算实测基线是 671；本轮新增 8 条：补丁装上、时长随 Blob、自家 clip 不解码、走媒体元素、拿到 blob URL、WebAudio 未被调用、外来 clip 仍走站点解码、空音频不抛） |
+| `check-ios-shim.js` | 24 块 / 476837 字节 / 83 标记 |
+| `gen-site-i18n.js --check` | 459 标签 / 40 片段 |
+| `gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+#### 未证实项
+
+- **后台是否真的继续念**：本轮的全部依据是「媒体元素是 iOS 会保活的那条路径」＋本地假件证明调用链改到了它；
+  真机未验。若仍停，下一步是把合成与播放一起搬进原生 `AVAudioPlayer`（`NativeSpeech.speakDirectly` 已在，
+  站点从不调用），那时连 `speakToFile` 的 base64 往返都可以去掉。
+- 解锁后的兜底 `play()` 是否真被触发、是否会被误触发（只在站点自己的 `isPlaying === true` 且元素 paused 时动手）。
+- 句速（`playbackSetting.rate`）改走媒体元素的 `playbackRate` 后，真机上语速与旧 WebAudio 路径是否一致。
+

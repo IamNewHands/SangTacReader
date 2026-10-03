@@ -27,6 +27,20 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
     static let shared = NativeSpeech()
 
+    /**
+     One synthesised sentence: the WAV bytes plus how long it plays.
+
+     The length is reported from here because the site used to read it off the
+     decoded WebAudio buffer (`audioItem.audioBuffer.duration`) -- and that
+     buffer is exactly what stops existing once iOS suspends the app. Handing the
+     number over with the bytes keeps the shim off WebAudio entirely for our own
+     clips.
+     */
+    struct Clip {
+        let data: Data
+        let duration: Double
+    }
+
     /// Synthesizers are retained here for the whole synthesis: dropping the last
     /// reference mid-flight stops the buffer callbacks.
     private var writers: [String: AVSpeechSynthesizer] = [:]
@@ -141,7 +155,7 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
                     rate: Double,
                     pitch: Double,
                     trace: @escaping (String) -> Void,
-                    completion: @escaping (Result<Data, Error>) -> Void) {
+                    completion: @escaping (Result<Clip, Error>) -> Void) {
 
         guard !text.isEmpty else {
             completion(.failure(NativeSpeech.error("empty text")))
@@ -173,7 +187,7 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
                      pitch: Double,
                      attemptIndex: Int,
                      trace: @escaping (String) -> Void,
-                     completion: @escaping (Result<Data, Error>) -> Void) {
+                     completion: @escaping (Result<Clip, Error>) -> Void) {
 
         guard attemptIndex < NativeSpeech.attempts.count else {
             completion(.failure(NativeSpeech.error(
@@ -211,12 +225,13 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
             return true
         }
 
-        func succeed(_ data: Data) {
+        func succeed(_ clip: Clip) {
             guard claim() else { return }
             DispatchQueue.main.async {
                 self.writers.removeValue(forKey: key)
-                trace("attempt \(attemptIndex + 1) ok: \(data.count) bytes")
-                completion(.success(data))
+                trace("attempt \(attemptIndex + 1) ok: \(clip.data.count) bytes,"
+                    + " \(String(format: "%.2f", clip.duration))s")
+                completion(.success(clip))
             }
         }
 
@@ -246,7 +261,10 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
                 let wav = NativeSpeech.wavContainer(samples: taken.samples,
                                                     sampleRate: taken.sampleRate,
                                                     channels: taken.channels)
-                succeed(wav)
+                succeed(Clip(data: wav,
+                             duration: NativeSpeech.clipDuration(samples: taken.samples,
+                                                                 sampleRate: taken.sampleRate,
+                                                                 channels: taken.channels)))
                 return
             }
             accumulator.append(pcm)
@@ -335,6 +353,13 @@ final class NativeSpeech: NSObject, AVSpeechSynthesizerDelegate {
         if !value.isFinite { return 0 }
         let clamped = min(max(value, -1.0), 1.0)
         return Int16(clamped * 32767.0)
+    }
+
+    /// How long an interleaved 16-bit sample block plays, in seconds. The site
+    /// paces its sentences with this number, so it has to travel with the WAV.
+    private static func clipDuration(samples: [Int16], sampleRate: Double, channels: Int) -> Double {
+        let frames = Double(samples.count) / Double(max(channels, 1))
+        return frames / (sampleRate > 0 ? sampleRate : 22050)
     }
 
     private static func wavContainer(samples: [Int16], sampleRate: Double, channels: Int) -> Data {

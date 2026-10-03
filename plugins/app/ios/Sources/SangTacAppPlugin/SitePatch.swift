@@ -1641,6 +1641,10 @@ enum SitePatch {
         if (window.__stvTtsProviderInstalled) { return; }
         window.__stvTtsProviderInstalled = true;
 
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
         function base64ToBlob(b64, mime) {
             var binary = atob(b64);
             var length = binary.length;
@@ -1706,7 +1710,18 @@ enum SitePatch {
                     throw new Error('iOS TTS returned no audio (got '
                         + (result === null ? 'null' : typeof result) + ')');
                 }
-                return base64ToBlob(encoded, (result && result.mime) || 'audio/wav');
+                var blob = base64ToBlob(encoded, (result && result.mime) || 'audio/wav');
+                // Playback runs through a media element (see installPlayback),
+                // and the site paces its sentences off the clip length. The
+                // native side already knows that length, so it rides along on
+                // the Blob instead of costing a WebAudio decode per sentence.
+                if (result && typeof result.duration === 'number' && result.duration > 0) {
+                    // A Blob that refuses the extra property is not worth failing
+                    // the sentence over: playback falls back to the WebAudio
+                    // decode, which is what used to happen for every clip.
+                    try { blob.__stvDuration = result.duration; } catch (e) {}
+                }
+                return blob;
             });
         };
 
@@ -1818,9 +1833,121 @@ enum SitePatch {
             return true;
         }
 
+        /**
+         The site plays every sentence through WebAudio: playWithEq() hands the
+         decoded buffer to webeq.setAudio(), which starts an
+         AudioBufferSourceNode. On iOS that graph is the whole of the
+         lock-screen failure, and it fails twice over.
+
+         Locking the screen suspends the WebKit content process, so the buffer
+         source stops mid-sentence. The suspension also leaves the AudioContext
+         in a state it never comes back from: after unlocking, every later
+         sentence is decoded and "played" into a graph that produces no sound at
+         all, and the site never re-synthesises because the queued items still
+         claim haveMp3. The device log shows both halves -- thirteen "The
+         operation was aborted" rejections at the instant of the lock, then
+         "reader TTS start" lines with no further speakToFile ever again, and
+         killing the app was the only way out.
+
+         A media element is the one audio path iOS keeps alive for a
+         backgrounded app that declares UIBackgroundModes=audio: WebKit takes the
+         background assertion for it, and nothing in this page ever asked for one
+         (the WebEq graph is built around an Audio() with no src, and the site's
+         mdAudio.play() keep-alive is a no-op on a sourceless element). So the
+         playback step moves onto the element the engine already owns.
+
+         Nothing else changes: the queue, the prefetch, the pacing and the
+         sentence-advance all still run through the site's own code.
+         */
+        function installPlayback() {
+            var engine = window.ttsEngine;
+            if (!engine || typeof engine.playWithEq !== 'function') { return false; }
+            if (engine.__stvTtsPlaybackInstalled) { return true; }
+            engine.__stvTtsPlaybackInstalled = true;
+
+            var webAudioPlay = engine.playWithEq;
+            var webAudioDecode = engine.decodeAudio;
+
+            // Our own clips carry their length, so the hot path never builds an
+            // AudioBuffer for them. Anything else -- a network provider's mp3 --
+            // still goes through the site's own decode.
+            engine.decodeAudio = function (blob) {
+                if (blob && typeof blob.__stvDuration === 'number' && blob.__stvDuration > 0) {
+                    return Promise.resolve({ duration: blob.__stvDuration, __stvDurationStub: true });
+                }
+                return webAudioDecode.apply(this, arguments);
+            };
+
+            // The site's own media-element path, minus its rate == 1 shortcut:
+            // play() delegates that case straight back to playWithEq, so calling
+            // play() from here would recurse forever.
+            engine.playWithEq = function (audioItem) {
+                var blob = audioItem && audioItem.blob;
+                if (!blob) {
+                    // requestAudioInstant() resolves null once synthesis has
+                    // failed three times, and the site still calls through.
+                    note('TTS', 'playback skipped: this sentence produced no audio');
+                    return;
+                }
+                this.currentAudio = audioItem;
+                var url;
+                try {
+                    url = URL.createObjectURL(blob);
+                } catch (e) {
+                    note('ERR', 'playback could not build a blob URL: ' + e);
+                    return;
+                }
+                var audio = this.audio;
+                try {
+                    audio.pause();
+                    audio.currentTime = 0;
+                    if (audio.src) { URL.revokeObjectURL(audio.src); }
+                } catch (e) {}
+                audio.src = url;
+                if (this.playbackSetting && this.playbackSetting.rate) {
+                    audio.playbackRate = this.playbackSetting.rate;
+                }
+                var started = audio.play();
+                if (started && typeof started.catch === 'function') {
+                    started.catch(function (e) {
+                        note('ERR', 'the media element refused playback (' + e + '), back to WebAudio');
+                        try { webAudioPlay.call(engine, audioItem); } catch (e2) {
+                            note('ERR', 'the WebAudio fallback failed too: ' + e2);
+                        }
+                    });
+                }
+            };
+
+            // If iOS suspended us anyway, the element comes back paused while the
+            // reader still believes it is reading. Nudge it once on the way back
+            // in -- gated on the site's own playing flag so a deliberate stop is
+            // never overridden.
+            function resumeIfItShouldBePlaying() {
+                var live = window.ttsEngine;
+                if (!live || !live.audio || !live.audio.src || !live.audio.paused) { return; }
+                var player = window.app && window.app.tts && window.app.tts.player;
+                if (!player || player.isPlaying !== true) { return; }
+                note('TTS', 'playback was suspended while the reader kept reading -> resumed');
+                try { live.audio.play(); } catch (e) {}
+            }
+
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'visible') { resumeIfItShouldBePlaying(); }
+            });
+            window.addEventListener('pageshow', resumeIfItShouldBePlaying);
+
+            note('PATCH', 'TTS playback moved to the media element (survives a screen lock)');
+            return true;
+        }
+
         var timer = setInterval(function () {
             var providerReady = installProvider();
             var listReady = installEngineList();
+            // Deliberately not part of the exit condition: the playback patch
+            // needs ttsEngine.playWithEq, which the real /stv.tts.js always has
+            // but a stub may not, and a missing one must not keep this timer
+            // alive for its full three minutes.
+            installPlayback();
             if (providerReady && listReady) { clearInterval(timer); }
         }, 250);
 

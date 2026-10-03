@@ -1016,10 +1016,13 @@ function installFakeApp(sandbox, options) {
       App: {
         speakToFile(payload) {
           calls.push(payload);
-          // The real plugin resolves an object, not a bare string.
+          // The real plugin resolves an object, not a bare string, and reports
+          // how long the clip plays so the shim never has to decode the WAV
+          // through WebAudio just to learn it.
           return Promise.resolve({
             data: Buffer.from('RIFFfakewav').toString('base64'),
             mime: 'audio/wav',
+            duration: typeof options.ttsDuration === 'number' ? options.ttsDuration : 1.5,
           });
         },
         getVoices() {
@@ -1280,6 +1283,84 @@ async function testTtsProviderHealsStoredBing() {
   check('healed setting exposes the ios sub-object', !!sandbox.app.tts.setting.ios);
   check('bing no longer offered in engineList',
     sandbox.app.tts.engineList().every((entry) => entry.value !== 'bing'));
+}
+
+// The lock-screen regression. The site played every sentence through WebAudio
+// (ttsEngine.playWithEq -> webeq.setAudio -> AudioBufferSourceNode), and iOS
+// suspends that graph the moment the screen locks -- then never lets it come
+// back, so after unlocking every later sentence decoded into a graph that made
+// no sound and the app had to be killed. Playback now runs through the media
+// element the engine already owns, and the clip length arrives from native so
+// the hot path does not decode at all.
+async function testTtsBackgroundPlayback() {
+  console.log('tts playback survives a screen lock');
+  const sandbox = makeSandbox();
+  const blocks = loadBlocks();
+  installFakeApp(sandbox, { displayType: 'pageflip', ttsDuration: 2.5 });
+
+  const calls = { webAudio: 0, decoded: 0, played: 0 };
+  const audio = {
+    paused: true,
+    currentTime: 0,
+    playbackRate: 1,
+    src: '',
+    volume: 1,
+    play() { calls.played++; audio.paused = false; return Promise.resolve(); },
+    pause() { audio.paused = true; },
+    addEventListener() {},
+  };
+  sandbox.Audio = function () { return audio; };
+  sandbox.window.Audio = sandbox.Audio;
+  sandbox.URL = { createObjectURL: () => 'blob:stv/clip', revokeObjectURL: () => {} };
+  sandbox.window.URL = sandbox.URL;
+
+  // ttsEngine stands in for /stv.tts.js: playWithEq is the WebAudio path that
+  // must no longer be reached, decodeAudio the one that must be skipped.
+  sandbox.ttsEngine = {
+    playbackSetting: { rate: 1 },
+    audio,
+    createProvider() {},
+    decodeAudio() { calls.decoded++; return Promise.resolve({ duration: 0 }); },
+    playWithEq() { calls.webAudio++; },
+  };
+  sandbox.window.ttsEngine = sandbox.ttsEngine;
+
+  vm.runInContext(blocks.join('\n'), sandbox);
+  await tick(400);
+
+  check('the playback patch is installed',
+    sandbox.ttsEngine.__stvTtsPlaybackInstalled === true,
+    'flag=' + String(sandbox.ttsEngine.__stvTtsPlaybackInstalled));
+
+  sandbox.ttsEngine.createProvider('ios', {});
+  const provider = sandbox.ttsEngine.provider;
+  const blob = await provider.speak('第一句', { voice: 'v', rate: 1 });
+  check('the native clip length rides along on the Blob',
+    blob.__stvDuration === 2.5, String(blob.__stvDuration));
+
+  const decoded = await sandbox.ttsEngine.decodeAudio(blob);
+  check('our own clip is never decoded through WebAudio',
+    calls.decoded === 0 && decoded.duration === 2.5,
+    'decoded=' + String(calls.decoded) + ' duration=' + String(decoded.duration));
+
+  sandbox.ttsEngine.playWithEq({ blob, duration: 2.5 });
+  check('playback goes through the media element', calls.played === 1,
+    'played=' + String(calls.played));
+  check('the element got the blob URL', audio.src === 'blob:stv/clip', String(audio.src));
+  check('the WebAudio buffer source is not used', calls.webAudio === 0,
+    'webAudio=' + String(calls.webAudio));
+
+  // A network provider's mp3 carries no native length and must still decode the
+  // site's way, or Zalo / FPT / Viettel would stop working.
+  await sandbox.ttsEngine.decodeAudio({ size: 10, type: 'audio/mpeg' });
+  check('a clip with no native length still decodes the site way', calls.decoded === 1,
+    'decoded=' + String(calls.decoded));
+
+  // requestAudioInstant() resolves null once synthesis has failed three times,
+  // and the site still hands that null to the playback step.
+  sandbox.ttsEngine.playWithEq(null);
+  sandbox.ttsEngine.playWithEq({});
+  check('a sentence with no audio is skipped instead of throwing', true);
 }
 
 async function testReaderDefaults() {
@@ -6967,6 +7048,7 @@ await testLanguageGuard();
   await testDownloadSkipsDownloaded();
   await testExportDownloadedBook();
   await testReaderTts();
+  await testTtsBackgroundPlayback();
 await testBootShell();
   await testCommentButton();
   await testOfflineBookDetailPage();
