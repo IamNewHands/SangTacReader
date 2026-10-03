@@ -1998,6 +1998,14 @@
     [
       "truy cập cài đặt để xem chi tiết",
       "请进入设置查看详情"
+    ],
+    [
+      "Bạn đã thay đổi mật khẩu, IP: ",
+      "您已修改密码，IP："
+    ],
+    [
+      "Bạn đã thay đổi mật khẩu",
+      "您已修改密码"
     ]
   ],
   "patterns": [

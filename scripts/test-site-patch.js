@@ -1650,6 +1650,20 @@ async function testI18nOverlay() {
     '结尾一句。Bạn đang đọc bản lưu trong hệ thống');
   sandbox.document.body.appendChild(mixedNotice);
 
+  // The notification list (app.fun.showNotify, page-vip:4607) renders server
+  // strings through app.render("notify") -> <div class="notify"><div
+  // class="content">, and app.text.notificationReplace only rewrites the four
+  // templates it knows about (chapter update, reply comment). Everything else the
+  // server writes -- the password-change notice here -- arrived Vietnamese in a
+  // Chinese UI (2026-10-03 report).
+  const notify = makeContainer('div', 'notify');
+  const notifyContent = makeContainer('div', 'content',
+    'Bạn đã thay đổi mật khẩu, IP: 58.246.50.161');
+  notify.appendChild(notifyContent);
+  sandbox.document.body.appendChild(notify);
+  const notifyPlain = makeContainer('div', 'content', 'Bạn đã thay đổi mật khẩu');
+  sandbox.document.body.appendChild(notifyPlain);
+
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(60);
 
@@ -1663,6 +1677,12 @@ async function testI18nOverlay() {
     JSON.stringify(comment.childNodes[0].nodeValue));
   check('concatenated message translated', toast.childNodes[0].nodeValue.indexOf('分钟') >= 0,
     JSON.stringify(toast.childNodes[0].nodeValue));
+  check('a server notification carrying an IP is translated',
+    notifyContent.childNodes[0].nodeValue === '您已修改密码，IP：58.246.50.161',
+    JSON.stringify(notifyContent.childNodes[0].nodeValue));
+  check('the same notice without the IP is translated too',
+    notifyPlain.childNodes[0].nodeValue === '您已修改密码',
+    JSON.stringify(notifyPlain.childNodes[0].nodeValue));
   check('placeholder attribute translated', input.getAttribute('placeholder') === '标题',
     JSON.stringify(input.getAttribute('placeholder')));
   check('chapter title numbering translated', chapterName.textContent === '第1章 Uống thuốc',

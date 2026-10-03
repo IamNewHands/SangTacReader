@@ -526,7 +526,9 @@ enum SiteI18nData {
             ['Mở khóa chương này cần cho phép sử dụng thần thạch', '解锁本章需要使用神石'],
             ['Mở khóa chương này cần cho phép sử dụng', '解锁本章需要使用'],
             ['Mở khóa chương này', '解锁本章'],
-            ['truy cập cài đặt để xem chi tiết', '请进入设置查看详情']
+            ['truy cập cài đặt để xem chi tiết', '请进入设置查看详情'],
+            ['Bạn đã thay đổi mật khẩu, IP: ', '您已修改密码，IP：'],
+            ['Bạn đã thay đổi mật khẩu', '您已修改密码']
         ];
 
         // [viPrefix, viSuffix, zhPrefix, zhSuffix] for messages whose middle part is
