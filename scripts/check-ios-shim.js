@@ -386,6 +386,28 @@ for (const block of blocks) {
   }
 }
 
+/**
+ * The workflow's shell steps are run by a bash whose locale makes it fold the
+ * high bytes of a multi-byte character into a variable name. `echo "…（$marker）…"`
+ * therefore asks for the variable `marker\xEF\xBC\x89`, `set -u` aborts, and the
+ * step dies with no output at all — which is what happened to run 37177806505,
+ * after a three-minute build. `${marker}` is always safe; this catches the bare
+ * form next to any non-ASCII character before the build starts.
+ */
+const WORKFLOW_DIR = path.join(__dirname, '..', '.github', 'workflows');
+for (const name of fs.readdirSync(WORKFLOW_DIR).filter((file) => /\.ya?ml$/.test(file))) {
+  const lines = fs.readFileSync(path.join(WORKFLOW_DIR, name), 'utf8').split(/\r?\n/);
+  lines.forEach((line, index) => {
+    if (/^\s*#/.test(line)) { return; }
+    const risky = /\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7F])/.exec(line);
+    if (risky) {
+      fail(`${name}:${index + 1} uses $${risky[1]} directly before `
+        + `${JSON.stringify(risky[2])}; write \${${risky[1]}} — bash folds the `
+        + 'high bytes into the name and set -u aborts the step');
+    }
+  });
+}
+
 console.log(
   `✓ injected document-start JavaScript is valid (${blocks.length} blocks, ${total} bytes, ` +
     `${REQUIRED_MARKERS.length} markers)`

@@ -3966,6 +3966,29 @@ WKUserScript、独立的 IIFE**，所以那是个 `ReferenceError`——本该�
 `check-ios-shim.js` 加了**按块的共享 helper 作用域检查**（`SHARED_HELPERS`：块里调用了某个
 helper 就必须在同一个块里定义它）。
 
+### CI：这一轮踩的两个坑
+
+第一次推送（`3aa1512`）的 `Build unsigned IPA` 以 exit 65 失败，第二次（`9ec4182`）
+在「Verify native plugins are linked」以 exit 1 失败。两个都不是站点补丁的问题：
+
+1. **`??` 会脱掉元组标签**。`self?.readDiagFile() ?? ("", 0)` 里的字面量是无标签元组，
+   `??` 取公共类型后结果成了 `(String, Int)`，于是下面的 `.text` / `.bytes` 不存在：
+
+   ```
+   SangTacAppPlugin.swift:844:36: error: value of tuple type '(String, Int)' has no member 'text'
+   ```
+
+   改成显式分支（`var text` / `var bytes` + `if let reader = self`）。**教训**：这是本轮唯一
+   一次「本机没有编译器」的代价——JS 侧有 815 条断言兜着，Swift 侧只有 CI。
+
+2. **`$var` 紧挨着全角字符会被 bash 吞进变量名**。runner 的 locale 下 bash 把多字节字符的
+   高位字节当作标识符的一部分，于是 `echo "✓ 诊断日志落盘（$marker）已编入产物"` 请求的是变量
+   `marker\xEF\xBC\x89`，`set -u` 直接中止，**整步零输出**（日志里只有
+   `line 61: marker…: unbound variable`）。改成 `${marker}`。
+
+   这类错误只在 CI 暴露，所以把检查并进了 `scripts/check-ios-shim.js`（跳过注释行，扫
+   `.github/workflows/*.yml`）：`$var` 后面紧跟非 ASCII 字符即报错，在构建之前就拦住。
+
 ### 守卫
 
 | 守卫 | 结果 |

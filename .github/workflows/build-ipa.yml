@@ -232,9 +232,14 @@ jobs:
           # 下一次启动（「闪退后诊断日志就清空了，导致没有日志」）。
           for marker in stv-diagnostic.log diagAppend diagRead diagClear; do
             if grep -q -F "$marker" "$syms.strings"; then
-              echo "✓ 诊断日志落盘（$marker）已编入产物"
+              # ${marker}, never the bare form: the runner's locale makes bash
+              # read the high bytes of a following full-width character as part
+              # of the name, so the bare form next to a full-width bracket asked
+              # for an unbound variable and `set -u` killed the step with no
+              # output at all.
+              echo "✓ 诊断日志落盘（${marker}）已编入产物"
             else
-              echo "::error::诊断日志落盘缺失（$marker 不在二进制里）"
+              echo "::error::诊断日志落盘缺失（${marker} 不在二进制里）"
               exit 1
             fi
           done
