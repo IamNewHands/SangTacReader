@@ -4270,6 +4270,69 @@ https://mhpic.cartoon.reader.qq.com/7782521204336702/20891046590338205/208910474
 读者也取不到的一对整体交回服务端、OCR 纯文本答案变成 `imageWidth:null` 的 JSON、本来就是 JSON 的
 答案不被改、`/open/autotrans.php` 的纯文本不被改。
 
+## §6.44 第 42 轮：第 41 轮在真机上生效了，冒出的是 `ui.scrollto`
+
+第 42 轮日志（1074 行，三次启动）。第 41 轮的两处修复**在真机上确认生效**：
+
+| 证据 | 说明 |
+| --- | --- |
+| 第 466 行（14:24，第 39 轮的包）`GET %5B%22https%3A//…%22%5D FAILED in 0ms: unsupported URL` | 数组被整串交给下载器 |
+| 第 980 行（15:08，第 41 轮的包）`GET https://mhpic.cartoon.reader.qq.com/…/20891047412422638 FAILED in 2653ms: A TLS error` | 数组被逐个走开，`unsupported URL` 消失，换成真实的 TLS 失败 |
+| 第 956 行 `unhandledrejection @app.v2.php:4399` **消失**，第 963 行 `tap div.chapterrow.chaplastreaded` | 第 40 轮的「上次读到」高亮生效了，用户点的就是它 |
+| 第 971 行之后每条 mhpic url 各失败两次 | 配对模式 (0,1)(1,2)(2,3) 让每个内部图被要两次 |
+
+### 新暴露的一处：站点把「元素」交给了只要「id」的函数
+
+第 956-962 行的新拒绝栈是：
+
+```
+unhandledrejection @https://sangtacviet.com/jqr.js:2:13070
+@jqr.js:2:21902  find@jqr.js:2:24475  @jqr.js:2:24964  k@jqr.js:2:963
+@https://sangtacviet.com/stv.ui.js:1017:15
+@https://sangtacviet.com/app.v2.php:4400:19
+```
+
+`app.v2.php:4399` 加标记成功了（所以 963 行有 `chaplastreaded`），**下一行 4400 抛错**：
+
+```js
+ui.scrollto(c, -300, l);
+```
+
+而 `ui.scrollto`（`stv.ui.js:1015-1019`）第一段就是：
+
+```js
+ui.scrollto=function(ele,offset, scroller){
+	$(scroller || [document.documentElement, document.body]).animate({
+		scrollTop: $("#"+ele).offset().top+(offset||0)
+	}, 200);
+}
+```
+
+它要的是 **id 字符串**，唯一调用点给的却是元素 `c`：选择器成了 `#[object HTMLDivElement]`，
+`jqr` 的 `find` 解析不了就抛。于是**标记有了、滚动没了**，每次进章节列表多一行 ERR。
+第 40 轮说「标记和滚动都回来了」是错的，滚动是另一处站点缺陷，这一轮才修。
+
+### 修法
+
+| 位置 | 改动 |
+| --- | --- |
+| `patchScrollto()` | 包 `ui.scrollto`：参数是元素时给它临时起一个 id（`__stvscrollto`）再走站点自己的路径，调用返回后撤掉。滚动量仍由站点那一行算（`$("#"+ele).offset().top` 同步求值，撤 id 不影响已开始的动画）；已经有 id 的行原样传，字符串参数原样走 |
+| `patchComicChapterListScroll()` | `stv.ui.js` 在本块之后才跑，所以修复放在**唯一需要它的时刻**——打开章节列表时先补 `ui.scrollto` 再调原函数 |
+| `imageBytesOne()` 记忆 | 配对模式让每个内部图被要两次（帧自己的 `lazyImageLoader.cache` 按「交进去的 url」做键，配对模式下那是整个数组，每对都不同，所以没用）。现在按图记住答案：成功缓存（上限 60 条，避免整章 base64 堆内存），失败也记住 |
+| 宿主记忆 | 某个图床已经拒过一次，本章其余图片不再逐个握手（每次 2.6-3.1 秒），直接交给服务端——那本来就是既有的兜底，猜错也只是同一结果来得更快；只记一行日志 |
+
+### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **851 条断言**全过（上一轮 844，新增 7） |
+| `scripts/check-ios-shim.js` | 26 块 / 611076 字节 / 121 标记 |
+| `scripts/gen-site-i18n.js --check` | 460 labels / 72 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：章节列表被包、`ui.scrollto` 在尾巴调用前已被补、没有 id 的行被临时命名且调用后复原、
+已有 id 的行按原 id 传、字符串参数原样走、同一张图两对都要只下载一次、已拒绝的图床不再被问第二次。
+
 
 
 

@@ -268,6 +268,13 @@ const REQUIRED_MARKERS = [
   // JSON.parse turned into a silent hang.
   'function patchOcrResponse(',
   '"imageWidth":null,"t_image":null',
+  // The last-read marker is applied a line before the site hands the ROW to
+  // ui.scrollto, which builds its selector as `$("#" + ele)` and so only takes an
+  // id. And paired mode asks for the same image twice, so a dead host used to cost
+  // one TLS handshake per image.
+  'function patchScrollto(',
+  'function patchComicChapterListScroll(',
+  'leaving the rest of this chapter to the',
 ];
 
 function fail(message) {

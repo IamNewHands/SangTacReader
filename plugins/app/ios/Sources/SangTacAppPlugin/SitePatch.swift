@@ -10379,6 +10379,18 @@ enum SitePatch {
         // image through the app's own HTTP plugin and answers "IMAGERAW:" plus
         // the base64, which the server accepts.
         var frameAsking = null;
+        // Paired mode asks for the SAME image twice: startTransPaired
+        // (comictranslator.php:126-150) builds pair (0,1) then (1,2) then (2,3),
+        // so every interior image is downloaded once per pair it belongs to. The
+        // frame's own lazyImageLoader.cache cannot help -- it is keyed by the url
+        // it was HANDED, and in paired mode that is the whole array, which is
+        // different for every pair. Remembering the answer per image halves the
+        // downloads, and remembering a host that already refused stops a dead
+        // source from spending one TLS handshake per image on it.
+        var frameBytes = {};
+        var frameHostDown = {};
+        var FRAME_BYTES_MAX = 60;
+        var frameBytesKept = 0;
 
         // The frame asks for bytes with whatever url it was handed, and in paired
         // mode that is a JSON array of two images. Handing that array straight to
@@ -10404,6 +10416,14 @@ enum SitePatch {
 
         // One image, or null when the reader cannot produce its bytes either.
         function imageBytesOne(url) {
+            if (Object.prototype.hasOwnProperty.call(frameBytes, url)) {
+                return Promise.resolve(frameBytes[url] || null);
+            }
+            var host = imageHost(url);
+            // One refusal from a host is enough to leave the rest of the chapter
+            // to the server: that is the fallback that already existed, so the
+            // worst a wrong guess costs is the same answer, reached at once.
+            if (host && frameHostDown[host]) { return Promise.resolve(null); }
             return new Promise(function (resolve) {
                 var images = window.app && window.app.images;
                 if (!images || typeof images.download !== 'function') {
@@ -10431,6 +10451,23 @@ enum SitePatch {
                         + messageOf(error) + '); letting the server try');
                     resolve(null);
                 }
+            }).then(function (value) {
+                // A failure carries no payload, so it is always worth keeping; the
+                // bytes are capped because a long chapter's worth of base64 is
+                // megabytes, and the duplicates are all inside the first pairs.
+                if (!value) {
+                    frameBytes[url] = '';
+                    if (host && !frameHostDown[host]) {
+                        frameHostDown[host] = true;
+                        note('COMIC', 'the image host ' + host + ' cannot be fetched'
+                            + ' from here; leaving the rest of this chapter to the'
+                            + ' server');
+                    }
+                } else if (frameBytesKept < FRAME_BYTES_MAX) {
+                    frameBytes[url] = value;
+                    frameBytesKept++;
+                }
+                return value;
             });
         }
 
@@ -10576,6 +10613,11 @@ enum SitePatch {
             if (translator.__stvBytes) { return true; }
             translator.__stvBytes = true;
             frameAsking = w;
+            // A new chapter means a new frame, so nothing remembered about the
+            // last one's images or hosts applies.
+            frameBytes = {};
+            frameHostDown = {};
+            frameBytesKept = 0;
 
             var loader = translator.lazyImageLoader;
             // The frame hard-codes transmode "paired" (comictranslator.php:470)
@@ -10835,6 +10877,66 @@ enum SitePatch {
             return true;
         }
 
+        // "上次读到" 的高亮回来了，滚到那一章却还是抛错。站点自己的尾巴是
+        // （app.v2.php:4396-4402）：
+        //
+        //     var c = l.q('[clink="' + h.url + '"]');
+        //     c.classList.add("chaplastreaded");
+        //     ui.scrollto(c, -300, l);              // 4400
+        //
+        // 而 ui.scrollto（stv.ui.js:1015-1019）第一段就是 `$("#" + ele)`——它要的是
+        // **id 字符串**，而唯一调用点给的是元素：选择器成了
+        // `#[object HTMLDivElement]`，jqr 的 find 解析不了就抛。于是标记有了、滚动没了，
+        // 每进一次章节列表多一行 `unhandledrejection @jqr.js`。
+        //
+        // 滚动量就是站点那一行算的，所以不重算：给这一行临时起个 id，让站点走它自己的
+        // 路径，调用返回后撤掉（`$("#"+ele).offset().top` 是同步求值的，animate 拿到
+        // 的是数值，撤 id 不影响已经开始的动画）。
+        function patchScrollto() {
+            var ui = window.ui;
+            if (!ui || typeof ui.scrollto !== 'function') { return false; }
+            if (ui.scrollto.__stvElement) { return true; }
+            var original = ui.scrollto;
+            var safe = function (ele, offset, scroller) {
+                if (!ele || typeof ele !== 'object' || ele.nodeType !== 1) {
+                    return original.apply(this, arguments);
+                }
+                var had = '';
+                try { had = String(ele.getAttribute('id') || ''); } catch (error) { had = ''; }
+                var name = had || '__stvscrollto';
+                if (!had) {
+                    try { ele.setAttribute('id', name); } catch (error) { /* an unnamed row still scrolls by id-less path below */ }
+                }
+                try {
+                    return original.call(this, name, offset, scroller);
+                } finally {
+                    if (!had) {
+                        try { ele.removeAttribute('id'); } catch (error) { /* nothing to undo */ }
+                    }
+                }
+            };
+            safe.__stvElement = true;
+            ui.scrollto = safe;
+            return true;
+        }
+
+        // stv.ui.js runs after this block, so ui.scrollto only exists later; the
+        // repair is made at the one moment it matters -- opening the chapter list
+        // whose tail calls it.
+        function patchComicChapterListScroll() {
+            var fun = window.app && window.app.fun;
+            if (!fun || typeof fun.openComicChapterList !== 'function') { return false; }
+            if (fun.openComicChapterList.__stvScroll) { return true; }
+            var original = fun.openComicChapterList;
+            var safe = function () {
+                patchScrollto();
+                return original.apply(this, arguments);
+            };
+            safe.__stvScroll = true;
+            fun.openComicChapterList = safe;
+            return true;
+        }
+
         function adoptReader() {
             var reader = window.app && window.app.comicReader;
             if (!reader) { return false; }
@@ -10844,7 +10946,8 @@ enum SitePatch {
             var style = patchComicInfoStyle();
             var count = patchComicChapterCount();
             var history = patchComicHistory();
-            return !!(origin && frame && remote && style && count && history);
+            var scroll = patchComicChapterListScroll();
+            return !!(origin && frame && remote && style && count && history && scroll);
         }
 
         // app.v2.comicprovider.js is loaded on demand -- the comic browser is the

@@ -6782,7 +6782,21 @@ async function testComicGate() {
     data: { chapters: [{ url: 'a' }, { url: 'b' }, { url: 'c' }] },
     q: (selector) => (selector === '.chaptercount' ? comicInfoCount : null),
   };
-  sandbox.window.app.fun = { setComicPageEvent() { return null; } };
+  sandbox.window.app.fun = {
+    setComicPageEvent() { return null; },
+    // app.v2.php:4367 -- its tail is the only caller of ui.scrollto, and it hands
+    // it a chapter row where ui.scrollto wants an id.
+    openComicChapterList() { return null; },
+  };
+  // stv.ui.js:1015 -- the site's own scroll helper, whose first expression is
+  // `$("#" + ele)`.
+  const scrollCalls = [];
+  sandbox.window.ui = {
+    scrollto(ele, offset, scroller) {
+      scrollCalls.push({ ele, offset, scroller });
+      return null;
+    },
+  };
   // The byte relay hands the OCR service an image it does not have to fetch, so
   // the page needs the app's own HTTP downloader to exist. A host the reader
   // cannot reach either rejects, which is what leaves the url for the server.
@@ -6827,6 +6841,32 @@ async function testComicGate() {
     String(lastRead.url));
   check('a book with no history still answers nothing',
     await comicHistory.getLastReadChapter('https://www.yemancomic.com/book/9/') === null);
+
+  // "unhandledrejection @jqr.js" right after the marker is applied: the site's own
+  // tail then calls ui.scrollto(c, -300, l) with the ROW, while ui.scrollto
+  // (stv.ui.js:1015) builds its selector as `$("#" + ele)`.
+  check('the chapter list is reached through a wrapper that repairs ui.scrollto',
+    sandbox.window.app.fun.openComicChapterList.__stvScroll === true);
+  sandbox.window.app.fun.openComicChapterList([], {});
+  check('ui.scrollto is repaired before the chapter list tail can call it',
+    sandbox.window.ui.scrollto.__stvElement === true);
+  const unnamedRow = makeElement('div');
+  sandbox.window.ui.scrollto(unnamedRow, -300, null);
+  check('a row with no id is named for the call, then left as it was',
+    scrollCalls.length === 1
+      && scrollCalls[0].ele === '__stvscrollto'
+      && scrollCalls[0].offset === -300
+      && unnamedRow.getAttribute('id') === undefined,
+    JSON.stringify({ calls: scrollCalls, id: unnamedRow.getAttribute('id') }));
+  const namedRow = makeElement('div');
+  namedRow.setAttribute('id', 'row7');
+  sandbox.window.ui.scrollto(namedRow, 0, null);
+  check('a row that already has an id is passed by that id',
+    scrollCalls[1].ele === 'row7' && namedRow.getAttribute('id') === 'row7',
+    JSON.stringify(scrollCalls[1]));
+  sandbox.window.ui.scrollto('row7', 0, null);
+  check('an id argument still goes straight through',
+    scrollCalls[2].ele === 'row7');
 
   check('the reader is adopted once app.v2.read.js has defined it',
     reader.getTranslatorUrl.__stvSameOrigin === true
@@ -6999,6 +7039,47 @@ async function testComicGate() {
   check('a pair the reader cannot fetch goes back whole, for the server to try',
     replies.length === 3 && replies[2].data === deadPair,
     JSON.stringify(replies.slice(2)));
+
+  // Paired mode builds pair (0,1) then (1,2) then (2,3), so every interior image
+  // is asked for twice, and a dead source used to spend one TLS handshake per
+  // ask. Both are remembered per frame now.
+  const downloads = [];
+  sandbox.window.app.images.download = (url) => {
+    downloads.push(String(url));
+    const text = String(url);
+    return (text.indexOf('dead.') >= 0 || text.indexOf('gone.') >= 0)
+      ? Promise.reject(new Error('unsupported URL'))
+      : Promise.resolve({ base64: 'QUJD' });
+  };
+  const twiceUrl = 'https://mhpic.example/twice.jpg';
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: twiceUrl },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: twiceUrl },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  check('an image two pairs both want is downloaded once',
+    downloads.filter((one) => one === twiceUrl).length === 1,
+    JSON.stringify(downloads));
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: 'https://gone.example/1.jpg' },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: 'https://gone.example/2.jpg' },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  check('a host that already refused is not asked again for the rest of the chapter',
+    downloads.filter((one) => one.indexOf('gone.example') >= 0).length === 1
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('the image host gone.example cannot be fetched from here') >= 0,
+    JSON.stringify(downloads));
 
   // The service answers PLAIN TEXT when it cannot fetch an element of that
   // array, and the frame's transImage parses responseText as JSON -- a throw
