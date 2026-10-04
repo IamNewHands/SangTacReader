@@ -666,6 +666,29 @@ function makeFakeFrame(contentElements) {
     addEventListener() {},
     removeEventListener() {},
   };
+  // The OCR service answers plain text ("Invalid image data: <url>") when it
+  // cannot fetch an image, and the frame's transImage parses responseText as
+  // JSON. The repair is checked against a real accessor on the prototype, so the
+  // stub has the same shape as the browser's rather than a plain property.
+  class FakeXhr {
+    constructor() {
+      this.__body = '';
+      this.responseURL = '';
+      this.status = 200;
+    }
+
+    open(method, url) { this.responseURL = url; }
+
+    send() {}
+
+    get responseText() { return this.__body; }
+  }
+  FakeXhr.prototype.__respond = function (url, body) {
+    this.responseURL = url;
+    this.__body = body;
+    return this;
+  };
+  frameWindow.XMLHttpRequest = FakeXhr;
   doc.defaultView = frameWindow;
   // The page-turn highlight dispatches `stvspeak` on the page element's
   // ownerDocument; hand every element placed in this document the link.
@@ -6761,8 +6784,13 @@ async function testComicGate() {
   };
   sandbox.window.app.fun = { setComicPageEvent() { return null; } };
   // The byte relay hands the OCR service an image it does not have to fetch, so
-  // the page needs the app's own HTTP downloader to exist.
-  sandbox.window.app.images = { download: () => Promise.resolve({ base64: 'QUJD' }) };
+  // the page needs the app's own HTTP downloader to exist. A host the reader
+  // cannot reach either rejects, which is what leaves the url for the server.
+  sandbox.window.app.images = {
+    download: (url) => (String(url).indexOf('dead.') >= 0
+      ? Promise.reject(new Error('unsupported URL'))
+      : Promise.resolve({ base64: 'QUJD' })),
+  };
   sandbox.window.location = { origin: 'https://sangtacviet.com' };
   await tick(300);
 
@@ -6919,6 +6947,17 @@ async function testComicGate() {
     await frameLoader.toRealRawData(
       JSON.stringify(['https://mhpic.example/1.jpg', 'LAZY:https://mhpic.example/2.jpg']))
       === 'https://mhpic.example/1.jpgIMAGERAW:https://mhpic.example/2.jpg');
+  // "paired" is the transmode the frame hard-codes, and startTransPaired
+  // (comictranslator.php:138) hands toRealRawData `JSON.stringify([u1, u2])`.
+  // Joining those two urls is not a url, and the service answers imageWidth=null
+  // to it; the array is the body it parses and stacks itself.
+  const plainPair = JSON.stringify([
+    'https://mhpic.cartoon.reader.qq.com/1.jpg',
+    'https://mhpic.cartoon.reader.qq.com/2.jpg',
+  ]);
+  check('a plain pair keeps the JSON array the service stacks into one image',
+    await frameLoader.toRealRawData(plainPair) === plainPair,
+    JSON.stringify(await frameLoader.toRealRawData(plainPair)));
 
   // Nothing on the site answers the frame's request for bytes, so the page does.
   const replies = [];
@@ -6936,6 +6975,51 @@ async function testComicGate() {
     JSON.stringify(replies));
   check('a message that is not the frame asking is left alone',
     (sandbox.__dispatch('message', { data: { type: 'somethingElse' } }), replies.length === 1));
+
+  // Paired mode asks for bytes with the whole JSON array, and handing that array
+  // to the app's downloader is what made the HTTP plugin answer "unsupported
+  // URL": the bytes the service could not fetch for itself were lost.
+  const pairUrl = JSON.stringify(['https://mhpic.example/4.jpg', 'https://mhpic.example/5.jpg']);
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: pairUrl },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  check('a paired request is answered with both images as IMAGERAW bytes',
+    replies.length === 2
+      && replies[1].url === pairUrl
+      && replies[1].data === 'IMAGERAW:QUJDIMAGERAW:QUJD',
+    JSON.stringify(replies.slice(1)));
+  const deadPair = JSON.stringify(['https://dead.example/1.jpg', 'https://dead.example/2.jpg']);
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: deadPair },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  check('a pair the reader cannot fetch goes back whole, for the server to try',
+    replies.length === 3 && replies[2].data === deadPair,
+    JSON.stringify(replies.slice(2)));
+
+  // The service answers PLAIN TEXT when it cannot fetch an element of that
+  // array, and the frame's transImage parses responseText as JSON -- a throw
+  // inside onreadystatechange leaves its promise unsettled, so the block never
+  // retried and nothing at all appeared. It has to arrive as readable data.
+  const ocrText = (url, body) => {
+    const xhr = new frame.contentWindow.XMLHttpRequest();
+    xhr.__respond(url, body);
+    return xhr.responseText;
+  };
+  const ocrUrl = 'https://sangtacviet.com/s1213ocr.php?lang=chinese';
+  check('an OCR answer that is not JSON becomes the empty-image answer, not a hang',
+    JSON.parse(ocrText(ocrUrl, 'Invalid image data: https://mhpic.example/1.jpg'))
+      .imageWidth === null,
+    ocrText(ocrUrl, 'Invalid image data: https://mhpic.example/1.jpg'));
+  check('a JSON OCR answer is left exactly as it came',
+    ocrText(ocrUrl, '{"blocks":[],"images":[],"imageWidth":800}')
+      === '{"blocks":[],"images":[],"imageWidth":800}');
+  check('the translation endpoint, which answers text on purpose, is untouched',
+    ocrText('https://sangtacviet.com/open/autotrans.php?lang=vi', 'xin chào')
+      === 'xin chào');
 
   // The server answers imageWidth=null exactly when it could not fetch the image
   // it was handed; that empty data url is what WebKit drew as the "?".

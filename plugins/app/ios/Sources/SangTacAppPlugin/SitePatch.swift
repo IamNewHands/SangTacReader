@@ -10380,44 +10380,77 @@ enum SitePatch {
         // the base64, which the server accepts.
         var frameAsking = null;
 
-        function imageBytes(url) {
+        // The frame asks for bytes with whatever url it was handed, and in paired
+        // mode that is a JSON array of two images. Handing that array straight to
+        // the app's downloader is what made the HTTP plugin answer "unsupported
+        // URL" and lose the bytes the service could not fetch for itself, so the
+        // array is walked instead.
+        function imageCandidates(url) {
+            var text = String(url || '');
+            if (text.charAt(0) !== '[') { return [text]; }
+            try {
+                var list = JSON.parse(text);
+                if (list && list.length) {
+                    return Array.prototype.map.call(list, function (one) {
+                        return String(one);
+                    });
+                }
+            } catch (error) {
+                note('ERR', 'the chapter frame asked for an unreadable image list: '
+                    + messageOf(error));
+            }
+            return [text];
+        }
+
+        // One image, or null when the reader cannot produce its bytes either.
+        function imageBytesOne(url) {
             return new Promise(function (resolve) {
-                var answered = false;
-                var done = function (value) {
-                    if (answered) { return; }
-                    answered = true;
-                    resolve(value);
-                };
-                // A url the server can fetch itself is a better answer than a
-                // page that never draws, so fall back to it when the client
-                // cannot produce the bytes.
-                setTimeout(function () { done(url); }, 15000);
+                var images = window.app && window.app.images;
+                if (!images || typeof images.download !== 'function') {
+                    resolve(null);
+                    return;
+                }
                 try {
-                    var images = window.app && window.app.images;
-                    if (!images || typeof images.download !== 'function') {
-                        done(url);
-                        return;
-                    }
                     images.download(url).then(function (blob) {
                         var reader = new FileReader();
                         reader.onload = function () {
                             var text = String(reader.result || '');
                             var comma = text.indexOf(',');
-                            done(comma < 0 ? url : 'IMAGERAW:' + text.slice(comma + 1));
+                            resolve(comma < 0
+                                ? null : 'IMAGERAW:' + text.slice(comma + 1));
                         };
-                        reader.onerror = function () { done(url); };
+                        reader.onerror = function () { resolve(null); };
                         reader.readAsDataURL(blob);
                     }, function (error) {
                         note('ERR', 'the chapter frame image could not be fetched ('
                             + messageOf(error) + '); letting the server try');
-                        done(url);
+                        resolve(null);
                     });
                 } catch (error) {
                     note('ERR', 'the chapter frame image could not be fetched ('
                         + messageOf(error) + '); letting the server try');
-                    done(url);
+                    resolve(null);
                 }
             });
+        }
+
+        function imageBytes(url) {
+            var list = imageCandidates(url);
+            var work = Promise.all(list.map(imageBytesOne)).then(function (parts) {
+                var ok = true;
+                for (var i = 0; i < parts.length; i++) {
+                    if (!parts[i]) { ok = false; }
+                }
+                // All of them or none: the frame's format is a run of IMAGERAW
+                // chunks that the service stacks back into one image, so a
+                // half-filled run would be neither bytes nor a url to fetch.
+                return ok ? parts.join('') : String(url);
+            });
+            // A downloader that never answers must not leave the frame waiting
+            // for a message that is not coming.
+            return Promise.race([work, new Promise(function (resolve) {
+                setTimeout(function () { resolve(String(url)); }, 15000);
+            })]);
         }
 
         function onChapterFrameMessage(event) {
@@ -10455,6 +10488,14 @@ enum SitePatch {
 
         function imageHost(url) {
             var text = String(url || '');
+            // Paired mode asks with a JSON array, and the host worth naming is the
+            // first image's.
+            if (text.charAt(0) === '[') {
+                try {
+                    var list = JSON.parse(text);
+                    if (list && list.length) { text = String(list[0]); }
+                } catch (error) { /* the raw text is the best name left */ }
+            }
             var at = text.indexOf('://');
             if (at < 0) { return ''; }
             var slash = text.indexOf('/', at + 3);
@@ -10487,7 +10528,48 @@ enum SitePatch {
             }
         }
 
+        // The OCR service answers PLAIN TEXT -- "Invalid image data: <url>",
+        // status 200 -- when it cannot fetch one of the urls it was handed
+        // (measured: any unfetchable element of a JSON array does this, while a
+        // single unfetchable url still answers JSON with imageWidth=null). The
+        // frame's transImage does JSON.parse(a.responseText) inside
+        // onreadystatechange, where nothing can catch it: the promise it is
+        // inside never settles, so triggerLoadImg never retries, nothing is
+        // drawn and not even the notice appears. The page just stops.
+        //
+        // Paired mode now hands the service two urls at once, so that answer is
+        // reachable on a working source and has to arrive as data the frame can
+        // read. Only the OCR endpoint is rewritten: /open/autotrans.php answers
+        // plain text on purpose (comictranslator.php:264 reads it as text).
+        function patchOcrResponse(w) {
+            var xhr = w ? w.XMLHttpRequest : null;
+            var proto = xhr && xhr.prototype;
+            if (!proto || proto.__stvOcr) { return false; }
+            var desc = Object.getOwnPropertyDescriptor(proto, 'responseText');
+            if (!desc || typeof desc.get !== 'function') { return false; }
+            var read = desc.get;
+            Object.defineProperty(proto, 'responseText', {
+                configurable: true,
+                enumerable: desc.enumerable,
+                get: function () {
+                    var text = read.call(this);
+                    if (typeof text !== 'string' || !text.length
+                        || text.charAt(0) === '{' || text.charAt(0) === '[') {
+                        return text;
+                    }
+                    var url = '';
+                    try { url = String(this.responseURL || ''); } catch (error) { url = ''; }
+                    if (url.indexOf('s1213ocr.php') < 0) { return text; }
+                    return '{"blocks":[],"images":["data:image/jpeg;base64,"],'
+                        + '"imageWidth":null,"t_image":null}';
+                },
+            });
+            proto.__stvOcr = true;
+            return true;
+        }
+
         function patchChapterTranslator(w) {
+            patchOcrResponse(w);
             var translator = null;
             try { translator = w ? w.translator : null; } catch (error) { translator = null; }
             if (!translator || !translator.lazyImageLoader) { return false; }
@@ -10496,14 +10578,43 @@ enum SitePatch {
             frameAsking = w;
 
             var loader = translator.lazyImageLoader;
+            // The frame hard-codes transmode "paired" (comictranslator.php:470)
+            // and startTransPaired (line 138) replaces the url it translates with
+            // `JSON.stringify([img.url, img2.url])` -- two images in one OCR call,
+            // so a text block that straddles the seam between them is read once.
+            // toRealRawData is therefore handed a JSON ARRAY, not a url, and that
+            // is the shape that was never repaired:
+            //
+            //   * the site's own body for it is `undefined` -- its `return` sits
+            //     inside the `LAZY:` branch, and a plain pair carries no such
+            //     prefix (measured: comicloader.php answers 36 plain
+            //     mhpic.cartoon.reader.qq.com urls for a Qidian chapter). An
+            //     empty body is what the service answers imageWidth=null to.
+            //   * joining the pair instead is no better: "https://ahttps://b" is
+            //     not a url either, and the service answers imageWidth=null for
+            //     it too (measured).
+            //
+            // The service DOES parse a JSON array itself and stacks what it
+            // fetched into one image (measured: two reachable urls -> one image,
+            // imageWidth 404), which is exactly what paired mode is for, so that
+            // is the body a plain pair has to keep. A single url goes back
+            // exactly as it came, which is the path that already worked.
             loader.toRealRawData = async function (imgs) {
                 var list = (typeof imgs === 'string' && imgs.charAt(0) === '[')
                     ? JSON.parse(imgs) : [imgs];
+                var lazy = false;
+                for (var j = 0; j < list.length; j++) {
+                    if (String(list[j]).indexOf('LAZY:') === 0) { lazy = true; }
+                }
+                if (!lazy) {
+                    return list.length > 1
+                        ? JSON.stringify(list) : String(list[0]);
+                }
                 var out = [];
                 for (var i = 0; i < list.length; i++) {
                     var one = String(list[i]);
                     // A url the server fetches itself goes back unchanged; that
-                    // return is the whole repair for this path.
+                    // return is the whole repair for the LAZY path.
                     out.push(one.indexOf('LAZY:') === 0
                         ? await loader.load(one.slice(5)) : one);
                 }

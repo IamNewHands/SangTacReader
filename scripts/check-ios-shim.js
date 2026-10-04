@@ -258,6 +258,16 @@ const REQUIRED_MARKERS = [
   'function patchComicChapterCount(',
   // The chapter-list tail reads `.url` off a value that IS the url.
   'function patchComicHistory(',
+  // The frame hard-codes "paired" mode, so it hands the OCR service a JSON array
+  // of two images: joining them was never a url, and the array is what the
+  // service parses itself. A paired request also reaches the byte relay, which
+  // used to hand the whole array to the downloader.
+  'function imageCandidates(',
+  'function imageBytesOne(',
+  // A url the service cannot fetch makes it answer plain text, which the frame's
+  // JSON.parse turned into a silent hang.
+  'function patchOcrResponse(',
+  '"imageWidth":null,"t_image":null',
 ];
 
 function fail(message) {

@@ -4195,6 +4195,81 @@ app.comicReader.history.getLastReadChapter(book.url).then(function(h){
 新增断言：历史被补丁、返回的值仍然处处等于那个 url（`==`、`encodeURIComponent`、
 `JSON.stringify`）、站点自己那串 `[clink="…"]` 选择器重新找得到行、没有历史时仍然回 null。
 
+## §6.43 第 41 轮：配对模式把两个 url 拼成一个（`u1u2` 不是 url）
+
+第 41 轮的日志（`D:\GitHub_Clone\新建 文本文档 (3).txt`，669 行）里图片仍然出不来。逐条对齐后
+**发现的是客户端自己的缺陷，而且对任何源都成立**，与「源站已死」是两件事。
+
+### 日志先证明了一件事：这份日志是第 39 轮的包
+
+`[PATCH] the detail page lists N chapter(s)` 是第 38 轮（`de43f86`）的 `patchComicChapterCount`，
+而 `unhandledrejection @4399` 还在——`patchComicHistory` 是第 40 轮（`7f4bad4`）才加的
+（`git log -S` 可查）。所以第 40 轮**没有装到机器上**，那一项不需要再改代码。
+
+### 帧的实际形状：`transmode` 是 `paired`，不是 `perpair`
+
+`comictranslator.php:470` 硬编码 `var transmode = "paired";`（查询串里的 `transmode=perpair`
+站点自己不看）。`startTransPaired`（同文件 122-154 行）为每一对相邻图做：
+
+```js
+var urls = {url: JSON.stringify([img.url, img2.url])};
+this.triggerLoadImg(urls, i);      // -> transImage(urls.url) -> toRealRawData(urls.url)
+```
+
+**所以 `toRealRawData` 收到的是一个 JSON 数组，不是一个 url。** 实测（`comicloader.php`，
+七杀拳 `7782521204336702` 第 1 话）它返回 36 条**裸 url**，没有任何 `LAZY:` 前缀：
+
+```
+https://mhpic.cartoon.reader.qq.com/7782521204336702/20891046590338205/20891047412422628
+...
+```
+
+日志里 4 条 `Http` 失败正是前 4 对（0,1）(1,2) (2,3) (3,4)——顺序和 `comicloader.php` 的返回
+顺序逐项吻合，这就是配对数组，不是镜像。
+
+### 站点缺的 `return` 被上一轮补成了另一种坏
+
+第 38 轮把「没有 `return`」补成 `out.join('')`：裸 url 走 `else` 分支，于是两个 url 被拼成
+`https://…22628https://…22638`。**那不是一个 url**，服务端只能答 `imageWidth=null`（实测：
+把两个能取到的 url 拼起来 → `imageWidth: null`）。
+
+而服务端**自己会解析 JSON 数组**并且把取到的图**竖着拼成一张**再 OCR（实测：
+`["<可达1>","<可达2>"]` → `imageWidth: 404`，`images[0]` 20523 字节）——这正是配对模式的目的
+（跨接缝的文字块只读一次）。
+
+### 修法
+
+| 位置 | 改动 |
+| --- | --- |
+| `loader.toRealRawData` | 没有 `LAZY:` 时：单个 url 原样返回；**一对返回 `JSON.stringify(list)`**，交给服务端自己取并拼接 |
+| `imageCandidates()` / `imageBytesOne()` / `imageBytes()` | 帧按**整个数组**要字节，而上一轮把数组直接交给 App 的下载器，HTTP 插件答 `unsupported URL`（日志 529 行 `GET %5B%22https%3A//…%22,%22…%22%5D FAILED in 0ms`）。现在逐个下载，按帧自己的约定拼 `IMAGERAW:` 串；**要么全有要么全无**，半个串既不是字节也不是 url |
+| `imageHost()` | 数组时取第一个图的 host，提示里不再打出整串 |
+| `patchOcrResponse()` | 服务端取不到数组里某个 url 时答的是**纯文本** `Invalid image data: <url>`（200），而帧的 `transImage` 在 `onreadystatechange` 里 `JSON.parse(a.responseText)`——那里没人能 catch，promise 永不 settle，`triggerLoadImg` 不重试、不渲染、连提示都没有，**页面直接停住**。现在只把 `s1213ocr.php` 的纯文本答案换成 `imageWidth:null` 的 JSON（`/open/autotrans.php` 本来就该是文本，不动） |
+
+### 顺带确认：用户试的四个源在服务端就是死的
+
+| 源 | 证据 |
+| --- | --- |
+| 七杀拳（QQ 漫画） | 图床 `mhpic.cartoon.reader.qq.com`：本机 `ENOTFOUND`，站点服务器答 `error:14094410:SSL routines:ssl3_read_bytes:sslv3 alert handshake failure` |
+| YemanComic | `comicloader.php` 回 `[]` |
+| 快看 | 详情 `GET /v2/pweb/topic/4832 -> 403`，0 章 |
+| 包子漫画 | 列表 403 bot check，重试仍 403 |
+
+这一部分客户端无法修；修完客户端后能验证的只有「换一个图床能解析的源」。
+
+### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **844 条断言**全过（上一轮 838，新增 6） |
+| `scripts/check-ios-shim.js` | 26 块 / 605870 字节 / 118 标记 |
+| `scripts/gen-site-i18n.js --check` | 460 labels / 72 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：一对裸 url 原样保留成 JSON 数组、单个裸 url 原样返回、配对请求回 `IMAGERAW:…IMAGERAW:…`、
+读者也取不到的一对整体交回服务端、OCR 纯文本答案变成 `imageWidth:null` 的 JSON、本来就是 JSON 的
+答案不被改、`/open/autotrans.php` 的纯文本不被改。
+
 
 
 
