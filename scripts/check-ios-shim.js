@@ -122,8 +122,7 @@ const REQUIRED_MARKERS = [
   'chapter unload keeps a real chapter while its own chapter is still loading',
   // A chapter that needs unlocking never gets cdata, so the display answers the
   // bottom bar with an empty name -- blanking the only proof that < or > moved.
-  'function installDisplayName(',
-  'the chapter bar keeps a name while the chapter has no content',
+  'function installDisplayName(',  'the chapter bar keeps a name while the chapter has no content',
   // Bing TTS speaks through MediaSource with a WebM/Opus buffer, which WebKit
   // on iOS cannot play -- the entry is dropped and a stored bing choice is
   // healed to the native provider.
@@ -223,6 +222,28 @@ const REQUIRED_MARKERS = [
   // description plus the template's hardcoded labels.
   'popup bodies are translated when auto translate is on',
   '站点没有删除评论的接口',
+  // 2026-10-04: the diagnostic buffer died with the page, so the one report that
+  // matters most — a crash — arrived with nothing in it. Every line is now
+  // mirrored into a file the app process owns, and the panel reads it back.
+  'stv-diagnostic.log',
+  'function toBase64(',
+  // ...and the same report said the faction board took 14 seconds: gtx answers
+  // one text per request, so the sweep was split into two sequential chunks of
+  // ~60. Now it is pooled, de-duplicated, cached and ramped.
+  'function gtxWorthSending(',
+  'function gtxCacheLoad(',
+  'nothing to send (谷歌通道)',
+  'width ended at ',
+  // 漫画: a failing source used to leave the preloader spinning and the detail
+  // page half built (both callers attach a bare .then()), and the chapter frame
+  // was on a different host from the page, so every read across it threw
+  // SecurityError.
+  'function guardProvider(',
+  'function patchTranslatorUrl(',
+  'the chapter frame is on ',
+  'function patchReaderFrame(',
+  'function reportFrame(',
+  'the chapter frame could not be wired up',
 ];
 
 function fail(message) {
@@ -288,6 +309,80 @@ const combined = blocks.map((block) => block.js).join('\n');
 for (const marker of REQUIRED_MARKERS) {
   if (!combined.includes(marker)) {
     fail(`injected JavaScript is missing required marker: ${marker}`);
+  }
+}
+
+/**
+ * Blocks are separate WKUserScripts, so each is its own script AND its own
+ * IIFE: a helper defined in one block is not in scope in another. A block that
+ * calls a neighbour's helper therefore throws `ReferenceError` — and only on
+ * the path that helper was written for, which is why it reads as "the failure
+ * handler failed". `comicGate` called `messageOf` (defined in
+ * `commentTranslate`) exactly that way, and every comic failure report it was
+ * supposed to write became a second, silent failure instead.
+ *
+ * The harness runs the blocks concatenated, so it cannot see this; only a
+ * per-block scope check can. Helpers listed here are duplicated per block on
+ * purpose, so every block that names one has to define it.
+ */
+const SHARED_HELPERS = ['note', 'messageOf', 'settle', 'appPlugin', 'q', 'qq',
+  'textOf', 'bodyOf', 'httpRequest', 'loadSettings', 'trimSlashes'];
+
+// Matched against the block with its comments removed, never a
+// string-stripped copy: these blocks are full of Vietnamese text and of regexes
+// that quote attribute names, and a quote-pairing pass over that desynchronises
+// and eats most of the block. Comments are the only thing that has to go — a
+// doc comment naming `q("...")` is not a call.
+function codeOnly(source) {
+  let out = '';
+  let i = 0;
+  let quote = null;
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (quote) {
+      if (ch === quote) { quote = null; }
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') { i += 1; }
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) { i += 1; }
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+for (const block of blocks) {
+  const code = codeOnly(block.js);
+  for (const helper of SHARED_HELPERS) {
+    const call = new RegExp('(^|[^.\\w$\'"`])' + helper + '\\s*\\(', 'm');
+    if (!call.test(code)) { continue; }
+    const declares = new RegExp(
+      '(?:function\\s+' + helper + '\\s*\\()'
+      + '|(?:(?:var|let|const)\\s+' + helper + '\\b)', 'm');
+    if (!declares.test(code)) {
+      const at = code.search(call);
+      const snippet = code.slice(Math.max(0, at - 60), at + 40).replace(/\s+/g, ' ');
+      fail(`${block.file} block #${block.index + 1} calls ${helper}() without defining it; `
+        + 'blocks are separate scripts and separate IIFEs, so that is a ReferenceError'
+        + ` — near: ${snippet}`);
+    }
   }
 }
 

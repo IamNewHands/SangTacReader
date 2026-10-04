@@ -942,9 +942,16 @@ enum SitePatch {
                 return b;
             }
             bar.appendChild(barButton('COPY', copyAll));
+            // The buffer dies with the page, so COPY alone cannot answer "what
+            // happened before the crash". SAVE hands the whole log -- including
+            // the lines the file kept from earlier launches -- to the system
+            // share sheet, which is the only route off the device.
+            bar.appendChild(barButton('SAVE', saveAll));
             bar.appendChild(barButton('CLEAR', function () {
                 lines = [];
+                prior = '';
                 errors = 0;
+                wipeFile();
                 render();
             }));
             // HIDE collapses the panel only. The badge is the tap target that
@@ -966,12 +973,14 @@ enum SitePatch {
         }
 
         function render() {
+            var body = fullText();
             if (listEl) {
-                listEl.textContent = lines.join(NL);
+                listEl.textContent = body;
                 listEl.scrollTop = listEl.scrollHeight;
             }
             if (countEl) {
-                countEl.textContent = 'stvdiag ' + lines.length + ' lines, ' + errors + ' errors';
+                countEl.textContent = 'stvdiag ' + lines.length + ' lines, ' + errors
+                    + ' errors' + (prior ? ' +' + priorBytes + 'B from the file' : '');
             }
             paintBadge();
         }
@@ -996,7 +1005,7 @@ enum SitePatch {
         }
 
         function copyAll() {
-            var text = lines.join(NL);
+            var text = fullText();
             function fallback() {
                 var ta = make('textarea', 'position:fixed;left:-9999px;top:0;opacity:0;');
                 ta.value = text;
@@ -1016,6 +1025,171 @@ enum SitePatch {
                 fallback();
             }
             return text;
+        }
+
+        // ---- the file the app process owns ----------------------------------
+        //
+        // Every line the buffer takes is mirrored into
+        // Library/Application Support/stv-diagnostic.log by `diagAppend`
+        // (SangTacAppPlugin.swift). A crash, a jetsam kill or a WebContent
+        // restart empties the page but not that file, so the next launch reads
+        // it back into `prior` -- shown above the live lines, and included in
+        // COPY and SAVE.
+        //
+        // Batched on purpose: one bridge hop per line would be a cost on every
+        // request, and 300ms is short enough that a crash loses at most the
+        // last few lines. An error flushes on the next turn instead, because
+        // the line right before a crash is the one worth keeping.
+
+        var FLUSH_MS = 300;
+        var PRIOR_MAX = 200000;
+        var pending = [];
+        var flushTimer = null;
+        var prior = '';
+        var priorBytes = 0;
+        var filePath = '';
+
+        function appPlugin() {
+            return window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.App;
+        }
+
+        function settle(call) {
+            if (call && typeof call.catch === 'function') { call.catch(function () {}); }
+            return call;
+        }
+
+        function fullText() {
+            if (!prior) { return lines.join(NL); }
+            return prior + (prior.charAt(prior.length - 1) === NL ? '' : NL)
+                + '---- this launch ----' + NL + lines.join(NL);
+        }
+
+        function flush() {
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            if (!pending.length) { return; }
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.diagAppend !== 'function') {
+                // No native sink (a plain browser, or the plugin is not
+                // published yet). Keep the lines queued so a later flush still
+                // carries them, but do not grow without bound.
+                while (pending.length > MAX) { pending.shift(); }
+                return;
+            }
+            var batch = pending;
+            pending = [];
+            settle(plugin.diagAppend({ lines: batch }));
+        }
+
+        function scheduleFlush() {
+            if (flushTimer) { return; }
+            flushTimer = setTimeout(function () { flush(); }, FLUSH_MS);
+        }
+
+        function readFile() {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.diagRead !== 'function') { return; }
+            settle(plugin.diagRead()).then(function (result) {
+                // The path and the size are recorded even when the file is
+                // empty: SAVE quotes the path, and an empty file is a fact worth
+                // being able to state.
+                filePath = (result && result.path) || filePath;
+                priorBytes = (result && result.bytes) || 0;
+                var text = result && result.text;
+                if (typeof text !== 'string' || !text) {
+                    prior = '';
+                    return;
+                }
+                if (text.length > PRIOR_MAX) {
+                    text = text.slice(text.length - PRIOR_MAX);
+                    var cut = text.indexOf(NL);
+                    if (cut > 0) { text = text.slice(cut + 1); }
+                }
+                prior = text;
+                if (open) { render(); }
+            });
+        }
+
+        function wipeFile() {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.diagClear !== 'function') { return; }
+            settle(plugin.diagClear());
+        }
+
+        // Base64 by hand rather than through btoa: btoa takes a binary string,
+        // which means building a second copy of the whole log as one JS string
+        // and throwing on any lone surrogate -- and the log is exactly the place
+        // a truncated UTF-8 sequence ends up. This walks the code points, so it
+        // is correct for the Vietnamese and Chinese text the log is full of.
+        var B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+            + '0123456789+/';
+
+        function utf8Bytes(text) {
+            var bytes = [];
+            for (var i = 0; i < text.length; i++) {
+                var code = text.charCodeAt(i);
+                if (code < 128) {
+                    bytes.push(code);
+                } else if (code < 2048) {
+                    bytes.push(192 | (code >> 6), 128 | (code & 63));
+                } else if (code >= 55296 && code < 56320 && i + 1 < text.length) {
+                    var low = text.charCodeAt(i + 1);
+                    if (low >= 56320 && low < 57344) {
+                        var point = 65536 + ((code - 55296) << 10) + (low - 56320);
+                        bytes.push(240 | (point >> 18), 128 | ((point >> 12) & 63),
+                            128 | ((point >> 6) & 63), 128 | (point & 63));
+                        i++;
+                    } else {
+                        // An unpaired high surrogate: written as the replacement
+                        // character, which is what the native side would have
+                        // received anyway.
+                        bytes.push(239, 191, 189);
+                    }
+                } else {
+                    bytes.push(224 | (code >> 12), 128 | ((code >> 6) & 63),
+                        128 | (code & 63));
+                }
+            }
+            return bytes;
+        }
+
+        function toBase64(text) {
+            var bytes = utf8Bytes(text);
+            var out = '';
+            for (var i = 0; i < bytes.length; i += 3) {
+                var b0 = bytes[i];
+                var b1 = i + 1 < bytes.length ? bytes[i + 1] : -1;
+                var b2 = i + 2 < bytes.length ? bytes[i + 2] : -1;
+                out += B64_ALPHABET.charAt(b0 >> 2);
+                out += B64_ALPHABET.charAt(((b0 & 3) << 4)
+                    | (b1 < 0 ? 0 : b1 >> 4));
+                out += b1 < 0 ? '=' : B64_ALPHABET.charAt(((b1 & 15) << 2)
+                    | (b2 < 0 ? 0 : b2 >> 6));
+                out += b2 < 0 ? '=' : B64_ALPHABET.charAt(b2 & 63);
+            }
+            return out;
+        }
+
+        function saveAll() {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.exportFile !== 'function') {
+                log('ERR', 'no export channel on this device; use COPY');
+                return;
+            }
+            var data = toBase64(fullText());
+            if (!data) {
+                log('ERR', 'could not encode the log for export; use COPY');
+                return;
+            }
+            var stamp = new Date();
+            var name = 'stv-diagnostic-' + stamp.getFullYear() + pad(stamp.getMonth() + 1)
+                + pad(stamp.getDate()) + '-' + pad(stamp.getHours())
+                + pad(stamp.getMinutes()) + pad(stamp.getSeconds()) + '.log';
+            settle(plugin.exportFile({ filename: name, data: data })).then(function () {
+                log('DIAG', 'exported ' + name + (filePath ? ' (file: ' + filePath + ')' : ''));
+            }, function (error) {
+                log('ERR', 'export failed: ' + fmt(error));
+            });
         }
 
         // ---- drag ------------------------------------------------------------
@@ -1078,9 +1252,20 @@ enum SitePatch {
         // ---- logging ---------------------------------------------------------
 
         function raw(text, isError) {
-            lines.push(stamp() + ' ' + text);
+            var line = stamp() + ' ' + text;
+            lines.push(line);
             while (lines.length > MAX) { lines.shift(); }
             if (isError) { errors++; }
+            // `pending` is assigned further down the same IIFE; an early error
+            // event can reach here first, hence the guard rather than a
+            // reordering that would put the file helpers above the buffer.
+            if (pending) {
+                pending.push(line);
+                // An error is the line a crash would take with it, so it goes
+                // out on the next turn instead of waiting for the batch timer.
+                if (isError) { setTimeout(function () { flush(); }, 0); }
+                else { scheduleFlush(); }
+            }
         }
 
         function paint() {
@@ -1197,8 +1382,12 @@ enum SitePatch {
             hide: hide,
             toggle: toggle,
             copy: copyAll,
-            text: function () { return lines.join(NL); },
+            save: saveAll,
+            text: function () { return fullText(); },
             lines: function () { return lines.slice(); },
+            file: function () { return { path: filePath, text: prior, bytes: priorBytes }; },
+            reload: readFile,
+            flush: function () { flush(); },
             enabled: function () { return enabled; },
             setEnabled: setEnabled
         };
@@ -1267,6 +1456,14 @@ enum SitePatch {
         pushNativeSwitch();
         document.addEventListener('DOMContentLoaded', pushNativeSwitch);
         setTimeout(pushNativeSwitch, 2000);
+
+        // What the last launch left in the file. Read whether or not the switch
+        // is on right now: the reader turns logging on precisely because the
+        // previous run ended badly, and the file is the only record of it.
+        // Plugins.App may not be published at document start, so retry once.
+        readFile();
+        document.addEventListener('DOMContentLoaded', readFile);
+        setTimeout(readFile, 2500);
         if (enabled) {
             if (!activate()) {
                 document.addEventListener('DOMContentLoaded', function () {
@@ -7476,10 +7673,30 @@ enum SitePatch {
         // Chrome's own translation endpoint: the same keyless channel
         // newsnook-ios uses for Google (`translate_a/single` with `client=gtx`).
         // It answers one text per request -- the multi-`q` form is not stable --
-        // so this is the one engine that fans out, at the concurrency newsnook
-        // picked for a channel that rate-limits by IP.
+        // so throughput here is concurrency, not batch size, and everything
+        // below exists to cut the number of requests and widen the pool.
         var GTX_URL = 'https://translate.googleapis.com/translate_a/single';
-        var GTX_CONCURRENCY = 3;
+        // newsnook-ios pins 3 because its feed is a handful of paragraphs. A
+        // faction board is 117 rows in one tap and the reader waits through all
+        // of it, so the pool starts at the same conservative 3 and then ramps:
+        // every GTX_RAMP_AFTER clean answers add one worker up to the ceiling,
+        // and any failure halves the width. A channel that begins to
+        // rate-limit therefore settles at whatever it is actually serving
+        // instead of failing a fixed fraction of the page.
+        var GTX_MIN_CONCURRENCY = 2;
+        var GTX_START_CONCURRENCY = 3;
+        var GTX_MAX_CONCURRENCY = 8;
+        var GTX_RAMP_AFTER = 6;
+
+        // The same string recurs inside one sweep (a faction name reappears in
+        // its own description) and the whole board is re-read on the next visit,
+        // so answers are kept. localStorage rather than app.storage: this is
+        // read inside the request path and Capacitor Preferences resolves a
+        // tick later, which is too late to skip the request.
+        var GTX_CACHE_KEY = 'stv.translate.cache';
+        var GTX_CACHE_MAX = 4000;
+        var gtxCache = null;
+        var gtxCacheDirty = false;
 
         // gtx speaks Google's own codes: zh-Hans / zh-Hant are BCP-47 and are
         // not what it expects for Chinese.
@@ -7488,6 +7705,75 @@ enum SitePatch {
             if (lower.indexOf('zh-hant') === 0) { return 'zh-TW'; }
             if (lower.indexOf('zh') === 0) { return 'zh-CN'; }
             return String(code);
+        }
+
+        function gtxCacheLoad() {
+            if (gtxCache) { return gtxCache; }
+            gtxCache = {};
+            try {
+                var raw = window.localStorage
+                    && window.localStorage.getItem(GTX_CACHE_KEY);
+                if (raw) {
+                    var parsed = JSON.parse(raw);
+                    if (parsed && typeof parsed === 'object') { gtxCache = parsed; }
+                }
+            } catch (e) {
+                gtxCache = {};
+            }
+            return gtxCache;
+        }
+
+        function gtxCacheSave() {
+            if (!gtxCacheDirty || !gtxCache) { return; }
+            gtxCacheDirty = false;
+            try {
+                if (window.localStorage) {
+                    window.localStorage.setItem(GTX_CACHE_KEY,
+                        JSON.stringify(gtxCache));
+                }
+            } catch (e) {
+                // A full store is not worth failing a translation over: drop it
+                // and let the next sweep rebuild what it needs.
+                gtxCache = {};
+                try { window.localStorage.removeItem(GTX_CACHE_KEY); } catch (e2) {}
+            }
+        }
+
+        function gtxKey(text, source, target) {
+            return gtxLanguage(source || 'auto') + '>' + gtxLanguage(target)
+                + '>' + text;
+        }
+
+        function gtxRemember(key, value) {
+            var cache = gtxCacheLoad();
+            if (key in cache) { return; }
+            var keys = Object.keys(cache);
+            if (keys.length >= GTX_CACHE_MAX) {
+                // Oldest insertion order, dropped in a batch: one eviction pass
+                // per 200 new entries rather than one per entry.
+                for (var i = 0; i < keys.length && i < 200; i++) {
+                    delete cache[keys[i]];
+                }
+            }
+            cache[key] = value;
+            gtxCacheDirty = true;
+        }
+
+        // A string with no Latin letter cannot come back changed: a bare URL, a
+        // run of punctuation, an emoji-only name and whitespace are all answers
+        // that equal their input, and each one still costs a round trip. CJK is
+        // already the target language, so it is skipped too. Vietnamese is Latin
+        // script with diacritics, hence the 192..537 band.
+        function gtxWorthSending(text) {
+            var value = String(text);
+            for (var i = 0; i < value.length; i++) {
+                var code = value.charCodeAt(i);
+                if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+                    return true;
+                }
+                if (code >= 192 && code <= 537) { return true; }
+            }
+            return false;
         }
 
         function gtxOne(text, source, target) {
@@ -7513,33 +7799,107 @@ enum SitePatch {
                 });
         }
 
+        /**
+         Four things happen before a request is made, because each one removes
+         requests rather than making them faster:
+
+           * a cached answer is used as-is (a revisit of the same board costs
+             nothing);
+           * a text that cannot change is answered with itself;
+           * identical texts inside one sweep share a single request;
+           * whatever is left goes through a pool that widens while the channel
+             is healthy and halves when it is not.
+         */
         function googleFreeBatch(texts, source, target) {
             var out = new Array(texts.length);
+            var cache = gtxCacheLoad();
+            var order = [];
+            var slots = {};
+            var skipped = 0;
+            var cached = 0;
+            var i;
+
+            for (i = 0; i < texts.length; i++) {
+                var text = texts[i];
+                var key = gtxKey(text, source, target);
+                if (Object.prototype.hasOwnProperty.call(cache, key)) {
+                    out[i] = cache[key];
+                    cached++;
+                    continue;
+                }
+                if (!gtxWorthSending(text)) {
+                    out[i] = text;
+                    gtxRemember(key, text);
+                    skipped++;
+                    continue;
+                }
+                if (!slots[key]) {
+                    slots[key] = [];
+                    order.push({ key: key, text: text });
+                }
+                slots[key].push(i);
+            }
+
+            if (!order.length) {
+                gtxCacheSave();
+                note('TRANSLATE', 'nothing to send (谷歌通道): ' + cached
+                    + ' cached, ' + skipped + ' cannot change');
+                return Promise.resolve(out);
+            }
+
             var next = 0;
+            var width = Math.min(GTX_START_CONCURRENCY, order.length);
+            var clean = 0;
             var failed = 0;
             var firstError = null;
+
+            function place(item, piece, remember) {
+                var list = slots[item.key];
+                for (var j = 0; j < list.length; j++) { out[list[j]] = piece; }
+                if (remember) { gtxRemember(item.key, piece); }
+            }
+
             function worker() {
-                if (next >= texts.length) { return Promise.resolve(); }
-                var index = next++;
-                return gtxOne(texts[index], source, target).then(function (piece) {
-                    out[index] = piece;
+                if (next >= order.length) { return Promise.resolve(); }
+                var item = order[next++];
+                return gtxOne(item.text, source, target).then(function (piece) {
+                    place(item, piece, true);
+                    clean++;
+                    if (clean >= GTX_RAMP_AFTER && width < GTX_MAX_CONCURRENCY) {
+                        clean = 0;
+                        width++;
+                        // The new worker shares `next`, so widening the pool
+                        // never sends the same text twice.
+                        return worker();
+                    }
                     return worker();
                 }, function (error) {
                     failed++;
+                    clean = 0;
                     if (!firstError) { firstError = error; }
-                    out[index] = texts[index];
+                    if (width > GTX_MIN_CONCURRENCY) {
+                        width = Math.max(GTX_MIN_CONCURRENCY,
+                            Math.floor(width / 2));
+                    }
+                    // A failure is transient, so it is NOT cached: the next
+                    // sweep has to try this text again.
+                    place(item, item.text, false);
                     return worker();
                 });
             }
+
             var workers = [];
-            var width = Math.min(GTX_CONCURRENCY, texts.length);
-            for (var i = 0; i < width; i++) { workers.push(worker()); }
+            for (i = 0; i < width; i++) { workers.push(worker()); }
             return Promise.all(workers).then(function () {
-                if (texts.length && failed === texts.length) { throw firstError; }
+                gtxCacheSave();
+                if (failed && failed === order.length) { throw firstError; }
                 if (failed) {
-                    note('TRANSLATE', failed + ' of ' + texts.length
-                        + ' line(s) kept the original text (谷歌通道)');
+                    note('TRANSLATE', failed + ' of ' + order.length
+                        + ' request(s) kept the original text (谷歌通道)');
                 }
+                note('TRANSLATE', '谷歌通道 sent ' + order.length + ' request(s)'
+                    + ' for ' + texts.length + ' item(s): ' + cached + ' cached, '
+                    + skipped + ' cannot change, width ended at ' + width);
                 return out;
             });
         }
@@ -7769,8 +8129,22 @@ enum SitePatch {
             });
         }
 
+        // Chunking exists to bound a request BODY: free (Edge), azure, google,
+        // deepl and openai all send a whole array in one call, so MAX_CHARS
+        // decides how many calls there are. gtx sends one text per call and
+        // fans out on its own, so chunking it only serialises the sweep -- the
+        // 2026-10-04 log shows the faction board split into two chunks of ~60
+        // and the second waiting for the first, which is half of the 14 seconds
+        // the reader sat through. It gets the whole list and decides its own
+        // width.
+        var POOLED_ENGINES = ['googlefree'];
+
         function runTranslate(texts, source, target, config) {
-            if ((config.engine || 'apple') !== 'apple') {
+            var engine = config.engine || 'apple';
+            if (engine !== 'apple') {
+                if (POOLED_ENGINES.indexOf(engine) >= 0) {
+                    return engineBatch(texts, source, target, config);
+                }
                 return runChunks(texts, source, target, config);
             }
             return probeApple(target).then(function (ready) {
@@ -9431,6 +9805,18 @@ enum SitePatch {
             if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
         }
 
+        // Every block is its own WKUserScript and its own IIFE, so a helper
+        // defined in another block is NOT in scope. `messageOf` is used by the
+        // failure paths below, and it used to resolve to nothing at all: the
+        // handler that was supposed to report a comic failure threw
+        // `ReferenceError: messageOf is not defined` instead, which is how a
+        // report turns into a second, silent failure.
+        function messageOf(error) {
+            if (!error) { return String(error); }
+            if (typeof error === 'string') { return error; }
+            return error.message ? String(error.message) : String(error);
+        }
+
         // The challenge document sets its cookie and redirects to the API URL, so
         // the frame's load event is the signal; the extra wait is for the native
         // side, whose cookie snapshot is read asynchronously off
@@ -9663,7 +10049,9 @@ enum SitePatch {
                         + '; the comic source cannot be resolved from that');
                     return null;
                 }
-                return original.call(this, value);
+                // A fresh instance every call (comicprovider.js:1931), so the
+                // guard is per instance and shadows the prototype method.
+                return guardProvider(original.call(this, value), value);
             };
             safe.__stvSafeArgument = true;
             window.getComicProvider = safe;
@@ -9676,6 +10064,326 @@ enum SitePatch {
             var translator = patchTranslateObject();
             var provider = patchGetComicProvider();
             return wrapped && translator && provider;
+        }
+
+        // ---- what a failing source is allowed to do --------------------------
+        //
+        // renderComicBrowser (app.v2.read.js:4209) and openComicByUrl
+        // (app_v2.html:4345) both attach a bare `.then()` and no rejection
+        // handler, so a provider that throws leaves the preloader spinning for
+        // ever ("只有顶部的分类") and the comicinfo page half built ("显示不全漫画
+        // 详情"). The throw itself is ordinary: every getComicList ends in
+        // `json.map(...)` over whatever the host answered, and a 403 answers
+        // `{"error":...}` instead of a list -- that is the
+        // `unhandledrejection getComicList@...:628:36` in the 2026-10-04 log.
+        //
+        // The provider is wrapped rather than the caller, because the caller is
+        // site code that cannot be reached before it runs: a failure becomes an
+        // empty result plus one line saying which source and why, and the page
+        // gets to finish instead of hanging.
+        function lengthOf(value) {
+            return typeof value === 'string' ? value.length : -1;
+        }
+
+        function describeInfo(host, result) {
+            var d = (result && typeof result === 'object') ? result : {};
+            var missing = [];
+            if (!d.name) { missing.push('name'); }
+            if (!d.thumb) { missing.push('thumb'); }
+            if (!d.desc) { missing.push('desc'); }
+            if (!d.tags || typeof d.tags.length !== 'number') { missing.push('tags'); }
+            if (!d.chapters || !d.chapters.length) { missing.push('chapters'); }
+            note('COMIC', host + ' details: '
+                + ((d.chapters && d.chapters.length) || 0) + ' chapter(s), name='
+                + lengthOf(d.name) + ' desc=' + lengthOf(d.desc) + ' tags='
+                + ((d.tags && d.tags.length) || 0)
+                + (missing.length ? '; missing ' + missing.join(',') : ''));
+            // app_v2.html:4360 reads `d.tags.length` and `d.desc` directly, so a
+            // provider that left either out takes the whole render down with it.
+            if (!d.tags || typeof d.tags.length !== 'number') { d.tags = []; }
+            if (typeof d.desc !== 'string') { d.desc = ''; }
+            if (typeof d.name !== 'string') { d.name = ''; }
+            if (typeof d.thumb !== 'string') { d.thumb = ''; }
+            if (!d.chapters || typeof d.chapters.length !== 'number') { d.chapters = []; }
+            return d;
+        }
+
+        function guardProvider(provider, host) {
+            if (!provider || provider.__stvGuarded) { return provider; }
+            provider.__stvGuarded = true;
+
+            var list = provider.getComicList;
+            if (typeof list === 'function') {
+                provider.getComicList = function () {
+                    var args = arguments;
+                    return Promise.resolve(list.apply(this, args)).then(
+                        function (result) {
+                            if (!result || typeof result.length !== 'number') {
+                                note('COMIC', host + ' answered no list;'
+                                    + ' showing an empty one');
+                                return [];
+                            }
+                            return result;
+                        },
+                        function (error) {
+                            note('ERR', host + ' could not load its list: '
+                                + messageOf(error));
+                            return [];
+                        });
+                };
+            }
+
+            var info = provider.getComicInfo;
+            if (typeof info === 'function') {
+                provider.getComicInfo = function () {
+                    var args = arguments;
+                    return Promise.resolve(info.apply(this, args)).then(
+                        function (result) { return describeInfo(host, result); },
+                        function (error) {
+                            // Resolved, not rejected: the page has no catch, and
+                            // an empty page with a reason on it is what tells the
+                            // reader this source is the problem.
+                            return describeInfo(host, {
+                                name: '', thumb: '', tags: [],
+                                desc: '这个源没有返回漫画详情：' + messageOf(error)
+                            });
+                        });
+                };
+            }
+            return provider;
+        }
+
+        // ---- the chapter frame ----------------------------------------------
+        //
+        // initRemote (app.v2.read.js:3788) puts the chapter in an iframe pointing
+        // at STV_SERVER/comictranslator.php and then treats that frame as
+        // same-origin: initEventForFrame reaches into `w.document`,
+        // `w.scrollY` and `w.__defineGetter__`. On this device STV_SERVER is
+        // https://sangtacviet.app while the page is https://sangtacviet.com
+        // ([DOMAIN] in the 2026-10-04 log), so every one of those reads throws
+        // SecurityError -- which is the
+        // `onerror SecurityError: Blocked a frame with origin
+        // "https://sangtacviet.com"` at app.v2.read.js:4091, the
+        // {"isTrusted":true} flood after it, and a reader whose menu and
+        // progress never bind.
+        //
+        // Pointing the frame at the origin the page is already on makes it
+        // same-origin again. That is a real fix and not just a quieter log: the
+        // site's own scroll/click/progress wiring only works on a readable
+        // frame.
+        function pageOrigin() {
+            var here = String(window.location.origin || '');
+            return here.indexOf('http') === 0 ? here : '';
+        }
+
+        function originOf(url) {
+            var text = String(url);
+            var at = text.indexOf('://');
+            if (at < 0) { return ''; }
+            var slash = text.indexOf('/', at + 3);
+            return slash < 0 ? text : text.slice(0, slash);
+        }
+
+        function patchTranslatorUrl(reader) {
+            if (typeof reader.getTranslatorUrl !== 'function') { return false; }
+            if (reader.getTranslatorUrl.__stvSameOrigin) { return true; }
+            var original = reader.getTranslatorUrl;
+            var safe = function (url) {
+                var built = String(original.call(this, url));
+                var origin = pageOrigin();
+                if (!origin) { return built; }
+                var frame = originOf(built);
+                if (!frame || frame === origin) { return built; }
+                var at = built.indexOf('://');
+                var slash = built.indexOf('/', at + 3);
+                note('COMIC', 'the chapter frame is on ' + frame + ' but the page is on '
+                    + origin + '; using the page origin so the frame stays readable');
+                return origin + built.slice(slash < 0 ? built.length : slash);
+            };
+            safe.__stvSameOrigin = true;
+            reader.getTranslatorUrl = safe;
+            return true;
+        }
+
+        // Every one of these reaches across the frame boundary, and each is
+        // called from a place with no handler: getCurrentChapterUrl splits the
+        // frame src on "?" and "=" without checking either, and
+        // updateCnameAndProgress reads w.document.body.scrollHeight. One throw
+        // there is an unhandled rejection and a reader stuck on the last screen
+        // it managed to draw.
+        function patchReaderFrame(reader) {
+            // Returns true only once all four are wrapped, so the caller's poll
+            // knows it can stop; a method that is not there yet keeps it false.
+            var complete = true;
+
+            if (typeof reader.initEventForFrame !== 'function') {
+                complete = false;
+            } else if (!reader.initEventForFrame.__stvGuarded) {
+                var wire = reader.initEventForFrame;
+                var safeWire = function (w) {
+                    // Set before the call, so a frame that turns out to be
+                    // cross-origin still leaves the reader with a window to
+                    // report against instead of a null.
+                    this.currentWindow = w;
+                    try {
+                        return wire.call(this, w);
+                    } catch (error) {
+                        note('ERR', 'the chapter frame could not be wired up ('
+                            + messageOf(error) + '); the menu will not follow the'
+                            + ' scroll, reading itself still works');
+                        return null;
+                    }
+                };
+                safeWire.__stvGuarded = true;
+                reader.initEventForFrame = safeWire;
+                complete = false;
+            }
+
+            if (typeof reader.updateCnameAndProgress !== 'function') {
+                complete = false;
+            } else if (!reader.updateCnameAndProgress.__stvGuarded) {
+                var update = reader.updateCnameAndProgress;
+                var safeUpdate = function () {
+                    try {
+                        return update.call(this);
+                    } catch (error) {
+                        note('ERR', 'the chapter progress could not be updated: '
+                            + messageOf(error));
+                        return null;
+                    }
+                };
+                safeUpdate.__stvGuarded = true;
+                reader.updateCnameAndProgress = safeUpdate;
+                complete = false;
+            }
+
+            if (typeof reader.getCurrentChapterUrl !== 'function') {
+                complete = false;
+            } else if (!reader.getCurrentChapterUrl.__stvGuarded) {
+                var current = reader.getCurrentChapterUrl;
+                var safeCurrent = function () {
+                    try {
+                        var url = current.call(this);
+                        if (typeof url === 'string') { return url; }
+                    } catch (error) {
+                        note('ERR', 'the current chapter url could not be read: '
+                            + messageOf(error));
+                    }
+                    return '';
+                };
+                safeCurrent.__stvGuarded = true;
+                reader.getCurrentChapterUrl = safeCurrent;
+                complete = false;
+            }
+
+            if (typeof reader.getCurrentChapterName !== 'function') {
+                complete = false;
+            } else if (!reader.getCurrentChapterName.__stvGuarded) {
+                // The site's version is `list.find(e => e.url == url).name`, so an
+                // unknown or empty url throws inside a menu render.
+                var safeName = function () {
+                    var url = this.getCurrentChapterUrl();
+                    var list = this.currentChapterList || [];
+                    for (var i = 0; i < list.length; i++) {
+                        if (list[i] && list[i].url === url) { return list[i].name; }
+                    }
+                    return '';
+                };
+                safeName.__stvGuarded = true;
+                reader.getCurrentChapterName = safeName;
+                complete = false;
+            }
+
+            return complete;
+        }
+
+        // What the chapter frame actually contains, once. This is the one
+        // measurement that separates "the site's translator answered nothing"
+        // from "the images are there and something else is blank": `images=0`
+        // with `body=0B` is the former, and no client-side change can fix it.
+        function reportFrame(frame, polls) {
+            var w = null;
+            try { w = frame.contentWindow; } catch (error) { w = null; }
+            if (!w) {
+                note('ERR', 'the chapter frame has no window');
+                return;
+            }
+            var report;
+            try {
+                var doc = w.document;
+                var images = doc.getElementsByTagName('img');
+                report = 'title=' + JSON.stringify(String(doc.title || ''))
+                    + ' images=' + images.length
+                    + ' body=' + ((doc.body && doc.body.innerHTML.length) || 0) + 'B'
+                    + ' readyState=' + String(doc.readyState);
+            } catch (error) {
+                report = 'unreadable: ' + messageOf(error);
+            }
+            note('COMIC', 'the chapter frame at '
+                + String(frame.src || '').slice(0, 140) + ' after ' + polls
+                + ' poll(s): ' + report);
+        }
+
+        function watchChapterFrame(reader) {
+            var polls = 0;
+            var timer = setInterval(function () {
+                polls++;
+                var page = reader.page;
+                if (!page && window.app && typeof window.app.topPage === 'function') {
+                    try { page = window.app.topPage(); } catch (error) { page = null; }
+                }
+                var frame = (page && typeof page.q === 'function')
+                    ? page.q('iframe') : null;
+                if (frame) {
+                    clearInterval(timer);
+                    reportFrame(frame, polls);
+                    return;
+                }
+                if (polls > 40) { clearInterval(timer); }
+            }, 250);
+        }
+
+        function patchInitRemote(reader) {
+            if (typeof reader.initRemote !== 'function') { return false; }
+            if (reader.initRemote.__stvWatched) { return true; }
+            var original = reader.initRemote;
+            var watched = function (url, chapters, bookinfo) {
+                note('COMIC', 'opening chapter ' + String(url)
+                    + ' with ' + ((chapters && chapters.length) || 0)
+                    + ' chapter(s) known');
+                watchChapterFrame(reader);
+                return original.apply(this, arguments);
+            };
+            watched.__stvWatched = true;
+            reader.initRemote = watched;
+            return true;
+        }
+
+        // "显示不全漫画详情": the comicinfo template clips its own detail block
+        // (app_v2.html:2726, `<div class="info" style="max-height:220px;
+        // overflow:hidden">`), so a long synopsis is cut off with no way to see
+        // the rest. bookinfo -- the novel page with the same shape -- has no cap.
+        function patchComicInfoStyle() {
+            var host = document.head || document.documentElement;
+            if (!host) { return false; }
+            if (host.querySelector && host.querySelector('[data-stvcomic=info]')) {
+                return true;
+            }
+            var style = document.createElement('style');
+            style.setAttribute('data-stvcomic', 'info');
+            style.textContent = '.comicinfo .info{max-height:none;overflow:visible;}';
+            host.appendChild(style);
+            return true;
+        }
+
+        function adoptReader() {
+            var reader = window.app && window.app.comicReader;
+            if (!reader) { return false; }
+            var origin = patchTranslatorUrl(reader);
+            var frame = patchReaderFrame(reader);
+            var remote = patchInitRemote(reader);
+            var style = patchComicInfoStyle();
+            return !!(origin && frame && remote && style);
         }
 
         // app.v2.comicprovider.js is loaded on demand -- the comic browser is the
@@ -9699,11 +10407,17 @@ enum SitePatch {
         }
         // Belt and braces: a bundle that defines the global some other way is
         // still caught, and the poll stops as soon as it is.
+        //
+        // app.comicReader is a different file again (app.v2.read.js, prefetched
+        // and loaded on demand), so it is watched by the same timer rather than
+        // by a second one.
         var attempts = 0;
+        var readerDone = false;
         var timer = setInterval(function () {
             attempts++;
             installed = adopt() || installed;
-            if (installed || attempts > 600) { clearInterval(timer); }
+            readerDone = adoptReader() || readerDone;
+            if ((installed && readerDone) || attempts > 600) { clearInterval(timer); }
         }, 100);
     })();
     """

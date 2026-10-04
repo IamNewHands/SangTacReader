@@ -32,6 +32,15 @@ const zlib = require('zlib');
 
 const TARGET_DIR = path.join(__dirname, '..', 'plugins', 'app', 'ios', 'Sources', 'SangTacAppPlugin');
 
+/**
+ * The file the app process owns (`Library/Application Support/
+ * stv-diagnostic.log`). Deliberately module-level and NOT part of a sandbox:
+ * the whole point of the durable sink is that its contents outlive the page, so
+ * a test can build one sandbox, throw it away, and read the log back from the
+ * next one.
+ */
+const diagFile = { text: '' };
+
 let failures = 0;
 function check(name, condition, detail) {
   if (condition) {
@@ -615,6 +624,21 @@ function makeFakeFrame(contentElements) {
     // querySelectorAll is what it delegates to; a real frame document answers
     // this, so the stub has to as well.
     querySelectorAll: (selector) => html.querySelectorAll(selector),
+    // The chapter-frame report counts images and reads the title off the frame
+    // document, which is what separates "the site's translator answered nothing"
+    // from "the images are there and something else is blank".
+    getElementsByTagName: (tag) => {
+      const wanted = String(tag).toLowerCase();
+      const out = [];
+      const visit = (node) => {
+        if (String(node.tagName || '').toLowerCase() === wanted) { out.push(node); }
+        for (const child of node.children || []) { visit(child); }
+      };
+      visit(html);
+      return out;
+    },
+    title: '',
+    readyState: 'complete',
   };
   frame.contentDocument = doc;
   const frameWindow = {
@@ -1103,6 +1127,32 @@ function installFakeApp(sandbox, options) {
             name: payload.filename,
             bytes: payload.data.length,
           });
+        },
+        // The durable sink (SangTacAppPlugin.swift). It models the file, not the
+        // bridge: what the page writes survives a new sandbox, which is the whole
+        // point of the feature.
+        diagAppend(payload) {
+          (stored.diagAppend || (stored.diagAppend = [])).push(payload);
+          if (options.diagAppendFails) {
+            return Promise.reject(new Error(options.diagAppendFails));
+          }
+          const lines = (payload && payload.lines) || [];
+          for (const line of lines) { diagFile.text += line + '\n'; }
+          return Promise.resolve({ value: true, bytes: diagFile.text.length });
+        },
+        diagRead() {
+          (stored.diagRead || (stored.diagRead = [])).push(true);
+          return Promise.resolve({
+            text: diagFile.text,
+            bytes: diagFile.text.length,
+            path: '/var/mobile/Containers/Data/Application/X/Library'
+              + '/Application Support/SangTacReader/stv-diagnostic.log',
+          });
+        },
+        diagClear() {
+          (stored.diagClear || (stored.diagClear = [])).push(true);
+          diagFile.text = '';
+          return Promise.resolve({ value: true });
         },
       },
       // Every network engine goes through the native Http plugin, because a
@@ -6555,10 +6605,16 @@ async function testComicGate() {
 
   // getComicProvider (comicprovider.js:1925) ends with an unguarded
   // `domain.replace`, which is the 1932:20 rejection in the device log.
+  // The table is what the test mutates later: replacing window.getComicProvider
+  // itself would put a new function in place that the wrapper never saw, which
+  // is not what the bundle does (it defines the global once).
+  const providerTable = { 'baozimh.com': { provider: 'baozimh' } };
   sandbox.window.getComicProvider = (domain) => {
-    // The site's own unguarded last line (comicprovider.js:1932).
+    // The site's own first two lines (comicprovider.js:1927) ...
+    try { domain = new URL(domain).hostname; } catch (e) { /* not a url */ }
+    // ... and its unguarded last line (comicprovider.js:1932).
     domain = domain.replace('www.', '');
-    return domain.indexOf('baozimh.com') >= 0 ? { provider: 'baozimh' } : null;
+    return providerTable[domain] || null;
   };
   await tick(200);
   check('getComicProvider is wrapped once it exists',
@@ -6569,6 +6625,173 @@ async function testComicGate() {
         .indexOf('getComicProvider was called with undefined') >= 0);
   check('a real url still resolves through the site implementation',
     !!sandbox.window.getComicProvider('https://www.baozimh.com/comic/abc'));
+
+  // ---- what a failing source is allowed to do ------------------------------
+  // renderComicBrowser (app.v2.read.js:4209) and openComicByUrl (app_v2.html:4345)
+  // attach a bare .then() and no rejection handler, so a provider that throws
+  // leaves the preloader spinning and the detail page half built. Both throws are
+  // ordinary: a 403 answers {"error":...} and `json.map` blows up on it.
+  const brokenList = {
+    getComicList() { return Promise.reject(new Error('json.map is not a function')); },
+  };
+  const brokenInfo = {
+    // A 403 answers `{"error":...}` where the provider expects a list, which is
+    // how `json.map` becomes the throw in the device log.
+    getComicList() { return Promise.resolve({ error: 'challenge_required' }); },
+    getComicInfo() { return Promise.reject(new Error('403 challenge_required')); },
+  };
+  const partialInfo = {
+    getComicList() { return Promise.resolve({ error: 'challenge_required' }); },
+    getComicInfo() { return Promise.resolve({ name: 'Chỉ có tên' }); },
+  };
+  providerTable['baozimh.com'] = brokenList;
+  providerTable['other.com'] = partialInfo;
+  providerTable['broken.com'] = brokenInfo;
+  await tick(200);
+
+  const handedOut = sandbox.window.getComicProvider('baozimh.com');
+  check('a provider is guarded when it is handed out, not when it is used',
+    handedOut === brokenList && brokenList.__stvGuarded === true,
+    JSON.stringify({ same: handedOut === brokenList, guarded: !!brokenList.__stvGuarded }));
+
+  const emptyList = await handedOut.getComicList();
+  check('a list that throws resolves as an empty list instead of an unhandled rejection',
+    Array.isArray(emptyList) && emptyList.length === 0, JSON.stringify(emptyList));
+  check('the source and the reason are reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('could not load its list: json.map is not a function') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-240));
+
+  const other = sandbox.window.getComicProvider('other.com');
+  const notAList = await other.getComicList();
+  check('an answer that is not a list becomes an empty one',
+    Array.isArray(notAList) && notAList.length === 0, JSON.stringify(notAList));
+
+  // The detail page reads d.tags.length and d.desc directly (app_v2.html:4360),
+  // so a provider that leaves one out takes the whole render down with it.
+  const partial = await other.getComicInfo();
+  check('missing detail fields are filled in rather than left to throw',
+    Array.isArray(partial.tags) && typeof partial.desc === 'string'
+      && typeof partial.thumb === 'string' && Array.isArray(partial.chapters)
+      && partial.name === 'Chỉ có tên',
+    JSON.stringify({ tags: partial.tags, desc: partial.desc, name: partial.name }));
+  check('the detail page says which fields the source did not send',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('missing thumb,desc,tags,chapters') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-240));
+  check('a source that lists nothing is reported as such',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('other.com details: 0 chapter(s)') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-240));
+
+  const failed = await sandbox.window.getComicProvider('broken.com').getComicInfo();
+  check('a source that cannot answer still lets the page finish',
+    typeof failed.desc === 'string'
+      && failed.desc.indexOf('这个源没有返回漫画详情') >= 0
+      && Array.isArray(failed.tags) && Array.isArray(failed.chapters),
+    failed.desc);
+
+  // ---- the chapter frame ---------------------------------------------------
+  // initRemote (app.v2.read.js:3788) points the frame at STV_SERVER while the page
+  // is on another of the site's hosts, and then treats the frame as same-origin:
+  // that is the SecurityError at app.v2.read.js:4091 and the {"isTrusted":true}
+  // flood after it.
+  const reader = {
+    page: null,
+    currentChapterList: [{ url: 'https://www.yemancomic.com/chapter/1/2.html', name: 'Ch. 2' }],
+    getTranslatorUrl(url) {
+      return 'https://sangtacviet.app/comictranslator.php?url='
+        + encodeURIComponent(url) + '&transmode=perpair&langhint=zh';
+    },
+    initEventForFrame() {
+      // What the real one does first: reach into the frame's document.
+      throw new Error('Blocked a frame with origin "https://sangtacviet.com"'
+        + ' from accessing a cross-origin frame.');
+    },
+    updateCnameAndProgress() { throw new Error('cross-origin again'); },
+    getCurrentChapterUrl() {
+      // The site splits the frame src on "?" without checking it exists.
+      const iframe = this.page.q('iframe');
+      const url = iframe.src.split('?')[1];
+      return decodeURIComponent(url.split('=')[1].split('&')[0]);
+    },
+    getCurrentChapterName() {
+      return this.currentChapterList.find((e) => e.url === this.getCurrentChapterUrl()).name;
+    },
+    initRemote() { return Promise.resolve(); },
+  };
+  sandbox.window.app.comicReader = reader;
+  sandbox.window.location = { origin: 'https://sangtacviet.com' };
+  await tick(300);
+
+  check('the reader is adopted once app.v2.read.js has defined it',
+    reader.getTranslatorUrl.__stvSameOrigin === true
+      && reader.initEventForFrame.__stvGuarded === true
+      && reader.getCurrentChapterUrl.__stvGuarded === true,
+    JSON.stringify({
+      origin: !!reader.getTranslatorUrl.__stvSameOrigin,
+      wire: !!reader.initEventForFrame.__stvGuarded,
+      url: !!reader.getCurrentChapterUrl.__stvGuarded,
+    }));
+
+  const built = reader.getTranslatorUrl('https://www.yemancomic.com/chapter/1/2.html');
+  check('the chapter frame is moved onto the origin the page is already on',
+    built.indexOf('https://sangtacviet.com/comictranslator.php') === 0
+      && built.indexOf('transmode=perpair') > 0,
+    built);
+  check('the rewrite is reported, because it is a real change of host',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the chapter frame is on https://sangtacviet.app but the page is on'
+        + ' https://sangtacviet.com') >= 0);
+
+  const contained = reader.initEventForFrame({ document: {} });
+  check('a frame that cannot be read no longer throws out of the reader',
+    contained === null
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('the chapter frame could not be wired up') >= 0,
+    String(contained));
+
+  const page = makeElement('div');
+  const frame = makeFakeFrame([makeElement('img'), makeElement('img')]);
+  // The site's getCurrentChapterUrl splits the frame src on "?" and then on "=",
+  // checking neither: a frame that has not been pointed at a chapter yet is the
+  // ordinary case, not an exotic one.
+  frame.src = 'https://sangtacviet.com/comictranslator.php';
+  page.appendChild(frame);
+  reader.page = page;
+  page.q = (selector) => (selector === 'iframe' ? frame : null);
+  check('a frame with no query string reads as an empty chapter url, not a throw',
+    reader.getCurrentChapterUrl() === '', JSON.stringify(reader.getCurrentChapterUrl()));
+  check('an unknown chapter url no longer throws inside a menu render',
+    reader.getCurrentChapterName() === '', JSON.stringify(reader.getCurrentChapterName()));
+  check('the unreadable url is reported once, not thrown',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the current chapter url could not be read') >= 0);
+
+  frame.src = 'https://sangtacviet.com/comictranslator.php?url='
+    + encodeURIComponent('https://www.yemancomic.com/chapter/1/2.html') + '&transmode=perpair';
+  check('a readable frame still answers the chapter it is showing',
+    reader.getCurrentChapterUrl() === 'https://www.yemancomic.com/chapter/1/2.html'
+      && reader.getCurrentChapterName() === 'Ch. 2',
+    reader.getCurrentChapterUrl());
+
+  reader.initRemote('https://www.yemancomic.com/chapter/1/2.html', reader.currentChapterList, {});
+  await tick(400);
+  const frameReport = String(sandbox.window.__stvDiag.text() || '');
+  check('what the chapter frame actually contains is measured, not guessed',
+    frameReport.indexOf('the chapter frame at https://sangtacviet.com/comictranslator.php')
+      >= 0 && frameReport.indexOf('images=2') >= 0,
+    frameReport.slice(-260));
+  check('opening a chapter says how many chapters the source listed',
+    frameReport.indexOf('opening chapter https://www.yemancomic.com/chapter/1/2.html'
+      + ' with 1 chapter(s) known') >= 0);
+
+  // "显示不全漫画详情": the comicinfo template clips its own detail block.
+  const styles = sandbox.document.head.querySelectorAll('[data-stvcomic=info]');
+  check('the comic detail block is no longer clipped to 220px',
+    styles.length === 1
+      && String(styles[0].textContent).indexOf('max-height:none') >= 0,
+    styles.length ? String(styles[0].textContent) : 'no style');
 }
 
 async function testNotifyBookTitles() {
@@ -7775,6 +7998,218 @@ async function testNativeDiagnosticsBridge() {
     String(diag.text()).slice(-200));
 }
 
+async function testDurableDiagnostics() {
+  console.log('the diagnostic log survives a crash');
+  diagFile.text = '';
+
+  // ---- first launch: lines reach the file -----------------------------------
+  const first = makeSandbox();
+  installFakeApp(first, { appLanguage: 'zh' });
+  vm.runInContext(loadBlocks().join('\n'), first);
+  await tick(60);
+
+  const diag = first.window.__stvDiag;
+  diag.log('COMIC', 'the chapter frame at about:blank after 3 poll(s): images=0');
+  first.window.__stvDiag.log('ERR', 'the chapter frame has no window');
+  await tick(500);
+
+  const appends = first.__stored.diagAppend || [];
+  check('the buffer is mirrored into the file the app process owns',
+    appends.length >= 1 && diagFile.text.indexOf('the chapter frame at about:blank') >= 0,
+    JSON.stringify(diagFile.text.slice(-160)));
+  check('an error line is flushed without waiting for the batch timer',
+    diagFile.text.indexOf('the chapter frame has no window') >= 0,
+    JSON.stringify(diagFile.text.slice(-160)));
+  check('the flush is batched rather than one bridge call per line',
+    appends.length <= 2, 'appends=' + appends.length);
+  check('the flush reports the path the file lives at',
+    String(diag.file().path || '').indexOf('stv-diagnostic.log') >= 0,
+    JSON.stringify(diag.file().path));
+  diag.reload();
+  await tick(30);
+  check('a reload pulls what the file holds back into the panel',
+    String(diag.text() || '').indexOf('the chapter frame at about:blank') >= 0,
+    JSON.stringify(String(diag.text() || '').slice(-160)));
+
+  // ---- second launch: the page is new, the file is not ----------------------
+  const second = makeSandbox();
+  installFakeApp(second, { appLanguage: 'zh' });
+  vm.runInContext(loadBlocks().join('\n'), second);
+  await tick(60);
+
+  const restored = String(second.window.__stvDiag.text() || '');
+  check('the next launch reads the previous run back out of the file',
+    restored.indexOf('the chapter frame at about:blank') >= 0
+      && restored.indexOf('the chapter frame has no window') >= 0,
+    JSON.stringify(restored.slice(-200)));
+  check('what the file kept is marked apart from this launch',
+    restored.indexOf('---- this launch ----') >= 0, JSON.stringify(restored.slice(-200)));
+  check('the panel counts the file it restored',
+    String(second.__stored.diagRead ? 'read' : 'no read') === 'read');
+
+  // ---- SAVE hands the whole log -- file plus this launch -- to the share sheet
+  second.window.__stvDiag.log('COMIC', 'a line from this launch');
+  await tick(500);
+  second.window.__stvDiag.save();
+  await tick(30);
+  const exported = (second.__stored.exports || []).slice(-1)[0];
+  check('SAVE exports the file and the live buffer together',
+    !!exported && exported.filename.indexOf('stv-diagnostic-') === 0
+      && Buffer.from(exported.data, 'base64').toString('utf8')
+        .indexOf('the chapter frame has no window') >= 0
+      && Buffer.from(exported.data, 'base64').toString('utf8')
+        .indexOf('a line from this launch') >= 0,
+    exported ? exported.filename : 'nothing exported');
+  check('the export is base64 that decodes as UTF-8, not mojibake',
+    !!exported && Buffer.from(exported.data, 'base64').toString('utf8')
+      .indexOf('\uFFFD') < 0,
+    exported ? Buffer.from(exported.data, 'base64').toString('utf8').slice(0, 60) : '');
+  check('the export is reported with the file path',
+    String(second.window.__stvDiag.text() || '').indexOf('exported stv-diagnostic-') >= 0);
+
+  // ---- CLEAR wipes the file too, so the next report starts clean -----------
+  const clearBar = second.document.body
+    .querySelectorAll('[data-stvdiag=panel]')[0].childNodes[0];
+  const clearButton = clearBar.children.filter((node) => node.textContent === 'CLEAR')[0];
+  clearButton.__fire('click', { stopPropagation() {}, preventDefault() {} });
+  await tick(40);
+  check('CLEAR empties the durable file as well as the panel',
+    diagFile.text.indexOf('the chapter frame') < 0
+      && String(second.window.__stvDiag.text() || '').indexOf('the chapter frame') < 0,
+    JSON.stringify(diagFile.text.slice(0, 120)));
+
+  // ---- a bridge that is not there yet must not lose the lines --------------
+  const late = makeSandbox({ diag: false });
+  installFakeApp(late, { appLanguage: 'zh' });
+  delete late.Capacitor.Plugins.App.diagAppend;
+  delete late.window.Capacitor.Plugins.App.diagAppend;
+  vm.runInContext(loadBlocks().join('\n'), late);
+  await tick(60);
+  late.window.__stvDiag.setEnabled(true);
+  await tick(40);
+  late.window.__stvDiag.log('COMIC', 'queued while there was no sink');
+  await tick(500);
+  check('a missing native sink keeps the lines queued instead of throwing',
+    String(late.window.__stvDiag.text() || '').indexOf('queued while there was no sink') >= 0);
+}
+
+/**
+ * The faction board is 117 rows on one tap and the 2026-10-04 log shows the
+ * reader waiting 14 seconds for it, in two sequential chunks of ~60 with three
+ * requests in flight. These assertions pin the four things that remove requests
+ * rather than making them faster: the pool is no longer chunked, repeats share
+ * one request, an answer is remembered across visits, and a text that cannot
+ * change is never sent.
+ */
+async function testGoogleFreeThroughput() {
+  console.log('the keyless Google channel is not the bottleneck');
+  const fixture = factionBoardFixture();
+  const sandbox = makeSandbox();
+  sandbox.localStorage.setItem('stv.translate.settings', JSON.stringify({
+    engine: 'googlefree', apiKey: '', region: '', endpoint: '', model: '',
+    readSource: 'vi', readTarget: 'zh-Hans', writeTarget: 'vi', auto: false,
+  }));
+
+  const asked = [];
+  installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { pagelisttheluc: fixture.page },
+    httpResponse: (url) => {
+      asked.push(String(url));
+      const match = /[?&]q=([^&]*)/.exec(String(url));
+      const text = decodeURIComponent(match ? match[1] : '');
+      return {
+        status: 200,
+        data: [[['【谷free】' + text, text, null, null, 10]], null, 'vi'],
+      };
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.document.body.appendChild(fixture.page);
+  sandbox.app.pushPage('pagelisttheluc', {});
+  await tick(60);
+
+  // 70 rows, and every description is the same string: 140 nodes, 71 distinct
+  // texts. The faction board in the 2026-10-04 log was 117 rows in two chunks of
+  // ~60 that ran one after the other.
+  for (let i = 0; i < 70; i++) {
+    fixture.addFaction('The luc so ' + i, 'Mo ta chung');
+  }
+  sandbox.__flushObservers();
+
+  // Captured before the sweep, because after it the nodes hold the answers.
+  const names = fixture.list.querySelectorAll('.name');
+  const descriptions = fixture.list.querySelectorAll('.description');
+  const originalNames = names.map((node) => node.textContent);
+  const originalDescriptions = descriptions.map((node) => node.textContent);
+
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(3000);
+
+  const unique = new Set(asked.map((url) => decodeURIComponent(/[?&]q=([^&]*)/.exec(url)[1])));
+  check('the sweep is not split into sequential chunks',
+    asked.length > 0 && asked.length <= 75,
+    'requests=' + asked.length + ' for 140 nodes');
+  check('a text repeated inside one sweep costs one request',
+    unique.size === asked.length && unique.size === 71,
+    'requests=' + asked.length + ' unique=' + unique.size);
+  check('the pool widens while the channel is healthy',
+    /width ended at [4-8]/.test(String(sandbox.window.__stvDiag.text() || '')),
+    (String(sandbox.window.__stvDiag.text() || '').match(/width ended at \d+/) || ['none'])[0]);
+  const contents = fixture.list.querySelectorAll('.name');
+  check('the answers still land on the right rows',
+    contents[0].textContent === '【谷free】The luc so 0'
+      && contents[69].textContent === '【谷free】The luc so 69',
+    contents[0].textContent + ' / ' + contents[69].textContent);
+
+  // ---- a revisit -----------------------------------------------------------
+  // The board is rebuilt from the site's own data every time it is opened, so
+  // the second visit sees the same 71 strings in fresh nodes. Putting the
+  // originals back and clearing the markers models that without a second
+  // sandbox (the cache lives in this origin's localStorage, per sandbox).
+  const before = asked.length;
+  names.forEach((node, index) => {
+    node.textContent = originalNames[index];
+    node.removeAttribute('stv-orig');
+    node.removeAttribute('stv-tr-done');
+  });
+  descriptions.forEach((node, index) => {
+    node.textContent = originalDescriptions[index];
+    node.removeAttribute('stv-orig');
+    node.removeAttribute('stv-tr-done');
+  });
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(1500);
+  check('the second visit is answered from the cache',
+    asked.length === before, 'extra requests=' + (asked.length - before));
+  check('the cache hit is reported',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('140 cached') >= 0,
+    lastGoogleNote(sandbox));
+
+  // ---- text that cannot change --------------------------------------------
+  // Added to the same board: the 140 rows above are already translated, so this
+  // sweep sees exactly these four strings.
+  fixture.addFaction('   ', '???');
+  fixture.addFaction('12345', 'https://zalo.me/g/x');
+  sandbox.__flushObservers();
+  const beforeNoise = asked.length;
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(800);
+  check('a text with no letter in it is never sent',
+    asked.length === beforeNoise + 1, 'requests=' + (asked.length - beforeNoise));
+  check('what was skipped is counted rather than silently dropped',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('3 cannot change') >= 0,
+    lastGoogleNote(sandbox));
+}
+
+/** The most recent gtx summary line, for failure messages. */
+function lastGoogleNote(sandbox) {
+  const all = String(sandbox.window.__stvDiag.text() || '')
+    .match(/谷歌通道 sent [^\n]*/g) || [];
+  return all.length ? all[all.length - 1] : 'none';
+}
+
 async function testSwipeDismiss() {
   console.log('swipe right to dismiss page');
 
@@ -7921,6 +8356,8 @@ await testPopupTranslate();
   testInjectionOrder();
   await testReaderPrefetch();
   await testNativeDiagnosticsBridge();
+  await testDurableDiagnostics();
+  await testGoogleFreeThroughput();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

@@ -219,11 +219,22 @@ jobs:
                         stvReaderTtsInstalled stvPageRepairInstalled stvBootShellInstalled \
                         stvAssetCache stvReaderPrefetchInstalled \
                         stvCommentTranslateInstalled stvAssetMirror \
+                        stvCboxFrameInstalled stvComicGateInstalled \
                         siteAssetRefresh data-stv-mirror stv.domain.trap.off; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
               echo "::error::$marker 缺失"
+              exit 1
+            fi
+          done
+          # 诊断日志必须落盘：页面里的缓冲随崩溃一起消失，只有原生写的文件能活到
+          # 下一次启动（「闪退后诊断日志就清空了，导致没有日志」）。
+          for marker in stv-diagnostic.log diagAppend diagRead diagClear; do
+            if grep -q -F "$marker" "$syms.strings"; then
+              echo "✓ 诊断日志落盘（$marker）已编入产物"
+            else
+              echo "::error::诊断日志落盘缺失（$marker 不在二进制里）"
               exit 1
             fi
           done

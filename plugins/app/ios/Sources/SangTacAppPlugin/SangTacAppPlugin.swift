@@ -50,6 +50,9 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "translationPrepare", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "translationTranslate", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "exportFile", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "diagAppend", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "diagRead", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "diagClear", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "siteAssetRefresh", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "siteAssetForget", returnType: CAPPluginReturnPromise)
     ]
@@ -708,6 +711,154 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             host.present(sheet, animated: true) {
                 call.resolve(["value": true, "name": name, "bytes": payload.count])
+            }
+        }
+    }
+
+    // MARK: - Durable diagnostic log
+
+    /**
+     The diagnostic buffer lives in the page, so it dies with the page: a crash,
+     a jetsam kill or a WebContent-process restart takes every line with it --
+     which is exactly the report that matters most ("闪退后诊断日志就清空了，导致
+     没有日志").
+
+     The sink is a file the app process owns, not the web view:
+     Library/Application Support/stv-diagnostic.log. Application Support rather
+     than Documents or Caches, because Documents is the user's iCloud-visible
+     area (no plist change needed to write here) and Caches may be purged at any
+     time, which is the one thing a crash log must survive.
+
+     The page keeps writing lines into its own buffer; `diagAppend` is only the
+     copy that outlives it. Writes are append-only and rotated by size, so the
+     file is bounded no matter how long logging stays on.
+     */
+    private static let diagFileMaxBytes = 1_500_000
+    private static let diagFileKeepBytes = 600_000
+    private static let diagReadMaxBytes = 400_000
+    private let diagQueue = DispatchQueue(label: "stv.diagnostic.file")
+
+    private func diagFileURL() -> URL? {
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directory = base.appendingPathComponent("SangTacReader", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            try? FileManager.default.createDirectory(at: directory,
+                                                     withIntermediateDirectories: true)
+        }
+        return directory.appendingPathComponent("stv-diagnostic.log")
+    }
+
+    /// One line per entry, each already stamped by the page. Appending with a
+    /// FileHandle keeps this O(new bytes) instead of rewriting the whole file.
+    private func appendDiagLines(_ lines: [String]) {
+        guard let url = diagFileURL(), !lines.isEmpty else { return }
+        let text = lines.joined(separator: "\n") + "\n"
+        guard let data = text.data(using: .utf8) else { return }
+        let manager = FileManager.default
+        if !manager.fileExists(atPath: url.path) {
+            manager.createFile(atPath: url.path, contents: nil)
+        }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+        } catch {
+            CAPLog.print("[SangTacApp:diag] append failed: \(error)")
+            return
+        }
+        diagRotateIfNeeded(url)
+    }
+
+    /// Keeps the newest `diagFileKeepBytes` once the file passes the ceiling.
+    /// Trimming at a line boundary means the survivor still reads as a log.
+    private func diagRotateIfNeeded(_ url: URL) {
+        let manager = FileManager.default
+        guard let attributes = try? manager.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? Int,
+              size > SangTacAppPlugin.diagFileMaxBytes,
+              let data = try? Data(contentsOf: url) else { return }
+        let keep = SangTacAppPlugin.diagFileKeepBytes
+        guard data.count > keep else { return }
+        var tail = data.suffix(keep)
+        // Drop the partial first line so the file never starts mid-entry.
+        if let newline = tail.firstIndex(of: 0x0A) {
+            tail = tail[tail.index(after: newline)...]
+        }
+        let marker = "[DIAG] the log was trimmed to its last \(keep) byte(s)\n"
+        var out = Data(marker.utf8)
+        out.append(contentsOf: tail)
+        try? out.write(to: url, options: .atomic)
+    }
+
+    /// The tail of the file, oldest line first, so the panel can show what
+    /// happened before the last launch ended.
+    private func readDiagFile() -> (text: String, bytes: Int) {
+        guard let url = diagFileURL(), let data = try? Data(contentsOf: url) else {
+            return ("", 0)
+        }
+        let limit = SangTacAppPlugin.diagReadMaxBytes
+        let slice = data.count > limit ? data.suffix(limit) : data
+        var text = String(decoding: slice, as: UTF8.self)
+        if data.count > limit, let newline = text.firstIndex(of: "\n") {
+            text = String(text[text.index(after: newline)...])
+            text = "[DIAG] showing the last \(limit) byte(s) of the file\n" + text
+        }
+        return (text, data.count)
+    }
+
+    /// Called once per batch, not once per line: the bridge hop is the cost.
+    @objc func diagAppend(_ call: CAPPluginCall) {
+        guard isTrustedCaller("diagAppend") else {
+            call.reject("diagnostic log needs a trusted origin")
+            return
+        }
+        let lines = (call.getArray("lines") ?? []).compactMap { $0 as? String }
+        guard !lines.isEmpty else {
+            call.resolve(["value": true, "bytes": 0])
+            return
+        }
+        diagQueue.async { [weak self] in
+            self?.appendDiagLines(lines)
+            let bytes = lines.reduce(0) { $0 + $1.utf8.count + 1 }
+            DispatchQueue.main.async {
+                call.resolve(["value": true, "bytes": bytes])
+            }
+        }
+    }
+
+    @objc func diagRead(_ call: CAPPluginCall) {
+        guard isTrustedCaller("diagRead") else {
+            call.reject("diagnostic log needs a trusted origin")
+            return
+        }
+        let url = diagFileURL()
+        diagQueue.async { [weak self] in
+            let result = self?.readDiagFile() ?? ("", 0)
+            DispatchQueue.main.async {
+                call.resolve([
+                    "text": result.text,
+                    "bytes": result.bytes,
+                    "path": url?.path ?? ""
+                ])
+            }
+        }
+    }
+
+    @objc func diagClear(_ call: CAPPluginCall) {
+        guard isTrustedCaller("diagClear") else {
+            call.reject("diagnostic log needs a trusted origin")
+            return
+        }
+        let url = diagFileURL()
+        diagQueue.async {
+            if let url = url { try? FileManager.default.removeItem(at: url) }
+            DispatchQueue.main.async {
+                call.resolve(["value": true])
             }
         }
     }

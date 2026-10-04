@@ -3880,3 +3880,120 @@ Qidian（62KB JSON）全都 200。真正坏在两处：
 - 五条都要真机复测。
 
 
+---
+
+## §6.39 第 37 轮：谷歌通道提速、漫画详情与正文、诊断日志落盘
+
+2026-10-04 11:11:03–11:12:17 的 267 行日志。这一轮的三条互相咬合：**没有落盘的日志就
+没有漫画的证据**，所以先把日志固化，再用它去定漫画的性。
+
+### (1) 免密钥谷歌通道「很慢」
+
+日志里的量化事实：`11:11:19` 点「译全部」，`11:11:33` 收尾，**117 个条目花了 14 秒**；
+`11:11:33 [TRANSLATE] 1 of 63 line(s) kept the original text (谷歌通道)` 与
+`translated 113 of 117 item(s) with googlefree` 是两条不同的汇总行。
+
+根因有三个，全部在客户端：
+
+| 根因 | 证据 | 修法 |
+| --- | --- | --- |
+| gtx 一个请求只送一段，池宽固定 3 | 日志里 117 次 `[Http] GET …translate_a/single`，每次 250–900ms | 池宽**自适应**：3 起步，每 6 个干净回答 +1，上限 8；任一失败减半（下限 2） |
+| `MAX_CHARS=3000` 把一次 sweep 切成两块，而 `runChunks` 是 `chain.then` **串行** | 117 行 → 63 + 54 两块，63 那一块先跑完 | 新增 `POOLED_ENGINES = ['googlefree']`：gtx 自己扇出，直接拿整张表，不再分块 |
+| 每次进页面都重翻一遍，同一串在一个 sweep 里也会重复送 | 无缓存 | `stv.translate.cache`（localStorage，4000 条上限）+ sweep 内按文本去重 |
+
+另外新增 `gtxWorthSending()`：没有拉丁字母的串（纯空白、纯标点、纯数字、纯 emoji、裸 URL）
+翻译结果必然等于原文，不再发请求——日志里 `???`、纯空白、`https://avalon-123.my.canva.site/`
+各占了一次往返。
+
+守卫：`谷歌通道 sent N request(s) for M item(s): X cached, Y cannot change, width ended at W`
+一行把四个数字都写出来；第二轮 sweep 的 71 个串全部命中缓存，**0 个请求**。
+
+### (2) 漫画：详情显示不全 + 章节正文空白卡住
+
+日志把两件事分得很清楚：
+
+- `11:11:41 [ERR] GET …baozimh.com/api/bzmhq/amp_comic_list… -> 403`，紧接着
+  `11:11:41 [ERR] unhandledrejection getComicList@app.v2.comicprovider.js:628:36`。
+  628 行是 `return translateObject(json.map(…))`，而 403 的 body 是
+  `{"challenge_url":…,"error":…}`——`json.map` 直接抛。
+  **`renderComicBrowser`（app.v2.read.js:4209）与 `openComicByUrl`（app_v2.html:4345）
+  都只挂了 `.then()`，没有 rejection 处理**，所以预加载转圈永远不停（「只有顶部的分类」），
+  详情页也停在半成品（「显示不全漫画详情」）。
+- `11:11:57 [ERR] onerror SecurityError: Blocked a frame with origin
+  "https://sangtacviet.com" from accessing a cross-origin frame @app.v2.read.js:4091`，
+  之后是一串 `[LOG] {"isTrusted":true}`。
+
+第二件事的根因在 `[DOMAIN] networkManagerXHR route: page=https://sangtacviet.com …
+STV_SERVER=https://sangtacviet.app`：`initRemote`（app.v2.read.js:3788）把章节放进
+`STV_SERVER/comictranslator.php` 的 iframe，然后**按同源使用它**——
+`initEventForFrame` 读 `w.document` / `w.scrollY` / `w.__defineGetter__`，
+`updateCnameAndProgress` 读 `w.document.body.scrollHeight`，
+`getCurrentChapterUrl` 对 `iframe.src` 连做两次 `split` 而不检查。跨源时第一处就抛，
+读者停在最后画出来的一屏。
+
+修法：
+
+| 改动 | 说明 |
+| --- | --- |
+| `guardProvider()` | `getComicProvider` 返回的实例上包 `getComicList` / `getComicInfo`：抛错 → 空列表 / 带原因的详情对象 + 一行 `[COMIC]`/`[ERR]`，页面能画完 |
+| `describeInfo()` | `d.tags.length` 与 `d.desc` 是 `app_v2.html:4360` 直接读的，缺字段会带崩整次渲染：补齐并记下**缺了哪几个** |
+| `patchTranslatorUrl()` | 章节 iframe 改用**页面自己的 origin**，跨源变同源，站点自己的滚动/点击/进度接线重新可用 |
+| `patchReaderFrame()` | `initEventForFrame` / `updateCnameAndProgress` / `getCurrentChapterUrl` / `getCurrentChapterName` 四处全部 try/catch，抛错只记一行 |
+| `reportFrame()` | 帧加载后量一次：`title` / `images=N` / `body=NB` / `readyState`——这是把「站点翻译器没回内容」和「图在那儿、别处空白」分开的唯一判据 |
+| `patchComicInfoStyle()` | 详情块自己的 `max-height:220px;overflow:hidden`（app_v2.html:2726）会截断长简介；novel 的 bookinfo 同结构但没有这个上限 |
+
+### (3) 诊断日志固化落盘
+
+「闪退后诊断日志就清空了」——缓冲在页面里，页面没了它就没了，而那恰恰是最需要的一份报告。
+
+- 原生新增 `diagAppend` / `diagRead` / `diagClear`（`SangTacAppPlugin.swift`），写入
+  `Library/Application Support/SangTacReader/stv-diagnostic.log`。用 Application Support
+  而不是 Documents（用户的 iCloud 可见区）或 Caches（随时可能被清），追加写 + 按大小轮转
+  （1.5MB 上限，保留最后 600KB，按行边界裁剪）。
+- 页面侧：`raw()` 每行入队，300ms 批量落盘一次（一次桥接调用而不是一行一次）；**ERR 行改用
+  下一轮事件循环立即落盘**，因为崩溃前那一行才是要留下的。
+- 下次启动把文件读回 `prior`，显示在实时行之上、并一起进 COPY / SAVE。SAVE 用手写 base64
+  （不走 `btoa`：它要求二进制字符串，会在孤立代理项上抛，而日志正是截断 UTF-8 出现的地方）
+  交给既有的 `exportFile` 分享面板。
+- 开关关着时非强制的批次仍然丢弃，只有原生标记为 `forced` 的失败批次会落盘——和
+  `logBatch` 的既有语义一致。
+
+### 顺带修掉的真缺陷
+
+`comicGate` 这个块调用了 `messageOf()`，而它定义在 `commentTranslate` 块里。**每个块是独立的
+WKUserScript、独立的 IIFE**，所以那是个 `ReferenceError`——本该写漫画失败报告的处理函数自己抛了，
+报告变成第二次静默失败。测试台把所有块拼成一个脚本跑，看不见这类错误，所以给
+`check-ios-shim.js` 加了**按块的共享 helper 作用域检查**（`SHARED_HELPERS`：块里调用了某个
+helper 就必须在同一个块里定义它）。
+
+### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **815 条断言**全过（上一轮 775，新增 40） |
+| `scripts/check-ios-shim.js` | 26 块 / 582034 字节 / 107 标记（含新的按块作用域检查） |
+| `scripts/gen-site-i18n.js --check` | 460 标签 / 72 片段 |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| `.github/workflows/build-ipa.yml` | 产物标记新增 `stvCboxFrameInstalled` / `stvComicGateInstalled` / `stv-diagnostic.log` / `diagAppend` / `diagRead` / `diagClear` |
+
+新增断言：日志落盘（批量镜像、ERR 立即落、跨启动读回、SAVE 的 base64 能按 UTF-8 解回、
+CLEAR 同时清文件、没有原生 sink 时不丢行）、谷歌通道吞吐（不分块、重复文本一次请求、
+再访命中缓存、无字母串不发、池宽爬升）、漫画（provider 守卫、缺字段补齐并点名、
+详情失败仍能画完、iframe 改同源、跨源抛错被兜住、`?` 缺失不抛、帧内容量测、详情块不再截断）。
+
+### 未证实项
+
+- **章节正文到底为什么空白**：`SecurityError` 与 `getComicList` 的 unhandled rejection 是
+  日志直接指认的，两处都修了。但「图片空白卡住」还有一种可能——`comictranslator.php`
+  本身没回内容。所以加了 `reportFrame()`：下一份日志里 `images=0 body=0B` 就是站点侧的问题
+  （客户端改不动），`images=N` 就说明图在那儿、问题在别处。
+- **qidian 点正文闪退**：这一轮没有针对它改代码。闪退会带走页面里的缓冲，所以**这一轮之后
+  才有证据**——`stv-diagnostic.log` 会留下崩溃前最后几百行。请复现一次并把日志发回来。
+- **详情页「显示不全」是高度截断**：这是从模板 `max-height:220px;overflow:hidden` 推的，
+  不是从日志读出来的。`[COMIC] <host> details: N chapter(s), name=L desc=L tags=N` 那一行
+  会给出真实的字段长度，下一份日志可以据此确认或推翻。
+- **自适应池宽的上限 8 是猜的**：gtx 是厂商给自家浏览器用的端点，没有 SLA。失败会减半并
+  继续，所以最坏情况是变慢而不是翻不出来，但真正的安全上限只能靠真机数据。
+- 三条都要真机复测。
+
+
