@@ -1,3 +1,5 @@
+**中文** | [English](README.en.md)
+
 # SangTacReader — sangtacviet 的非官方 iOS 客户端
 
 把 sangtacviet 的网页版装进一个 iOS 原生外壳：Capacitor 8 应用，远程加载
