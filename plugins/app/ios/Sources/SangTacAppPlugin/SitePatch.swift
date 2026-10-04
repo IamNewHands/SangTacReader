@@ -6082,6 +6082,109 @@ enum SitePatch {
             return true;
         }
 
+        // 用户 → 通知 (app.fun.showNotify, page-vip:4607) renders one line per item
+        // from /mobile/jsonify.php?ajax=getnotify. The chapter-update line is the
+        // site's own template -- "《{0}》来自{1}有{2}个新章节" -- and {0} is the
+        // book's VIETNAMESE name; the server never sends the Chinese one. The item
+        // does carry the book's link, though (`href`, the same value its click
+        // handler hands to app.url.handler), and the reader follows the book, so
+        // the Chinese name can be fetched from the book itself.
+        function bookFromHref(href) {
+            var parts = String(href || '').split('/');
+            for (var i = 0; i < parts.length; i++) {
+                if (parts[i] !== 'truyen' && parts[i] !== 'truyenn') { continue; }
+                var host = parts[i + 1];
+                var id = parts[i + 3];
+                if (host && id) { return { host: host, id: id }; }
+            }
+            return null;
+        }
+
+        // The title is the text the site itself wrapped in 《 》.
+        function titleInNotify(text) {
+            var open = text.indexOf('《');
+            if (open < 0) { return ''; }
+            var close = text.indexOf('》', open + 1);
+            if (close < 0 || close <= open + 1) { return ''; }
+            return text.substring(open + 1, close);
+        }
+
+        var bookNames = {};
+
+        function askBookName(book, done) {
+            var key = book.host + '/' + book.id;
+            if (bookNames[key] !== undefined) { done(bookNames[key]); return; }
+            var app = window.app;
+            if (!app || !app.net || typeof app.net.getCacheLater !== 'function') { return; }
+            app.net.getCacheLater('/mobile/bookinfo.php?hid=' + book.id
+                + '&host=' + book.host).then(function (down) {
+                    var name = down && down.book && down.book.name;
+                    bookNames[key] = typeof name === 'string' ? name : '';
+                    done(bookNames[key]);
+                }, function (error) {
+                    bookNames[key] = '';
+                    note('ERR', 'the notification book lookup failed for ' + key + ': '
+                        + String(error));
+                });
+        }
+
+        function retitleNotify(item) {
+            if (!item || !item.querySelector) { return; }
+            var body = item.querySelector('.content');
+            if (!body || !body.childNodes) { return; }
+            var data = item.data || {};
+            var book = bookFromHref(data.href);
+            if (!book) { return; }
+            for (var i = 0; i < body.childNodes.length; i++) {
+                var node = body.childNodes[i];
+                if (node.nodeType !== 3 || node.__stvNotifyAsked) { continue; }
+                var text = String(node.nodeValue || '');
+                var vietnamese = titleInNotify(text);
+                if (!vietnamese) { continue; }
+                node.__stvNotifyAsked = true;
+                askBookName(book, function (name) {
+                    if (!name || name === vietnamese) { return; }
+                    node.nodeValue = text.split(vietnamese).join(name);
+                    note('NOTIFY', 'a notification title became ' + name);
+                });
+                return;
+            }
+        }
+
+        function watchNotify(page) {
+            if (!page || page.__stvNotifyWatched) { return; }
+            page.__stvNotifyWatched = true;
+            var scan = function () {
+                var items = page.querySelectorAll('.notify');
+                for (var i = 0; i < items.length; i++) { retitleNotify(items[i]); }
+            };
+            scan();
+            if (typeof MutationObserver !== 'function') { return; }
+            var observer = new MutationObserver(scan);
+            observer.observe(page, { childList: true, subtree: true });
+        }
+
+        function patchNotifyTitles() {
+            var app = window.app;
+            var fun = app && app.fun;
+            if (!fun || typeof fun.showNotify !== 'function') { return false; }
+            if (fun.__stvNotifyTitlesPatched) { return true; }
+            fun.__stvNotifyTitlesPatched = true;
+            var original = fun.showNotify;
+            fun.showNotify = function () {
+                var result = original.apply(this, arguments);
+                try {
+                    var page = app.topPage ? app.topPage() : null;
+                    if (page) { watchNotify(page); }
+                } catch (error) {
+                    note('ERR', 'notify title patch: ' + String(error));
+                }
+                return result;
+            };
+            note('PATCH', 'notification book titles are looked up in Chinese');
+            return true;
+        }
+
         var patchAttempts = 0;
         var patchTimer = setInterval(function () {
             patchAttempts++;
@@ -6089,7 +6192,8 @@ enum SitePatch {
             var range = patchDownloadRange();
             var rows = patchDownloadedRow();
             var pages = patchStaticPostEmptyState();
-            if ((readers && range && rows && pages) || patchAttempts > 600) {
+            var notify = patchNotifyTitles();
+            if ((readers && range && rows && pages && notify) || patchAttempts > 600) {
                 clearInterval(patchTimer);
             }
         }, 200);
@@ -6980,6 +7084,7 @@ enum SitePatch {
         var ENGINE_LABELS = [
             ['apple', 'iOS 系统离线（推荐，免密钥）'],
             ['free', '免密钥联网（微软 Edge 通道）'],
+            ['googlefree', '免密钥联网（谷歌翻译通道）'],
             ['azure', 'Azure Translator（自备 Key）'],
             ['google', 'Google Cloud Translation（自备 Key）'],
             ['deepl', 'DeepL（自备 Key）'],
@@ -7368,6 +7473,77 @@ enum SitePatch {
             });
         }
 
+        // Chrome's own translation endpoint: the same keyless channel
+        // newsnook-ios uses for Google (`translate_a/single` with `client=gtx`).
+        // It answers one text per request -- the multi-`q` form is not stable --
+        // so this is the one engine that fans out, at the concurrency newsnook
+        // picked for a channel that rate-limits by IP.
+        var GTX_URL = 'https://translate.googleapis.com/translate_a/single';
+        var GTX_CONCURRENCY = 3;
+
+        // gtx speaks Google's own codes: zh-Hans / zh-Hant are BCP-47 and are
+        // not what it expects for Chinese.
+        function gtxLanguage(code) {
+            var lower = String(code).toLowerCase();
+            if (lower.indexOf('zh-hant') === 0) { return 'zh-TW'; }
+            if (lower.indexOf('zh') === 0) { return 'zh-CN'; }
+            return String(code);
+        }
+
+        function gtxOne(text, source, target) {
+            var url = GTX_URL + '?client=gtx&dt=t&sl='
+                + encodeURIComponent(source && source !== 'auto'
+                    ? gtxLanguage(source) : 'auto')
+                + '&tl=' + encodeURIComponent(gtxLanguage(target))
+                + '&q=' + encodeURIComponent(text);
+            return httpRequest('GET', url, { 'Accept': 'application/json' })
+                .then(function (response) {
+                    var data = bodyOf(response);
+                    var segments = data && data[0];
+                    if (!segments || !segments.length) {
+                        throw new Error('谷歌通道没有返回译文');
+                    }
+                    var out = '';
+                    for (var i = 0; i < segments.length; i++) {
+                        var piece = segments[i] && segments[i][0];
+                        if (typeof piece === 'string') { out += piece; }
+                    }
+                    if (!out) { throw new Error('谷歌通道没有返回译文'); }
+                    return out;
+                });
+        }
+
+        function googleFreeBatch(texts, source, target) {
+            var out = new Array(texts.length);
+            var next = 0;
+            var failed = 0;
+            var firstError = null;
+            function worker() {
+                if (next >= texts.length) { return Promise.resolve(); }
+                var index = next++;
+                return gtxOne(texts[index], source, target).then(function (piece) {
+                    out[index] = piece;
+                    return worker();
+                }, function (error) {
+                    failed++;
+                    if (!firstError) { firstError = error; }
+                    out[index] = texts[index];
+                    return worker();
+                });
+            }
+            var workers = [];
+            var width = Math.min(GTX_CONCURRENCY, texts.length);
+            for (var i = 0; i < width; i++) { workers.push(worker()); }
+            return Promise.all(workers).then(function () {
+                if (texts.length && failed === texts.length) { throw firstError; }
+                if (failed) {
+                    note('TRANSLATE', failed + ' of ' + texts.length
+                        + ' line(s) kept the original text (谷歌通道)');
+                }
+                return out;
+            });
+        }
+
         function azureBatch(texts, source, target, config) {
             var url = 'https://api.cognitive.microsofttranslator.com/translate'
                 + '?api-version=3.0&to=' + encodeURIComponent(target);
@@ -7511,6 +7687,9 @@ enum SitePatch {
         function engineBatch(texts, source, target, config) {
             var engine = config.engine || 'apple';
             if (engine === 'free') { return freeBatch(texts, source, target); }
+            if (engine === 'googlefree') {
+                return googleFreeBatch(texts, source, target);
+            }
             if (engine === 'azure') { return azureBatch(texts, source, target, config); }
             if (engine === 'google') { return googleBatch(texts, source, target, config); }
             if (engine === 'deepl') { return deeplBatch(texts, source, target, config); }
@@ -8643,7 +8822,7 @@ enum SitePatch {
         // settles it instead of guessing a second time.
         var DELETE_CALLS = [
             { how: 'post', target: '/', body: 'ajax=delcomment&cid=' },
-            { how: 'post', target: '/', body: 'ajax=deletecomment&cid=' },
+            { how: 'post', target: '/', body: 'ajax=comment&sub=delcomment&cid=' },
             { how: 'get', target: '/mobile/comment.php?act=delcomment&cid=' }
         ];
 
@@ -8713,9 +8892,21 @@ enum SitePatch {
             var tried = [];
             var next = function () {
                 if (index >= DELETE_CALLS.length) {
-                    note('COMMENT', 'every candidate endpoint refused the delete of '
+                    note('COMMENT', 'every candidate endpoint answered nothing for comment '
                         + comment.id + ': ' + tried.join(' | '));
-                    hint('删除失败：站点没有接受这个请求（详情见诊断日志）');
+                    // The site's own client has no delete-comment call at all: the
+                    // complete `ajax=` list in its bundles is
+                    // addbookmark/cboximg/faction/followbook/getbuyhistory/
+                    // getchapterlist/getfollowing/getinv/getlistfaction/getnotify/
+                    // like/listsavedhistory/loadhistory/login/logout/online/
+                    // postcomment/querylikestatus/readchapter/register/replycomment/
+                    // reportappscript/reportscripterror/savehistory/topic/trans/
+                    // unlike/verifycaptcha -- and no delete anywhere. The button is
+                    // dead on the site side too, so the honest answer is that, not
+                    // another guess.
+                    note('COMMENT', 'the site has no delete-comment endpoint: its own client'
+                        + ' never calls one, and every shape tried answers an empty body');
+                    hint('删除失败：站点没有删除评论的接口（不是 App 的问题）');
                     return;
                 }
                 var step = DELETE_CALLS[index++];
@@ -8723,7 +8914,9 @@ enum SitePatch {
                 note('COMMENT', 'trying ' + label + ' for comment ' + comment.id);
                 attemptDelete(step, comment.id).then(function (answer) {
                     var ok = readsAsSuccess(answer);
-                    tried.push(label + ' -> ' + (ok ? 'success' : String(answer).slice(0, 40)));
+                    var seen = String(answer === null || answer === undefined ? '' : answer);
+                    tried.push(label + ' -> ' + (ok ? 'success'
+                        : (seen ? seen.slice(0, 40) : 'empty')));
                     if (!ok) { next(); return; }
                     note('COMMENT', 'comment ' + comment.id + ' deleted by ' + label);
                     if (comment.block && comment.block.parentNode) {
@@ -8775,6 +8968,111 @@ enum SitePatch {
             note('COMMENT', 'delete tapped on comment ' + String(comment.id));
             askDeleteComment(comment);
         }, true);
+
+        // ---- popups: the faction window's own text --------------------------
+        //
+        // 社区 → 势力 translates the list, but the window that opens on a row
+        // prints the description the server sent (app_v2.html:4907) plus the
+        // hardcoded labels "Cấp:" / "Nhân số:" -- none of which goes through the
+        // list's translation, so the reader taps a translated row and gets a
+        // Vietnamese window (2026-10-04 report: "势力中可以正常翻译，但是弹出的申请说明
+        // 没有翻译"). With auto translate on, any text node in a popup body that
+        // still carries a Vietnamese-only letter goes to the engine as well.
+        var VI_ONLY = 'ăâđêôơưĂÂĐÊÔƠƯ'
+            + 'áàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ';
+
+        function hasVietnamese(text) {
+            for (var i = 0; i < text.length; i++) {
+                if (VI_ONLY.indexOf(text.charAt(i)) >= 0) { return true; }
+            }
+            return false;
+        }
+
+        function popupTargets(body) {
+            var out = [];
+            var walk = function (node) {
+                var children = node.childNodes || [];
+                for (var i = 0; i < children.length; i++) {
+                    var child = children[i];
+                    if (child.nodeType === 1) {
+                        if (child.getAttribute
+                            && child.getAttribute('stv-orig') !== undefined
+                            && child.getAttribute('stv-orig') !== null) { continue; }
+                        walk(child);
+                        continue;
+                    }
+                    if (child.nodeType !== 3 || child.__stvPopupDone) { continue; }
+                    var text = String(child.nodeValue || '').trim();
+                    if (text.length < 5 || !hasVietnamese(text)) { continue; }
+                    out.push({ node: child, text: text });
+                }
+            };
+            walk(body);
+            return out;
+        }
+
+        function runPopupBody(body, config) {
+            var targets = popupTargets(body);
+            if (!targets.length) { return; }
+            var texts = [];
+            for (var i = 0; i < targets.length; i++) {
+                // Marked before the request, so a second sweep of the same popup
+                // (the site re-renders it on every open) does not re-send them.
+                targets[i].node.__stvPopupDone = true;
+                texts.push(targets[i].text);
+            }
+            runTranslate(texts, config.readSource, config.readTarget, config)
+                .then(function (out) {
+                    var done = 0;
+                    for (var j = 0; j < targets.length; j++) {
+                        var piece = out[j];
+                        if (typeof piece !== 'string' || !piece
+                            || piece === targets[j].text) { continue; }
+                        targets[j].node.nodeValue = piece;
+                        done++;
+                    }
+                    note('TRANSLATE', 'popup: translated ' + done + ' of ' + targets.length
+                        + ' line(s) with ' + config.engine);
+                }, function (error) {
+                    fail(error);
+                });
+        }
+
+        function autoTranslatePopup(popup) {
+            if (!popup || !popup.querySelector) { return; }
+            loadSettings().then(function (config) {
+                if (!config.auto) { return; }
+                var bodies = qq(popup, '.popupedit_body');
+                var yesno = q(popup, '.popupyesno_text');
+                if (yesno) { bodies.push(yesno); }
+                for (var i = 0; i < bodies.length; i++) {
+                    runPopupBody(bodies[i], config);
+                }
+            });
+        }
+
+        // app.context.showPopup (app.v2.js:2291) is the single funnel for the
+        // site's own windows; app.context.yesno builds its own, but its text is a
+        // dictionary entry and the overlay already rewrites it.
+        function hookPopup() {
+            var app = window.app;
+            var ctx = app && app.context;
+            if (!ctx || typeof ctx.showPopup !== 'function') { return false; }
+            if (ctx.__stvPopupHooked) { return true; }
+            ctx.__stvPopupHooked = true;
+            var original = ctx.showPopup;
+            ctx.showPopup = function () {
+                var popup = original.apply(this, arguments);
+                try {
+                    autoTranslatePopup(popup);
+                } catch (error) {
+                    note('ERR', 'popup translate hook: ' + messageOf(error));
+                }
+                return popup;
+            };
+            note('TRANSLATE', 'popup bodies are translated when auto translate is on');
+            return true;
+        }
 
         // ---- the Cbox frame bridge ------------------------------------------
         //
@@ -8853,8 +9151,13 @@ enum SitePatch {
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
-            var ready = hookPushPage() && hookCommentEmbed();
-            if (ready || attempts > 2500) { clearInterval(timer); }
+            // Called unconditionally: `a && b && c` short-circuits, and a hook
+            // whose subject is missing (app.comment on a page that never opened
+            // one) would then keep the later hooks from ever installing.
+            var page = hookPushPage();
+            var embed = hookCommentEmbed();
+            var popup = hookPopup();
+            if ((page && embed && popup) || attempts > 2500) { clearInterval(timer); }
         }, 20);
     })();
     """
@@ -9246,8 +9549,133 @@ enum SitePatch {
             return true;
         }
 
+        // ---- the site's own translator, which every comic source runs through ----
+        //
+        // Each provider's getComicList ends in `translateObject(list)`
+        // (app.v2.js:8780). That helper walks the whole object, joins EVERY leaf
+        // -- `url` and `thumb` included -- into one string, posts it to the site's
+        // `sajax=trans`, splits the answer on the same separator and reassigns the
+        // pieces with shift(). Two ways that loses the data:
+        //
+        //   * a piece count that does not match (the translator merges or drops
+        //     something) shifts every later value, so the tail fields come back
+        //     undefined -- `d[j].url` undefined is exactly the
+        //     "unhandledrejection getComicProvider ... 1932:20" in the 2026-10-04
+        //     device log (that line is `.replace` on a non-string);
+        //   * `translateWithQt` is a bare XMLHttpRequest with NO error handler, so
+        //     a request that never answers leaves the promise pending for ever and
+        //     the list never renders -- the preloader just spins, which is what
+        //     "所有的来源我都试了，没显示内容" looks like.
+        //
+        // The repair keeps the site's translation where it works and never lets it
+        // touch a URL or a cover, never shifts the values, and gives up after
+        // TRANSLATE_OBJECT_TIMEOUT_MS instead of hanging.
+        var TRANSLATE_OBJECT_TIMEOUT_MS = 6000;
+        var OBJ_SEP = '=||=';
+        var NOT_TRANSLATED = ['url', 'thumb', 'avatar', 'icon', 'host', 'id',
+            'bid', 'comic_id', 'languageHint', 'transModeHint'];
+
+        function looksLikeUrl(value) {
+            if (typeof value !== 'string') { return true; }
+            if (value.indexOf('http://') === 0 || value.indexOf('https://') === 0) {
+                return true;
+            }
+            return value.indexOf('/') === 0 && value.length > 1;
+        }
+
+        function safeTranslateObject(obj) {
+            if (!obj || typeof obj !== 'object') { return Promise.resolve(obj); }
+            var holders = [];
+            var values = [];
+            var collect = function (node) {
+                for (var key in node) {
+                    var value = node[key];
+                    if (typeof value === 'function') { continue; }
+                    if (value && typeof value === 'object') { collect(value); continue; }
+                    if (NOT_TRANSLATED.indexOf(key) >= 0) { continue; }
+                    if (looksLikeUrl(value)) { continue; }
+                    holders.push({ node: node, key: key });
+                    values.push(value);
+                }
+            };
+            collect(obj);
+            if (!values.length) { return Promise.resolve(obj); }
+            var translator = window.translateWithQt;
+            if (typeof translator !== 'function') { return Promise.resolve(obj); }
+
+            var settled = false;
+            var giveUp = new Promise(function (resolve) {
+                setTimeout(function () {
+                    if (settled) { return; }
+                    settled = true;
+                    note('COMIC', 'the site translator did not answer in '
+                        + TRANSLATE_OBJECT_TIMEOUT_MS + 'ms; keeping the source names');
+                    resolve(obj);
+                }, TRANSLATE_OBJECT_TIMEOUT_MS);
+            });
+            var attempt = Promise.resolve()
+                .then(function () { return translator(values.join(OBJ_SEP)); })
+                .then(function (translated) {
+                    if (settled) { return obj; }
+                    settled = true;
+                    if (typeof translated !== 'string') { return obj; }
+                    var pieces = translated.split(OBJ_SEP);
+                    if (pieces.length !== values.length) {
+                        note('COMIC', 'the site translator answered ' + pieces.length
+                            + ' piece(s) for ' + values.length + ' value(s); keeping the'
+                            + ' source names instead of shifting them');
+                        return obj;
+                    }
+                    for (var i = 0; i < holders.length; i++) {
+                        holders[i].node[holders[i].key] = pieces[i];
+                    }
+                    return obj;
+                }, function (error) {
+                    if (settled) { return obj; }
+                    settled = true;
+                    note('ERR', 'the site translator failed: ' + messageOf(error));
+                    return obj;
+                });
+            return Promise.race([attempt, giveUp]);
+        }
+
+        function patchTranslateObject() {
+            var current = window.translateObject;
+            if (current === safeTranslateObject) { return true; }
+            if (typeof current !== 'function') { return false; }
+            window.translateObject = safeTranslateObject;
+            note('PATCH', 'the comic sources translator can no longer lose the data');
+            return true;
+        }
+
+        // getComicProvider (comicprovider.js:1925) ends with
+        // `domain.replace("www.","")` -- unguarded, so any non-string argument
+        // throws. That is the 1932:20 rejection in the 2026-10-04 log.
+        function patchGetComicProvider() {
+            var original = window.getComicProvider;
+            if (typeof original !== 'function') { return false; }
+            if (original.__stvSafeArgument) { return true; }
+            var safe = function (domain) {
+                var value = domain;
+                if (value && typeof value === 'object') { value = value.url; }
+                if (typeof value !== 'string' || !value) {
+                    note('ERR', 'getComicProvider was called with ' + String(value)
+                        + '; the comic source cannot be resolved from that');
+                    return null;
+                }
+                return original.call(this, value);
+            };
+            safe.__stvSafeArgument = true;
+            window.getComicProvider = safe;
+            note('PATCH', 'getComicProvider no longer throws on a bad argument');
+            return true;
+        }
+
         function adopt() {
-            return wrap(window.AutoHttp);
+            var wrapped = wrap(window.AutoHttp);
+            var translator = patchTranslateObject();
+            var provider = patchGetComicProvider();
+            return wrapped && translator && provider;
         }
 
         // app.v2.comicprovider.js is loaded on demand -- the comic browser is the

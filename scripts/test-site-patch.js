@@ -6378,24 +6378,27 @@ async function testCommentDelete() {
 
   shown[0].action.stvdelok({ parentNode: { removeChild() {} } });
   await tick(120);
-  check('the ladder tries the site comment API first, then its delete variant',
+  check('the ladder tries the site comment API first, then its controller shape',
     posted.length === 2
       && posted[0].body === 'ajax=delcomment&cid=55'
-      && posted[1].body === 'ajax=deletecomment&cid=55',
+      && posted[1].body === 'ajax=comment&sub=delcomment&cid=55',
     JSON.stringify(posted));
   check('the last candidate is the mobile comment endpoint',
     fetched.length === 1
       && fetched[0] === '/mobile/comment.php?act=delcomment&cid=55',
     JSON.stringify(fetched));
-  check('every refusal is written to the panel',
+  check('the empty answers are written to the panel as empty',
     String(sandbox.window.__stvDiag.text() || '')
-      .indexOf('every candidate endpoint refused the delete of 55') >= 0,
+      .indexOf('every candidate endpoint answered nothing for comment 55') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-320));
+  check('the panel says the site itself has no delete-comment endpoint',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the site has no delete-comment endpoint') >= 0);
   check('a failed delete leaves the comment in place',
     fixture.view.querySelectorAll('[view=commentblock]').length === 1);
-  check('the reader is told the delete failed',
+  check('the reader is told the site has no delete endpoint',
     sandbox.document.body.querySelectorAll('[data-stvtranslate=hint]')
-      .some((node) => node.textContent.indexOf('删除失败') >= 0),
+      .some((node) => node.textContent.indexOf('站点没有删除评论的接口') >= 0),
     String(sandbox.document.body.querySelectorAll('[data-stvtranslate=hint]')
       .map((node) => node.textContent).join(' | ')));
 
@@ -6499,6 +6502,177 @@ async function testComicGate() {
   check('a source that is not challenged is passed through untouched',
     calls.length === 4 && !!plain && Array.isArray(plain.items),
     JSON.stringify(plain));
+
+  // ---- the site's own translator, which every comic source runs through -----
+  // translateObject (app.v2.js:8780) joins every leaf -- urls included -- into
+  // one string and reassigns the pieces with shift(), and translateWithQt has no
+  // error handler at all. Either way the provider's rows are lost.
+  const seen = [];
+  sandbox.window.translateWithQt = (text) => {
+    seen.push(text);
+    return Promise.resolve('【译】' + text.split('=||=').join('=||=【译】'));
+  };
+  const siteTranslator = async (obj) => obj;
+  sandbox.window.translateObject = siteTranslator;
+  await tick(200);
+  check('the site translator is replaced once it exists',
+    sandbox.window.translateObject !== siteTranslator);
+
+  const rows = [{
+    url: 'https://www.baozimh.com/comic/abc',
+    name: 'Truyện một',
+    thumb: 'https://static-tw.baozimh.com/cover/abc.jpg?w=285',
+  }];
+  const translated = await sandbox.window.translateObject(rows);
+  check('the urls and covers are never sent to the translator',
+    seen.length === 1 && seen[0] === 'Truyện một', JSON.stringify(seen));
+  check('a translated row keeps its url and cover',
+    translated[0].url === rows[0].url && translated[0].thumb === rows[0].thumb,
+    JSON.stringify(translated[0]));
+  check('the name is the one value that changes',
+    translated[0].name === '【译】Truyện một', translated[0].name);
+
+  // A piece count that does not match must keep the originals, not shift them.
+  seen.length = 0;
+  sandbox.window.translateWithQt = () => Promise.resolve('only-one-piece');
+  const two = [{ name: 'Một', author: 'Hai' }];
+  const kept = await sandbox.window.translateObject(two);
+  check('a mismatched piece count keeps every original value',
+    kept[0].name === 'Một' && kept[0].author === 'Hai', JSON.stringify(kept[0]));
+  check('the mismatch is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('keeping the source names instead of shifting them') >= 0);
+
+  // ...and a translator that never answers must not hang the list for ever.
+  sandbox.window.translateWithQt = () => new Promise(() => {});
+  const hung = [{ name: 'Ba' }];
+  const settled = await Promise.race([
+    sandbox.window.translateObject(hung).then(() => 'settled'),
+    tick(9000).then(() => 'hung'),
+  ]);
+  check('a translator that never answers gives up instead of hanging',
+    settled === 'settled' && hung[0].name === 'Ba', settled);
+
+  // getComicProvider (comicprovider.js:1925) ends with an unguarded
+  // `domain.replace`, which is the 1932:20 rejection in the device log.
+  sandbox.window.getComicProvider = (domain) => {
+    // The site's own unguarded last line (comicprovider.js:1932).
+    domain = domain.replace('www.', '');
+    return domain.indexOf('baozimh.com') >= 0 ? { provider: 'baozimh' } : null;
+  };
+  await tick(200);
+  check('getComicProvider is wrapped once it exists',
+    sandbox.window.getComicProvider.__stvSafeArgument === true);
+  check('a non-string argument no longer throws',
+    sandbox.window.getComicProvider(undefined) === null
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('getComicProvider was called with undefined') >= 0);
+  check('a real url still resolves through the site implementation',
+    !!sandbox.window.getComicProvider('https://www.baozimh.com/comic/abc'));
+}
+
+async function testNotifyBookTitles() {
+  console.log('the notification book title is looked up in Chinese');
+  const page = makeContainer('div', '');
+  const bar = makeContainer('div', 'titlebar');
+  bar.appendChild(makeContainer('div', 'rctx'));
+  const box = makeContainer('div', 'notifybox');
+  page.appendChild(bar);
+  page.appendChild(box);
+
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    appLanguage: 'zh',
+    pages: { pagenotify: page },
+    bookInfoResponses: {
+      '/mobile/bookinfo.php?hid=1044096078&host=qidian': {
+        book: { name: '这些仙子全都不正常！' },
+      },
+    },
+  });
+  app.fun.showNotify = function () { return null; };
+  app.topPage = () => page;
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+  check('the notification page hook is installed',
+    app.fun.__stvNotifyTitlesPatched === true
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('notification book titles are looked up in Chinese') >= 0);
+
+  app.fun.showNotify();
+  await tick(40);
+  const item = makeContainer('div', 'notify');
+  const content = makeContainer('div', 'content',
+    '《 Những Thứ Này Tiên Tử Toàn Bộ Đều Không Bình Thường!》来自qidian有1个新章节.');
+  item.appendChild(content);
+  item.data = { href: '/truyen/qidian/1/1044096078/' };
+  box.appendChild(item);
+  sandbox.__flushObservers();
+  await tick(150);
+  check('the Vietnamese title inside 《》 becomes the book name in Chinese',
+    content.childNodes[0].nodeValue
+      === '《这些仙子全都不正常！》来自qidian有1个新章节.',
+    JSON.stringify(content.childNodes[0].nodeValue));
+  check('the lookup is reported in the panel',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('a notification title became 这些仙子全都不正常！') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+  check('a notification with no book link is left alone',
+    (() => {
+      const other = makeContainer('div', 'notify');
+      const body = makeContainer('div', 'content', '《 Một truyện 》来自qidian有1个新章节.');
+      other.appendChild(body);
+      other.data = { href: '/user/306185/' };
+      box.appendChild(other);
+      sandbox.__flushObservers();
+      return body.childNodes[0].nodeValue === '《 Một truyện 》来自qidian有1个新章节.';
+    })(),
+    'the user link is not a book');
+}
+
+async function testPopupTranslate() {
+  console.log('popup bodies are translated when auto translate is on');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { appLanguage: 'zh', displayType: 'auto' });
+  sandbox.localStorage.setItem('stv.translate.settings', JSON.stringify({
+    engine: 'apple',
+    apiKey: '',
+    region: '',
+    endpoint: '',
+    model: '',
+    readSource: 'vi',
+    readTarget: 'zh-Hans',
+    writeTarget: 'vi',
+    auto: true,
+  }));
+  // 势力's own window: the description the server sent plus the two labels the
+  // template hardcodes (app_v2.html:4907).
+  const popup = makeContainer('div', 'popupedit');
+  const body = makeContainer('div', 'popupedit_body');
+  const desc = makeContainer('div', '', 'Môn phái mạnh nhất');
+  body.appendChild(desc);
+  body.appendChild(makeContainer('p', '', 'Cấp: 3'));
+  popup.appendChild(body);
+  app.context = { showPopup: () => popup };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+  check('the popup hook is installed',
+    app.context.__stvPopupHooked === true
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('popup bodies are translated when auto translate is on') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+
+  app.context.showPopup({ title: 'Thiên Long Môn', body: '', button: '' });
+  await tick(200);
+  check('the popup body goes to the engine',
+    desc.textContent === '【系统】Môn phái mạnh nhất', desc.textContent);
+  check('the popup translation is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('popup: translated 2 of 2 line(s)') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
 }
 
 async function testCommentTranslate() {
@@ -6743,6 +6917,21 @@ async function testCommentTranslateProviders() {
         && headers['Ocp-Apim-Subscription-Region'] === 'eastasia',
       answer: (texts) => ({ status: 200, data: texts.map((text) => ({ translations: [{ text: '【Azure】' + text }] })) }),
       marker: '【Azure】',
+    },
+    {
+      engine: 'googlefree',
+      extra: {},
+      texts: (payload) => [decodeURIComponent(String(payload.url).split('&q=')[1])],
+      // Chrome's own endpoint, no key: newsnook-ios uses the same one for its
+      // keyless Google channel. zh-Hans is BCP-47; gtx wants zh-CN.
+      url: 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=vi'
+        + '&tl=zh-CN&q=' + encodeURIComponent('Một bình luận'),
+      headers: (headers) => headers.Accept === 'application/json',
+      answer: (texts) => ({
+        status: 200,
+        data: [[['【谷歌免费】' + texts[0], texts[0], null, null, 10]], null, 'vi'],
+      }),
+      marker: '【谷歌免费】',
     },
     {
       engine: 'google',
@@ -7723,6 +7912,8 @@ await testCboxFrame();
 await testFactionBoardTranslate();
 await testCommentDelete();
 await testComicGate();
+await testNotifyBookTitles();
+await testPopupTranslate();
   await testTranslateKeyStorage();
   await testAssetCacheStabiliser();
   await testAssetMirror();

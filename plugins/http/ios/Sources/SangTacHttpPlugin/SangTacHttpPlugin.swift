@@ -329,6 +329,10 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
     /// panel can name them; they are not trusted with cookies (they have none).
     private static let knownApiHosts = [
         "translation.googleapis.com",
+        // The keyless Google channel (`client=gtx`) lives on a different host from
+        // the official API, so the panel would otherwise call it a foreign host on
+        // every request.
+        "translate.googleapis.com",
         "api.cognitive.microsofttranslator.com",
         "api-free.deepl.com",
         "api.deepl.com",

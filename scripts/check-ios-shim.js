@@ -209,6 +209,20 @@ const REQUIRED_MARKERS = [
   // wrapper 漫画 renders its tabs and no rows at all.
   'window.__stvComicGateInstalled',
   'the comic source asked for a bot check',
+  // The keyless Google channel (newsnook-ios uses the same endpoint), and the
+  // two comic repairs: the site's own translator used to mangle every provider's
+  // rows (url included) or hang for ever, and getComicProvider threw on a
+  // non-string argument.
+  'translate_a/single',
+  'the comic sources translator can no longer lose the data',
+  'getComicProvider no longer throws on a bad argument',
+  // The notification line's book name is the server's Vietnamese one; the
+  // Chinese name comes from the book the item links to.
+  'notification book titles are looked up in Chinese',
+  // 势力 translates its list but the window it opens prints the server's own
+  // description plus the template's hardcoded labels.
+  'popup bodies are translated when auto translate is on',
+  '站点没有删除评论的接口',
 ];
 
 function fail(message) {

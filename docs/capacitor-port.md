@@ -3754,4 +3754,129 @@ frame 自己 hello / 自己建按钮 / 最新优先 / 回写文本 / 已翻不�
   主宰 的读音是 `Chủ Tể`，服务器用的是越南语意译 `chúa tể`。
 - 真机复测：用户页「修炼」右边的名号是否整条中文；若仍是越南语，看诊断日志里的 `[I18N]` 行。
 
+### 6.38 第三十六轮（真机反馈五条：势力弹窗、免密钥谷歌通道、漫画还是空的、通知书名、删除评论）
+
+用户给了一份 431 行的真机日志（10:33:56–10:38:58）和五条问题。上一轮的两处先在这里对账：
+**Cbox 翻译确认生效**（`[TRANSLATE] the Cbox frame asked for the translator` → `Cbox: 55 line(s)
+answered` → `[CBOX] 55 line(s) translated`），**「我的页面」空状态也生效**（`staticpost.php
+answered with an empty body; showing the empty state`）。
+
+#### (1) 势力：列表翻了，点开的那扇窗没翻
+
+`app.fun.showListFaction`（app_v2.html:4891）把列表交给翻译层，但点一行打开的是
+`app.context.menu.factionInfo`（app.v2.js:3002），它的正文由调用方拼：
+
+```
+<div>${d.description}</div><p>Cấp: ${d.level}</p><p>Nhân số: ${d.member}</p>
+```
+
+`Cấp:` / `Nhân số:` 是模板里写死的越南语，`d.description` 是服务器发来的**数据**——两者都不在
+`textTargets()` 覆盖的三类里（评论 / 帖子 / 势力行），所以那一页整段保持越南语。
+
+修法两半：
+
+| 半 | 改动 |
+| --- | --- |
+| 模板里的标签 | `data/site-i18n.json` 加两条片段：`Cấp: ` → `等级：`、`Nhân số: ` → `人数：`；另加一条精确词条 `Gửi đơn xin thành công.` → `申请已发送成功。`（申请成功后服务器回的那句） |
+| 数据本身 | `commentTranslate` 新增 `hookPopup()`：包 `app.context.showPopup`（app.v2.js:2291，站点所有自绘窗口的唯一入口），自动翻译开着时把 `.popupedit_body` / `.popupyesno_text` 里**仍含越南语独有字母**的文本节点交给引擎，和势力列表走同一个引擎与设置 |
+
+`.popupyesno_text` 里那句「Xin vào thế lực này? …」本来就在词典里（§6.36 之前就收了），
+所以「申请说明」这一条的实际缺口是**弹窗正文里的数据**与两个标签。
+
+#### (2) 翻译通道加「免密钥谷歌」
+
+参照 `newsnook-ios/src/features/translation/freeProviders.ts`：Chrome 内置翻译用的
+`https://translate.googleapis.com/translate_a/single`（`client=gtx`，无需 Key）。
+
+- 新引擎代码 `googlefree`，设置里的名字是「免密钥联网（谷歌翻译通道）」，排在微软免密钥通道后面。
+- 响应是 `[[["译文","原文",null,null,10],…],null,"vi"]`：按顺序把每段的第 0 项拼起来（音译/词典段跳过）。
+- gtx 只认自己的语言代码，所以 `zh-Hans` → `zh-CN`、`zh-Hant` → `zh-TW`（`gtxLanguage()`）。
+- 这个端点一次只稳一段，所以它是唯一**并发**的引擎：每条文本一个请求，并发 3（newsnook 对
+  「按 IP 限速的免费通道」用的也是 3）。单条失败保留原文，全部失败才算失败。
+- 请求走原生 Http 插件（页面级 fetch 到那个域会被 CORS 挡），并把
+  `translate.googleapis.com` 加进 `SangTacHttpPlugin.knownApiHosts`，否则面板会把它当外部主机
+  逐条报「no cookies sent」。
+
+#### (3) 漫画还是空的：站点自己的翻译器把数据弄坏了
+
+这一轮日志把范围钉死了——**不是网络**：YemanComic（55KB HTML）、KuaikanManhua（47KB JSON）、
+Qidian（62KB JSON）全都 200。真正坏在两处：
+
+1. `translateObject`（app.v2.js:8780）把**整棵对象的所有叶子**（`url`、`thumb` 也在内）拼成
+   一个字符串，发给站点的 `sajax=trans`，再按同一个分隔符切开、用 `shift()` 逐字段写回。
+   段数一旦对不上（翻译器合并/丢弃），后面的字段整体错位，尾部字段变成 `undefined`——日志里
+   `unhandledrejection getComicProvider@…:1932:20` 就是 `domain.replace` 收到了非字符串
+   （`openComicByUrl(d[j].url)` 拿到 `undefined`）。
+2. `translateWithQt` 用的是**裸 XMLHttpRequest，没有 onerror**：请求不回来，Promise 永不 settle，
+   于是每个来源的 `getComicList()` 都悬着，列表连渲染都到不了——这正是「所有的来源我都试了，
+   没显示内容」。
+
+修法（`comicGate` 块扩写）：把 `window.translateObject` 换成 `safeTranslateObject`，
+`window.getComicProvider` 换成会先做类型检查的版本。
+
+| 规则 | 为什么 |
+| --- | --- |
+| `url` / `thumb` / `avatar` / `icon` / `host` / `id` / `bid` / `comic_id` 以及任何 `http(s)://` 或 `/` 开头的值都不送翻译 | 站点的原实现会把封面和地址也送去翻译 |
+| 段数与送出的值数不一致就**整体放弃**、保留原文 | 错位比不翻更糟：地址没了、书名串行 |
+| 6 秒不回来就放弃并记一行日志 | 原实现会永久挂住，列表永远不出 |
+| `getComicProvider` 收到非字符串时返回 null 并记一行 | 原来直接 `TypeError`，漫画详情页白屏 |
+
+#### (4) 通知里的书名
+
+通知正文是站点自己的模板「《{0}》来自{1}有{2}个新章节」，`{0}` 是书的**越南语**名
+（`/mobile/jsonify.php?ajax=getnotify` 只发这个）。条目里带着书的链接（`href`，就是它点击时
+交给 `app.url.handler` 的那个值），所以中文名可以从书本身取：`pageRepair` 新增
+`patchNotifyTitles()`，包 `app.fun.showNotify`，扫描 `.notify`，从 `href`
+（`/truyen/<host>/<n>/<id>/`）取出 host 与 id，用站点自己带缓存的
+`app.net.getCacheLater('/mobile/bookinfo.php?hid=<id>&host=<host>')` 取 `book.name`（中文），
+把《》里的越南语标题替换掉。同一本书只查一次（`bookNames`）。
+
+#### (5) 删除评论：站点侧根本没有这个接口
+
+上一轮的阶梯三级**全部返回空 body**（日志 10:34:32）。这一轮把站点的接口面查全了：
+
+- 站点客户端用到的 `ajax=` 一共 29 个（addbookmark / cboximg / faction / followbook /
+  getbuyhistory / getchapterlist / getfollowing / getinv / getlistfaction / getnotify / like /
+  listsavedhistory / loadhistory / login / logout / online / postcomment / querylikestatus /
+  readchapter / register / replycomment / reportappscript / reportscripterror / savehistory /
+  topic / trans / unlike / verifycaptcha），**没有任何删除评论的调用**；
+- `sajax=` 只有 7 个，也没有；
+- 用云端抓取对比：已知处理器（`?ajax=postcomment`）在未登录时回 `login`，而
+  `delcomment` / `deletecomment` / `comment&sub=delcomment` / `comment&sub=delete` /
+  `delcmt` / `comment.php?act=deletecomment` **全部回 0 字节**——和完全不存在的处理器一样。
+
+所以那个按钮在站点侧从来就是死的（模板渲染了 `.cmtdel`，`app.comment.applyEvent` 只绑
+`.avatar` / `.name` / `.cmtresp`）。修法改成**如实报告**：阶梯保留三种最可能的形态，全部返回空时
+提示「删除失败：站点没有删除评论的接口（不是 App 的问题）」，并把结论写进面板，不再让读者
+反复点一个不可能生效的按钮。
+
+#### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **775 条断言**全过（上一轮 753，新增 22） |
+| `scripts/check-ios-shim.js` | 26 块 / 538646 字节 / 95 标记 |
+| `scripts/gen-site-i18n.js --check` | **460 标签** / **72 片段** |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：免密钥谷歌通道（一个请求打到 `translate_a/single`、`zh-Hans`→`zh-CN`、无 Key 头、
+译文落回评论正文）、弹窗（钩子装上、正文进引擎、日志行）、通知书名（钩子装上、`href` 解析、
+《》内替换成中文、非书链接不动）、漫画（`translateObject` 被替换、地址与封面不送翻译、
+段数不符保留原文、永不回应的翻译器 6 秒放弃、`getComicProvider` 收到非字符串不再抛且原样可用）、
+删除评论（新的候选顺序、空回答被记为 empty、结论行、读者提示）。
+
+#### 未证实项
+
+- **漫画到底修好没有**：`translateObject` 与 `getComicProvider` 两处是日志直接指认的缺陷，
+  但修好之后列表能不能出、详情页能不能开，只能真机验。下一份日志里看有没有
+  `[COMIC] the site translator answered … keeping the source names`（说明段数不符被兜住）
+  或 `did not answer in 6000ms`（说明 `sajax=trans` 本身不通）。
+- **免密钥谷歌通道的可用性**：`translate_a/single` 是厂商给自家浏览器用的端点，没有 SLA，
+  可能限速（429）或在部分网络不可达。限速时按 newsnook 的说法提示换用自备 Key。
+- **弹窗自动翻译的边界**：现在只处理 `.popupedit_body` 与 `.popupyesno_text`，且要求文本里
+  至少有一个越南语独有字母；纯 ASCII 的越南语（无音调符号）不会被送出去。
+- **删除评论仍然删不掉**：本轮只是把「删不掉」说清楚。如果站点之后加了接口，改
+  `DELETE_CALLS` 一条即可。
+- 五条都要真机复测。
+
 
