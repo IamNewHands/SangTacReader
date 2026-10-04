@@ -759,12 +759,12 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         guard let data = text.data(using: .utf8) else { return }
         let manager = FileManager.default
         if !manager.fileExists(atPath: url.path) {
-            manager.createFile(atPath: url.path, contents: nil)
+            _ = manager.createFile(atPath: url.path, contents: nil)
         }
         guard let handle = try? FileHandle(forWritingTo: url) else { return }
         defer { try? handle.close() }
         do {
-            try handle.seekToEnd()
+            _ = try handle.seekToEnd()
             try handle.write(contentsOf: data)
             try handle.synchronize()
         } catch {
@@ -838,11 +838,21 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         let url = diagFileURL()
         diagQueue.async { [weak self] in
-            let result = self?.readDiagFile() ?? ("", 0)
+            // An explicit branch rather than `?? ("", 0)`: the coalescing form
+            // unlabels the tuple, and the labels are what the payload below
+            // reads. (The first CI run of this failed on exactly that:
+            // "value of tuple type '(String, Int)' has no member 'text'".)
+            var text = ""
+            var bytes = 0
+            if let reader = self {
+                let result = reader.readDiagFile()
+                text = result.text
+                bytes = result.bytes
+            }
             DispatchQueue.main.async {
                 call.resolve([
-                    "text": result.text,
-                    "bytes": result.bytes,
+                    "text": text,
+                    "bytes": bytes,
                     "path": url?.path ?? ""
                 ])
             }
