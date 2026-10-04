@@ -6801,7 +6801,11 @@ async function testComicGate() {
     imgs: [],
     lazyImageLoader: {
       cache: {},
-      load(url) { return Promise.resolve('IMAGERAW:' + url); },
+      // A host the reader cannot reach either answers with the url it was given,
+      // which is what the parent's relay does when its own download fails.
+      load(url) {
+        return Promise.resolve(String(url).indexOf('dead.') >= 0 ? url : 'IMAGERAW:' + url);
+      },
       async toRealRawData(imgs) {
         const list = (typeof imgs === 'string' && imgs.charAt(0) === '[')
           ? JSON.parse(imgs) : [imgs];
@@ -6812,6 +6816,14 @@ async function testComicGate() {
           return loaded.join('');
         }
       },
+    },
+    // The site's transImage: what the byte retry re-enters with. A body that is
+    // not IMAGERAW: bytes is what the server answers an empty image to.
+    transImage(url) {
+      frameSent.push({ kind: 'transImage', url });
+      return Promise.resolve(String(url).indexOf('IMAGERAW:') === 0
+        ? { blocks: [], images: ['data:image/jpeg;base64,QUJD'], imageWidth: 800 }
+        : { blocks: [], images: ['data:image/jpeg;base64,'], imageWidth: null });
     },
     loadTranslatedImage(data, order) { frameSent.push({ kind: 'render', data, order }); },
     startTrans() { frameSent.push({ kind: 'start' }); },
@@ -6907,6 +6919,34 @@ async function testComicGate() {
     typeof frame.contentWindow.translator.showError === 'function'
       && (frame.contentWindow.translator.showError(2),
         chapcontent.children.length === 2));
+
+  // A page the server could not fetch but the reader can: the bytes go up
+  // instead of the url, which is the only path left when what is blocked is the
+  // site's own egress rather than the reader's.
+  frame.contentWindow.translator.loadTranslatedImage(
+    { blocks: [], images: ['data:image/jpeg;base64,'], imageWidth: null,
+      base: { url: 'https://mhpic.example/9.jpg' } }, 3);
+  await tick(80);
+  check('an image the server could not fetch is retried with the reader own bytes',
+    frameSent.some((entry) => entry.kind === 'transImage'
+      && entry.url === 'IMAGERAW:https://mhpic.example/9.jpg')
+    && frameSent.some((entry) => entry.kind === 'render' && entry.order === 3),
+    JSON.stringify(frameSent.filter((entry) => entry.order === 3)));
+  check('a retry that worked draws the page instead of a notice',
+    chapcontent.children.length === 2,
+    JSON.stringify(chapcontent.children.map((child) => String(child.textContent))));
+
+  frame.contentWindow.translator.loadTranslatedImage(
+    { blocks: [], images: ['data:image/jpeg;base64,'], imageWidth: null,
+      base: { url: 'https://dead.example/1.jpg' } }, 4);
+  await tick(80);
+  check('a page neither side can fetch names the host instead of a broken picture',
+    String(chapcontent.children[chapcontent.children.length - 1].textContent)
+      .indexOf('dead.example') >= 0,
+    JSON.stringify(chapcontent.children.map((child) => String(child.textContent))));
+  check('a page is only retried once, not in a loop',
+    frameSent.filter((entry) => entry.kind === 'transImage'
+      && entry.url === 'IMAGERAW:https://dead.example/1.jpg').length === 0);
   check('how many images the frame has to translate is reported',
     (frame.contentWindow.translator.imgs = [{ url: 'a' }, { url: 'b' }],
     frame.contentWindow.translator.startTrans(),

@@ -250,6 +250,10 @@ const REQUIRED_MARKERS = [
   'function patchChapterTranslator(',
   'function onChapterFrameMessage(',
   'the chapter frame translator is patched',
+  // When the site's own egress is what is blocked, the reader fetches the page
+  // and hands the bytes over; a page neither side can reach names the host.
+  'function imageHost(',
+  'could not be fetched here either',
   // The comic detail page's own chapter-count row is never filled by the site.
   'function patchComicChapterCount(',
 ];

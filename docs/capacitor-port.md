@@ -4096,5 +4096,66 @@ CLEAR 同时清文件、没有原生 sink 时不丢行）、谷歌通道吞吐�
   实现，真机若出现 `LAZY:` 源才有数据。
 - **yemancomic 源 `comicloader.php` 回 `[]`**：服务端抓不到该章的图列表，客户端无解。
 
+## §6.41 第 39 轮：新日志证明客户端已经通了，剩下的失败在源站
+
+新日志（14:06–14:07）把上一轮的每一处修复都确认了一遍：
+
+| 日志行 | 说明 |
+| --- | --- |
+| `the detail page lists 672 chapter(s)` | 详情页章节计数补丁生效 |
+| `the chapter frame translator is patched` | 帧内翻译器补丁生效 |
+| `the chapter frame has 36 image(s) to translate` | `comicloader.php` 给出了 36 张图（上一轮 `a.send(undefined)`，一张都发不出去） |
+| `at +3000ms: … body=18127B readyState=complete` | 帧真的加载并画完了（旧量测永远 `body=0B`） |
+| `the translator answered no image for block 0..7` | 服务端对每一张都回了 `imageWidth=null` |
+
+也就是说客户端这一侧已经没有断点，剩下的失败在「服务端取图」那一步。
+
+### 为什么这些图取不到
+
+日志里点的是 Qidian（`cartoon.reader.qq.com`）的《斗破苍穹》。服务端给出的 36 个地址都是
+`https://mhpic.cartoon.reader.qq.com/<cmid>/<chid>/<imgid>`，而**这个主机名在三个公共解析器上
+都没有 A 记录**：
+
+| 解析器 | `mhpic.cartoon.reader.qq.com` |
+| --- | --- |
+| AliDNS 223.5.5.5 | NOERROR，0 条回答 |
+| DNSPod doh.pub | NOERROR，0 条回答 |
+| Google dns.google | NOERROR，0 条回答 |
+
+服务端对它报的是 `error:14094410:SSL routines:ssl3_read_bytes:sslv3 alert handshake failure`
+（连上了但对不上 TLS），而客户端连解析都拿不到地址——**这个源现在谁都取不到图**。同一份日志里
+BaoziManhua 仍是 403 bot check（`comicGate` 试过、`did not stick`）。两个源都是源站自身的问题。
+
+### 这一轮补的最后一根杠杆
+
+「服务端出口被挡、读者的网络能通」的情况（国内图床常见）仍然有救，所以加了**按需字节重传**：
+
+| 改动 | 说明 |
+| --- | --- |
+| `loadTranslatedImage` 守卫里的 `retryWithBytes()` | 服务端答 `imageWidth=null` 时先向父窗口要这张图的字节（`app.images.download` 走 App 的 HTTP 插件），拿到就再 POST 一次 `IMAGERAW:<base64>`；成功照常渲染，两边都失败才写提示 |
+| 每张图只重试一次 | `data.__stvBytesTried` 挡住循环 |
+| 提示里点名图源主机 | `frameNotice()` 现在写「图源 xxx 的图片无法访问」，读者能分清是源坏了还是 App 坏了 |
+| `toRealRawData` 仍先送普通 url | 服务端能取到的源不多花一个字节的上传流量 |
+
+### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **834 条断言**全过（上一轮 830，新增 4） |
+| `scripts/check-ios-shim.js` | 26 块 / 597516 字节 / 113 标记 |
+| `scripts/gen-site-i18n.js --check` | 460 标签 / 72 片段 |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：服务端取不到时用读者自己的字节重试并渲染、重试成功不写提示、两边都失败时提示点名
+图源主机、同一张图不会被反复重试。
+
+### 未证实项
+
+- **真机复测**：只有「读者的网络能取、服务端取不到」的源才会因为这次改动出图。
+- **源可用性**：本机确认 Qidian 的图床域名无解析、BaoziManhua 有 bot 网关；Kuaikan / YemanComic
+  的 `comicloader.php` 都回 `[]`（服务端抓不到图列表）。其余源未逐个验证，本机受代理限制
+  （manhwasco / colamanga / baozimh 直连被重置）。
+
+
 
 

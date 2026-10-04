@@ -10453,7 +10453,15 @@ enum SitePatch {
             return data.imageWidth === null || data.imageWidth === undefined;
         }
 
-        function frameNotice(w, order) {
+        function imageHost(url) {
+            var text = String(url || '');
+            var at = text.indexOf('://');
+            if (at < 0) { return ''; }
+            var slash = text.indexOf('/', at + 3);
+            return slash < 0 ? text.slice(at + 3) : text.slice(at + 3, slash);
+        }
+
+        function frameNotice(w, order, data) {
             try {
                 var doc = w.document;
                 var host = doc.getElementById ? doc.getElementById('chapcontent') : null;
@@ -10465,7 +10473,13 @@ enum SitePatch {
                 box.style.padding = '28px 18px';
                 box.style.textAlign = 'center';
                 box.style.color = '#888';
-                box.textContent = '这一页没有取到图片：站点翻译服务没有返回内容。';
+                var source = imageHost(data && data.base && data.base.url);
+                // Naming the host is the difference between "the app is broken"
+                // and "this source is": a page whose image host does not answer
+                // anywhere cannot be fixed from here.
+                box.textContent = source
+                    ? '这一页没有取到图片：图源 ' + source + ' 的图片无法访问。'
+                    : '这一页没有取到图片：站点翻译服务没有返回内容。';
                 host.appendChild(box);
             } catch (error) {
                 note('ERR', 'the chapter frame notice could not be shown: '
@@ -10498,14 +10512,48 @@ enum SitePatch {
 
             var render = translator.loadTranslatedImage;
             if (typeof render === 'function' && !render.__stvGuarded) {
+                // The server fetches the image itself first, so a source it can
+                // reach costs no extra traffic. When it answers without an image
+                // the page asks its OWN network for the bytes and hands them
+                // over -- the only path left when what is blocked is the site's
+                // egress rather than the reader's.
+                var retryWithBytes = function (data, order) {
+                    var url = data && data.base && data.base.url;
+                    if (!url || data.__stvBytesTried) { return false; }
+                    data.__stvBytesTried = true;
+                    loader.load(String(url)).then(function (payload) {
+                        var text = String(payload || '');
+                        if (text.indexOf('IMAGERAW:') !== 0) {
+                            note('COMIC', 'the image at ' + imageHost(url)
+                                + ' could not be fetched here either');
+                            frameNotice(w, order, data);
+                            return null;
+                        }
+                        return translator.transImage(text).then(function (again) {
+                            if (answerHasNoImage(again)) {
+                                note('COMIC', 'the translator answered no image for block '
+                                    + order + ' even from the reader own bytes');
+                                frameNotice(w, order, data);
+                                return null;
+                            }
+                            again.base = data.base;
+                            return render.call(translator, again, order);
+                        });
+                    }, function () {
+                        frameNotice(w, order, data);
+                    });
+                    return true;
+                };
+
                 var safeRender = function (data, order) {
-                    if (answerHasNoImage(data)) {
-                        note('COMIC', 'the translator answered no image for block '
-                            + order + '; showing a notice instead of a broken picture');
-                        frameNotice(w, order);
-                        return null;
+                    if (!answerHasNoImage(data)) {
+                        return render.apply(this, arguments);
                     }
-                    return render.apply(this, arguments);
+                    if (retryWithBytes(data, order)) { return null; }
+                    note('COMIC', 'the translator answered no image for block '
+                        + order + '; showing a notice instead of a broken picture');
+                    frameNotice(w, order, data);
+                    return null;
                 };
                 safeRender.__stvGuarded = true;
                 translator.loadTranslatedImage = safeRender;
@@ -10517,7 +10565,7 @@ enum SitePatch {
             if (typeof translator.showError !== 'function') {
                 translator.showError = function (order) {
                     note('COMIC', 'the translator gave up on block ' + order);
-                    frameNotice(w, order);
+                    frameNotice(w, order, null);
                 };
             }
 
