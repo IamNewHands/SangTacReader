@@ -1698,6 +1698,24 @@ async function testI18nOverlay() {
   sandbox.document.body.appendChild(danhhaoFull);
   const danhhaoLow = makeContainer('div', 'value danhhao', 'Phàm nhân');
   sandbox.document.body.appendChild(danhhaoLow);
+  // 2026-10-04 report: "展示越南语和中文混合，比如Chân Đế三重". The realm table
+  // only had the eight realms the earlier samples turned up; the ladder is longer
+  // (these came from live comment lists, whose items carry `danhhao` too), and a
+  // realm that is still missing must not leave a half-translated row.
+  const danhhaoChande = makeContainer('div', 'value danhhao', 'Chân Đế Tam Trọng');
+  sandbox.document.body.appendChild(danhhaoChande);
+  const danhhaoHuHoang = makeContainer('div', 'value danhhao', 'Hư Hoàng Tứ Trọng');
+  sandbox.document.body.appendChild(danhhaoHuHoang);
+  const danhhaoDocDao = makeContainer('div', 'value danhhao', 'Đọc Đạo Đại Đế Sơ Kỳ');
+  sandbox.document.body.appendChild(danhhaoDocDao);
+  const danhhaoChuaTe = makeContainer('div', 'value danhhao',
+    'Chúa Tể Cửu Thiên Thập Địa Nhất Trọng');
+  sandbox.document.body.appendChild(danhhaoChuaTe);
+  const danhhaoVinhHang = makeContainer('div', 'value danhhao',
+    'Vĩnh Hằng Hỗn Độn Chúa Tể Cửu Trọng');
+  sandbox.document.body.appendChild(danhhaoVinhHang);
+  const danhhaoUnknown = makeContainer('div', 'value danhhao', 'Thiên Đế Tam Trọng');
+  sandbox.document.body.appendChild(danhhaoUnknown);
 
   vm.runInContext(loadBlocks().join('\n'), sandbox);
   await tick(60);
@@ -1727,6 +1745,32 @@ async function testI18nOverlay() {
   check('the base realm is translated',
     danhhaoLow.childNodes[0].nodeValue === '凡人',
     JSON.stringify(danhhaoLow.childNodes[0].nodeValue));
+  check('the realm from the 2026-10-04 report is translated whole',
+    danhhaoChande.childNodes[0].nodeValue === '真帝三重',
+    JSON.stringify(danhhaoChande.childNodes[0].nodeValue));
+  check('虚皇 is translated',
+    danhhaoHuHoang.childNodes[0].nodeValue === '虚皇四重',
+    JSON.stringify(danhhaoHuHoang.childNodes[0].nodeValue));
+  check('读道大帝 is translated',
+    danhhaoDocDao.childNodes[0].nodeValue === '读道大帝初期',
+    JSON.stringify(danhhaoDocDao.childNodes[0].nodeValue));
+  check('the longer 主宰九天十地 wins over 主宰九天',
+    danhhaoChuaTe.childNodes[0].nodeValue === '主宰九天十地一重',
+    JSON.stringify(danhhaoChuaTe.childNodes[0].nodeValue));
+  check('永恒混沌主宰 is translated',
+    danhhaoVinhHang.childNodes[0].nodeValue === '永恒混沌主宰九重',
+    JSON.stringify(danhhaoVinhHang.childNodes[0].nodeValue));
+  check('a realm the table does not know leaves the row whole, never half',
+    danhhaoUnknown.childNodes[0].nodeValue === 'Thiên Đế Tam Trọng',
+    JSON.stringify(danhhaoUnknown.childNodes[0].nodeValue));
+  // The overlay queues the line when the diagnostics block is injected after it
+  // (which is the order this harness loads the Swift files in), so give the
+  // retry its 200ms.
+  await tick(300);
+  check('the unfinished 名号 is named in the panel so it can be added',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('名号没有对应词条，整条保持原文: Thiên Đế Tam Trọng') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
   check('placeholder attribute translated', input.getAttribute('placeholder') === '标题',
     JSON.stringify(input.getAttribute('placeholder')));
   check('chapter title numbering translated', chapterName.textContent === '第1章 Uống thuốc',

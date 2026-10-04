@@ -89,6 +89,11 @@ const REQUIRED_MARKERS = [
   // language is resolved from the site's own "lang" cookie first.
   'function chineseUi(',
   'function currentLanguage(',
+  // The 修炼 value is one datum, so a realm the table does not know must not be
+  // half translated ("Chân Đế三重", 2026-10-04 report): the row is left whole
+  // and the string is logged instead.
+  'function isDanhhaoNode(',
+  '名号没有对应词条',
   // Switching language has to re-render the page from the new cookie, or the
   // strings the overlay already rewrote stay Chinese and the page is left
   // half-translated -- which is the report this round answers.

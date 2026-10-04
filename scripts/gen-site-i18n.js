@@ -263,6 +263,55 @@ ${data.patterns
         return value;
     }
 
+    // Letters that exist only in Vietnamese. A fragment pass that leaves one of
+    // these behind has translated part of the string and left the rest.
+    var VIETNAMESE_ONLY = 'ăâđêôơưĂÂĐÊÔƠƯ'
+        + 'áàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ';
+
+    function hasVietnameseLetter(text) {
+        for (var i = 0; i < text.length; i++) {
+            if (VIETNAMESE_ONLY.indexOf(text.charAt(i)) >= 0) { return true; }
+        }
+        return false;
+    }
+
+    // The 修炼 row (.value.danhhao, page-vip:2750) holds ONE datum: the server's
+    // danh hào, "<realm> <layer>". The table knows every layer and the realms
+    // that have been observed, so a realm it does not know came out half
+    // translated -- "Chân Đế三重" (2026-10-04 report) -- which reads as a broken
+    // row rather than as an untranslated one. For this one node the rule is
+    // all-or-nothing, and the string that could not be finished is logged so the
+    // next report can name it instead of describing it.
+    function isDanhhaoNode(node) {
+        var parent = node.parentNode;
+        if (!parent || parent.nodeType !== 1) { return false; }
+        var classes = parent.className;
+        if (typeof classes !== 'string' || !classes) { return false; }
+        return classes.split(' ').indexOf('danhhao') >= 0;
+    }
+
+    var reportedDanhhao = {};
+    var danhhaoQueue = [];
+
+    function flushDanhhao() {
+        if (!danhhaoQueue.length || !window.__stvDiag) { return; }
+        while (danhhaoQueue.length) {
+            window.__stvDiag.log('I18N',
+                '名号没有对应词条，整条保持原文: ' + danhhaoQueue.shift());
+        }
+    }
+
+    function reportDanhhao(value) {
+        if (reportedDanhhao[value]) { return; }
+        reportedDanhhao[value] = true;
+        danhhaoQueue.push(value);
+        flushDanhhao();
+        // The diagnostics block is injected before this one in the app, so the
+        // line lands immediately. The retry is for any load order that puts it
+        // after: this overlay must not depend on being injected last.
+        if (danhhaoQueue.length) { setTimeout(flushDanhhao, 200); }
+    }
+
     var rewritten = 0;
 
     // The reader header prints the site's own Vietnamese machine translation of
@@ -457,7 +506,14 @@ ${data.patterns
             }
             if (current.length >= 5) {
                 var fragments = translateFragments(current);
-                if (fragments !== current) { node.nodeValue = fragments; rewritten++; }
+                if (fragments !== current) {
+                    if (isDanhhaoNode(node) && hasVietnameseLetter(fragments)) {
+                        reportDanhhao(current);
+                    } else {
+                        node.nodeValue = fragments;
+                        rewritten++;
+                    }
+                }
             }
             return;
         }
