@@ -256,6 +256,8 @@ const REQUIRED_MARKERS = [
   'could not be fetched here either',
   // The comic detail page's own chapter-count row is never filled by the site.
   'function patchComicChapterCount(',
+  // The chapter-list tail reads `.url` off a value that IS the url.
+  'function patchComicHistory(',
 ];
 
 function fail(message) {

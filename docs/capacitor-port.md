@@ -4156,6 +4156,46 @@ BaoziManhua 仍是 403 bot check（`comicGate` 试过、`did not stick`）。两
   的 `comicloader.php` 都回 `[]`（服务端抓不到图列表）。其余源未逐个验证，本机受代理限制
   （manhwasco / colamanga / baozimh 直连被重置）。
 
+## §6.42 第 40 轮：章节列表的 `unhandledrejection`（站点把 url 当对象读）
+
+日志里每进一次章节列表都有一行 `[ERR] unhandledrejection @https://sangtacviet.com/app.v2.php:4399:9`。
+站点自己的尾巴是（app.v2.php:4396-4402）：
+
+```js
+app.comicReader.history.getLastReadChapter(book.url).then(function(h){
+    if(h){
+        var c = l.q(`[clink="${h.url}"]`);
+        c.classList.add("chaplastreaded");
+        ui.scrollto(c, -300, l);
+    }
+});
+```
+
+而 `getLastReadChapter`（app.v2.read.js:4480-4486）返回的是 `this.data[url].lastRead`——
+**章节 URL 本身，一个字符串**。于是 `h.url` 是 `undefined`，选择器永远是 `[clink="undefined"]`，
+`l.q()` 回 null，`c.classList.add` 抛错：没有「上次读到」标记、没有滚动到那一章，每次访问多一行 ERR。
+
+同一份数据在 `readComicNow`（app.v2.php:4533）里是直接当 url 用的（`showComicChapter(h, …)`），
+所以这个值必须**同时**能当字符串用。
+
+### 修法
+
+`patchComicHistory()` 包 `app.comicReader.history.getLastReadChapter`，把答案换成**字符串对象**：
+它在哪里都按 url 强制转换和比较（`chapters.find(e => e.url == url)`、`encodeURIComponent(url)`、
+`JSON.stringify`），同时又带一个 `.url` 给唯一读它的那个调用点。在生产者一侧修值，
+就把「本来工作正常」的章节列表本身留在了补丁之外。
+
+### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **838 条断言**全过（上一轮 834，新增 4） |
+| `scripts/check-ios-shim.js` | 26 块 / 599769 字节 / 114 标记 |
+
+新增断言：历史被补丁、返回的值仍然处处等于那个 url（`==`、`encodeURIComponent`、
+`JSON.stringify`）、站点自己那串 `[clink="…"]` 选择器重新找得到行、没有历史时仍然回 null。
+
+
 
 
 

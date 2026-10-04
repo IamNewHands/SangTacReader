@@ -10651,6 +10651,48 @@ enum SitePatch {
             return true;
         }
 
+        // "unhandledrejection @app.v2.php:4399:9" on every comic chapter list.
+        // The site's own tail is
+        //
+        //     history.getLastReadChapter(book.url).then(function(h){
+        //         if(h){ var c = l.q('[clink="' + h.url + '"]');
+        //                c.classList.add('chaplastreaded'); }
+        //     });
+        //
+        // and getLastReadChapter (app.v2.read.js:4483) answers
+        // `this.data[url].lastRead` -- the chapter URL ITSELF, a string -- so
+        // `h.url` is undefined, the selector is always '[clink="undefined"]',
+        // l.q() answers null and the chain dies: no last-read marker, no scroll
+        // to it, and one ERR line per visit. readComicNow (app.v2.php:4533) hands
+        // the same answer straight to showComicChapter AS the url, so the value
+        // has to keep working as a string as well.
+        //
+        // A String object is both: it coerces and compares as the url everywhere
+        // the site already uses it (`chapters.find(e => e.url == url)`,
+        // `encodeURIComponent(url)`, `JSON.stringify`), and it answers `.url` for
+        // the one caller that reads that. Repairing the value at its producer
+        // leaves the chapter list itself -- which works -- out of the patch.
+        function patchComicHistory() {
+            var reader = window.app && window.app.comicReader;
+            var history = reader && reader.history;
+            if (!history || typeof history.getLastReadChapter !== 'function') {
+                return false;
+            }
+            if (history.getLastReadChapter.__stvUrl) { return true; }
+            var original = history.getLastReadChapter;
+            var safe = function () {
+                return Promise.resolve(original.apply(this, arguments)).then(function (h) {
+                    if (!h || h.url) { return h; }
+                    var carrier = new String(String(h));
+                    carrier.url = String(h);
+                    return carrier;
+                });
+            };
+            safe.__stvUrl = true;
+            history.getLastReadChapter = safe;
+            return true;
+        }
+
         // "下面的目录没显示，只有一个「章」字": the comicinfo template renders
         // `<span class="chaptercount"></span> Chương` (app.v2.php:443), and
         // setComicPageEvent -- the only place that page is filled -- never writes
@@ -10690,7 +10732,8 @@ enum SitePatch {
             var remote = patchInitRemote(reader);
             var style = patchComicInfoStyle();
             var count = patchComicChapterCount();
-            return !!(origin && frame && remote && style && count);
+            var history = patchComicHistory();
+            return !!(origin && frame && remote && style && count && history);
         }
 
         // app.v2.comicprovider.js is loaded on demand -- the comic browser is the

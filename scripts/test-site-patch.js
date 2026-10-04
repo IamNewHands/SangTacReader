@@ -6717,6 +6717,19 @@ async function testComicGate() {
   const reader = {
     page: null,
     currentChapterList: [{ url: 'https://www.yemancomic.com/chapter/1/2.html', name: 'Ch. 2' }],
+    // The site's comic history. getLastReadChapter answers `lastRead`, which is
+    // the chapter URL itself (app.v2.read.js:4483) -- the value the chapter-list
+    // tail then reads `.url` off.
+    history: {
+      data: {
+        'https://www.yemancomic.com/book/1/': {
+          lastRead: 'https://www.yemancomic.com/chapter/1/2.html',
+        },
+      },
+      getLastReadChapter(url) {
+        return Promise.resolve(this.data[url] ? this.data[url].lastRead : null);
+      },
+    },
     getTranslatorUrl(url) {
       return 'https://sangtacviet.app/comictranslator.php?url='
         + encodeURIComponent(url) + '&transmode=perpair&langhint=zh';
@@ -6762,6 +6775,30 @@ async function testComicGate() {
     String(sandbox.window.__stvDiag.text() || '')
       .indexOf('the detail page lists 3 chapter(s)') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-200));
+
+  // "unhandledrejection @app.v2.php:4399:9": the chapter-list tail reads `.url`
+  // off a value that IS the url.
+  const comicHistory = sandbox.window.app.comicReader.history;
+  check('the comic history is repaired once the reader exists',
+    comicHistory.getLastReadChapter.__stvUrl === true);
+  const lastRead = await comicHistory.getLastReadChapter('https://www.yemancomic.com/book/1/');
+  check('the last-read chapter still reads as the url everywhere the site uses it',
+    String(lastRead) === 'https://www.yemancomic.com/chapter/1/2.html'
+      && lastRead == 'https://www.yemancomic.com/chapter/1/2.html'
+      && encodeURIComponent(lastRead)
+        === 'https%3A%2F%2Fwww.yemancomic.com%2Fchapter%2F1%2F2.html'
+      && JSON.stringify({ lastRead: lastRead })
+        === '{"lastRead":"https://www.yemancomic.com/chapter/1/2.html"}',
+    JSON.stringify(String(lastRead)));
+  const chapterRows = makeElement('div');
+  const lastRow = makeElement('div');
+  lastRow.setAttribute('clink', String(lastRead));
+  chapterRows.appendChild(lastRow);
+  check('the site own last-read marker finds its row again',
+    chapterRows.querySelector('[clink="' + lastRead.url + '"]') === lastRow,
+    String(lastRead.url));
+  check('a book with no history still answers nothing',
+    await comicHistory.getLastReadChapter('https://www.yemancomic.com/book/9/') === null);
 
   check('the reader is adopted once app.v2.read.js has defined it',
     reader.getTranslatorUrl.__stvSameOrigin === true
