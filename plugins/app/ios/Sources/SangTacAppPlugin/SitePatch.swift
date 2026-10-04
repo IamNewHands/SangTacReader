@@ -795,7 +795,6 @@ enum SitePatch {
         var listEl = null;
         var countEl = null;
         var badge = null;
-        var badgeHidden = false;
         var open = false;
         var enabled = readEnabled();
 
@@ -878,6 +877,14 @@ enum SitePatch {
             badge.setAttribute('data-stvdiag', 'badge');
             host.appendChild(badge);
             bindDrag(badge, badge, function () { toggle(); }, true);
+            // At document start <body> does not exist yet, so the badge can land
+            // on <html> -- outside the body's stacking context, and skipped by
+            // anything that walks the body. Move it in as soon as there is a body.
+            document.addEventListener('DOMContentLoaded', function () {
+                if (badge && document.body && badge.parentNode !== document.body) {
+                    document.body.appendChild(badge);
+                }
+            });
             return true;
         }
 
@@ -891,7 +898,12 @@ enum SitePatch {
                 badge.style.background = 'rgba(25,25,25,0.6)';
                 badge.style.color = '#cfc';
             }
-            badge.style.display = (enabled && !badgeHidden) ? 'block' : 'none';
+            // While the switch is on the badge is ALWAYS on screen. It is the only
+            // way back to the panel, so nothing except the switch itself may take
+            // it away. (The old rule kept a `badgeHidden` flag that only the next
+            // ERR cleared, which is why the floating button looked like it needed
+            // a failure before it appeared: HIDE collapsed the badge too.)
+            badge.style.display = enabled ? 'block' : 'none';
         }
 
         // ---- expanded panel --------------------------------------------------
@@ -935,11 +947,10 @@ enum SitePatch {
                 errors = 0;
                 render();
             }));
-            bar.appendChild(barButton('HIDE', function () {
-                hide();
-                badgeHidden = true;
-                paintBadge();
-            }));
+            // HIDE collapses the panel only. The badge is the tap target that
+            // brings the panel back, so collapsing both would leave the reader
+            // with no way in until the next error happened to reset the flag.
+            bar.appendChild(barButton('HIDE', function () { hide(); }));
             bar.appendChild(barButton('CLOSE', function () { hide(); }));
             root.appendChild(bar);
 
@@ -971,7 +982,6 @@ enum SitePatch {
             if (!enabled) { return; }
             if (!buildPanel()) { return; }
             open = true;
-            badgeHidden = false;
             root.style.display = 'block';
             render();
         }
@@ -1070,10 +1080,7 @@ enum SitePatch {
         function raw(text, isError) {
             lines.push(stamp() + ' ' + text);
             while (lines.length > MAX) { lines.shift(); }
-            if (isError) {
-                errors++;
-                badgeHidden = false;
-            }
+            if (isError) { errors++; }
         }
 
         function paint() {
@@ -1160,7 +1167,6 @@ enum SitePatch {
             if (!enabled) {
                 lines = [];
                 errors = 0;
-                badgeHidden = false;
                 open = false;
                 if (root && root.parentNode) { root.parentNode.removeChild(root); }
                 if (badge && badge.parentNode) { badge.parentNode.removeChild(badge); }
@@ -6021,13 +6027,69 @@ enum SitePatch {
             }, 100);
         }
 
+        // 用户 → 我的页面 (app.fun.showUserPages, _page_vip.html:4784) pushes an
+        // empty pagewithtitle and fills it from
+        // /mobile/staticpost.php?author=<uid> (:4790). For an account that has
+        // never published a static page the server answers 200 with an EMPTY body
+        // (device log 23:17:05 "staticpost.php?author=306185 -> 200 text/html
+        // string 0b"), and `innerHTML = ''` leaves a white screen under the title
+        // bar -- indistinguishable from a broken page. The endpoint itself works,
+        // so the repair is one sentence instead of a blank page.
+        //
+        // Hooked on app.net.get rather than on showUserPages: the site's own
+        // `.then` writes the string straight into innerHTML, and a blank response
+        // produces NO DOM mutation, so an observer on the page could never tell
+        // "the answer was empty" apart from "the answer has not arrived yet".
+        var SPACE = ' ';
+        var NL = String.fromCharCode(10);
+        var TAB = String.fromCharCode(9);
+        var CR = String.fromCharCode(13);
+
+        var EMPTY_PAGES_HTML = '<div class="stv-emptypages" style="padding:28px 18px;'
+            + 'text-align:center;opacity:0.75;font-size:14px;line-height:1.8;">'
+            + '这个账号还没有发布过页面<br>'
+            + '<span style="font-size:12px;opacity:0.85;">'
+            + '（站点的「页面」指作者发布的专栏/静态页，不是个人主页）</span></div>';
+
+        function isBlankText(text) {
+            for (var i = 0; i < text.length; i++) {
+                var ch = text.charAt(i);
+                if (ch !== SPACE && ch !== NL && ch !== TAB && ch !== CR) { return false; }
+            }
+            return true;
+        }
+
+        function patchStaticPostEmptyState() {
+            var app = window.app;
+            var net = app && app.net;
+            if (!net || typeof net.get !== 'function') { return false; }
+            if (net.__stvStaticPostPatched) { return true; }
+            net.__stvStaticPostPatched = true;
+            var original = net.get;
+            net.get = function (url) {
+                var call = original.apply(this, arguments);
+                if (typeof url !== 'string'
+                    || url.indexOf('/mobile/staticpost.php') !== 0) { return call; }
+                if (!call || typeof call.then !== 'function') { return call; }
+                return call.then(function (body) {
+                    if (typeof body !== 'string' || !isBlankText(body)) { return body; }
+                    note('PAGE', 'staticpost.php answered with an empty body; showing the '
+                        + 'empty state instead of a blank page');
+                    return EMPTY_PAGES_HTML;
+                });
+            };
+            note('PATCH', 'an empty 我的页面 gets a sentence instead of a white screen');
+            return true;
+        }
+
         var patchAttempts = 0;
         var patchTimer = setInterval(function () {
             patchAttempts++;
             var readers = patchReaders();
             var range = patchDownloadRange();
             var rows = patchDownloadedRow();
-            if ((readers && range && rows) || patchAttempts > 600) {
+            var pages = patchStaticPostEmptyState();
+            if ((readers && range && rows && pages) || patchAttempts > 600) {
                 clearInterval(patchTimer);
             }
         }, 200);
@@ -7198,6 +7260,10 @@ enum SitePatch {
                 return persistSettings(settings).then(function () {
                     note('TRANSLATE', 'settings saved (engine=' + next.engine
                         + ', key=' + (has ? 'set' : 'none') + ')');
+                    // The Cbox frame is a separate document with no access to
+                    // app.storage, so it keeps its own copy of the auto flag and
+                    // can only be told about a change over postMessage.
+                    cboxMessage({ stvCbox: 'settings', auto: !!settings.auto });
                 }, function (error) {
                     note('ERR', 'translate settings save failed: ' + messageOf(error));
                 });
@@ -7626,6 +7692,31 @@ enum SitePatch {
             host.appendChild(row);
         }
 
+        // A faction row is `view-listthelucitem` (page-vip:2222): `.name` and
+        // `.description` under `.theluciteminfo`. One 译 per row, under the
+        // description. Two nodes, one request -- the name alone reads like a
+        // fragment, and the row is what the reader is looking at.
+        function decorateFaction(item) {
+            if (!item || !item.getAttribute) { return; }
+            if (item.getAttribute('stv-tr')) { return; }
+            var info = q(item, '.theluciteminfo');
+            if (!info) { return; }
+            item.setAttribute('stv-tr', '1');
+            var row = document.createElement('div');
+            row.className = 'stv-translate-row';
+            row.style.cssText = 'margin-top:4px;';
+            var button = makeButton('译', 'stv-translate-one');
+            button.style.fontSize = '12px';
+            button.style.padding = '2px 8px';
+            button.style.marginLeft = '0';
+            button.addEventListener('click', function (event) {
+                stop(event);
+                translateNodes(button, [q(info, '.name'), q(info, '.description')]);
+            }, true);
+            row.appendChild(button);
+            info.appendChild(row);
+        }
+
         function originalOf(node) {
             var stored = node.getAttribute('stv-orig');
             return (stored === null || stored === undefined) ? null : stored;
@@ -7656,6 +7747,52 @@ enum SitePatch {
                         content.textContent = out[0];
                         button.textContent = '原文';
                         note('TRANSLATE', 'one comment translated with ' + config.engine);
+                    }, function (error) {
+                        button.textContent = '译';
+                        fail(error);
+                    });
+            });
+        }
+
+        // The multi-node sibling of translateOne(): a faction row is a name plus a
+        // description, and one tap should cost one request rather than two. Same
+        // restore/attribute rules as everywhere else, so 原文 still undoes it.
+        function translateNodes(button, nodes) {
+            var live = [];
+            var texts = [];
+            var restored = false;
+            for (var i = 0; i < nodes.length; i++) {
+                var node = nodes[i];
+                if (!node || !node.getAttribute) { continue; }
+                if (originalOf(node) !== null) { restore(node, button); restored = true; continue; }
+                if (node.getAttribute('stv-tr-done')) { continue; }
+                var text = textOf(node);
+                if (!text) { continue; }
+                live.push(node);
+                texts.push(text);
+            }
+            if (!live.length) {
+                if (restored) { button.textContent = '译'; }
+                return;
+            }
+            loadSettings().then(function (config) {
+                button.textContent = '…';
+                return runTranslate(texts, config.readSource, config.readTarget, config)
+                    .then(function (out) {
+                        var done = 0;
+                        for (var j = 0; j < live.length; j++) {
+                            var piece = out[j];
+                            if (typeof piece !== 'string' || !piece || piece === texts[j]) {
+                                live[j].setAttribute('stv-tr-done', '1');
+                                continue;
+                            }
+                            live[j].setAttribute('stv-orig', live[j].innerHTML);
+                            live[j].textContent = piece;
+                            done++;
+                        }
+                        button.textContent = done ? '原文' : '译';
+                        note('TRANSLATE', 'translated ' + done + ' of ' + live.length
+                            + ' node(s) in one row with ' + config.engine);
                     }, function (error) {
                         button.textContent = '译';
                         fail(error);
@@ -7695,6 +7832,26 @@ enum SitePatch {
                 var post = textOf(body);
                 if (post) { out.push({ node: body, kind: 'post', text: post }); }
             }
+            // 社区 → 势力 (app.fun.showListFaction, page-vip:4891): the board is
+            // built from /mobile/jsonify.php?ajax=getlistfaction and every row is
+            // a faction name plus a Vietnamese description.
+            var factions = qq(scope, '.listthelucitem');
+            for (var k = 0; k < factions.length; k++) {
+                var info = q(factions[k], '.theluciteminfo');
+                if (!info) { continue; }
+                var parts = [q(info, '.name'), q(info, '.description')];
+                for (var m = 0; m < parts.length; m++) {
+                    var part = parts[m];
+                    if (!part || !part.getAttribute) { continue; }
+                    if (part.getAttribute('stv-orig') !== undefined
+                        && part.getAttribute('stv-orig') !== null) { continue; }
+                    if (part.getAttribute('stv-tr-done')) { continue; }
+                    var factionText = textOf(part);
+                    if (factionText) {
+                        out.push({ node: part, kind: 'faction', text: factionText });
+                    }
+                }
+            }
             return out;
         }
 
@@ -7720,6 +7877,18 @@ enum SitePatch {
         // progress, and a list that has not arrived yet arms a one-shot instead
         // of answering "还没有可翻译的评论".
         function translateAll(page, button) {
+            // The Cbox board is a cross-origin frame: none of its text is in this
+            // document, so there is nothing for textTargets() to collect. Hand the
+            // sweep to the frame and let it report progress on its own button.
+            if (q(page, '.cbox')) {
+                var sent = cboxMessage({ stvCbox: 'sweep' });
+                if (button) { button.textContent = sent ? '翻译中…' : '等加载…'; }
+                note('TRANSLATE', 'Cbox sweep requested (' + sent + ' frame(s) known)');
+                setTimeout(function () {
+                    if (button) { button.textContent = '译全部'; }
+                }, 8000);
+                return;
+            }
             var targets = textTargets(page);
             if (!targets.length) {
                 if (qq(page, '[stv-orig]').length) {
@@ -7780,13 +7949,15 @@ enum SitePatch {
 
         // Boards and comment hosts, i.e. everything under 社区 that is rendered
         // in this webview: the channel/post list (`.posts`, page-vip:1087), the
-        // book comment page (`.commentview`, :914) and the embeds used by a
-        // single post and by a user home (`.comments`/`.embedcomment`, :2892).
+        // book comment page (`.commentview`, :914), the embeds used by a single
+        // post and by a user home (`.comments`/`.embedcomment`, :2892) and the
+        // faction board (`.listtheluc`, :1888).
         // The Cbox board is a cross-origin iframe and cannot be reached from
         // here.
         function hasTranslatableContent(page) {
             return !!(q(page, '.commentview') || q(page, '.comments')
-                || q(page, '.embedcomment') || q(page, '.posts'));
+                || q(page, '.embedcomment') || q(page, '.posts')
+                || q(page, '.listtheluc') || q(page, '.cbox'));
         }
 
         function setInputText(input, text) {
@@ -7887,6 +8058,8 @@ enum SitePatch {
                 var body = q(wraps[j], '.content');
                 if (body) { decoratePost(body); }
             }
+            var factions = qq(page, '.listthelucitem');
+            for (var k = 0; k < factions.length; k++) { decorateFaction(factions[k]); }
             decorateInputs(page);
         }
 
@@ -7959,6 +8132,10 @@ enum SitePatch {
                 // translated too -- textTargets() skips what is already done.
                 page.__stvAutoOn = true;
                 if (page.__stvSweep) { page.__stvSweep(); }
+                // The Cbox board has nothing to sweep on this side -- its text
+                // lives in the cross-origin frame, which keeps its own observer
+                // once it has been told the setting is on.
+                if (q(page, '.cbox')) { cboxMessage({ stvCbox: 'settings', auto: true }); }
             });
         }
 
@@ -8448,12 +8625,658 @@ enum SitePatch {
             return true;
         }
 
+        // ---- the delete button on a comment --------------------------------
+        //
+        // The site renders `.cmtdel` for the reader's own comments
+        // (view-commentblock, page-vip:2350) and then never binds it:
+        // app.comment.applyEvent (app.v2.js:3730) wires `.avatar`, `.name` and
+        // `.cmtresp` and stops there, and no delete-comment call exists anywhere
+        // in the bundles this repo mirrors -- the Android app's older page copy
+        // has the same dead button, so it has never worked.
+        //
+        // Which endpoint deletes a comment is in no file we have: the site's PHP
+        // is not shipped, the desktop bundle has no caller either, and the local
+        // TLS block rules out probing with a real session. So this is the same
+        // ladder the unlike button uses -- try the two shapes the site's own
+        // comment API suggests, in order, and stop at the first answer that reads
+        // as success. Whatever happened goes to the panel, so the next device log
+        // settles it instead of guessing a second time.
+        var DELETE_CALLS = [
+            { how: 'post', target: '/', body: 'ajax=delcomment&cid=' },
+            { how: 'post', target: '/', body: 'ajax=deletecomment&cid=' },
+            { how: 'get', target: '/mobile/comment.php?act=delcomment&cid=' }
+        ];
+
+        function dismissPopup(pop) {
+            var overlay = pop && pop.parentNode;
+            if (!overlay) { return; }
+            if (typeof overlay.hide === 'function') { overlay.hide(); return; }
+            if (overlay.removeChild) { overlay.removeChild(pop); }
+        }
+
+        // The block that owns the tapped button, walking up to the comment
+        // template's root. `data-id` is stamped on it by applyEvent.
+        function commentOf(target) {
+            var node = target;
+            var button = null;
+            while (node && node.nodeType === 1) {
+                if (!button && node.classList && node.classList.contains('cmtdel')) {
+                    button = node;
+                }
+                if (node.getAttribute && node.getAttribute('view') === 'commentblock') {
+                    return {
+                        button: button || node,
+                        block: node,
+                        id: node.getAttribute('data-id')
+                    };
+                }
+                node = node.parentElement;
+            }
+            return button ? { button: button, block: null, id: null } : null;
+        }
+
+        // Deliberately strict: a false "success" would tell the reader the comment
+        // is gone while it is still there, and a false "failure" only costs the
+        // next candidate. The site's own post path answers the bare string
+        // "success" (app.v2.js:3872), so that plus the two JSON shapes is enough.
+        function readsAsSuccess(answer) {
+            if (answer === null || answer === undefined) { return false; }
+            if (typeof answer === 'string') {
+                var text = answer.replace(/ /g, '').toLowerCase();
+                return text === 'success' || text.indexOf('"code":100') >= 0
+                    || text.indexOf('"status":"success"') >= 0;
+            }
+            if (typeof answer === 'object') {
+                return answer.code === 100 || answer.status === 'success'
+                    || answer.ok === true;
+            }
+            return false;
+        }
+
+        function attemptDelete(step, cid) {
+            var app = window.app;
+            var net = app && app.net;
+            if (!net) { return Promise.reject(new Error('app.net is missing')); }
+            if (step.how === 'get') {
+                return net.get(step.target + encodeURIComponent(cid), true);
+            }
+            return net.post(step.target, step.body + encodeURIComponent(cid));
+        }
+
+        function deleteComment(comment) {
+            if (!comment.id) {
+                note('ERR', 'comment delete: the block carries no data-id');
+                hint('这条评论没有 id，无法删除');
+                return;
+            }
+            var index = 0;
+            var tried = [];
+            var next = function () {
+                if (index >= DELETE_CALLS.length) {
+                    note('COMMENT', 'every candidate endpoint refused the delete of '
+                        + comment.id + ': ' + tried.join(' | '));
+                    hint('删除失败：站点没有接受这个请求（详情见诊断日志）');
+                    return;
+                }
+                var step = DELETE_CALLS[index++];
+                var label = step.how + ' ' + (step.body || step.target);
+                note('COMMENT', 'trying ' + label + ' for comment ' + comment.id);
+                attemptDelete(step, comment.id).then(function (answer) {
+                    var ok = readsAsSuccess(answer);
+                    tried.push(label + ' -> ' + (ok ? 'success' : String(answer).slice(0, 40)));
+                    if (!ok) { next(); return; }
+                    note('COMMENT', 'comment ' + comment.id + ' deleted by ' + label);
+                    if (comment.block && comment.block.parentNode) {
+                        comment.block.parentNode.removeChild(comment.block);
+                    }
+                    hint('已删除这条评论');
+                }, function (error) {
+                    tried.push(label + ' -> ' + messageOf(error));
+                    next();
+                });
+            };
+            next();
+        }
+
+        // A destructive action never rides on a single tap: the site's own popup
+        // template is the confirmation (app.context.popup, app.v2.js:2195).
+        function askDeleteComment(comment) {
+            var app = window.app;
+            var ctx = app && app.context;
+            if (!ctx || typeof ctx.showPopup !== 'function') {
+                note('ERR', 'no popup template for the delete confirmation');
+                hint('删除需要确认，这个版本的站点没有确认框');
+                return;
+            }
+            try {
+                ctx.showPopup({
+                    title: '删除这条评论？',
+                    body: '<center>删除后无法恢复。</center>',
+                    button: '<button action=stvdelno>取消</button>'
+                        + '<button action=stvdelok>删除</button>',
+                    action: {
+                        stvdelno: function (pop) { dismissPopup(pop); },
+                        stvdelok: function (pop) {
+                            dismissPopup(pop);
+                            deleteComment(comment);
+                        }
+                    }
+                });
+                note('COMMENT', 'delete confirmation shown for comment ' + comment.id);
+            } catch (error) {
+                note('ERR', 'delete confirmation failed: ' + messageOf(error));
+            }
+        }
+
+        document.addEventListener('click', function (event) {
+            var comment = commentOf(event.target);
+            if (!comment) { return; }
+            stop(event);
+            note('COMMENT', 'delete tapped on comment ' + String(comment.id));
+            askDeleteComment(comment);
+        }, true);
+
+        // ---- the Cbox frame bridge ------------------------------------------
+        //
+        // 社区 → Cbox is an iframe to www6.cbox.ws (page-vip:995), i.e. a
+        // cross-origin document. Capacitor's own bridge script is injected with
+        // `forMainFrameOnly: true` (node_modules/@capacitor/ios, JSExport.swift:20),
+        // so the frame has no window.Capacitor and therefore no engine, no API
+        // key and no settings; the site patches are main-frame-only as well.
+        // postMessage is the only channel that crosses that boundary, so the
+        // frame asks and this side -- which does have all three -- answers. The
+        // other half is SitePatch.cboxFrame, the one block injected into every
+        // frame.
+        var cboxFrames = [];
+
+        function cboxMessage(message) {
+            for (var i = 0; i < cboxFrames.length; i++) {
+                try {
+                    cboxFrames[i].source.postMessage(message, cboxFrames[i].origin);
+                } catch (error) {
+                    note('ERR', 'cbox postMessage failed: ' + messageOf(error));
+                }
+            }
+            return cboxFrames.length;
+        }
+
+        function rememberCboxFrame(source, origin) {
+            for (var i = 0; i < cboxFrames.length; i++) {
+                if (cboxFrames[i].source === source) {
+                    cboxFrames[i].origin = origin;
+                    return;
+                }
+            }
+            cboxFrames.push({ source: source, origin: origin });
+        }
+
+        window.addEventListener('message', function (event) {
+            var data = event && event.data;
+            if (!data || typeof data !== 'object' || data.stvCbox === undefined) { return; }
+            // A Cbox box is served from cbox.ws (cbox.im for some assets). The
+            // check is on the origin the browser reports, never on the payload:
+            // any page in the web view can post to us.
+            if (typeof event.origin !== 'string' || event.origin.indexOf('cbox') < 0) {
+                note('ERR', 'ignored a stvCbox message from ' + String(event.origin));
+                return;
+            }
+            var source = event.source;
+            if (!source || typeof source.postMessage !== 'function') { return; }
+            rememberCboxFrame(source, event.origin);
+
+            if (data.stvCbox === 'log') {
+                note(String(data.tag || 'CBOX'), String(data.message || ''));
+                return;
+            }
+            if (data.stvCbox === 'hello') {
+                note('TRANSLATE', 'the Cbox frame asked for the translator');
+                loadSettings().then(function (config) {
+                    source.postMessage({ stvCbox: 'settings', auto: !!config.auto },
+                        event.origin);
+                });
+                return;
+            }
+            if (data.stvCbox !== 'ask') { return; }
+            var id = data.id;
+            var texts = data.texts || [];
+            loadSettings().then(function (config) {
+                return runTranslate(texts, config.readSource, config.readTarget, config);
+            }).then(function (out) {
+                source.postMessage({ stvCbox: 'answer', id: id, out: out }, event.origin);
+                note('TRANSLATE', 'Cbox: ' + out.length + ' line(s) answered');
+            }, function (error) {
+                source.postMessage({ stvCbox: 'answer', id: id, out: [] }, event.origin);
+                fail(error);
+            });
+        }, false);
+
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
             var ready = hookPushPage() && hookCommentEmbed();
             if (ready || attempts > 2500) { clearInterval(timer); }
         }, 20);
+    })();
+    """
+
+    // MARK: - The Cbox board's own frame
+
+    /**
+     社区 → Cbox is an iframe to www6.cbox.ws (page-vip:995). It is the only
+     cross-origin document the app puts on screen, and it needs three things the
+     main frame gets for free:
+
+       1. A script that runs there at all. Every other block -- and Capacitor's
+          own native bridge (node_modules/@capacitor/ios, JSExport.swift:20) --
+          is injected with `forMainFrameOnly: true`. This block is the single
+          exception, so its first line has to be a refusal: the reader's chapter
+          frames are same-origin and must not pay for it.
+       2. A translator. The frame has no window.Capacitor, so it asks the parent
+          over postMessage. The parent's half is the bridge in
+          `commentTranslate`, which owns the settings, the engines and the key.
+       3. A way to say "translate this" without the parent's title bar, because
+          the site scales the frame (`showWebCbox`, page-vip:4597) and the
+          frame's own controls are the ones the reader is looking at.
+
+     Nothing here is keyed on Cbox's class names: the box is a third-party
+     document whose markup this repo has no copy of (the local DNS blackholes
+     cbox.ws) and which changes without notice. "A text node with a letter in
+     it, outside the frame's own controls" is the whole rule.
+     */
+    static let cboxFrame = """
+    (function () {
+        var here = (window.location && window.location.hostname) || '';
+        if (here.indexOf('cbox') < 0) { return; }
+        if (window.__stvCboxFrameInstalled) { return; }
+        window.__stvCboxFrameInstalled = true;
+
+        // Sixty lines per request: a chat box holds hundreds, and the parent's
+        // engine chunks whatever it is handed.
+        var LIMIT = 60;
+        var SKIP = ['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'SELECT',
+            'OPTION', 'IFRAME', 'CANVAS', 'SVG', 'BUTTON', 'LABEL', 'HEAD'];
+        var LETTERS = /[A-Za-z]/;
+        var SPACES = / /g;
+        var auto = false;
+        var nextId = 1;
+        var pending = {};
+        var button = null;
+        var label = '';
+        var timer = null;
+
+        function post(message) {
+            try {
+                if (window.parent && window.parent !== window) {
+                    window.parent.postMessage(message, '*');
+                }
+            } catch (error) {}
+        }
+
+        function note(message) {
+            post({ stvCbox: 'log', tag: 'CBOX', message: message });
+        }
+
+        function tagOf(node) {
+            return String((node && node.tagName) || '').toUpperCase();
+        }
+
+        function skipTag(tag) {
+            for (var i = 0; i < SKIP.length; i++) { if (SKIP[i] === tag) { return true; } }
+            return false;
+        }
+
+        function isOurs(node) {
+            var walk = node;
+            while (walk) {
+                if (walk.getAttribute
+                    && walk.getAttribute('data-stvtranslate')) { return true; }
+                walk = walk.parentNode;
+            }
+            return false;
+        }
+
+        function isCandidate(node) {
+            var parent = node.parentNode;
+            if (!parent || parent.nodeType !== 1) { return false; }
+            if (skipTag(tagOf(parent))) { return false; }
+            if (isOurs(parent)) { return false; }
+            var text = String(node.nodeValue || '').replace(SPACES, '');
+            if (text.length < 2) { return false; }
+            return LETTERS.test(text);
+        }
+
+        function collect() {
+            var body = document.body;
+            if (!body) { return []; }
+            var all = [];
+            var walk = function (node) {
+                var children = node.childNodes;
+                if (!children) { return; }
+                for (var i = 0; i < children.length; i++) {
+                    var child = children[i];
+                    if (child.nodeType === 1) {
+                        if (skipTag(tagOf(child))) { continue; }
+                        walk(child);
+                    } else if (child.nodeType === 3) {
+                        if (child.__stvCboxDone) { continue; }
+                        if (isCandidate(child)) { all.push(child); }
+                    }
+                }
+            };
+            walk(body);
+            // Newest first: a chat box appends, so the tail of the document is
+            // what the reader is looking at. The rest is picked up by the next
+            // sweep, which is what lets the button work through a backlog
+            // instead of re-sending the same sixty lines forever.
+            var out = [];
+            for (var j = all.length - 1; j >= 0 && out.length < LIMIT; j--) {
+                out.push(all[j]);
+            }
+            return out;
+        }
+
+        function paint(text) {
+            if (label === text) { return; }
+            label = text;
+            if (button) { button.textContent = text; }
+        }
+
+        function apply(nodes, out) {
+            var done = 0;
+            for (var i = 0; i < nodes.length; i++) {
+                var node = nodes[i];
+                if (!node || !node.parentNode) { continue; }
+                node.__stvCboxDone = true;
+                var piece = out[i];
+                if (typeof piece !== 'string' || !piece) { continue; }
+                if (piece === String(node.nodeValue)) { continue; }
+                if (node.__stvCboxOrig === undefined) {
+                    node.__stvCboxOrig = node.nodeValue;
+                }
+                node.nodeValue = piece;
+                done++;
+            }
+            return done;
+        }
+
+        function sweep() {
+            var nodes = collect();
+            if (!nodes.length) {
+                paint('译');
+                post({ stvCbox: 'done', count: 0 });
+                return;
+            }
+            var texts = [];
+            for (var i = 0; i < nodes.length; i++) {
+                texts.push(String(nodes[i].nodeValue));
+            }
+            var id = nextId++;
+            pending[id] = nodes;
+            paint('翻译中…');
+            post({ stvCbox: 'ask', id: id, texts: texts });
+        }
+
+        function setAuto(on) {
+            auto = !!on;
+            if (!auto || window.__stvCboxObserver) { return; }
+            if (!document.body || typeof MutationObserver !== 'function') { return; }
+            var observer = new MutationObserver(function (records) {
+                for (var i = 0; i < records.length; i++) {
+                    // Our own button and our own writes are not new messages.
+                    if (isOurs(records[i].target)) { continue; }
+                    if (timer) { clearTimeout(timer); }
+                    timer = setTimeout(sweep, 900);
+                    return;
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            window.__stvCboxObserver = observer;
+            note('auto translate is on for this frame');
+        }
+
+        function build() {
+            if (button) { return !!button.parentNode; }
+            var host = document.body;
+            if (!host) { return false; }
+            var bar = document.createElement('div');
+            bar.setAttribute('data-stvtranslate', 'cboxbar');
+            bar.style.cssText = 'position:fixed;left:6px;bottom:6px;z-index:2147483645;'
+                + 'display:flex;align-items:center;';
+            button = document.createElement('button');
+            button.setAttribute('data-stvtranslate', 'cboxbutton');
+            button.style.cssText = 'padding:6px 10px;border-radius:8px;'
+                + 'border:1px solid #555;background:rgba(20,20,20,0.85);color:#eee;'
+                + 'font:12px/1.3 -apple-system,BlinkMacSystemFont,sans-serif;';
+            button.textContent = '译';
+            button.addEventListener('click', function (event) {
+                event.stopPropagation();
+                event.preventDefault();
+                sweep();
+            }, true);
+            bar.appendChild(button);
+            host.appendChild(bar);
+            return true;
+        }
+
+        window.addEventListener('message', function (event) {
+            var data = event && event.data;
+            if (!data || typeof data !== 'object' || data.stvCbox === undefined) { return; }
+            if (data.stvCbox === 'settings') { setAuto(!!data.auto); return; }
+            if (data.stvCbox === 'sweep') { sweep(); return; }
+            if (data.stvCbox !== 'answer') { return; }
+            var nodes = pending[data.id];
+            if (!nodes) { return; }
+            delete pending[data.id];
+            var done = apply(nodes, data.out || []);
+            paint('译');
+            post({ stvCbox: 'done', count: done });
+            note(done + ' line(s) translated');
+        }, false);
+
+        function boot() {
+            if (!build()) { return; }
+            post({ stvCbox: 'hello' });
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', boot);
+        } else {
+            boot();
+        }
+    })();
+    """
+
+    // MARK: - The comic sources' bot check
+
+    /**
+     漫画点进去只有顶部的分类，一条数据都没有.
+
+     The comic browser is a site feature that scrapes third-party manga sites
+     through `window.AutoHttp` (app.v2.comicprovider.js:79), and BaoziManhua --
+     the default source and every one of its 32 tabs -- now answers its list API
+     with
+
+        403 {"error":"challenge_required",
+             "challenge_url":"/__gatekeeper_challenge/start?return=..."}
+
+     (device log 23:15:40 / 23:16:01 / 23:18:06 / :09 / :10). The native plugin
+     RESOLVES a 4xx with `error: true` rather than rejecting
+     (SangTacHttpPlugin.swift:762), so `getComicList` gets that object, reads
+     `.items` off it, and throws -- which is the `unhandledrejection` at
+     comicprovider.js:628 in the same log.
+
+     Two halves:
+
+       1. The token is minted by a script, and a URLSession never runs scripts.
+          So the challenge is solved where scripts do run -- a hidden frame in
+          this web view, which shares WKWebsiteDataStore with the page and
+          therefore with the cookie snapshot the native plugin reads.
+       2. `baozimh.com` had to be added to the plugin's cookie allow-list
+          (SangTacHttpPlugin.swift `cookieHosts`), or the retry would travel
+          anonymous and be challenged again.
+
+     A source that stays gated is not retried in a loop: one pass per host per
+     five minutes, and the refusal is written to the panel so the next device log
+     shows whether the challenge is solvable at all.
+     */
+    static let comicGate = """
+    (function () {
+        if (window.__stvComicGateInstalled) { return; }
+        window.__stvComicGateInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        // The challenge document sets its cookie and redirects to the API URL, so
+        // the frame's load event is the signal; the extra wait is for the native
+        // side, whose cookie snapshot is read asynchronously off
+        // WKHTTPCookieStore and is what the retry actually travels with.
+        var SETTLE_MS = 700;
+        var GIVE_UP_MS = 12000;
+        var GATE_TTL_MS = 300000;
+
+        var gatedAt = {};
+
+        function isChallenge(answer) {
+            if (!answer || typeof answer !== 'object') { return false; }
+            if (answer.error === 'challenge_required') { return true; }
+            return typeof answer.challenge_url === 'string'
+                && answer.challenge_url.length > 0;
+        }
+
+        // Built by hand rather than with URL(): the challenge URL is a path on
+        // the host that issued it, and nothing else is needed.
+        function absolute(raw, requestUrl) {
+            var text = String(raw || '');
+            if (!text) { return ''; }
+            if (text.indexOf('http://') === 0 || text.indexOf('https://') === 0) {
+                return text;
+            }
+            var request = String(requestUrl || '');
+            var schemeEnd = request.indexOf('://');
+            if (schemeEnd < 0) { return text; }
+            var hostEnd = request.indexOf('/', schemeEnd + 3);
+            if (hostEnd < 0) { hostEnd = request.length; }
+            var origin = request.slice(0, hostEnd);
+            if (text.charAt(0) !== '/') { return origin + '/' + text; }
+            return origin + text;
+        }
+
+        function hostOf(url) {
+            var request = String(url || '');
+            var schemeEnd = request.indexOf('://');
+            if (schemeEnd < 0) { return request; }
+            var hostEnd = request.indexOf('/', schemeEnd + 3);
+            if (hostEnd < 0) { hostEnd = request.length; }
+            return request.slice(schemeEnd + 3, hostEnd);
+        }
+
+        function recentlyGated(host) {
+            var at = gatedAt[host];
+            return !!at && (Date.now() - at) < GATE_TTL_MS;
+        }
+
+        function passGate(url) {
+            return new Promise(function (resolve, reject) {
+                if (!url) { reject(new Error('no challenge url')); return; }
+                var host = document.body || document.documentElement;
+                if (!host) { reject(new Error('no document to mount the frame in')); return; }
+                var frame = document.createElement('iframe');
+                frame.setAttribute('data-stvcomic', 'gate');
+                frame.setAttribute('style', 'position:fixed;left:-9999px;top:0;'
+                    + 'width:1px;height:1px;border:0;opacity:0;');
+                var done = false;
+                var giveUp = null;
+                var settle = null;
+                var finish = function (ok, why) {
+                    if (done) { return; }
+                    done = true;
+                    if (giveUp) { clearTimeout(giveUp); }
+                    if (settle) { clearTimeout(settle); }
+                    if (frame.parentNode) { frame.parentNode.removeChild(frame); }
+                    if (ok) { resolve(why); } else { reject(new Error(why)); }
+                };
+                giveUp = setTimeout(function () {
+                    finish(false, 'the challenge did not finish in ' + GIVE_UP_MS + 'ms');
+                }, GIVE_UP_MS);
+                frame.addEventListener('load', function () {
+                    if (done || settle) { return; }
+                    settle = setTimeout(function () {
+                        finish(true, 'the challenge frame loaded');
+                    }, SETTLE_MS);
+                });
+                host.appendChild(frame);
+                frame.src = url;
+            });
+        }
+
+        function wrap(auto) {
+            if (!auto || typeof auto.get !== 'function') { return false; }
+            if (auto.get.__stvComicGateWrapped) { return true; }
+            var original = auto.get;
+            var wrapped = function (url) {
+                var args = arguments;
+                var self = this;
+                return original.apply(self, args).then(function (answer) {
+                    if (!isChallenge(answer)) { return answer; }
+                    var host = hostOf(url);
+                    var gate = absolute(answer.challenge_url, url);
+                    note('COMIC', 'the comic source asked for a bot check on ' + host
+                        + ': ' + gate);
+                    if (recentlyGated(host)) {
+                        note('ERR', 'the bot check for ' + host + ' did not stick;'
+                            + ' leaving the answer alone for five minutes');
+                        return answer;
+                    }
+                    gatedAt[host] = Date.now();
+                    return passGate(gate).then(function (why) {
+                        note('COMIC', why + '; retrying ' + url);
+                        return original.apply(self, args);
+                    }, function (error) {
+                        note('ERR', 'the bot check for ' + host + ' failed: '
+                            + (error && error.message ? error.message : String(error)));
+                        return answer;
+                    });
+                });
+            };
+            wrapped.__stvComicGateWrapped = true;
+            auto.get = wrapped;
+            note('PATCH', 'the comic sources bot check is handled');
+            return true;
+        }
+
+        function adopt() {
+            return wrap(window.AutoHttp);
+        }
+
+        // app.v2.comicprovider.js is loaded on demand -- the comic browser is the
+        // only thing that needs it -- so the global it defines is watched rather
+        // than read. A top-level `var` in a classic script assigns through this
+        // accessor, which puts the wrapper in place before the first request.
+        var current = window.AutoHttp;
+        var installed = false;
+        try {
+            Object.defineProperty(window, 'AutoHttp', {
+                configurable: true,
+                get: function () { return current; },
+                set: function (value) {
+                    current = value;
+                    installed = adopt() || installed;
+                }
+            });
+            if (current) { installed = adopt() || installed; }
+        } catch (error) {
+            note('ERR', 'could not watch AutoHttp: ' + error);
+        }
+        // Belt and braces: a bundle that defines the global some other way is
+        // still caught, and the poll stops as soon as it is.
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            installed = adopt() || installed;
+            if (installed || attempts > 600) { clearInterval(timer); }
+        }, 100);
     })();
     """
 
@@ -9105,5 +9928,6 @@ enum SitePatch {
                                 keyboardPopup, gridLayout, settingsBackup,
                                 bookmarkToggle, readerTts,
                                 pageRepair, downloadExport, commentTranslate,
+                                comicGate,
                                 swipeDismiss, readerPrefetch]
 }

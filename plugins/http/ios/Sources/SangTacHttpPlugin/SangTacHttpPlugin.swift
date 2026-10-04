@@ -311,7 +311,18 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         "sangtacviet.com",
         "sangtacviet.vip",
         "sangtacviet.app",
-        "stv-appdomain-00000001.org"
+        "stv-appdomain-00000001.org",
+        // The comic browser is a site feature that scrapes third-party manga
+        // sites, and BaoziManhua now answers its list API with a bot challenge
+        // (`challenge_required`) whose pass token IS a cookie. The `comicGate`
+        // block solves that challenge in a hidden frame of this web view, so the
+        // token lands in WKWebsiteDataStore -- and without this host on the list
+        // the retry would travel anonymous and be challenged again.
+        //
+        // It cannot leak the site's session: `matching(_:host:)` keeps only the
+        // cookies whose domain is the request's host, so a request to baozimh
+        // carries baozimh's cookies and nothing else.
+        "baozimh.com"
     ]
 
     /// Hosts the app itself talks to for translation. Listed so the diagnostic

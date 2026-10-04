@@ -137,6 +137,15 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
                          forMainFrameOnly: true)
         })
 
+        // One block is injected into every frame instead: the Cbox board
+        // (社区 → Cbox) is an iframe to www6.cbox.ws, and Capacitor's own bridge
+        // script is main-frame-only, so that frame has no window.Capacitor and no
+        // translator of its own. The block's first line refuses to exist anywhere
+        // but Cbox, which keeps the reader's same-origin chapter frames out of it.
+        scripts.append(WKUserScript(source: SitePatch.cboxFrame,
+                                    injectionTime: .atDocumentStart,
+                                    forMainFrameOnly: false))
+
         // The web view exists before plugins load (CAPBridgeViewController
         // .loadView() -> prepareWebView() -> CapacitorBridge.init() -> plugins)
         // and the page URL is loaded later in viewDidLoad(), so this lands in

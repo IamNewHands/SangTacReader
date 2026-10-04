@@ -193,6 +193,17 @@ const REQUIRED_MARKERS = [
   // 所以站点自己写的 toast 与列表刷新是死代码，成与不成看起来一模一样。
   'function attachFollow(',
   '站点没有取消关注的接口',
+  // The Cbox board is a cross-origin frame and Capacitor's bridge is
+  // main-frame-only, so this one block is injected into every frame and refuses
+  // to exist anywhere but Cbox. Without the marker the whole 社区 → Cbox
+  // translation channel is silently absent.
+  'window.__stvCboxFrameInstalled',
+  'stvCbox',
+  // The comic sources now answer the list API with a bot challenge, and the
+  // token is minted by a script the plugin's URLSession never runs. Without this
+  // wrapper 漫画 renders its tabs and no rows at all.
+  'window.__stvComicGateInstalled',
+  'the comic source asked for a bot check',
 ];
 
 function fail(message) {

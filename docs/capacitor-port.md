@@ -3531,4 +3531,156 @@ buffer 再播一次**——而那个播放图已经不出声了。
   与名号这套不重合，指南里也没有名号，那张表帮不上忙。
 - 服务器偶尔发双空格（实测 `"Đạo Tôn  Sơ Kỳ"`）：带前导空格的词条只吃掉一个，那条会剩一个空格。
 
+### 6.36 第三十四轮（真机反馈五条：Cbox/势力自动翻译、漫画空列表、删除评论、我的页面、诊断悬浮按钮）
+
+用户的输入是一份 239 行的真机日志（`新建 文本文档 (3).txt`，23:15:40–23:18:26）加五条问题。
+五条各自独立，逐条定性如下。
+
+#### (1) 社区 → Cbox / 势力 也要有「杂谈」那种自动翻译
+
+`commentTranslate` 的入口是 `hasTranslatableContent()`，本轮之前只认
+`.commentview` / `.comments` / `.embedcomment` / `.posts`；翻译目标 `textTargets()` 只有
+`.cmtcontent`（评论）和 `.postcontent > .content`（帖子）。所以只有杂谈（`pageposts`）有
+「译全部 + 自动翻译」。日志把差别写得很直白：`[PAGE] open pageposts` 后面有
+`[TRANSLATE] watching the page for late comments and posts`，而 `open pagecbox` /
+`open pagelisttheluc` 后面一行都没有。
+
+**势力**（`page-pagelisttheluc` :1888 + 行模板 `view-listthelucitem` :2222）是同源页面，直接扩：
+
+| 位置 | 改动 |
+| --- | --- |
+| `hasTranslatableContent` | 加 `.listtheluc` |
+| `textTargets` | 多一类 `faction`：每行 `.name` + `.description` 两个节点 |
+| `decorateAll` / `decorateFaction` | 每行一个「译」按钮，插在 `.theluciteminfo` 末尾 |
+| `translateNodes` | `translateOne()` 的多节点版本：一次请求翻一整行，`原文` 仍能还原 |
+
+**Cbox**（`page-pagecbox` :982）是**跨源 iframe**（`www6.cbox.ws`），两个挡点都有据可查：
+
+| 挡点 | 证据 |
+| --- | --- |
+| 我们的补丁进不去 | 每个块都是 `forMainFrameOnly: true`（SangTacAppPlugin.swift:137） |
+| 那个 frame 里没有 Capacitor | `@capacitor/ios` 自己的桥接脚本同样是 `forMainFrameOnly: true`（`node_modules/@capacitor/ios/.../JSExport.swift:20`），所以 frame 里没有 `window.Capacitor`，够不到任何引擎 |
+
+修法：新增 `SitePatch.cboxFrame`，**唯一**用 `forMainFrameOnly: false` 注入的块；第一行就按
+hostname 判断，不是 Cbox 立刻 `return`，所以读者的同源章节 frame 一分钱都不付。frame 自己不翻译：
+它把文本 `postMessage` 给父窗口，父窗口那半留在 `commentTranslate` 里（有设置、有引擎、有 Key）。
+协议只有七种消息（`hello` / `settings` / `ask` / `answer` / `sweep` / `done` / `log`），
+父窗口只接受 `event.origin` 里含 `cbox` 的消息，回包按那个 origin 定向发。
+
+Cbox 的 class 名一个都没用：那是一个第三方文档，本机 DNS 把 `cbox.ws` 黑洞掉了（`web_fetch`
+直接报 non-public IP），仓库里没有副本，它的标记随时会变。规则只有一条——**带字母的文本节点，
+且不在我们自己的控件里**。每轮最多 60 条、从文档末尾往前取（聊天框是追加的，最新在最后），
+已翻过的不再发，所以按钮按几次就能把积压翻完。frame 里自带一个小「译」按钮（`position:fixed`），
+父页面标题栏的「译全部」走 `sweep` 消息。
+
+#### (2) 漫画只有顶部分类：baozimh 的反爬网关
+
+`BaoziManhua.getComicList`（app.v2.comicprovider.js:613）打
+`https://www.baozimh.com/api/bzmhq/amp_comic_list?...`，对方现在回
+
+```
+403 {"error":"challenge_required",
+     "challenge_url":"/__gatekeeper_challenge/start?return=%2Fapi%2Fbzmhq%2Famp_comic_list"}
+```
+
+（日志 23:15:40 / 23:16:01 / 23:18:06 / :09 / :10，五次）。原生插件对 4xx 是 **resolve**
+而不是 reject（SangTacHttpPlugin.swift:762 `result["error"] = true` 之后照常 `call.resolve`），
+所以 `getComicList` 拿到那个对象、读 `.items` 得到 `undefined`、`undefined.map` 抛错——日志里那条
+`unhandledrejection getComicList@…:628:36` 就是它。32 个分类全是 baozimh 的 type/region 组合，
+于是整页只剩站点自己的 tab 栏。
+
+**这是第三方站的反爬，不是我们的代码缺陷**；能做的只有让 token 落到位。token 是脚本发的，
+而插件的 URLSession 永远不跑脚本，所以两半：
+
+| 半 | 改动 |
+| --- | --- |
+| 脚本在哪儿跑 | 新增 `SitePatch.comicGate`：包 `window.AutoHttp.get`，答案里出现 `challenge_required` 就把 `challenge_url` 装进一个隐藏 iframe（同一个 web view，因此同一个 `WKWebsiteDataStore`），load 之后再等 700ms 让原生 cookie 快照刷新，然后重试一次 |
+| 重试带不带 cookie | `SangTacHttpPlugin.cookieHosts` 加 `baozimh.com`。不加的话重试是匿名的，会被再挑战一次 |
+
+`AutoHttp` 是 `app.v2.comicprovider.js` 里顶层 `var`（只有打开漫画时那个 bundle 才加载），
+所以用 `Object.defineProperty(window, 'AutoHttp', {set, get})` 监视它，另加一个 100ms 轮询兜底。
+一个 host 五分钟内只挑战一次（`GATE_TTL_MS`），免得解不开时反复挂 iframe。
+
+#### (3) 用户 → 我的评论：删除按钮没反应
+
+站点渲染了 `.cmtdel`（`view-commentblock` :2350），但 `app.comment.applyEvent`
+（app.v2.js:3730-3747）只绑 `.avatar` / `.name` / `.cmtresp`，**全站没有任何 `.cmtdel` 的
+handler**，也没有任何 `delcomment` / `deletecomment` 调用方；Android 包里那份更老的页面副本
+（`apk_extracted/assets/public/index.html:673`）同样只有模板没有 handler。**这个按钮在站点侧
+从来就是死的。**
+
+删除接口的名字在仓库里查不到：站点的 PHP 不发、桌面 bundle 里也没有调用方，而本机 TLS 被拦
+（schannel `SEC_E_NO_CREDENTIALS`）没法带会话探测。所以照 `bookmarkToggle` 取消点赞那套阶梯来：
+`app.context.popup` 先确认（破坏性动作不挂单次点击），确认后按顺序试
+
+| # | 请求 |
+| --- | --- |
+| 1 | `POST /` `ajax=delcomment&cid=<id>` |
+| 2 | `POST /` `ajax=deletecomment&cid=<id>` |
+| 3 | `GET /mobile/comment.php?act=delcomment&cid=<id>` |
+
+第一个读起来像成功的就停手并把这个评论块从 DOM 摘掉；三次都不行就如实提示「站点没有接受这个
+请求」并让读者看诊断日志。**每一步都写进 `[COMMENT]` 日志**，所以下一份真机日志能直接定案。
+
+#### (4) 用户 → 我的页面点进去没数据
+
+功能是 `app.fun.showUserPages()`（:4784）：推一个空白 `pagewithtitle`，再用
+`GET /mobile/staticpost.php?author=<uid>`（:4790）填内容。
+
+**结论：真的没数据，不是代码 bug。** 日志第 11 行
+`GET https://sangtacviet.app/mobile/staticpost.php?author=306185 -> 200 text/html string 0b`
+—— 200 但 body 是 0 字节；我用云端抓取复核同一个 URL，同样空 body。
+
+顺手修的是表现：`innerHTML = ''` 会留下一整屏白底，和「页面坏了」无法区分。`pageRepair` 里包一层
+`app.net.get`，只针对 `/mobile/staticpost.php`，空 body 换成一句「这个账号还没有发布过页面」。
+钩在 `net.get` 而不是 `showUserPages`：站点自己的 `.then` 把字符串直接写进 `innerHTML`，
+空回答**不产生任何 DOM 变更**，挂在页面上的 observer 永远分不清「回答是空的」和「回答还没到」。
+
+#### (5) 诊断日志的悬浮按钮要「一开就有」
+
+根因是 `HIDE` 把面板**和徽标一起**收掉（`badgeHidden = true`），而徽标只在**出现 ERR 时**才被
+放回来（`raw()` 里 `badgeHidden = false`）。所以读者为了收掉那块占屏 42% 的面板点一次 HIDE 之后，
+只剩报错能把小圆点叫回来——正是「要报一次错才显示出来」。
+
+修法：`paintBadge()` 改成 `enabled ? 'block' : 'none'`（删掉 `badgeHidden` 这个变量和它的四处
+引用），`HIDE` 只收面板；徽标是回到面板的唯一入口，任何别的东西都不许把它拿走。另外
+`buildBadge()` 在 DOMContentLoaded 时把徽标从 `<html>` 搬进 `<body>`（document start 时还没有 body）。
+
+#### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **746 条断言**全过（上一轮 686，新增 60） |
+| `scripts/check-ios-shim.js` | 26 块 / 514623 字节 / 87 标记 |
+| `scripts/gen-site-i18n.js --check` | 459 标签 / 63 片段（本轮没动词典） |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言分六组：悬浮按钮（HIDE 后面板收起而徽标仍在、徽标在 `<body>` 里、还没报错时就在屏上）、
+我的页面空状态（空回答变成一句话、有内容原样透传、其余端点不动）、势力页（标题按钮、每行按钮、
+一次请求翻一行、译全部跳过已翻、再点还原）、删除评论（先确认、不动手不发请求、三级阶梯的顺序、
+全被拒时保留评论并提示、成功时停在第一级并摘掉节点）、Cbox（父窗口回 `settings` 且按 origin 定向、
+`ask` 用配置的引擎翻译并带 id 回包、译全部发 `sweep`、非 cbox origin 的消息被拒、frame 块全局唯一、
+frame 自己 hello / 自己建按钮 / 最新优先 / 回写文本 / 已翻不重发 / 新消息被拾起 / 在读者章节 frame 里
+完全不动）、漫画网关（`AutoHttp` 被监视、挑战装进隐藏 iframe、重试一次、frame 收掉、
+同一 host 不反复挑战、非挑战源原样透传，以及**原生 `cookieHosts` 里必须有 `baozimh.com`**——
+这条把两半钉在一起，任一半被删就红）。
+
+#### 未证实项
+
+- **Cbox 能否真的注入**：`cboxFrame` 是本仓库唯一 `forMainFrameOnly: false` 的块，它能不能进
+  `www6.cbox.ws` 那个 frame、frame 里 `postMessage` 能否到达父窗口，都只能真机验。
+  若 frame 里没有出现小「译」按钮，就是注入被挡，需要换路子（原生隐藏 WKWebView）。
+- **Cbox 的 DOM 结构未知**：本机 DNS 黑洞掉 cbox.ws，仓库里没有副本，所以用的是「带字母的文本节点」
+  这条通用规则。副作用是 frame 自己的界面文字（如时间戳「11 giờ trước」）也会被翻——可接受。
+- **删除评论的接口名是猜的**：三级阶梯覆盖了站点自己的命名习惯，但服务端可能一个都不认。
+  下一份真机日志里 `[COMMENT] trying …` / `every candidate endpoint refused …` 会给出答案；
+  若真的没有删除接口，就只能如实提示失败（和取消点赞那条同性质）。
+- **baozimh 的挑战能不能在 iframe 里解**：`__gatekeeper_challenge` 若要求顶层导航或带
+  `X-Frame-Options: DENY`，iframe 方案就不成立。日志里 `[COMIC] the comic source asked for a bot
+  check…` 与随后的 `the challenge frame loaded; retrying …` 能证明走到了哪一步；若挑战本身过不去，
+  只剩换源（`app.fun.changeComicProvider()` 里有 YemanComic / KuaikanManhua / ManhuaSFACG 等）这一条路。
+- **`baozimh.com` 进 cookie 白名单的安全性**：`matching(_:host:)` 只按请求 host 过滤 cookie，
+  所以发给 baozimh 的只有 baozimh 自己的 cookie，站点会话不会外流；这一点是读代码得出的，没有运行时验证。
+- 五条都要真机复测。
+
 

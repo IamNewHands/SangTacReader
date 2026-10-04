@@ -1410,12 +1410,34 @@ async function testDiagPanel() {
   const badge = sandbox.document.body.querySelectorAll('[data-stvdiag=badge]')[0];
   const panel = sandbox.document.body.querySelectorAll('[data-stvdiag=panel]')[0];
   check('the badge and the panel are built', !!badge && !!panel);
+  check('the badge lives in <body>, not on <html>',
+    !!badge && badge.parentNode === sandbox.document.body,
+    badge && badge.parentNode ? badge.parentNode.tagName : 'no badge');
   check('the badge is visible before anything has errored',
     !!badge && badge.style.display === 'block',
     badge ? badge.style.display : 'no badge');
   check('the panel is on screen while logging is on',
     !!panel && panel.style.display === 'block',
     panel ? panel.style.display : 'no panel');
+  // The floating button exists for as long as the switch is on, and HIDE is not
+  // allowed to take it away: it is the only way back to the panel. The old rule
+  // kept a `badgeHidden` flag that only the next ERR cleared, which is why the
+  // button looked like it needed a failure before it appeared.
+  const diagBar = panel.childNodes[0];
+  const hideButton = diagBar.children.filter((node) => node.textContent === 'HIDE')[0];
+  check('the panel has a HIDE button', !!hideButton,
+    diagBar.children.map((node) => node.textContent).join(','));
+  check('nothing has errored yet',
+    diag.lines().filter((line) => line.indexOf('[ERR]') === 0).length === 0,
+    diag.text().slice(-200));
+  // The stub's addEventListener only treats `{capture: true}` as capture, so a
+  // plain event object reaches the button's handler either way.
+  hideButton.__fire('click', { stopPropagation() {}, preventDefault() {} });
+  check('HIDE collapses the panel', panel.style.display === 'none', panel.style.display);
+  check('HIDE leaves the floating button on screen',
+    badge.style.display === 'block', badge.style.display);
+  diag.show();
+  check('the panel comes back from the button', panel.style.display === 'block');
   // The web view runs edge to edge (`viewport-fit=cover`), so a panel anchored at
   // top:0 puts its button bar under the status bar / Dynamic Island, where a tap
   // belongs to the system and never reaches the page -- HIDE and CLOSE were
@@ -3243,6 +3265,63 @@ async function testSafeAreaRespectsSiteValues() {
   check('a missing bottom inset is still filled in',
     root.style.getPropertyValue('--screensafebottom') === '34px',
     root.style.getPropertyValue('--screensafebottom'));
+}
+
+async function testEmptyUserPages() {
+  console.log('the blank 我的页面 gets an empty state');
+  // 用户 → 我的页面 (page-vip:4784) fills its body from
+  // /mobile/staticpost.php?author=<uid>, and the server answers an account with
+  // no static pages with a 200 and an EMPTY body (device log 23:17:05,
+  // "staticpost.php?author=306185 -> 200 text/html string 0b"). `innerHTML = ''`
+  // then leaves a white screen under the title bar.
+  const url = '/mobile/staticpost.php?author=306185';
+  const page = makeElement('div');
+  page.className = 'pagewithtitle';
+  const content = makeElement('div');
+  content.className = 'content';
+  page.appendChild(content);
+
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    pages: { pagewithtitle: page },
+    bookInfoResponses: {
+      [url]: '',
+      '/mobile/staticpost.php?author=1': '<div class="post">hello</div>',
+    },
+  });
+  // The site's own implementation, reduced to the two lines that matter: push
+  // the empty page, then write the response straight into its body.
+  app.fun.showUserPages = function (userdata) {
+    const pushed = app.pushPage('pagewithtitle', { title: userdata.displayname });
+    return app.net.get('/mobile/staticpost.php?author=' + userdata.id)
+      .then((body) => { pushed.q('.content').innerHTML = body; return pushed; });
+  };
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(400);
+
+  check('the empty-state hook is installed and reported',
+    app.net.__stvStaticPostPatched === true
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('我的页面 gets a sentence') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+
+  await app.fun.showUserPages({ id: '306185', displayname: '读者' });
+  await tick(30);
+  check('an empty answer becomes a sentence instead of a blank page',
+    content.innerHTML.indexOf('stv-emptypages') >= 0,
+    String(content.innerHTML).slice(0, 200));
+  check('the empty state says what the page is',
+    content.innerHTML.indexOf('还没有发布过页面') >= 0);
+  check('the substitution is reported in the panel',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('staticpost.php answered with an empty body') >= 0);
+
+  const real = await app.net.get('/mobile/staticpost.php?author=1');
+  check('a page that has content is passed through untouched',
+    real === '<div class="post">hello</div>', String(real));
+  const other = await app.net.get('/mobile/booklist.php?method=mybook');
+  check('every other endpoint is untouched', other === null, String(other));
 }
 
 async function testDomainFailover() {
@@ -5937,6 +6016,447 @@ async function testCommunityBoardTranslate() {
     single.input.value === '【系统】这是一条帖子评论', single.input.value);
 }
 
+/**
+ * page-pagecbox (_page_vip.html:982): a title bar plus the cross-origin Cbox
+ * iframe. Nothing of the board's own text is in this document.
+ */
+function cboxPageFixture() {
+  const page = makeContainer('div', '');
+  const bar = makeContainer('div', 'titlebar');
+  const ctx = makeContainer('div', 'rctx');
+  bar.appendChild(ctx);
+  const frame = makeContainer('iframe', 'cbox');
+  page.appendChild(bar);
+  page.appendChild(frame);
+  return { page, bar, ctx, frame };
+}
+
+async function testCboxFrameBridge() {
+  console.log('the Cbox frame gets the translator over postMessage');
+  const fixture = cboxPageFixture();
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { pagecbox: fixture.page },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  sandbox.document.body.appendChild(fixture.page);
+  app.pushPage('pagecbox', {});
+  await tick(60);
+  check('the Cbox page is treated as a translatable page',
+    fixture.bar.querySelectorAll('.stv-translate-all').length === 1,
+    String(fixture.bar.querySelectorAll('.stv-translate-all').length));
+
+  const replies = [];
+  const cboxWindow = {
+    postMessage(message, origin) { replies.push({ message, origin }); },
+  };
+  const fromFrame = (data, origin) => sandbox.__dispatch('message', {
+    data,
+    origin: origin === undefined ? 'https://www6.cbox.ws' : origin,
+    source: cboxWindow,
+  });
+
+  fromFrame({ stvCbox: 'hello' });
+  await tick(80);
+  check('the frame is answered with the current settings',
+    replies.length === 1 && replies[0].message.stvCbox === 'settings'
+      && replies[0].message.auto === false,
+    JSON.stringify(replies));
+  check('the answer is addressed to the cbox origin, never to *',
+    replies.length === 1 && replies[0].origin === 'https://www6.cbox.ws',
+    JSON.stringify(replies.map((entry) => entry.origin)));
+
+  fromFrame({ stvCbox: 'ask', id: 7, texts: ['xin chào', 'tạm biệt'] });
+  await tick(200);
+  const answer = replies[replies.length - 1].message;
+  check('an ask is translated and sent back under its own id',
+    answer.stvCbox === 'answer' && answer.id === 7
+      && JSON.stringify(answer.out)
+        === JSON.stringify(['【系统】xin chào', '【系统】tạm biệt']),
+    JSON.stringify(answer));
+  const calls = sandbox.__stored.translationTranslate || [];
+  check('the Cbox request uses the configured engine and targets',
+    calls.length === 1 && calls[0].source === 'vi' && calls[0].target === 'zh-Hans',
+    JSON.stringify(calls));
+
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(60);
+  check('译全部 on the Cbox page sweeps the frame instead of this document',
+    replies[replies.length - 1].message.stvCbox === 'sweep',
+    JSON.stringify(replies[replies.length - 1]));
+
+  const before = replies.length;
+  fromFrame({ stvCbox: 'ask', id: 8, texts: ['xin chào'] }, 'https://evil.example');
+  await tick(80);
+  check('a stvCbox message from another origin is refused',
+    replies.length === before
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('ignored a stvCbox message') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+
+  fromFrame({ stvCbox: 'log', tag: 'CBOX', message: 'auto translate is on' });
+  await tick(20);
+  check("the frame's own log lines land in the panel",
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('[CBOX] auto translate is on') >= 0);
+}
+
+async function testCboxFrame() {
+  console.log('the Cbox frame translates its own messages');
+  const frameBlocks = loadBlocks().filter(
+    (js) => js.indexOf('__stvCboxFrameInstalled') >= 0,
+  );
+  check('there is exactly one every-frame block', frameBlocks.length === 1,
+    String(frameBlocks.length));
+  check('the every-frame block refuses to run outside Cbox',
+    frameBlocks[0].indexOf("here.indexOf('cbox') < 0") >= 0);
+
+  const sandbox = makeSandbox({ diag: false });
+  // The one thing that makes the block act: the frame's own host.
+  sandbox.window.location = { hostname: 'www6.cbox.ws' };
+  const posts = [];
+  sandbox.window.parent = {
+    postMessage(message, origin) { posts.push({ message, origin }); },
+  };
+  const log = makeContainer('div', 'log');
+  log.appendChild(makeContainer('div', 'msg', 'xin chào các bạn'));
+  log.appendChild(makeContainer('div', 'msg', 'hôm nay trời đẹp'));
+  sandbox.document.body.appendChild(log);
+
+  vm.runInContext(frameBlocks[0], sandbox);
+  check('the frame announces itself to the parent',
+    posts.length === 1 && posts[0].message.stvCbox === 'hello' && posts[0].origin === '*',
+    JSON.stringify(posts));
+  check('the frame builds its own translate button',
+    sandbox.document.body.querySelectorAll('[data-stvtranslate=cboxbutton]').length === 1,
+    String(sandbox.document.body.querySelectorAll('[data-stvtranslate]').length));
+
+  sandbox.__dispatch('message', { data: { stvCbox: 'sweep' } });
+  const ask = posts[posts.length - 1].message;
+  check('a sweep asks for the newest lines first',
+    ask.stvCbox === 'ask' && ask.id === 1
+      && JSON.stringify(ask.texts) === JSON.stringify(['hôm nay trời đẹp', 'xin chào các bạn']),
+    JSON.stringify(ask));
+
+  sandbox.__dispatch('message', {
+    data: { stvCbox: 'answer', id: 1, out: ['今天天气真好', '大家好'] },
+  });
+  check('the answer is written back into the message nodes',
+    log.children[1].textContent === '今天天气真好'
+      && log.children[0].textContent === '大家好',
+    log.children.map((node) => node.textContent).join(' | '));
+
+  sandbox.__dispatch('message', { data: { stvCbox: 'sweep' } });
+  const second = posts[posts.length - 1].message;
+  check('an already translated line is not sent again',
+    second.stvCbox === 'done' && second.count === 0,
+    JSON.stringify(second));
+
+  const third = makeContainer('div', 'msg', 'một tin nhắn mới');
+  log.appendChild(third);
+  sandbox.__dispatch('message', { data: { stvCbox: 'sweep' } });
+  const last = posts[posts.length - 1].message;
+  check('a line that arrives later is picked up',
+    last.stvCbox === 'ask'
+      && JSON.stringify(last.texts) === JSON.stringify(['một tin nhắn mới']),
+    JSON.stringify(last));
+
+  const outside = makeSandbox({ diag: false });
+  outside.window.location = { hostname: 'sangtacviet.com' };
+  const leaked = [];
+  outside.window.parent = { postMessage(message) { leaked.push(message); } };
+  vm.runInContext(frameBlocks[0], outside);
+  check('the block does nothing at all in the reader frames',
+    leaked.length === 0 && outside.window.__stvCboxFrameInstalled === undefined,
+    JSON.stringify(leaked));
+}
+
+/**
+ * page-pagelisttheluc (_page_vip.html:1888) plus its row template
+ * (view-listthelucitem, :2222): a faction name and a Vietnamese description.
+ */
+function factionBoardFixture() {
+  const page = makeContainer('div', '');
+  const bar = makeContainer('div', 'titlebar');
+  const ctx = makeContainer('div', 'rctx');
+  bar.appendChild(ctx);
+  const list = makeContainer('div', 'listtheluc');
+  page.appendChild(bar);
+  page.appendChild(list);
+  const addFaction = (name, description) => {
+    const item = makeContainer('div', 'listthelucitem');
+    const info = makeContainer('div', 'theluciteminfo');
+    info.appendChild(makeContainer('div', 'name', name));
+    info.appendChild(makeContainer('div', 'description', description));
+    item.appendChild(info);
+    list.appendChild(item);
+    return { item, info };
+  };
+  return { page, bar, ctx, list, addFaction };
+}
+
+async function testFactionBoardTranslate() {
+  console.log('the faction board is translatable');
+  const fixture = factionBoardFixture();
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { pagelisttheluc: fixture.page },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.document.body.appendChild(fixture.page);
+
+  app.pushPage('pagelisttheluc', {});
+  await tick(60);
+  check('the faction board gets the title buttons',
+    fixture.bar.querySelectorAll('.stv-translate-all').length === 1,
+    String(fixture.bar.querySelectorAll('.stv-translate-all').length));
+
+  const first = fixture.addFaction('Thiên Long Môn', 'Môn phái mạnh nhất');
+  fixture.addFaction('Huyền Thiên Tông', 'Chuyên về luyện đan');
+  sandbox.__flushObservers();
+  check('every faction row gets its own translate button',
+    fixture.list.querySelectorAll('.stv-translate-one').length === 2,
+    String(fixture.list.querySelectorAll('.stv-translate-one').length));
+
+  click(first.info.querySelectorAll('.stv-translate-one')[0]);
+  await tick(200);
+  const calls = sandbox.__stored.translationTranslate || [];
+  check('one tap sends the name and the description in one request',
+    calls.length === 1
+      && JSON.stringify(calls[0].texts)
+        === JSON.stringify(['Thiên Long Môn', 'Môn phái mạnh nhất']),
+    JSON.stringify(calls));
+  check('the translated row shows both halves',
+    first.info.querySelectorAll('.name')[0].textContent === '【系统】Thiên Long Môn'
+      && first.info.querySelectorAll('.description')[0].textContent
+        === '【系统】Môn phái mạnh nhất',
+    first.info.querySelectorAll('.name')[0].textContent);
+
+  click(fixture.bar.querySelectorAll('.stv-translate-all')[0]);
+  await tick(200);
+  const after = (sandbox.__stored.translationTranslate || []).slice(1);
+  check('译全部 skips the row that is already translated',
+    after.length === 1
+      && JSON.stringify(after[0].texts)
+        === JSON.stringify(['Huyền Thiên Tông', 'Chuyên về luyện đan']),
+    JSON.stringify(after));
+
+  click(first.info.querySelectorAll('.stv-translate-one')[0]);
+  await tick(60);
+  check('tapping the same row again restores the original',
+    first.info.querySelectorAll('.name')[0].getAttribute('stv-orig') === undefined
+      && first.info.querySelectorAll('.name')[0].innerHTML === 'Thiên Long Môn'
+      && first.info.querySelectorAll('.description')[0].innerHTML
+        === 'Môn phái mạnh nhất',
+    first.info.querySelectorAll('.name')[0].innerHTML);
+}
+
+/**
+ * view-commentblock (_page_vip.html:2333) as the site renders it for the
+ * reader's own comment: the delete button is there, nothing is bound to it.
+ */
+function commentWithDeleteFixture() {
+  const page = makeContainer('div', '');
+  const bar = makeContainer('div', 'titlebar');
+  bar.appendChild(makeContainer('div', 'rctx'));
+  const view = makeContainer('div', 'commentview');
+  const block = makeContainer('div', '');
+  block.setAttribute('view', 'commentblock');
+  block.setAttribute('data-id', '55');
+  const body = makeContainer('div', 'cmtbody');
+  body.appendChild(makeContainer('div', 'cmtcontent content', 'Bình luận của tôi'));
+  const footer = makeContainer('div', 'cmtfooter');
+  const del = makeContainer('span', 'cmtdel');
+  const delText = makeContainer('text', '', 'delete');
+  del.appendChild(delText);
+  footer.appendChild(del);
+  body.appendChild(footer);
+  block.appendChild(body);
+  view.appendChild(block);
+  page.appendChild(bar);
+  page.appendChild(view);
+  return { page, bar, view, block, del, delText };
+}
+
+async function testCommentDelete() {
+  console.log('the delete button on a comment');
+  const fixture = commentWithDeleteFixture();
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    appLanguage: 'zh',
+    pages: { comment: fixture.page },
+  });
+  const shown = [];
+  app.context = { showPopup(template) { shown.push(template); return null; } };
+  const posted = [];
+  const fetched = [];
+  const answers = {};
+  app.net.post = (url, body) => {
+    posted.push({ url, body });
+    const action = String(body).replace('ajax=', '').split('&')[0];
+    return Promise.resolve(Object.prototype.hasOwnProperty.call(answers, action)
+      ? answers[action]
+      : { code: 101 });
+  };
+  app.net.get = (url) => {
+    fetched.push(url);
+    return Promise.resolve('failure');
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  sandbox.document.body.appendChild(fixture.page);
+  app.pushPage('comment', {});
+  await tick(60);
+
+  const tapDelete = () => sandbox.__dispatch('click', {
+    target: fixture.delText,
+    stopPropagation() {},
+    preventDefault() {},
+  });
+
+  tapDelete();
+  await tick(20);
+  check('tapping 删除 asks first instead of deleting',
+    shown.length === 1 && shown[0].title === '删除这条评论？'
+      && shown[0].action && typeof shown[0].action.stvdelok === 'function',
+    JSON.stringify(shown.map((template) => template.title)));
+  check('nothing is sent until the confirmation is accepted',
+    posted.length === 0 && fetched.length === 0, JSON.stringify(posted));
+  check('the tap is reported with the comment id',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('delete tapped on comment 55') >= 0);
+
+  shown[0].action.stvdelok({ parentNode: { removeChild() {} } });
+  await tick(120);
+  check('the ladder tries the site comment API first, then its delete variant',
+    posted.length === 2
+      && posted[0].body === 'ajax=delcomment&cid=55'
+      && posted[1].body === 'ajax=deletecomment&cid=55',
+    JSON.stringify(posted));
+  check('the last candidate is the mobile comment endpoint',
+    fetched.length === 1
+      && fetched[0] === '/mobile/comment.php?act=delcomment&cid=55',
+    JSON.stringify(fetched));
+  check('every refusal is written to the panel',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('every candidate endpoint refused the delete of 55') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-320));
+  check('a failed delete leaves the comment in place',
+    fixture.view.querySelectorAll('[view=commentblock]').length === 1);
+  check('the reader is told the delete failed',
+    sandbox.document.body.querySelectorAll('[data-stvtranslate=hint]')
+      .some((node) => node.textContent.indexOf('删除失败') >= 0),
+    String(sandbox.document.body.querySelectorAll('[data-stvtranslate=hint]')
+      .map((node) => node.textContent).join(' | ')));
+
+  // Now let the first candidate answer with the site's own success shape.
+  answers.delcomment = { code: 100 };
+  posted.length = 0;
+  fetched.length = 0;
+  shown.length = 0;
+  tapDelete();
+  shown[0].action.stvdelok({ parentNode: { removeChild() {} } });
+  await tick(120);
+  check('a success stops the ladder at the first candidate',
+    posted.length === 1 && fetched.length === 0, JSON.stringify(posted));
+  check('the deleted comment is taken off the page',
+    fixture.view.querySelectorAll('[view=commentblock]').length === 0,
+    String(fixture.view.querySelectorAll('[view=commentblock]').length));
+  check('the reader is told the delete worked',
+    sandbox.document.body.querySelectorAll('[data-stvtranslate=hint]')
+      .some((node) => node.textContent.indexOf('已删除') >= 0));
+}
+
+async function testComicGate() {
+  console.log('the comic sources bot check');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+
+  const descriptor = Object.getOwnPropertyDescriptor(sandbox.window, 'AutoHttp');
+  check('the on-demand bundle global is watched, so the hook lands before the first call',
+    !!descriptor && typeof descriptor.set === 'function',
+    descriptor ? Object.keys(descriptor).join(',') : 'no descriptor');
+
+  const api = 'https://www.baozimh.com/api/bzmhq/amp_comic_list?type=all&region=all&page=0';
+  const calls = [];
+  const challenge = {
+    error: 'challenge_required',
+    challenge_url: '/__gatekeeper_challenge/start?return=%2Fapi%2Fbzmhq%2Famp_comic_list',
+  };
+  sandbox.window.AutoHttp = {
+    get(url) {
+      calls.push(url);
+      if (String(url).indexOf('baozimh.com') < 0) { return Promise.resolve({ items: [] }); }
+      const seen = calls.filter((entry) => String(entry).indexOf('baozimh.com') >= 0).length;
+      if (seen === 2) {
+        return Promise.resolve({ items: [{ comic_id: 'a', name: 'Truyện một' }] });
+      }
+      return Promise.resolve(challenge);
+    },
+  };
+  check('the wrapper is installed as soon as the global appears',
+    sandbox.window.AutoHttp.get.__stvComicGateWrapped === true);
+  // The other half: the challenge token is a cookie, and the plugin only attaches
+  // a host's cookies when the host is on its allow-list. Without this the retry
+  // travels anonymous and is challenged again.
+  check('baozimh is on the plugin cookie allow-list',
+    fs.readFileSync(path.join(__dirname, '..', 'plugins', 'http', 'ios', 'Sources',
+      'SangTacHttpPlugin', 'SangTacHttpPlugin.swift'), 'utf8')
+      .indexOf('"baozimh.com"') >= 0);
+
+  const pending = sandbox.window.AutoHttp.get(api);
+  await tick(30);
+  const frames = sandbox.document.body.querySelectorAll('[data-stvcomic=gate]');
+  check('a bot check is answered by loading the challenge in this web view',
+    frames.length === 1
+      && frames[0].src === 'https://www.baozimh.com/__gatekeeper_challenge/start'
+        + '?return=%2Fapi%2Fbzmhq%2Famp_comic_list',
+    frames.length ? String(frames[0].src) : 'no frame');
+  check('the challenge is reported before it is attempted',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the comic source asked for a bot check on www.baozimh.com') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+
+  frames[0].__fire('load', {});
+  const answer = await pending;
+  await tick(60);
+  check('the request is retried once the challenge frame has loaded',
+    calls.length === 2, JSON.stringify(calls));
+  check('the retry answer is what the caller gets',
+    !!answer && Array.isArray(answer.items) && answer.items.length === 1,
+    JSON.stringify(answer));
+  check('the challenge frame is taken down again',
+    sandbox.document.body.querySelectorAll('[data-stvcomic=gate]').length === 0);
+  check('the retry is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the challenge frame loaded; retrying') >= 0);
+
+  // A source that stays gated must not loop the challenge frame.
+  const again = await sandbox.window.AutoHttp.get(api);
+  await tick(30);
+  check('a host that was just challenged is not challenged again in a loop',
+    calls.length === 3
+      && sandbox.document.body.querySelectorAll('[data-stvcomic=gate]').length === 0
+      && !!again && again.error === 'challenge_required',
+    JSON.stringify(calls));
+  check('the refusal to retry is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('did not stick; leaving the answer alone') >= 0);
+
+  const plain = await sandbox.window.AutoHttp.get('https://example.com/x');
+  check('a source that is not challenged is passed through untouched',
+    calls.length === 4 && !!plain && Array.isArray(plain.items),
+    JSON.stringify(plain));
+}
+
 async function testCommentTranslate() {
   console.log('comment translation (system offline engine)');
   const fixture = commentPageFixture(['Bình luận một', 'Bình luận hai']);
@@ -6869,9 +7389,21 @@ function testInjectionOrder() {
     .filter(Boolean)
     .map((entry) => entry.replace(/^SiteI18nData[.]/, ''));
 
+  // `cboxFrame` is the one block that must NOT be in `all`: it is the only one
+  // injected with forMainFrameOnly: false (the Cbox board is a cross-origin
+  // iframe), and putting it in the main-frame list would run it in the reader's
+  // same-origin chapter frames.
+  const everyFrame = ['cboxFrame'];
   check('every declared block is injected',
-    declared.every((name) => listed.indexOf(name) >= 0),
-    declared.filter((name) => listed.indexOf(name) < 0).join(', '));
+    declared.every((name) => listed.indexOf(name) >= 0 || everyFrame.indexOf(name) >= 0),
+    declared.filter((name) => listed.indexOf(name) < 0
+      && everyFrame.indexOf(name) < 0).join(', '));
+  check('the every-frame block is kept out of the main-frame list',
+    listed.indexOf('cboxFrame') < 0);
+  check('the every-frame block is the one wired in with forMainFrameOnly: false',
+    /SitePatch[.]cboxFrame[\s\S]{0,240}?forMainFrameOnly: false/.test(
+      fs.readFileSync(path.join(TARGET_DIR, 'SangTacAppPlugin.swift'), 'utf8'),
+    ));
   check('no block is injected twice',
     listed.length === new Set(listed).size, listed.join(', '));
   check('the generated i18n overlay is injected',
@@ -7119,6 +7651,7 @@ await testLanguageGuard();
 await testBootShell();
   await testCommentButton();
   await testOfflineBookDetailPage();
+await testEmptyUserPages();
   await testDomainFailover();
   await testDownloadRowControls();
   await testStorageAccessor();
@@ -7141,6 +7674,11 @@ await testBootShell();
   await testTranslateAllWaitsForTheList();
   await testAutoTranslateWaitsForTheList();
   await testCommunityBoardTranslate();
+await testCboxFrameBridge();
+await testCboxFrame();
+await testFactionBoardTranslate();
+await testCommentDelete();
+await testComicGate();
   await testTranslateKeyStorage();
   await testAssetCacheStabiliser();
   await testAssetMirror();
