@@ -526,6 +526,16 @@ function makeSandbox(options) {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
     Blob: globalThis.Blob,
     Uint8Array,
+    // The chapter-frame byte relay reads an image blob back as a data url, which
+    // is how the OCR service is handed bytes it does not have to fetch itself.
+    // The stub answers from the blob's own `base64`, so a test can follow the
+    // "IMAGERAW:" prefix all the way to the frame's reply.
+    FileReader: class {
+      readAsDataURL(blob) {
+        this.result = 'data:image/jpeg;base64,' + String((blob && blob.base64) || '');
+        if (this.onload) { this.onload(); }
+      }
+    },
     // The mirror-failover block reads the origin of the URL bestDomain()
     // returned.
     URL: globalThis.URL,
@@ -606,6 +616,14 @@ function makeFakeFrame(contentElements) {
     documentElement: html,
     body: frameBody,
     getElementById: byId,
+    // The chapter-frame repair writes a notice into the frame when the OCR
+    // service answers without an image, so the stub document has to be able to
+    // make one.
+    createElement: (tag) => {
+      const node = makeElement(tag);
+      node.ownerDocument = doc;
+      return node;
+    },
     docEventListeners: {},
     // The page-turn hook listens for `stvspeak` on the reader document in the
     // capture phase and makeSentence() fires the same event with the page
@@ -6721,8 +6739,29 @@ async function testComicGate() {
     initRemote() { return Promise.resolve(); },
   };
   sandbox.window.app.comicReader = reader;
+  // setComicPageEvent is the only thing that fills the comicinfo page, and the
+  // chapter count the template leaves empty has to be written from there.
+  const comicInfoCount = makeElement('span');
+  const comicInfo = {
+    data: { chapters: [{ url: 'a' }, { url: 'b' }, { url: 'c' }] },
+    q: (selector) => (selector === '.chaptercount' ? comicInfoCount : null),
+  };
+  sandbox.window.app.fun = { setComicPageEvent() { return null; } };
+  // The byte relay hands the OCR service an image it does not have to fetch, so
+  // the page needs the app's own HTTP downloader to exist.
+  sandbox.window.app.images = { download: () => Promise.resolve({ base64: 'QUJD' }) };
   sandbox.window.location = { origin: 'https://sangtacviet.com' };
   await tick(300);
+
+  check('the comic detail page count row is filled where the site leaves it empty',
+    sandbox.window.app.fun.setComicPageEvent.__stvCount === true);
+  sandbox.window.app.fun.setComicPageEvent(comicInfo);
+  check('the detail page says how many chapters the source listed',
+    comicInfoCount.textContent === '3', JSON.stringify(comicInfoCount.textContent));
+  check('the filled count is reported',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the detail page lists 3 chapter(s)') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
 
   check('the reader is adopted once app.v2.read.js has defined it',
     reader.getTranslatorUrl.__stvSameOrigin === true
@@ -6753,6 +6792,32 @@ async function testComicGate() {
 
   const page = makeElement('div');
   const frame = makeFakeFrame([makeElement('img'), makeElement('img')]);
+  // The translator comictranslator.php defines in its own inline script. Its
+  // `toRealRawData` is the site's, verbatim in shape: no `return` at all when
+  // nothing carries the LAZY: prefix, which is the empty POST body that made the
+  // server answer an empty data url.
+  const frameSent = [];
+  frame.contentWindow.translator = {
+    imgs: [],
+    lazyImageLoader: {
+      cache: {},
+      load(url) { return Promise.resolve('IMAGERAW:' + url); },
+      async toRealRawData(imgs) {
+        const list = (typeof imgs === 'string' && imgs.charAt(0) === '[')
+          ? JSON.parse(imgs) : [imgs];
+        if (list.find((entry) => String(entry).indexOf('LAZY:') === 0)) {
+          const loaded = await Promise.all(list.map(async (entry) => (
+            String(entry).indexOf('LAZY:') === 0
+              ? await this.load(String(entry).slice(5)) : entry)));
+          return loaded.join('');
+        }
+      },
+    },
+    loadTranslatedImage(data, order) { frameSent.push({ kind: 'render', data, order }); },
+    startTrans() { frameSent.push({ kind: 'start' }); },
+  };
+  const frameLoader = frame.contentWindow.translator.lazyImageLoader;
+  const siteToRealRawData = frameLoader.toRealRawData;
   // The site's getCurrentChapterUrl splits the frame src on "?" and then on "=",
   // checking neither: a frame that has not been pointed at a chapter yet is the
   // ordinary case, not an exotic one.
@@ -6776,7 +6841,7 @@ async function testComicGate() {
     reader.getCurrentChapterUrl());
 
   reader.initRemote('https://www.yemancomic.com/chapter/1/2.html', reader.currentChapterList, {});
-  await tick(400);
+  await tick(900);
   const frameReport = String(sandbox.window.__stvDiag.text() || '');
   check('what the chapter frame actually contains is measured, not guessed',
     frameReport.indexOf('the chapter frame at https://sangtacviet.com/comictranslator.php')
@@ -6785,6 +6850,68 @@ async function testComicGate() {
   check('opening a chapter says how many chapters the source listed',
     frameReport.indexOf('opening chapter https://www.yemancomic.com/chapter/1/2.html'
       + ' with 1 chapter(s) known') >= 0);
+
+  // ---- what the frame has to hand the translator --------------------------
+  check('the site own toRealRawData drops a plain url, which is the empty body',
+    await siteToRealRawData('https://mhpic.example/1.jpg') === undefined);
+  check('the frame translator is repaired from the page, same-origin as it now is',
+    frame.contentWindow.translator.__stvBytes === true
+      && frameLoader.toRealRawData !== siteToRealRawData);
+  check('the repair is reported, because it is what the reader was missing',
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the chapter frame translator is patched') >= 0);
+  check('a plain image url reaches the OCR service instead of being dropped',
+    await frameLoader.toRealRawData('https://mhpic.example/1.jpg')
+      === 'https://mhpic.example/1.jpg');
+  check('a LAZY: url is fetched and handed over as IMAGERAW bytes',
+    await frameLoader.toRealRawData('LAZY:https://mhpic.example/2.jpg')
+      === 'IMAGERAW:https://mhpic.example/2.jpg');
+  check('a batch keeps both kinds, in order',
+    await frameLoader.toRealRawData(
+      JSON.stringify(['https://mhpic.example/1.jpg', 'LAZY:https://mhpic.example/2.jpg']))
+      === 'https://mhpic.example/1.jpgIMAGERAW:https://mhpic.example/2.jpg');
+
+  // Nothing on the site answers the frame's request for bytes, so the page does.
+  const replies = [];
+  frame.contentWindow.postMessage = (payload) => { replies.push(payload); };
+  sandbox.__dispatch('message', {
+    data: { type: 'requestLazyImageData', url: 'https://mhpic.example/3.jpg' },
+    source: frame.contentWindow,
+  });
+  await tick(80);
+  check('the page answers the frame with bytes the OCR service cannot fetch itself',
+    replies.length === 1
+      && replies[0].type === 'lazyImageData'
+      && replies[0].url === 'https://mhpic.example/3.jpg'
+      && replies[0].data === 'IMAGERAW:QUJD',
+    JSON.stringify(replies));
+  check('a message that is not the frame asking is left alone',
+    (sandbox.__dispatch('message', { data: { type: 'somethingElse' } }), replies.length === 1));
+
+  // The server answers imageWidth=null exactly when it could not fetch the image
+  // it was handed; that empty data url is what WebKit drew as the "?".
+  const chapcontent = makeElement('div');
+  chapcontent.id = 'chapcontent';
+  frame.contentDocument.body.appendChild(chapcontent);
+  frame.contentWindow.translator.loadTranslatedImage(
+    { blocks: [], images: ['data:image/jpeg;base64,'], imageWidth: null }, 0);
+  check('an answer with no image becomes a sentence, not a broken picture',
+    chapcontent.children.length === 1
+      && String(chapcontent.children[0].textContent).indexOf('没有取到图片') >= 0,
+    JSON.stringify(chapcontent.children.map((child) => String(child.textContent))));
+  check('a page the server did fetch still goes to the site renderer',
+    (frame.contentWindow.translator.loadTranslatedImage(
+      { blocks: [], images: ['data:image/jpeg;base64,AAAA'], imageWidth: 800 }, 1),
+    frameSent.some((entry) => entry.kind === 'render' && entry.order === 1)));
+  check('showError exists now, so a failed image stops dying as a TypeError',
+    typeof frame.contentWindow.translator.showError === 'function'
+      && (frame.contentWindow.translator.showError(2),
+        chapcontent.children.length === 2));
+  check('how many images the frame has to translate is reported',
+    (frame.contentWindow.translator.imgs = [{ url: 'a' }, { url: 'b' }],
+    frame.contentWindow.translator.startTrans(),
+    String(sandbox.window.__stvDiag.text() || '')
+      .indexOf('the chapter frame has 2 image(s) to translate') >= 0));
 
   // "显示不全漫画详情": the comicinfo template clips its own detail block.
   const styles = sandbox.document.head.querySelectorAll('[data-stvcomic=info]');

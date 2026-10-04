@@ -10297,31 +10297,257 @@ enum SitePatch {
             return complete;
         }
 
-        // What the chapter frame actually contains, once. This is the one
-        // measurement that separates "the site's translator answered nothing"
-        // from "the images are there and something else is blank": `images=0`
-        // with `body=0B` is the former, and no client-side change can fix it.
-        function reportFrame(frame, polls) {
+        // What the chapter frame actually contains. This is the one measurement
+        // that separates "the site's translator answered nothing" from "the
+        // images are there and something else is blank".
+        //
+        // It used to be taken the moment the iframe ELEMENT existed -- 250ms
+        // after initRemote appended it -- which is the frame's initial
+        // about:blank document, not its content. Every 2026-10-04 line therefore
+        // read `images=0 body=0B readyState=complete` whatever the site did, and
+        // the question the measurement was added to answer stayed open. Measure
+        // on arrival, then again once the frame has had time to load and draw,
+        // and stop as soon as one of them shows content.
+        function frameSource(frame) {
+            return String((frame && frame.src) || '').slice(0, 140);
+        }
+
+        function frameReport(frame) {
             var w = null;
             try { w = frame.contentWindow; } catch (error) { w = null; }
-            if (!w) {
-                note('ERR', 'the chapter frame has no window');
-                return;
-            }
-            var report;
+            if (!w) { return 'no window'; }
             try {
                 var doc = w.document;
                 var images = doc.getElementsByTagName('img');
-                report = 'title=' + JSON.stringify(String(doc.title || ''))
+                return 'title=' + JSON.stringify(String(doc.title || ''))
                     + ' images=' + images.length
                     + ' body=' + ((doc.body && doc.body.innerHTML.length) || 0) + 'B'
                     + ' readyState=' + String(doc.readyState);
             } catch (error) {
-                report = 'unreadable: ' + messageOf(error);
+                return 'unreadable: ' + messageOf(error);
             }
-            note('COMIC', 'the chapter frame at '
-                + String(frame.src || '').slice(0, 140) + ' after ' + polls
-                + ' poll(s): ' + report);
+        }
+
+        function followChapterFrame(frame, polls) {
+            var plan = [900, 3000];
+            var seen = '';
+            var settled = false;
+            var look = function (label) {
+                var report = frameReport(frame);
+                // `body=0B` is the about:blank answer; anything else is the
+                // frame's own document, so the rest of the plan is noise.
+                if (report !== 'no window' && report.indexOf('body=0B') < 0) {
+                    settled = true;
+                }
+                if (report === seen) { return; }
+                seen = report;
+                note('COMIC', 'the chapter frame at ' + frameSource(frame)
+                    + ' after ' + polls + ' poll(s), ' + label + ': ' + report);
+            };
+            look('on arrival');
+            for (var i = 0; i < plan.length; i++) {
+                (function (delay) {
+                    setTimeout(function () {
+                        if (!settled) { look('at +' + delay + 'ms'); }
+                    }, delay);
+                })(plan[i]);
+            }
+        }
+
+        // ---- what the chapter frame has to hand the translator ----------------
+        //
+        // comictranslator.php's inline script turns each image url into the body
+        // /s1213ocr.php accepts, and on 2026-10-04 both of its paths were dead:
+        //
+        //   * a plain url: `toRealRawData` has NO `return` when no entry carries
+        //     the "LAZY:" prefix, so it yields undefined and transImage runs
+        //     `a.send(undefined)`. An empty body makes the server answer
+        //     {"blocks":[],"imageWidth":null,"images":["data:image/jpeg;base64,"]}
+        //     -- an EMPTY data url (measured: 112 bytes). ComicRenderer.render()
+        //     writes that into an `<img src>`, which WebKit draws as its
+        //     broken-image glyph: that glyph is the "?" the reader reported, and
+        //     no download was ever in flight.
+        //   * a "LAZY:" url: lazyImageLoader.load() postMessages
+        //     {type:"requestLazyImageData"} to the parent and waits for a
+        //     {type:"lazyImageData"} answer. Nothing on the site listens (checked
+        //     against the live app.v2.php and all seven bundles the frame loads),
+        //     so that promise never settles and the page never draws at all.
+        //
+        // patchTranslatorUrl makes the frame same-origin, so the parent can reach
+        // in and repair both halves. The bytes half uses the protocol the frame
+        // already documents ("return as IMAGERAW format"): the parent fetches the
+        // image through the app's own HTTP plugin and answers "IMAGERAW:" plus
+        // the base64, which the server accepts.
+        var frameAsking = null;
+
+        function imageBytes(url) {
+            return new Promise(function (resolve) {
+                var answered = false;
+                var done = function (value) {
+                    if (answered) { return; }
+                    answered = true;
+                    resolve(value);
+                };
+                // A url the server can fetch itself is a better answer than a
+                // page that never draws, so fall back to it when the client
+                // cannot produce the bytes.
+                setTimeout(function () { done(url); }, 15000);
+                try {
+                    var images = window.app && window.app.images;
+                    if (!images || typeof images.download !== 'function') {
+                        done(url);
+                        return;
+                    }
+                    images.download(url).then(function (blob) {
+                        var reader = new FileReader();
+                        reader.onload = function () {
+                            var text = String(reader.result || '');
+                            var comma = text.indexOf(',');
+                            done(comma < 0 ? url : 'IMAGERAW:' + text.slice(comma + 1));
+                        };
+                        reader.onerror = function () { done(url); };
+                        reader.readAsDataURL(blob);
+                    }, function (error) {
+                        note('ERR', 'the chapter frame image could not be fetched ('
+                            + messageOf(error) + '); letting the server try');
+                        done(url);
+                    });
+                } catch (error) {
+                    note('ERR', 'the chapter frame image could not be fetched ('
+                        + messageOf(error) + '); letting the server try');
+                    done(url);
+                }
+            });
+        }
+
+        function onChapterFrameMessage(event) {
+            var data = event && event.data;
+            if (!data || data.type !== 'requestLazyImageData'
+                || typeof data.url !== 'string') {
+                return;
+            }
+            var target = event.source || frameAsking;
+            imageBytes(data.url).then(function (payload) {
+                try {
+                    if (target && typeof target.postMessage === 'function') {
+                        target.postMessage({
+                            type: 'lazyImageData',
+                            url: data.url,
+                            data: payload,
+                        }, '*');
+                    }
+                } catch (error) {
+                    note('ERR', 'the chapter frame image could not be handed back: '
+                        + messageOf(error));
+                }
+            });
+        }
+        window.addEventListener('message', onChapterFrameMessage);
+
+        // The server answers imageWidth=null exactly when it could not fetch the
+        // image it was handed; a page it did fetch always carries the width it
+        // measured. Rendering that answer is what put the broken glyph on screen,
+        // so say it in words instead.
+        function answerHasNoImage(data) {
+            if (!data || typeof data !== 'object') { return false; }
+            return data.imageWidth === null || data.imageWidth === undefined;
+        }
+
+        function frameNotice(w, order) {
+            try {
+                var doc = w.document;
+                var host = doc.getElementById ? doc.getElementById('chapcontent') : null;
+                if (!host) { return; }
+                var box = doc.createElement('div');
+                box.className = 'stv-img-missing';
+                box.setAttribute('ord', String(order));
+                box.style.order = String(order);
+                box.style.padding = '28px 18px';
+                box.style.textAlign = 'center';
+                box.style.color = '#888';
+                box.textContent = '这一页没有取到图片：站点翻译服务没有返回内容。';
+                host.appendChild(box);
+            } catch (error) {
+                note('ERR', 'the chapter frame notice could not be shown: '
+                    + messageOf(error));
+            }
+        }
+
+        function patchChapterTranslator(w) {
+            var translator = null;
+            try { translator = w ? w.translator : null; } catch (error) { translator = null; }
+            if (!translator || !translator.lazyImageLoader) { return false; }
+            if (translator.__stvBytes) { return true; }
+            translator.__stvBytes = true;
+            frameAsking = w;
+
+            var loader = translator.lazyImageLoader;
+            loader.toRealRawData = async function (imgs) {
+                var list = (typeof imgs === 'string' && imgs.charAt(0) === '[')
+                    ? JSON.parse(imgs) : [imgs];
+                var out = [];
+                for (var i = 0; i < list.length; i++) {
+                    var one = String(list[i]);
+                    // A url the server fetches itself goes back unchanged; that
+                    // return is the whole repair for this path.
+                    out.push(one.indexOf('LAZY:') === 0
+                        ? await loader.load(one.slice(5)) : one);
+                }
+                return out.join('');
+            };
+
+            var render = translator.loadTranslatedImage;
+            if (typeof render === 'function' && !render.__stvGuarded) {
+                var safeRender = function (data, order) {
+                    if (answerHasNoImage(data)) {
+                        note('COMIC', 'the translator answered no image for block '
+                            + order + '; showing a notice instead of a broken picture');
+                        frameNotice(w, order);
+                        return null;
+                    }
+                    return render.apply(this, arguments);
+                };
+                safeRender.__stvGuarded = true;
+                translator.loadTranslatedImage = safeRender;
+            }
+
+            // triggerLoadImg calls this after three failures and the frame
+            // defines it nowhere, so a failed image used to die as a TypeError
+            // with nothing at all on screen.
+            if (typeof translator.showError !== 'function') {
+                translator.showError = function (order) {
+                    note('COMIC', 'the translator gave up on block ' + order);
+                    frameNotice(w, order);
+                };
+            }
+
+            var start = translator.startTrans;
+            if (typeof start === 'function' && !start.__stvLogged) {
+                var safeStart = function () {
+                    var list = translator.imgs || [];
+                    note('COMIC', 'the chapter frame has ' + list.length
+                        + ' image(s) to translate');
+                    return start.apply(this, arguments);
+                };
+                safeStart.__stvLogged = true;
+                translator.startTrans = safeStart;
+            }
+            note('COMIC', 'the chapter frame translator is patched');
+            return true;
+        }
+
+        // The frame parses its inline script before `load` fires, but its src is
+        // replaced on every chapter change, so the patch is attempted on a short
+        // poll rather than once.
+        function watchChapterTranslator(frame) {
+            var tries = 0;
+            var timer = setInterval(function () {
+                tries++;
+                var w = null;
+                try { w = frame.contentWindow || null; } catch (error) { w = null; }
+                if (patchChapterTranslator(w)) { clearInterval(timer); return; }
+                if (tries > 100) { clearInterval(timer); }
+            }, 200);
         }
 
         function watchChapterFrame(reader) {
@@ -10336,7 +10562,8 @@ enum SitePatch {
                     ? page.q('iframe') : null;
                 if (frame) {
                     clearInterval(timer);
-                    reportFrame(frame, polls);
+                    watchChapterTranslator(frame);
+                    followChapterFrame(frame, polls);
                     return;
                 }
                 if (polls > 40) { clearInterval(timer); }
@@ -10376,6 +10603,37 @@ enum SitePatch {
             return true;
         }
 
+        // "下面的目录没显示，只有一个「章」字": the comicinfo template renders
+        // `<span class="chaptercount"></span> Chương` (app.v2.php:443), and
+        // setComicPageEvent -- the only place that page is filled -- never writes
+        // the count, unlike the novel page's own bookinfo fill. With the i18n
+        // overlay translating "Chương" the row reads as a bare "章" and the
+        // detail page looks like it has no chapter list at all.
+        function patchComicChapterCount() {
+            var fun = window.app && window.app.fun;
+            if (!fun || typeof fun.setComicPageEvent !== 'function') { return false; }
+            if (fun.setComicPageEvent.__stvCount) { return true; }
+            var original = fun.setComicPageEvent;
+            var safe = function (page) {
+                var result = original.apply(this, arguments);
+                try {
+                    var data = (page && page.data) || {};
+                    var total = (data.chapters && data.chapters.length) || 0;
+                    var node = (page && typeof page.q === 'function')
+                        ? page.q('.chaptercount') : null;
+                    if (node) { node.textContent = total ? String(total) : ''; }
+                    note('COMIC', 'the detail page lists ' + total + ' chapter(s)');
+                } catch (error) {
+                    note('ERR', 'the comic detail count could not be filled: '
+                        + messageOf(error));
+                }
+                return result;
+            };
+            safe.__stvCount = true;
+            fun.setComicPageEvent = safe;
+            return true;
+        }
+
         function adoptReader() {
             var reader = window.app && window.app.comicReader;
             if (!reader) { return false; }
@@ -10383,7 +10641,8 @@ enum SitePatch {
             var frame = patchReaderFrame(reader);
             var remote = patchInitRemote(reader);
             var style = patchComicInfoStyle();
-            return !!(origin && frame && remote && style);
+            var count = patchComicChapterCount();
+            return !!(origin && frame && remote && style && count);
         }
 
         // app.v2.comicprovider.js is loaded on demand -- the comic browser is the

@@ -242,8 +242,16 @@ const REQUIRED_MARKERS = [
   'function patchTranslatorUrl(',
   'the chapter frame is on ',
   'function patchReaderFrame(',
-  'function reportFrame(',
+  'function frameReport(',
   'the chapter frame could not be wired up',
+  // The frame's translator never handed the OCR service an image: a plain url
+  // was dropped by toRealRawData's missing return, and a LAZY: url waited for a
+  // parent answer nobody sends. Both are repaired from the parent now.
+  'function patchChapterTranslator(',
+  'function onChapterFrameMessage(',
+  'the chapter frame translator is patched',
+  // The comic detail page's own chapter-count row is never filled by the site.
+  'function patchComicChapterCount(',
 ];
 
 function fail(message) {

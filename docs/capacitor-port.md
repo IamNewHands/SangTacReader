@@ -4019,4 +4019,82 @@ CLEAR 同时清文件、没有原生 sink 时不丢行）、谷歌通道吞吐�
   继续，所以最坏情况是变慢而不是翻不出来，但真正的安全上限只能靠真机数据。
 - 三条都要真机复测。
 
+## §6.40 第 38 轮：漫画章节「显示问号」的根因（帧内翻译器两条路都是死的）
+
+上一轮加的 `reportFrame()` 想把「站点翻译器没回内容」和「图在那儿、别处空白」分开，但它的
+量测点在 `initRemote` 追加 iframe 之后的第 250ms——那是帧的初始 `about:blank` 文档，不是它的
+内容。所以日志里每一条都是 `images=0 body=0B readyState=complete`，无论站点做了什么。这一轮
+先把量测修对，再顺着站点自己的协议把根因查到端点。
+
+### 根因：帧内 `toRealRawData` 没有 `return`
+
+`comictranslator.php` 的内联脚本把每张图变成 `/s1213ocr.php` 能吃的 body，两条路都是死的：
+
+| 路 | 代码 | 结果 |
+| --- | --- | --- |
+| 普通 url | `lazyImageLoader.toRealRawData()` 在没有条目带 `LAZY:` 前缀时**根本没有 `return`** | 返回 `undefined` → `transImage` 执行 `a.send(undefined)` → **空 body** |
+| `LAZY:` url | `lazyImageLoader.load()` 向父窗口 `postMessage({type:"requestLazyImageData"})` 等回包 | 站点**任何地方都没有这个监听器**（live `app.v2.php` 与帧加载的 7 个 bundle 全 0 命中）→ Promise 永不 settle，页面永远不画 |
+
+空 body 的服务端回答（实测 112 字节）：
+
+```
+{"blocks":[],"imageWidth":null,"images":["data:image/jpeg;base64,"]}
+```
+
+`ComicRenderer.render()` 把它写进 `<img src>`，WebKit 画成破图图标——**读者看到的「问号」
+就是这个图标**，不是下载慢，也不是图片被防盗链挡住。
+
+验证（直连 `sangtacviet.app`，不是设备）：
+
+| 请求 body | 服务端回答 |
+| --- | --- |
+| 空 | `imageWidth=null`，`images=["data:image/jpeg;base64,"]` |
+| 普通 url（可达） | 真图 + `imageWidth=202` + blocks |
+| 普通 url（`mhpic.cartoon.reader.qq.com`，该主机 **DNS 无 A 记录**） | `data:image/jpeg;base64,` 加一段 `error:14094410:SSL routines...` 的 base64，同样是坏图 |
+| `IMAGERAW:<base64>` | 真图 + blocks —— 协议成立 |
+
+### 修法
+
+帧现在是同源的（上一轮的 `patchTranslatorUrl`），所以父窗口能伸手进去补：
+
+| 改动 | 说明 |
+| --- | --- |
+| `patchChapterTranslator()` | 用父窗口的函数替换帧内 `toRealRawData`：普通 url 原样返回（缺的就是这个 `return`），`LAZY:` 走父窗口取字节 |
+| `onChapterFrameMessage()` | 补上站点缺的那半：收 `requestLazyImageData` → 用 App 自己的 HTTP 插件下载 → 回 `{type:"lazyImageData", data:"IMAGERAW:"+base64}`；取不到就把 url 交回服务端自取 |
+| `answerHasNoImage()` + `frameNotice()` | 服务端答 `imageWidth=null` 时不再渲染那张坏图，改在 `#chapcontent` 里写一句「这一页没有取到图片」 |
+| `translator.showError` | 帧里从来只有调用没有定义（三次重试后 `TypeError`，屏幕上什么都不发生），补成同一句提示 |
+| `startTrans` 包一层 | 记一行 `the chapter frame has N image(s) to translate`，下一份日志直接看出 `comicloader.php` 到底给了几张图 |
+| `followChapterFrame()` | 量测改成到达时 + 900ms + 3000ms，看到 `body` 非 0 就停——上一轮那条永远 `body=0B` 的日志不再出现 |
+
+### 详情页「只有一个『章』字」
+
+`app.v2.php:443` 的模板是 `<span class="chaptercount"></span> Chương`，而 `setComicPageEvent`
+（该页唯一的填充点）**从不写这个计数**——小说的 bookinfo 有写。i18n 覆盖层把 `Chương` 译成
+「章」之后，那一行就读成一个孤零零的「章」。`patchComicChapterCount()` 包
+`app.fun.setComicPageEvent`，用 `page.data.chapters.length` 补上。
+
+### 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/test-site-patch.js` | **830 条断言**全过（上一轮 815，新增 15） |
+| `scripts/check-ios-shim.js` | 26 块 / 594851 字节 / 111 标记（新增 4 个 marker） |
+| `scripts/gen-site-i18n.js --check` | 460 标签 / 72 片段 |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：`toRealRawData` 对普通 url 确实返回 undefined（先复现站点缺陷）、补丁后普通 url
+原样送达、`LAZY:` 变成 `IMAGERAW:`、批量保持顺序、父窗口回包内容正确、非本帧消息不理会、
+无图回答变成提示而不是坏图、有图回答仍交给站点渲染、`showError` 存在、计数补丁写入 3。
+
+### 未证实项
+
+- **真机复测**：`mhpic.cartoon.reader.qq.com` 在本机 DNS 无 A 记录，用户点的那一章
+  （`cartoon.reader.qq.com` 源）的图**任何客户端都取不到**；修好之后这类源会显示那句提示而
+  不是问号，能取到图的源会重新出图。这一条只能靠真机确认。
+- **`LAZY:` 前缀由谁产生**：`comicloader.php` 是服务端 PHP，本机只见到普通 url（qq 源 36 条
+  全是普通 url，yemancomic 源返回 `[]`）。父窗口那半按站点自己注释里写的 `IMAGERAW` 协议
+  实现，真机若出现 `LAZY:` 源才有数据。
+- **yemancomic 源 `comicloader.php` 回 `[]`**：服务端抓不到该章的图列表，客户端无解。
+
+
 
