@@ -276,17 +276,29 @@ jobs:
             echo "::error::setDiagnostics 缺失（原生诊断门无法开关）"
             exit 1
           fi
-          # 会话响应缓存里的章节列表那条规则。它没有 UI：一旦丢掉，表现只是
+          # 内容响应缓存里的章节列表那条规则。它没有 UI：一旦丢掉，表现只是
           # 「章节列表又发了三次」，面板上看不出来。**这一条只能查源码**：
           # 它唯一的诊断字面量只经过 CAPLog，release 产物里会被优化掉（第一次
           # 写成二进制 strings 检查时就是这样红的），而 `sajax=getchapterlist`
           # 又同时出现在 SiteI18nData 的注入块里，放在 strings 检查里会「因为
           # 别的地方有同样的字符串」而假装通过。源码检查证明的是「规则还在」，
           # 能不能链进产物由上面的编译与注册步骤负责。
-          for marker in 'cachePolicy(method:' 'sajax=getchapterlist' \
-                        'chapterListTTL' 'isCacheableChapterList'; do
+          #
+          # 第 45 轮把这条规则搬出了插件本体：分类在 SangTacHttpPlugin.contentClass，
+          # 策略（TTL 与 SWR）与接受条件在 ContentCache.swift 的 ContentPolicies /
+          # isChapterListBody。所以标记分成两组，各自查自己的文件——搬走之后还按老
+          # 路径查，只会红在一句「源码里没有」，而不是红在规则丢了。
+          for marker in 'sajax=getchapterlist' 'contentClass(method:'; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
               echo "✓ $marker 还在响应缓存源码里"
+            else
+              echo "::error::$marker 缺失（章节列表缓存规则被删改）"
+              exit 1
+            fi
+          done
+          for marker in 'case chapterList' 'isChapterListBody' '6 * 3600'; do
+            if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/ContentCache.swift; then
+              echo "✓ $marker 还在内容缓存源码里"
             else
               echo "::error::$marker 缺失（章节列表缓存规则被删改）"
               exit 1
