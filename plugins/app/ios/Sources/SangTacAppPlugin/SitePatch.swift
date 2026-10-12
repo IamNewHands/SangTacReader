@@ -1646,6 +1646,14 @@ enum SitePatch {
 
      Replacing the accessor -- not wrapping it, because the original discards the
      value inside its own body -- is the smallest repair at the exact seam.
+
+     The same seam also owns the site's *blob* store (§6.45.3 (8)). The site keeps
+     the reader's images (`img.*`, app.v2.js:7457-7466) and its imported fonts
+     (`font_*`, :7158) through `app.storage.cache.setFile`, which on iOS means
+     UserDefaults -- a store iOS holds in memory, holding megabytes of base64. So
+     `getFile`/`setFile`/`deleteFile` are wrapped for those two key prefixes and
+     the bytes go to files instead, with a one-time migration that reads the old
+     value, verifies the new one, and only then blanks the old one.
      */
     static let storageAccessor = """
     (function () {
@@ -1661,6 +1669,100 @@ enum SitePatch {
                 return result.value;
             }
             return result;
+        }
+
+        function blobKey(key) {
+            return typeof key === 'string'
+                && (key.indexOf('img.') === 0 || key.indexOf('font_') === 0);
+        }
+
+        function blobPlugin() {
+            var Capacitor = window.Capacitor;
+            var plugins = Capacitor && Capacitor.Plugins;
+            return (plugins && plugins.App) ? plugins.App : null;
+        }
+
+        /**
+         Moves the site's image and font blobs out of the Preferences store.
+
+         The three methods keep their contracts (a string in, a string out, and
+         an empty value meaning "delete"), so the site cannot tell the difference.
+         A read migrates: the value still in Preferences is written to a file,
+         read back to prove it landed, and only then blanked in place -- so a kill
+         during the move loses nothing, the next read just tries again.
+         */
+        function wrapBlobs(app) {
+            var cache = app.storage && app.storage.cache;
+            if (!cache || typeof cache.getFile !== 'function') { return; }
+            if (cache.__stvBlobsWrapped) { return; }
+            var plugin = blobPlugin();
+            if (!plugin) { return; }
+            cache.__stvBlobsWrapped = true;
+
+            var storedGet = cache.getFile;
+            var storedSet = cache.setFile;
+            var storedDelete = cache.deleteFile;
+            // The migration reads through `app.storage.get`, which is what the
+            // site's own `cache.getFile` is (app.v2.js:574-576) -- and it is the
+            // repaired accessor by the time this runs.
+            function legacyRead(key) {
+                return Promise.resolve().then(function () {
+                    return app.storage.get(key);
+                });
+            }
+
+            cache.getFile = function (key) {
+                if (!blobKey(key)) { return storedGet.call(cache, key); }
+                return Promise.resolve().then(function () {
+                    return plugin.blobRead({ key: key });
+                }).then(function (result) {
+                    var value = (result && result.value) || '';
+                    if (value) { return value; }
+                    return legacyRead(key).then(function (legacy) {
+                        if (!legacy) { return ''; }
+                        return plugin.blobWrite({ key: key, value: String(legacy) })
+                            .then(function () {
+                                return plugin.blobRead({ key: key });
+                            })
+                            .then(function (check) {
+                                if (!check || check.value !== String(legacy)) { return legacy; }
+                                return Promise.resolve(storedSet.call(cache, key, ''))
+                                    .then(function () {
+                                        note('BLOB', key + ' moved out of the Preferences store');
+                                        return legacy;
+                                    });
+                            }, function () { return legacy; });
+                    });
+                });
+            };
+
+            cache.setFile = function (key, value) {
+                if (!blobKey(key)) { return storedSet.call(cache, key, value); }
+                var text = (value === null || value === undefined) ? '' : String(value);
+                return Promise.resolve().then(function () {
+                    return plugin.blobWrite({ key: key, value: text });
+                }).then(function (result) {
+                    if (result && result.value === false) {
+                        note('ERR', 'blob store refused ' + key + ' (' + text.length + ' chars)');
+                    }
+                    return result;
+                });
+            };
+
+            cache.deleteFile = function (key) {
+                if (!blobKey(key)) {
+                    // The site's own deleteFile is `app.storage.set(key, null)`
+                    // (app.v2.js:583), which is what a passthrough would call.
+                    return typeof storedDelete === 'function'
+                        ? storedDelete.call(cache, key)
+                        : cache.set(key, null);
+                }
+                return Promise.resolve().then(function () {
+                    return plugin.blobDelete({ key: key });
+                });
+            };
+
+            note('BLOB', 'images and fonts now live in files, not in UserDefaults');
         }
 
         function patch() {
@@ -1687,6 +1789,7 @@ enum SitePatch {
                     return undefined;
                 });
             };
+            wrapBlobs(app);
             window.__stvStorageAccessorPatched = true;
             note('STORAGE', 'app.storage.get reads the Preferences result properly');
             return true;
@@ -11627,6 +11730,310 @@ enum SitePatch {
      `SiteI18nData` is generated from data/site-i18n.json by
      scripts/gen-site-i18n.js.
      */
+    // MARK: - Content cache (settings rows + refreshed-content hook)
+
+    /**
+     The page-side half of §6.45: the settings rows that make the content cache
+     visible and adjustable, and the listener that turns a background refresh into
+     a re-render.
+
+     Why these rows live here rather than in `pageRepair`: this block is the owner
+     of the cache, so it is the owner of the one screen that configures it.
+     `pageRepair` already owns the settings page's translation and asset-mirror
+     rows, and a second block appending to the same section would be two owners of
+     one page.
+
+     The listener is the second half of stale-while-revalidate. The plugin serves
+     the stored answer immediately and refreshes behind the reader; when the bytes
+     actually changed it emits `contentRefreshed`, and only the page can decide
+     whether the screen showing them is still on top. The site's own renderer lives
+     in a mirrored bundle, so this *probes* for it (load/refresh/reload/render) and
+     records which one it used -- a `no refresh hook` line in the device log is the
+     input for wiring it properly next round, and costs nothing but the line.
+     */
+    static let contentCache = """
+    (function () {
+        if (window.__stvContentCacheInstalled) { return; }
+        window.__stvContentCacheInstalled = true;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function http() {
+            var Capacitor = window.Capacitor;
+            var plugins = Capacitor && Capacitor.Plugins;
+            return (plugins && plugins.Http) ? plugins.Http : null;
+        }
+
+        function call(method, options) {
+            var plugin = http();
+            if (!plugin || typeof plugin[method] !== 'function') {
+                return Promise.reject(new Error('Http.' + method + ' is not available'));
+            }
+            return plugin[method](options || {});
+        }
+
+        function bytesText(bytes) {
+            var value = Number(bytes) || 0;
+            if (value < 1024) { return value + ' B'; }
+            if (value < 1024 * 1024) { return (value / 1024).toFixed(1) + ' KB'; }
+            return (value / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        var RETENTION = [7, 30, 90, 365];
+        var SPACE_MB = [128, 256, 512, 1024];
+
+        function nextIn(list, current) {
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] > current) { return list[i]; }
+            }
+            return list[0];
+        }
+
+        function addRow(host, title, value) {
+            var item = document.createElement('div');
+            item.className = 'settingitem stv-cache-row';
+            var name = document.createElement('div');
+            name.className = 'settingitemtitle';
+            name.textContent = title;
+            var cell = document.createElement('div');
+            cell.textContent = value;
+            item.appendChild(name);
+            item.appendChild(cell);
+            host.appendChild(item);
+            return { item: item, cell: cell };
+        }
+
+        function tapped(event) {
+            if (event) {
+                if (typeof event.stopPropagation === 'function') { event.stopPropagation(); }
+                if (typeof event.preventDefault === 'function') { event.preventDefault(); }
+            }
+        }
+
+        function paint(stats, rows, state) {
+            var hits = (Number(stats.hits) || 0) + (Number(stats.staleServed) || 0);
+            state.retention = Number(stats.retentionDays) || 30;
+            state.spaceMb = Math.round((Number(stats.maxBytes) || 0) / (1024 * 1024));
+            rows.usage.cell.textContent = bytesText(stats.bytes) + ' · '
+                + (Number(stats.entries) || 0) + ' 项 · 命中 ' + hits;
+            rows.retention.cell.textContent = state.retention + ' 天';
+            rows.space.cell.textContent = state.spaceMb + ' MB';
+        }
+
+        function install(page, state) {
+            var section = page.querySelector('.settingsection');
+            var host = section && section.parentNode;
+            if (!host || page.querySelector('.stv-cache-row')) { return true; }
+            var header = document.createElement('div');
+            header.className = 'settingsection mt-3';
+            header.textContent = '缓存';
+            host.appendChild(header);
+
+            var rows = {
+                usage: addRow(host, '内容缓存占用', '读取中…'),
+                retention: addRow(host, '保留时间', state.retention + ' 天'),
+                space: addRow(host, '保留空间', state.spaceMb + ' MB'),
+                clear: addRow(host, '清除内容缓存', '点击清除')
+            };
+
+            function refresh() {
+                call('cacheStats', {}).then(function (stats) {
+                    paint(stats, rows, state);
+                }, function (error) {
+                    note('ERR', 'cacheStats failed: ' + error);
+                });
+            }
+
+            function configure(options, what) {
+                call('cacheConfig', options).then(function (stats) {
+                    paint(stats, rows, state);
+                    note('CACHE', what + ' -> ' + JSON.stringify(options));
+                }, function (error) {
+                    note('ERR', 'cacheConfig failed: ' + error);
+                });
+            }
+
+            rows.usage.item.addEventListener('click', function (event) {
+                tapped(event);
+                refresh();
+            }, true);
+
+            rows.retention.item.addEventListener('click', function (event) {
+                tapped(event);
+                var days = nextIn(RETENTION, state.retention);
+                configure({ retentionDays: days }, 'retention');
+            }, true);
+
+            rows.space.item.addEventListener('click', function (event) {
+                tapped(event);
+                var mb = nextIn(SPACE_MB, state.spaceMb);
+                configure({ maxBytes: mb * 1024 * 1024 }, 'space');
+            }, true);
+
+            rows.clear.item.addEventListener('click', function (event) {
+                tapped(event);
+                call('clearCache', {}).then(function (result) {
+                    var cleared = Number(result && result.cleared) || 0;
+                    rows.clear.cell.textContent = '已清除 ' + cleared + ' 项';
+                    note('CACHE', 'content cache cleared: ' + cleared + ' entr(ies)');
+                    refresh();
+                }, function (error) {
+                    note('ERR', 'clearCache failed: ' + error);
+                });
+            }, true);
+
+            note('CACHE', 'settings rows added');
+            refresh();
+            return true;
+        }
+
+        // ---- a refreshed answer, drawn again ----------------------------
+
+        var HOOKS = ['load', 'refresh', 'reload', 'render'];
+
+        function ownerOf(url) {
+            var nodes = document.querySelectorAll('[from], [src]');
+            for (var i = 0; i < nodes.length; i++) {
+                var attr = nodes[i].getAttribute('from') || nodes[i].getAttribute('src') || '';
+                if (!attr) { continue; }
+                if (attr === url || url.indexOf(attr) >= 0 || attr.indexOf(url) >= 0) {
+                    return nodes[i];
+                }
+            }
+            return null;
+        }
+
+        function redraw(url, cls) {
+            var owner = ownerOf(url);
+            if (!owner) {
+                note('CACHE', 'no refresh hook for ' + cls + ': nothing on screen owns it');
+                return;
+            }
+            for (var i = 0; i < HOOKS.length; i++) {
+                var name = HOOKS[i];
+                if (typeof owner[name] !== 'function') { continue; }
+                try {
+                    owner[name]();
+                    note('CACHE', 'refreshed ' + cls + ' through ' + name + '() on '
+                        + String(owner.tagName || '?').toLowerCase());
+                    return;
+                } catch (error) {
+                    note('ERR', 'refresh through ' + name + '() failed: ' + error);
+                }
+            }
+            note('CACHE', 'no refresh hook for ' + cls + ': tried ' + HOOKS.join('/'));
+        }
+
+        function listen() {
+            var plugin = http();
+            if (!plugin || typeof plugin.addListener !== 'function') { return false; }
+            if (window.__stvContentCacheListening) { return true; }
+            window.__stvContentCacheListening = true;
+            plugin.addListener('contentRefreshed', function (event) {
+                try {
+                    var data = event || {};
+                    var url = data.url ? String(data.url) : '';
+                    if (!url) { return; }
+                    note('CACHE', 'refreshed behind the reader: ' + url);
+                    redraw(url, data['class'] ? String(data['class']) : 'content');
+                } catch (error) {
+                    note('ERR', 'contentRefreshed handling failed: ' + error);
+                }
+            });
+            return true;
+        }
+
+        function hookPushPage() {
+            var app = window.app;
+            if (!app || typeof app.pushPage !== 'function') { return false; }
+            if (app.__stvCacheHooked) { return true; }
+            app.__stvCacheHooked = true;
+            var original = app.pushPage;
+            app.pushPage = function (name) {
+                var page = original.apply(this, arguments);
+                try {
+                    if (name === 'pagesetting' && page && page.nodeType === 1) {
+                        install(page, state);
+                    }
+                } catch (error) {
+                    note('ERR', 'cache settings rows: ' + error);
+                }
+                return page;
+            };
+            return true;
+        }
+
+        // ---- what the cache cannot see at all ---------------------------
+        //
+        // The site asks for its own API through XMLHttpRequest whenever the target
+        // matches the page origin and the mirror is alive (app.v2.js:700, :760);
+        // only the requests that go somewhere else are sent through the native
+        // plugin. Those XHR reads never reach the content cache, so on a page
+        // whose origin IS the chosen mirror the whole list/bookinfo path would sit
+        // outside it -- and the reader would report "缓存没生效" while every
+        // assertion here passed.
+        //
+        // Counting them is how the next device log answers that with a number
+        // instead of a guess. Read-only: `open` is wrapped only to look at the url.
+        var NATIVE_ONLY = ['sajax=readchapter', 'sajax=getchapterlist', 'bookinfo.php',
+            'booklist.php', 'userinfo.php', 'readcomment', 'grantcontext'];
+        var bypassed = [];
+
+        function watchXhr() {
+            var proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+            if (!proto || typeof proto.open !== 'function') { return false; }
+            if (proto.__stvCacheWatched) { return true; }
+            proto.__stvCacheWatched = true;
+            var originalOpen = proto.open;
+            proto.open = function (method, url) {
+                try {
+                    var text = String(url || '');
+                    for (var i = 0; i < NATIVE_ONLY.length; i++) {
+                        if (text.indexOf(NATIVE_ONLY[i]) >= 0) {
+                            bypassed.push(text);
+                            break;
+                        }
+                    }
+                } catch (error) {
+                    // Counting may never break the request it is counting.
+                }
+                return originalOpen.apply(this, arguments);
+            };
+            return true;
+        }
+
+        function reportBypass() {
+            if (!bypassed.length) { return; }
+            note('CACHE', bypassed.length + ' site request(s) went through the page own'
+                + ' XMLHttpRequest (outside the native cache), first: ' + bypassed[0]);
+            bypassed = [];
+        }
+
+        // Cap and retention are what the rows edit and what the rows display, so
+        // the value shown is the value the plugin actually holds.
+        var state = { retention: 30, spaceMb: 256 };
+
+        var attempts = 0;
+        var timer = setInterval(function () {
+            attempts++;
+            watchXhr();
+            var hooked = hookPushPage();
+            var listening = listen();
+            if ((hooked && listening) || attempts > 800) { clearInterval(timer); }
+        }, 25);
+
+        // Its own timer, because the one above stops as soon as the hooks are in
+        // place: the first report is a second in, which is after the shell has
+        // asked for its own first data, and then every ten seconds.
+        var bypassTicks = 0;
+        setInterval(function () {
+            bypassTicks++;
+            if (bypassTicks === 40 || bypassTicks % 400 === 0) { reportBypass(); }
+        }, 25);
+    })();
+    """
     static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
@@ -11634,6 +12041,6 @@ enum SitePatch {
                                 keyboardPopup, gridLayout, settingsBackup,
                                 bookmarkToggle, readerTts,
                                 pageRepair, downloadExport, commentTranslate,
-                                comicGate,
+                                comicGate, contentCache,
                                 swipeDismiss, readerPrefetch]
 }

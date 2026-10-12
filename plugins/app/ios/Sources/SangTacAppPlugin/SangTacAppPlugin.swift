@@ -1,5 +1,6 @@
 import Foundation
 import Capacitor
+import CryptoKit
 import Security
 import UIKit
 import WebKit
@@ -54,7 +55,12 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "diagRead", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "diagClear", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "siteAssetRefresh", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "siteAssetForget", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "siteAssetForget", returnType: CAPPluginReturnPromise),
+        // The site's own blob store (`img.*` images, `font_*` fonts), moved out
+        // of UserDefaults -- see the `blob store` section below.
+        CAPPluginMethod(name: "blobRead", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "blobWrite", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "blobDelete", returnType: CAPPluginReturnPromise)
     ]
 
     private var observers: [NSObjectProtocol] = []
@@ -713,6 +719,86 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.resolve(["value": true, "name": name, "bytes": payload.count])
             }
         }
+    }
+
+    // MARK: - Site blob store
+
+    /**
+     `app.storage.cache.setFile` is the site's blob store: the reader's own images
+     kept as base64 under `img.*` (app.v2.js:7457-7466) and its imported fonts
+     under `font_*` (:7158). On iOS that call lands in the Preferences plugin,
+     which is UserDefaults -- a store iOS keeps entirely in memory, and one manga
+     page is around a megabyte of base64 (§6.45.2 (6)).
+
+     So those two key families move to files here. The page keeps calling the same
+     three methods with the same string semantics; only where the bytes live
+     changes. Application Support rather than Caches, for the same reason the
+     diagnostic log and the content cache are there: this data must survive a
+     storage squeeze, or the reader pays to download it again.
+
+     The file name is a hash of the key, so a font name full of Vietnamese or
+     Chinese cannot become an invalid or colliding path. The page passes the key
+     on every call, so the name has to be stable rather than readable.
+     */
+    private static let blobFileMaxBytes = 16 * 1024 * 1024
+    private static let blobKeyMaxLength = 200
+
+    private func blobFile(_ key: String) -> URL? {
+        guard !key.isEmpty, key.count <= SangTacAppPlugin.blobKeyMaxLength else { return nil }
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let directory = base.appendingPathComponent("SangTacReader/site-blobs", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            try? FileManager.default.createDirectory(at: directory,
+                                                     withIntermediateDirectories: true)
+        }
+        let digest = SHA256.hash(data: Data(key.utf8))
+        let name = digest.map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent(name + ".blob")
+    }
+
+    @objc func blobRead(_ call: CAPPluginCall) {
+        guard let key = call.getString("key"), let file = blobFile(key) else {
+            call.resolve(["value": ""])
+            return
+        }
+        let value = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        call.resolve(["value": value, "bytes": value.utf8.count])
+    }
+
+    @objc func blobWrite(_ call: CAPPluginCall) {
+        guard let key = call.getString("key"), let file = blobFile(key) else {
+            call.reject("Missing or oversized 'key'")
+            return
+        }
+        let value = call.getString("value") ?? ""
+        // The site's own delete convention is `setFile(key, "")`
+        // (app.v2.js:7477-7481), so an empty value deletes here as well.
+        guard !value.isEmpty else {
+            try? FileManager.default.removeItem(at: file)
+            call.resolve(["value": true, "bytes": 0])
+            return
+        }
+        guard value.utf8.count <= SangTacAppPlugin.blobFileMaxBytes else {
+            CAPLog.print("[SangTacApp:blob] refused a \(value.utf8.count)-byte value")
+            call.resolve(["value": false, "bytes": value.utf8.count])
+            return
+        }
+        do {
+            try value.write(to: file, atomically: true, encoding: .utf8)
+            call.resolve(["value": true, "bytes": value.utf8.count])
+        } catch {
+            call.reject("blob write failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func blobDelete(_ call: CAPPluginCall) {
+        guard let key = call.getString("key"), let file = blobFile(key) else {
+            call.resolve(["value": true])
+            return
+        }
+        try? FileManager.default.removeItem(at: file)
+        call.resolve(["value": true])
     }
 
     // MARK: - Durable diagnostic log

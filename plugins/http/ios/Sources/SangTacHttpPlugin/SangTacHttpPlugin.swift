@@ -50,7 +50,13 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         CAPPluginMethod(name: "syncCookies", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setDiagnostics", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startForeground", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "stopForeground", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "stopForeground", returnType: CAPPluginReturnPromise),
+        // The content cache's own surface: what it holds, its budget, and how to
+        // empty it. Called by the settings rows the `contentCache` block adds
+        // (docs/capacitor-port.md §6.45.3 (7)).
+        CAPPluginMethod(name: "cacheStats", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cacheConfig", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "clearCache", returnType: CAPPluginReturnPromise)
     ]
 
     /// Mirror of the Android plugin's default; only used when the site sends no
@@ -99,199 +105,122 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             || text.contains("bookmanage.php")
     }
 
-    /// Chapter bodies are the expensive response (`mustRevalidate` forces a
-    /// network fetch) and immutable published text. The site keeps its own offline
-    /// copy of the same content, so a cached answer cannot go stale in a way that
-    /// matters. The other reusable answer -- a book's chapter list -- is decided
-    /// in `cachePolicy` below.
-    private static func isChapterRequest(_ url: URL) -> Bool {
-        return url.absoluteString.contains("sajax=readchapter")
-    }
-
-    /// Below this a body cannot be a chapter -- it is the site's own failure JSON.
-    private static let minCacheableChapterBytes = 4096
-
     /**
-     A real chapter body is tens of KB of JSON text. Two things must both hold
-     before one is worth keeping:
+     Which class of answer this request is asking for, or nil for everything that
+     must never be answered from a stored copy.
 
-       * It has to be big enough to be a chapter. The site's failure answers are a
-         few dozen bytes (`{"code": 7,"time": 1000}`) and caching one would make
-         the failure stick.
-       * It has to be the site's own answer at all. `sajax=readchapter` replies
-         with JSON under a `Content-Type: text/html` header (docs/capacitor-port.md:112)
-         and `app.reader.getContent2` runs `JSON.parse` on it
-         (app.v2.read.js:582) -- so a body that is not JSON means the reader is
-         already broken (a Cloudflare interstitial, a login page, a proxy error)
-         and caching it would make that stick for the whole session. The two
-         failure codes the device logs record -- `7` for a mirror that cannot
-         serve reads, `10002` for a timeout -- are excluded for the same reason.
+     This is the whole admission policy of the content cache: a class named here
+     is one `ContentPolicies` has a rule for, and everything else -- every write,
+     every probe, every endpoint nobody has measured -- falls through to "always
+     the network".
 
-     The failure mode is the safe direction: anything unrecognised is simply
-     fetched again.
+     Two paths are shared between reads and writes and are told apart by their
+     query: `booklist.php` only caches the `method=` list tabs and only as a POST
+     (the POST body is the reader's own history list, which is why the body is
+     part of the key), and `comment.php` only caches its first page.
      */
-    private static func isCacheableChapter(_ body: Data) -> Bool {
-        guard body.count >= minCacheableChapterBytes else { return false }
-        var data = body
-        // JSONSerialization tolerates a UTF-8 BOM, but the site's own reader
-        // strips one explicitly (app.v2.read.js:577), so match that.
-        if data.count >= 3, data[data.startIndex] == 0xEF,
-           data[data.startIndex + 1] == 0xBB, data[data.startIndex + 2] == 0xBF {
-            data = Data(data.dropFirst(3))
+    static func contentClass(method: String, url: URL, responseType: String?) -> ContentClass? {
+        let text = url.absoluteString
+        // The reader asks for these two through the plugin directly
+        // (app.v2.read.js:552-576 / app.v2.js:263).
+        if text.contains("sajax=readchapter") { return .chapter }
+        if text.contains("sajax=getchapterlist") { return .chapterList }
+        if text.contains("/mobile/bookinfo.php") { return .bookInfo }
+        if text.contains("/mobile/booklist.php") {
+            guard method.caseInsensitiveCompare("POST") == .orderedSame else { return nil }
+            guard let range = text.range(of: "method=") else { return nil }
+            let name = String(text[range.upperBound...].prefix { $0.isLetter || $0.isNumber })
+            let tabs = ["history", "following", "bookmarked", "mybook", "bookpush", "nhunger"]
+            return tabs.contains(name) ? .homeList : nil
         }
-        guard let parsed = try? JSONSerialization.jsonObject(with: data,
-                                                             options: [.fragmentsAllowed]),
-              let object = parsed as? [String: Any],
-              let code = object["code"] else {
-            return false
+        if text.contains("/mobile/userinfo.php") { return .userInfo }
+        if text.contains("act=readcomment") {
+            // Later pages are what "load more" asks for, and a stale one there is
+            // a visible duplicate or a skip rather than a saved round trip.
+            return text.contains("start=0") ? .comment : nil
         }
-        // Numeric form via NSNumber: `String(describing:)` would render a JSON
-        // `7.0` as "7.0" and let it through the comparison below.
-        if let number = code as? NSNumber {
-            let value = number.intValue
-            return value != 7 && value != 10002
-        }
-        let text = String(describing: code)
-        return text != "7" && text != "10002"
-    }
-
-    /// Which answers may be reused, and for how long, decided from the request
-    /// alone. One function so the lookup and the store can never disagree.
-    ///
-    ///   * a chapter body -- immutable published text, kept for the whole session;
-    ///   * a book's chapter list -- 115 KB of JSON that the 2026-09-23 device log
-    ///     shows fetched three times in one launch (entering the list, opening the
-    ///     reader, walking back out: 1484 + 1162 + 828 ms), while it only changes
-    ///     when the author publishes.
-    ///
-    /// Nothing else. The user-state endpoints (`userinfo.php`, the
-    /// `booklist.php?method=*` tabs) are deliberately left alone: their answers
-    /// carry unread counts and follow state, and a stale one is a wrong screen
-    /// rather than a saved round trip.
-    private struct CachePolicy {
-        /// `nil` keeps the entry for the session, which is what an immutable
-        /// chapter body wants. A list can go stale, so it carries a clock.
-        let ttl: TimeInterval?
-        let accepts: (Data) -> Bool
-    }
-
-    /// Longer than the 60 s the device log shows between the first and last copy
-    /// of the same list, and short enough that a chapter published while the
-    /// reader is open cannot hide behind it for a session.
-    private static let chapterListTTL: TimeInterval = 300
-
-    /// `GET` only: the cache key carries the method and the URL but no request
-    /// body, so a POST must never be answered from here.
-    private static func isChapterListRequest(_ method: String, _ url: URL) -> Bool {
-        guard method.caseInsensitiveCompare("GET") == .orderedSame else { return false }
-        return url.absoluteString.contains("sajax=getchapterlist")
-    }
-
-    /**
-     The chapter list's own signature: `{"code":1,"data":"1-/-<id>-/-<name>-/-/-…"}`.
-
-     `code == 1` *and* a string `data` carrying the site's own `-/-` separator must
-     both hold. That is what keeps an error page, a Cloudflare interstitial or the
-     site's own `{"code":400}` out of the cache -- and the failure direction is the
-     one that matters, because a cached failure would persist for the whole TTL.
-     */
-    private static func isCacheableChapterList(_ body: Data) -> Bool {
-        var data = body
-        if data.count >= 3, data[data.startIndex] == 0xEF,
-           data[data.startIndex + 1] == 0xBB, data[data.startIndex + 2] == 0xBF {
-            data = Data(data.dropFirst(3))
-        }
-        guard let parsed = try? JSONSerialization.jsonObject(with: data,
-                                                             options: [.fragmentsAllowed]),
-              let object = parsed as? [String: Any],
-              let code = object["code"] as? NSNumber, code.intValue == 1,
-              let list = object["data"] as? String,
-              list.contains("-/-") else {
-            return false
-        }
-        return true
-    }
-
-    private static func cachePolicy(method: String, url: URL) -> CachePolicy? {
-        if isChapterRequest(url) {
-            return CachePolicy(ttl: nil, accepts: isCacheableChapter)
-        }
-        if isChapterListRequest(method, url) {
-            return CachePolicy(ttl: chapterListTTL, accepts: isCacheableChapterList)
-        }
+        if text.contains("/io/grantcontext/context") { return .grant }
+        // Covers and page images: the site fetches every one of them through
+        // `Http.get({responseType: 'blob'})` (app.v2.js:7328-7337). Whether the
+        // bytes really are an image is decided by `isImageBody` before storing,
+        // so a non-image that happens to be asked for as a blob is simply not
+        // kept -- which is why this branch needs no host or path test.
+        let requested = (responseType ?? "").lowercased()
+        if requested == "blob" || requested == "arraybuffer" { return .image }
         return nil
     }
 
-    /// Session-scoped LRU for reusable answers. Bounded by both entry count and
-    /// total bytes, evicting least-recently-used first. Deliberately in memory:
-    /// an app restart starts clean, which bounds the memory and removes any
-    /// question about serving an answer from a previous version of the app.
-    private final class ResponseCache {
-        struct Entry {
-            let status: Int
-            let contentType: String
-            let headers: [String: String]
-            let body: Data
-            /// `nil` = valid until the app exits.
-            let expiresAt: Date?
-        }
-
-        private let lock = NSLock()
-        private var entries: [String: Entry] = [:]
-        private var order: [String] = []
-        private var bytes = 0
-        private let maxEntries: Int
-        private let maxBytes: Int
-
-        init(maxEntries: Int, maxBytes: Int) {
-            self.maxEntries = maxEntries
-            self.maxBytes = maxBytes
-        }
-
-        func get(_ key: String) -> Entry? {
-            lock.lock()
-            defer { lock.unlock() }
-            guard let entry = entries[key] else { return nil }
-            if let expiresAt = entry.expiresAt, expiresAt <= Date() {
-                // Dropped here rather than on the next sweep, so the byte budget
-                // is freed the moment the answer stops being useful.
-                entries.removeValue(forKey: key)
-                if let index = order.firstIndex(of: key) { order.remove(at: index) }
-                bytes -= entry.body.count
-                return nil
-            }
-            if let index = order.firstIndex(of: key) {
-                order.remove(at: index)
-                order.append(key)
-            }
-            return entry
-        }
-
-        func set(_ key: String, _ entry: Entry) {
-            lock.lock()
-            defer { lock.unlock() }
-            if let existing = entries[key] {
-                bytes -= existing.body.count
-                if let index = order.firstIndex(of: key) { order.remove(at: index) }
-            }
-            entries[key] = entry
-            order.append(key)
-            bytes += entry.body.count
-            while (entries.count > maxEntries || bytes > maxBytes), let oldest = order.first {
-                order.removeFirst()
-                if let removed = entries.removeValue(forKey: oldest) {
-                    bytes -= removed.body.count
-                }
-            }
+    /// Whether the serving host belongs in the key. It does not for the two read
+    /// endpoints: `bestDomain()` moves between launches and mirrors not only
+    /// change, they are chosen by a race the reader cannot see (§6.25), while
+    /// `h=` already names the content server that hosts the book. Getting this
+    /// wrong costs one wasted round trip; including the host would make every
+    /// chapter miss whenever the reader's mirror changed, which is the exact
+    /// failure this cache exists to remove.
+    static func includesHost(_ cls: ContentClass) -> Bool {
+        switch cls {
+        case .chapter, .chapterList: return false
+        default: return true
         }
     }
 
-    /// Chapter bodies are tens of KB each and a chapter list is ~115 KB; 300
-    /// entries is far more than a reading session touches, and the byte cap is
-    /// what actually bounds the footprint (kept well under the 64MB URLCache so
-    /// the two budgets together stay modest on a 3GB device).
-    private let responseCache = ResponseCache(maxEntries: 300,
-                                              maxBytes: 64 * 1024 * 1024)
+    /**
+     The persistent answer store (docs/capacitor-port.md §6.45). One owner for
+     "may this be reused", "what is its key", "is it still current" and "evict
+     what" -- the old code spread the first two between `cachePolicy` and an
+     ad-hoc key built at the call site, which is exactly how a policy and its key
+     drift apart.
+
+     In memory this is only an index of small sidecars; the bytes live on disk,
+     so a chapter read yesterday is still here today, which is the whole point of
+     the change.
+     */
+    let contentCache = ContentCache()
+
+    /// One answer, handed to every caller waiting on the same request.
+    struct SharedAnswer {
+        let status: Int
+        let contentType: String
+        let headers: [String: String]
+        let body: Data
+        let failure: String?
+    }
+
+    private final class InFlightRequest {
+        var waiters: [(SharedAnswer) -> Void] = []
+    }
+
+    private let inFlightLock = NSLock()
+    private var inFlight: [String: InFlightRequest] = [:]
+
+    /// `true` when this caller has to perform the request; `false` when an
+    /// identical one is already on the wire and this call was attached to it.
+    ///
+    /// The 2026-09-23 device log is the reason: the same 115KB chapter list
+    /// fetched three times in one launch (1484 + 1162 + 828 ms) and
+    /// `userinfo.php` twice back to back. Nothing in the site's own `app.net`
+    /// de-duplicates a request, and both of those answers are identical inside
+    /// one launch.
+    func registerInFlight(_ key: String, waiter: @escaping (SharedAnswer) -> Void) -> Bool {
+        inFlightLock.lock()
+        if let existing = inFlight[key] {
+            existing.waiters.append(waiter)
+            inFlightLock.unlock()
+            return false
+        }
+        let entry = InFlightRequest()
+        inFlight[key] = entry
+        inFlightLock.unlock()
+        return true
+    }
+
+    func finishInFlight(_ key: String, answer: SharedAnswer) {
+        inFlightLock.lock()
+        let entry = inFlight.removeValue(forKey: key)
+        inFlightLock.unlock()
+        guard let entry = entry else { return }
+        for waiter in entry.waiters { waiter(answer) }
+    }
 
     // MARK: - Request policy
 
@@ -567,6 +496,11 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             store.getAllCookies { [weak self] cookies in
                 self?.setSnapshot(cookies, issuedAt: generation)
             }
+            // The first-request prewarm (see `prewarmUserInfo`). Late on purpose:
+            // the shell's own boot window belongs to the site's bundles.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.prewarmUserInfo()
+            }
         }
     }
 
@@ -580,6 +514,156 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         }
         setDiagnosticsEnabled(on)
         call.resolve(["enabled": on])
+    }
+
+    // MARK: - Content cache methods
+
+    /**
+     The three calls the injected `contentCache` block makes: what the cache is
+     holding, how to change its budget, and how to empty it.
+
+     The settings live in this plugin's own UserDefaults key rather than in the
+     site's Preferences store -- §6.45.3 (8) moves the site's own blobs *out* of
+     UserDefaults for size reasons, and the cache config must not ride along with
+     the store that change is trying to keep small.
+     */
+    @objc func cacheStats(_ call: CAPPluginCall) {
+        call.resolve(contentCache.stats())
+    }
+
+    @objc func cacheConfig(_ call: CAPPluginCall) {
+        var config = contentCache.config
+        var changed = false
+        if let raw = call.options["retentionDays"] as? NSNumber, raw.intValue > 0 {
+            config.retentionDays = raw.intValue
+            changed = true
+        }
+        if let raw = call.options["maxBytes"] as? NSNumber, raw.intValue > 0 {
+            config.maxBytes = raw.intValue
+            changed = true
+        }
+        if let raw = call.options["maxEntries"] as? NSNumber, raw.intValue > 0 {
+            config.maxEntries = raw.intValue
+            changed = true
+        }
+        if let raw = call.options["enabled"], !(raw is NSNull) {
+            if let number = raw as? NSNumber {
+                config.enabled = number.boolValue
+                changed = true
+            } else if let text = raw as? String {
+                config.enabled = (text == "true" || text == "1")
+                changed = true
+            }
+        }
+        if changed {
+            contentCache.apply(config: config)
+            callLog("cache", "config retention=\(config.retentionDays)d bytes=\(config.maxBytes)"
+                + " entries=\(config.maxEntries) enabled=\(config.enabled)")
+        }
+        call.resolve(contentCache.stats())
+    }
+
+    @objc func clearCache(_ call: CAPPluginCall) {
+        let result = contentCache.clear()
+        let cleared = result["entries"] ?? 0
+        callLog("cache", "cleared \(cleared) content entr(ies)")
+        call.resolve(["cleared": cleared])
+    }
+
+    // MARK: - First-request prewarm
+
+    /**
+     `userinfo.php` is the first data request of a cold start and the device log
+     shows it asked for twice, back to back (484 + 711ms in the 2026-09-23 log).
+     Asking for it from here, a moment after the web view is up, means the
+     reader's own request finds an answer on disk instead of spending a round trip
+     on it.
+     */
+    private let userInfoLock = NSLock()
+    private var sawUserInfoRequest = false
+    private var prewarmed = false
+
+    private func noteUserInfoRequest() {
+        userInfoLock.lock()
+        sawUserInfoRequest = true
+        userInfoLock.unlock()
+    }
+
+    /**
+     Deliberately late: the site's own shell and its boot bundles own the first
+     seconds, and adding a request inside that window costs the reader more than it
+     saves. Two seconds in the shell has already painted (§6.23: `shell released`
+     at +1225ms) and one extra connection changes nothing.
+
+     Skipped when the site has already asked for the same thing: a prewarm that
+     races the reader's own request is a duplicated request, not a warm cache.
+     */
+    private func prewarmUserInfo() {
+        userInfoLock.lock()
+        let already = sawUserInfoRequest || prewarmed
+        prewarmed = true
+        userInfoLock.unlock()
+        guard !already, contentCache.isEnabled else { return }
+        guard let page = self.bridge?.webView?.url,
+              let host = page.host, !host.isEmpty,
+              let url = URL(string: "https://" + host + "/mobile/userinfo.php") else { return }
+        nativeCookies(for: url) { [weak self] cookies in
+            guard let self = self else { return }
+            var headers: [String: String] = [
+                "x-stv-transport": "app",
+                "x-requested-with": "com.sangtacviet.mobilereader",
+                "User-Agent": SangTacHttpPlugin.defaultUserAgent,
+                "Referer": page.absoluteString,
+                "Origin": page.scheme.map { $0 + "://" + host } ?? ("https://" + host)
+            ]
+            let cookieHeader = SangTacHttpPlugin.mergeCookieHeader(jsHeader: nil,
+                                                                   nativeCookies: cookies)
+            if !cookieHeader.isEmpty { headers["Cookie"] = cookieHeader }
+            self.warmRequest(method: "GET", url: url, headers: headers)
+        }
+    }
+
+    /**
+     One request issued by us rather than by the page, stored through the same
+     class policy the page's own request will hit. The key has to match that
+     request exactly -- same host, same method, same (empty) body, same
+     translation variant -- or this is a wasted request rather than a warm cache.
+     That is why the host comes from the page URL: it is what `fullUrl()` prefers
+     while the origin is alive (app.v2.js:110-129).
+     */
+    private func warmRequest(method: String, url: URL, headers: [String: String]) {
+        guard let cls = SangTacHttpPlugin.contentClass(method: method, url: url,
+                                                       responseType: nil) else { return }
+        let policy = ContentPolicies.policy(for: cls, config: contentCache.config)
+        let key = ContentCache.key(cls: cls, method: method, url: url,
+                                   variant: SangTacHttpPlugin.chapterVariant(headers["Cookie"]),
+                                   bodyHash: ContentCache.bodyHash(nil),
+                                   includeHost: SangTacHttpPlugin.includesHost(cls))
+        if let existing = contentCache.entry(key),
+           existing.expiresAt.map({ $0 > Date() }) ?? true {
+            callLog("cache", "prewarm skipped: \(cls.rawValue) is already fresh")
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = SangTacHttpPlugin.defaultTimeout
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self, error == nil, let http = response as? HTTPURLResponse,
+                  http.statusCode >= 200, http.statusCode < 300 else { return }
+            let body = data ?? Data()
+            let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            guard policy.accepts(body, contentType) else { return }
+            let headerMap = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
+                if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
+            }
+            self.storeResponseCookies(http, for: url)
+            self.contentCache.store(key: key, cls: cls, status: http.statusCode,
+                                    contentType: contentType, headers: headerMap, body: body,
+                                    ttl: policy.ttl, servedBy: url.host ?? "")
+            self.callLog("ok", "\(method) \(url.absoluteString) prewarmed class="
+                + "\(cls.rawValue) bytes=\(body.count)")
+        }.resume()
     }
 
     @objc func get(_ call: CAPPluginCall) { perform("GET", call) }
@@ -693,48 +777,121 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 headers["User-Agent"] = SangTacHttpPlugin.defaultUserAgent
             }
 
-            // Answers we already have are served from the session cache, so a
-            // re-read costs no network at all.
-            //
-            // The key is built HERE, from the Cookie header that is *about to be
-            // sent*, not from that header's two sources separately. They can
-            // disagree -- the native snapshot lags the page's own
-            // `document.cookie` writes, and for httpOnly names the page's header
-            // has no value at all -- and a key derived from them independently
-            // would describe a request that was never sent, then serve a chapter
-            // in the language the reader had already moved away from.
+            // Which class of answer this is, decided before the lookup so the key
+            // and the store rule come from one place.
+            let contentClass = SangTacHttpPlugin.contentClass(
+                method: method, url: url, responseType: call.getString("responseType"))
+            if contentClass == .userInfo { self.noteUserInfoRequest() }
+            // Built before the lookup: for the POST lists the body is part of the
+            // key, and building it may add a Content-Type header.
+            let body = self.bodyData(for: call, headers: &headers)
+            // `rescan=true` is the reader asking for a fresh copy of a chapter it
+            // already has (app.v2.read.js:566-567). It must never be answered from
+            // the cache, and its answer replaces whatever was stored.
+            let bypassCache = url.absoluteString.contains("rescan=true")
+
             var cacheKey: String?
-            var responsePolicy: CachePolicy?
-            if let policy = SangTacHttpPlugin.cachePolicy(method: method, url: url) {
-                // The method is part of the identity too: a GET and a POST to the
-                // same URL are not the same answer. Not reachable today (the
-                // downloader uses `&download=true`, a different URL), but it costs
-                // nothing to be right.
-                let key = method + "|" + url.absoluteString + "|"
-                    + SangTacHttpPlugin.chapterVariant(headers["Cookie"])
-                cacheKey = key
-                responsePolicy = policy
-                if let cached = self.responseCache.get(key) {
-                    self.serveCached(cached, url: url, call: call, method: method,
-                                     elapsedMs: elapsedMs())
-                    return
+            var policy: ContentPolicy?
+            if let contentClass = contentClass {
+                // The key is built HERE, from the Cookie header that is *about to
+                // be sent*, not from that header's two sources separately. They
+                // can disagree -- the native snapshot lags the page's own
+                // `document.cookie` writes, and for httpOnly names the page's
+                // header has no value at all -- and a key derived from them
+                // independently would describe a request that was never sent, then
+                // serve a chapter in the language the reader had already moved
+                // away from.
+                cacheKey = ContentCache.key(
+                    cls: contentClass, method: method, url: url,
+                    variant: SangTacHttpPlugin.chapterVariant(headers["Cookie"]),
+                    bodyHash: ContentCache.bodyHash(body),
+                    includeHost: SangTacHttpPlugin.includesHost(contentClass))
+                policy = ContentPolicies.policy(for: contentClass,
+                                                config: self.contentCache.config)
+            }
+
+            // 1. An answer we already have on disk --------------------------
+            var conditional: ContentCache.Entry?
+            if let key = cacheKey, let policy = policy, !bypassCache {
+                if let hit = self.contentCache.lookup(key) {
+                    let fresh = hit.entry.expiresAt.map { $0 > Date() } ?? true
+                    let age = Int(Date().timeIntervalSince(hit.entry.storedAt))
+                    if fresh {
+                        self.contentCache.noteHit()
+                        self.callLog("ok", "\(method) \(url.absoluteString) cache hit class="
+                            + "\(policy.cls.rawValue) age=\(age)s by=\(hit.entry.servedBy)")
+                        self.deliver(status: hit.entry.status,
+                                     contentType: hit.entry.contentType,
+                                     headers: hit.entry.headers, body: hit.body,
+                                     url: url, call: call, method: method,
+                                     label: "cache", elapsedMs: elapsedMs())
+                        return
+                    }
+                    if policy.serveStale {
+                        // Shown now, refreshed behind the reader -- the whole point
+                        // of a stale-while-revalidate window ("先显示，后台再取新
+                        // 数据，有变化就更新").
+                        self.contentCache.noteStaleServed()
+                        self.callLog("ok", "\(method) \(url.absoluteString) cache stale class="
+                            + "\(policy.cls.rawValue) age=\(age)s refresh=scheduled")
+                        self.deliver(status: hit.entry.status,
+                                     contentType: hit.entry.contentType,
+                                     headers: hit.entry.headers, body: hit.body,
+                                     url: url, call: call, method: method,
+                                     label: "stale", elapsedMs: elapsedMs())
+                        self.refreshBehind(key: key, policy: policy, url: url, method: method,
+                                           headers: headers, body: body, stale: hit.entry,
+                                           staleBody: hit.body)
+                        return
+                    }
+                    if policy.revalidate {
+                        // Expired and not worth showing: ask the server whether our
+                        // copy is still current instead of re-downloading it.
+                        conditional = hit.entry
+                    }
                 }
             }
 
-            // Build the body first: it may contribute a Content-Type header.
-            let body = self.bodyData(for: call, headers: &headers)
-
+            // 2. The network half, shared with any identical request already on
+            //    the wire ----------------------------------------------------
             var request = URLRequest(url: url)
             request.httpMethod = method
             request.timeoutInterval = timeout
             if SangTacHttpPlugin.mustRevalidate(url) {
                 request.cachePolicy = .reloadIgnoringLocalCacheData
             }
+            if let conditional = conditional, let policy = policy, policy.revalidate {
+                if let stamp = conditional.headers["Last-Modified"]
+                    ?? conditional.headers["last-modified"] {
+                    request.setValue(stamp, forHTTPHeaderField: "If-Modified-Since")
+                }
+                if let tag = conditional.headers["ETag"] ?? conditional.headers["etag"] {
+                    request.setValue(tag, forHTTPHeaderField: "If-None-Match")
+                }
+            }
             for (key, value) in headers {
                 request.setValue(value, forHTTPHeaderField: key)
             }
             if let body = body {
                 request.httpBody = body
+            }
+
+            if let key = cacheKey {
+                let elected = self.registerInFlight(key) { answer in
+                    if let failure = answer.failure {
+                        self.callLog("err", "\(method) \(url.absoluteString) shared request failed: "
+                            + failure)
+                        call.reject(failure)
+                        return
+                    }
+                    self.callLog("ok", "\(method) \(url.absoluteString) shared in-flight answer "
+                        + "(\(answer.body.count)b)")
+                    self.deliver(status: answer.status, contentType: answer.contentType,
+                                 headers: answer.headers, body: answer.body, url: url,
+                                 call: call, method: method, label: "shared",
+                                 elapsedMs: elapsedMs())
+                }
+                guard elected else { return }
             }
 
             self.session.dataTask(with: request) { data, response, error in
@@ -745,12 +902,19 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                     self.callLog("err", "\(method) \(url.absoluteString) -> \(message)")
                     self.report("ERR", "\(method) \(url.absoluteString) FAILED in "
                         + "\(elapsedMs())ms: \(message)", force: true)
+                    if let key = cacheKey {
+                        self.finishInFlight(key, answer: SangTacHttpPlugin.failedAnswer(message))
+                    }
                     call.reject(message, nil, error)
                     return
                 }
                 guard let http = response as? HTTPURLResponse else {
                     self.report("ERR", "\(method) \(url.absoluteString) no HTTP response",
                                 force: true)
+                    if let key = cacheKey {
+                        self.finishInFlight(
+                            key, answer: SangTacHttpPlugin.failedAnswer("No HTTP response"))
+                    }
                     call.reject("No HTTP response")
                     return
                 }
@@ -763,62 +927,59 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                     if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
                 }
 
-                let payload = SangTacHttpPlugin.responsePayload(
-                    body: body,
-                    contentType: contentType,
-                    responseType: call.getString("responseType"))
-
-                var result: [String: Any] = [
-                    "status": http.statusCode,
-                    "headers": headerMap,
-                    "url": http.url?.absoluteString ?? url.absoluteString,
-                    "data": payload.value
-                ]
-                if http.statusCode >= 400 {
-                    result["error"] = true
+                // 304: the copy we already had is still current. Restart its clock
+                // and hand back the stored bytes -- this is the cheapest possible
+                // refresh of the 115KB chapter list.
+                if http.statusCode == 304, let key = cacheKey, let policy = policy,
+                   let stored = self.contentCache.lookup(key) {
+                    self.contentCache.renew(key, ttl: policy.ttl)
+                    self.contentCache.noteRevalidation(used304: true)
+                    self.callLog("ok", "\(method) \(url.absoluteString) 304 reused class="
+                        + "\(policy.cls.rawValue)")
+                    self.finishInFlight(key, answer: SharedAnswer(
+                        status: stored.entry.status,
+                        contentType: stored.entry.contentType,
+                        headers: stored.entry.headers, body: stored.body, failure: nil))
+                    self.deliver(status: stored.entry.status,
+                                 contentType: stored.entry.contentType,
+                                 headers: stored.entry.headers, body: stored.body,
+                                 url: url, call: call, method: method, label: "304",
+                                 elapsedMs: elapsedMs())
+                    return
                 }
 
-                // Keep the answer for the next time it is asked for. The policy's
-                // own `accepts` is what decides -- a chapter has to be 2xx, big
-                // enough and actually the site's JSON rather than a challenge page
-                // that happens to be large; a chapter list additionally has to
-                // carry `code:1` and the site's own `-/-` record separator.
-                if let key = cacheKey, let policy = responsePolicy,
-                   http.statusCode >= 200, http.statusCode < 300, policy.accepts(body) {
-                    let expiresAt = policy.ttl.map { Date().addingTimeInterval($0) }
-                    let lifetime = policy.ttl.map { "\(Int($0))s" } ?? "the session"
-                    self.responseCache.set(key, ResponseCache.Entry(status: http.statusCode,
-                                                                    contentType: contentType,
-                                                                    headers: headerMap,
-                                                                    body: body,
-                                                                    expiresAt: expiresAt))
-                    // Kept out of the panel (it fires on every cached answer) but
-                    // written to the native call log, which is the only place that
-                    // shows what the session cache actually decided to hold.
-                    self.callLog("ok", "\(method) \(url.absoluteString) cached-for "
-                        + lifetime + " (\(body.count)b)")
+                // Keep the answer for the next launch. The class's own `accepts`
+                // is what decides, and a refusal is logged with its reason so that
+                // a "nothing is being cached" report has an answer in the log.
+                if let key = cacheKey, let policy = policy, !bypassCache,
+                   http.statusCode >= 200, http.statusCode < 300 {
+                    if policy.accepts(body, contentType) {
+                        self.contentCache.store(key: key, cls: policy.cls, status: http.statusCode,
+                                                contentType: contentType, headers: headerMap,
+                                                body: body, ttl: policy.ttl,
+                                                servedBy: url.host ?? "")
+                        self.callLog("ok", "\(method) \(url.absoluteString) cached class="
+                            + "\(policy.cls.rawValue) ttl=\(Int(policy.ttl))s bytes=\(body.count)")
+                    } else {
+                        self.contentCache.noteReject()
+                        self.callLog("ok", "\(method) \(url.absoluteString) not cached class="
+                            + "\(policy.cls.rawValue) status=\(http.statusCode) "
+                            + "bytes=\(body.count) content-type="
+                            + "\(contentType.isEmpty ? "none" : contentType)"
+                            + " (not the shape this class accepts)")
+                    }
                 }
 
-                self.callLog(http.statusCode >= 400 ? "err" : "ok",
-                             "\(method) \(url.absoluteString) -> \(http.statusCode) bytes=\(body.count) data=\(payload.kind)")
-                // Only failures reach the panel while logging is off: the preview
-                // decodes the response body and every report is a cross-process
-                // call, and paying that for a 200 on every request in a list page
-                // is exactly the waste this gate exists to remove. The check sits
-                // outside the string build so `preview()` is never even called.
-                //
-                // A 4xx counts as a failure too: an expired session answers 401/403
-                // and "the request failed" is exactly what a bug report needs.
-                let isFailure = http.statusCode >= 400
-                if isFailure || self.diagnosticsOn {
-                    self.report(isFailure ? "ERR" : "Http",
-                                "\(method) \(url.absoluteString) -> \(http.statusCode) "
-                        + "\(contentType.isEmpty ? "no-content-type" : contentType) "
-                        + "\(payload.kind) \(body.count)b in \(elapsedMs())ms "
-                        + SangTacHttpPlugin.preview(payload: payload, body: body),
-                                force: isFailure)
+                if let key = cacheKey {
+                    self.finishInFlight(key, answer: SharedAnswer(
+                        status: http.statusCode, contentType: contentType,
+                        headers: headerMap, body: body,
+                        failure: http.statusCode >= 400 ? "HTTP \(http.statusCode)" : nil))
                 }
-                call.resolve(result)
+                self.deliver(status: http.statusCode, contentType: contentType,
+                             headers: headerMap, body: body, url: url,
+                             resultURL: http.url?.absoluteString, call: call,
+                             method: method, label: "", elapsedMs: elapsedMs())
             }.resume()
         }
     }
@@ -1081,37 +1242,123 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         return ordered.joined(separator: ";") + "|" + (signedIn ? "in" : "out")
     }
 
-    /// Answers from the session cache, rebuilt through the same
-    /// `responsePayload` the network path uses: its typing is load-bearing (the
-    /// reader calls `r.data.replace(...)` on a text/html body), so the cached
-    /// bytes have to go through the identical branch.
-    ///
-    /// It reports to the panel like the network path does, because
-    /// `[Http] sajax=readchapter ... (cache)` is how a cache hit is confirmed on a
-    /// sideloaded build -- CAPLog is not readable there. `report` is gated on the
-    /// diagnostics switch, so this costs nothing while logging is off.
-    private func serveCached(_ cached: ResponseCache.Entry,
-                             url: URL,
-                             call: CAPPluginCall,
-                             method: String,
-                             elapsedMs: Int) {
+    /**
+     Hand one answer back to one caller: build the payload through the same
+     `responsePayload` branch the network path uses (its typing is load-bearing --
+     the reader calls `r.data.replace(...)` on a text/html body, so an answer that
+     came off the disk has to go through the identical branch), log it, and
+     resolve.
+
+     `label` says where the bytes came from -- `cache`, `stale`, `304`, `shared`,
+     or empty for a fresh network answer. That word is how the next device log
+     answers "is the cache doing anything at all", which is exactly what the
+     2026-10-12 report could not tell: the panel is the only place a sideloaded
+     build can show it, and `report` is gated on the diagnostics switch, so this
+     costs nothing while logging is off.
+     */
+    private func deliver(status: Int, contentType: String, headers: [String: String],
+                         body: Data, url: URL, resultURL: String? = nil,
+                         call: CAPPluginCall, method: String, label: String,
+                         elapsedMs: Int) {
         let payload = SangTacHttpPlugin.responsePayload(
-            body: cached.body,
-            contentType: cached.contentType,
+            body: body, contentType: contentType,
             responseType: call.getString("responseType"))
         var result: [String: Any] = [
-            "status": cached.status,
-            "headers": cached.headers,
-            "url": url.absoluteString,
+            "status": status,
+            "headers": headers,
+            "url": resultURL ?? url.absoluteString,
             "data": payload.value
         ]
-        if cached.status >= 400 { result["error"] = true }
-        callLog("ok", "\(method) \(url.absoluteString) -> \(cached.status) "
-            + "bytes=\(cached.body.count) data=\(payload.kind) (cache)")
-        report("Http", "\(method) \(url.absoluteString) -> \(cached.status) "
-            + "\(cached.contentType.isEmpty ? "no-content-type" : cached.contentType) "
-            + "\(payload.kind) \(cached.body.count)b in \(elapsedMs)ms (cache)")
+        let isFailure = status >= 400 || status == 0
+        if isFailure { result["error"] = true }
+        let suffix = label.isEmpty ? "" : " (\(label))"
+        callLog(isFailure ? "err" : "ok", "\(method) \(url.absoluteString) -> \(status) "
+            + "bytes=\(body.count) data=\(payload.kind)\(suffix)")
+        // Only failures reach the panel while logging is off: the preview decodes
+        // the response body and every report is a cross-process call, and paying
+        // that for a 200 on every request in a list page is exactly the waste this
+        // gate exists to remove. The check sits outside the string build so
+        // `preview()` is never even called.
+        //
+        // A 4xx counts as a failure too: an expired session answers 401/403 and
+        // "the request failed" is exactly what a bug report needs.
+        if isFailure || diagnosticsOn {
+            report(isFailure ? "ERR" : "Http",
+                   "\(method) \(url.absoluteString) -> \(status) "
+                + "\(contentType.isEmpty ? "no-content-type" : contentType) "
+                + "\(payload.kind) \(body.count)b in \(elapsedMs)ms\(suffix) "
+                + SangTacHttpPlugin.preview(payload: payload, body: body),
+                   force: isFailure)
+        }
         call.resolve(result)
+    }
+
+    /// The answer handed to a caller whose shared request failed.
+    static func failedAnswer(_ message: String) -> SharedAnswer {
+        SharedAnswer(status: 0, contentType: "", headers: [:], body: Data(), failure: message)
+    }
+
+    /**
+     The background half of stale-while-revalidate: the reader already has the old
+     answer on screen, so this exists to make the *next* request fresh -- and, when
+     the bytes really changed, to tell the page so it can re-render whatever part
+     of the screen is showing them (`contentRefreshed`, consumed by the
+     `contentCache` block in SitePatch.swift).
+
+     Failures are silent by design: nobody is waiting on this one.
+     */
+    private func refreshBehind(key: String, policy: ContentPolicy, url: URL,
+                               method: String, headers: [String: String], body: Data?,
+                               stale: ContentCache.Entry, staleBody: Data) {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = SangTacHttpPlugin.defaultTimeout
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        if policy.revalidate {
+            if let stamp = stale.headers["Last-Modified"] ?? stale.headers["last-modified"] {
+                request.setValue(stamp, forHTTPHeaderField: "If-Modified-Since")
+            }
+            if let tag = stale.headers["ETag"] ?? stale.headers["etag"] {
+                request.setValue(tag, forHTTPHeaderField: "If-None-Match")
+            }
+        }
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        if let body = body { request.httpBody = body }
+        session.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self = self, let http = response as? HTTPURLResponse else { return }
+            let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            if http.statusCode == 304 {
+                self.contentCache.renew(key, ttl: policy.ttl)
+                self.contentCache.noteRevalidation(used304: true)
+                self.callLog("ok", "\(method) \(url.absoluteString) background refresh 304 class="
+                    + "\(policy.cls.rawValue)")
+                return
+            }
+            guard http.statusCode >= 200, http.statusCode < 300 else { return }
+            let fresh = data ?? Data()
+            guard policy.accepts(fresh, contentType) else { return }
+            let headerMap = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
+                if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
+            }
+            let changed = ContentCache.bodyHash(fresh) != ContentCache.bodyHash(staleBody)
+            self.contentCache.store(key: key, cls: policy.cls, status: http.statusCode,
+                                    contentType: contentType, headers: headerMap, body: fresh,
+                                    ttl: policy.ttl, servedBy: url.host ?? "")
+            self.contentCache.noteRevalidation(used304: false)
+            self.callLog("ok", "\(method) \(url.absoluteString) background refresh class="
+                + "\(policy.cls.rawValue) changed=\(changed ? "yes" : "no")")
+            guard changed else { return }
+            // Only the page can re-render what it already drew, and only the page
+            // knows whether that screen is still on top -- so the event carries the
+            // url and the class, and the injected block decides what to do.
+            DispatchQueue.main.async {
+                self.notifyListeners("contentRefreshed", data: [
+                    "url": url.absoluteString,
+                    "class": policy.cls.rawValue,
+                    "bytes": fresh.count
+                ])
+            }
+        }.resume()
     }
 
     private func storeResponseCookies(_ response: HTTPURLResponse, for url: URL) {

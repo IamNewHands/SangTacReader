@@ -1169,6 +1169,32 @@ function installFakeApp(sandbox, options) {
             bytes: payload.data.length,
           });
         },
+        // The site's blob store (img.* images, font_* fonts) after §6.45.3 (8):
+        // the bytes live in a file the app owns rather than in UserDefaults.
+        // Modelled as a map so a test can see exactly what landed there.
+        blobRead(payload) {
+          (stored.blobRead || (stored.blobRead = [])).push(payload);
+          const blobs = stored.blobs || (stored.blobs = {});
+          const has = Object.prototype.hasOwnProperty.call(blobs, payload.key);
+          const value = has ? blobs[payload.key] : '';
+          return Promise.resolve({ value: value, bytes: value.length });
+        },
+        blobWrite(payload) {
+          (stored.blobWrite || (stored.blobWrite = [])).push(payload);
+          if (options.blobWriteFails) {
+            return Promise.reject(new Error(options.blobWriteFails));
+          }
+          const blobs = stored.blobs || (stored.blobs = {});
+          if (!payload.value) { delete blobs[payload.key]; }
+          else { blobs[payload.key] = payload.value; }
+          return Promise.resolve({ value: true, bytes: String(payload.value || '').length });
+        },
+        blobDelete(payload) {
+          (stored.blobDelete || (stored.blobDelete = [])).push(payload);
+          const blobs = stored.blobs || (stored.blobs = {});
+          delete blobs[payload.key];
+          return Promise.resolve({ value: true });
+        },
         // The durable sink (SangTacAppPlugin.swift). It models the file, not the
         // bridge: what the page writes survives a new sandbox, which is the whole
         // point of the feature.
@@ -1220,6 +1246,39 @@ function installFakeApp(sandbox, options) {
         setDiagnostics(payload) {
           (stored.setDiagnostics || (stored.setDiagnostics = [])).push(payload);
           return Promise.resolve({ enabled: !!payload.enabled });
+        },
+        // The content cache's own surface (§6.45.3 (7)): the settings rows read
+        // it, write its budget, clear it -- and the page listens for a refresh
+        // that happened behind the reader.
+        cacheStats(payload) {
+          (stored.cacheStats || (stored.cacheStats = [])).push(payload);
+          if (options.cacheStatsFails) {
+            return Promise.reject(new Error(options.cacheStatsFails));
+          }
+          return Promise.resolve(options.cacheStatsResponse
+            ? options.cacheStatsResponse()
+            : { entries: 12, bytes: 1572864, hits: 7, staleServed: 2, misses: 3,
+                retentionDays: 30, maxBytes: 268435456 });
+        },
+        cacheConfig(payload) {
+          (stored.cacheConfig || (stored.cacheConfig = [])).push(payload);
+          if (options.cacheConfigFails) {
+            return Promise.reject(new Error(options.cacheConfigFails));
+          }
+          return Promise.resolve(options.cacheConfigResponse
+            ? options.cacheConfigResponse(payload)
+            : Object.assign({ entries: 12, bytes: 1572864, hits: 7, staleServed: 2,
+                misses: 3, retentionDays: 30, maxBytes: 268435456 }, payload));
+        },
+        clearCache(payload) {
+          (stored.clearCache || (stored.clearCache = [])).push(payload);
+          return Promise.resolve({ cleared: options.cacheCleared === undefined
+            ? 12 : options.cacheCleared });
+        },
+        addListener(name, handler) {
+          const listeners = stored.listeners || (stored.listeners = {});
+          listeners[name] = handler;
+          return Promise.resolve({ remove() {} });
         },
       },
     },
@@ -8675,6 +8734,233 @@ async function testSwipeDismiss() {
     'tab category swipes must keep working');
 }
 
+/**
+ * The site's own blob store, after §6.45.3 (8): `img.*` (the reader's images) and
+ * `font_*` (its imported fonts) belong in files, not in UserDefaults -- which iOS
+ * keeps in memory and which the site was filling with megabytes of base64.
+ *
+ * The move has to be invisible to the site: the same three methods, the same
+ * string in and string out, and a migration that cannot lose a value.
+ */
+async function testSiteBlobs() {
+  console.log('site blob store (images and fonts out of UserDefaults)');
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    preferences: {
+      store: { 'img.legacy': 'BASE64-LEGACY', 'config.reader': '{"display_type":"pageflip"}' },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  const diag = () => String(sandbox.window.__stvDiag.text() || '');
+  const blobs = () => sandbox.__stored.blobs || {};
+
+  check('the blob store reports itself installed',
+    diag().indexOf('images and fonts now live in files') >= 0, diag().slice(-200));
+
+  // A value written before the move is still what the site reads...
+  const migrated = await app.storage.cache.getFile('img.legacy');
+  check('a legacy image is still returned', migrated === 'BASE64-LEGACY', String(migrated));
+  check('it was written to the app-owned file store',
+    blobs()['img.legacy'] === 'BASE64-LEGACY', JSON.stringify(blobs()));
+  // ...and the UserDefaults copy is blanked only after the file reads back, so a
+  // kill in the middle of the move loses nothing.
+  check('the Preferences copy is blanked after the file reads back',
+    sandbox.__stored.prefStore['img.legacy'] === '',
+    JSON.stringify(sandbox.__stored.prefStore['img.legacy']));
+  check('the migration is reported once', diag().indexOf('img.legacy moved out') >= 0,
+    diag().slice(-240));
+
+  // A second read is answered from the file, with no migration work.
+  const writesBefore = (sandbox.__stored.blobWrite || []).length;
+  const again = await app.storage.cache.getFile('img.legacy');
+  check('a second read comes from the file', again === 'BASE64-LEGACY', String(again));
+  check('and does not migrate again',
+    (sandbox.__stored.blobWrite || []).length === writesBefore,
+    String((sandbox.__stored.blobWrite || []).length));
+
+  // Writes: files, not UserDefaults.
+  await app.storage.cache.setFile('img.new', 'BASE64-NEW');
+  check('a new image is written to the file store', blobs()['img.new'] === 'BASE64-NEW');
+  check('the Preferences store is not touched', !('img.new' in sandbox.__stored.prefStore));
+
+  // Fonts take the same route.
+  await app.storage.cache.setFile('font_Noto', 'FONTDATA');
+  check('an imported font is written to the file store', blobs()['font_Noto'] === 'FONTDATA');
+
+  // The site's own delete convention, and the explicit delete.
+  await app.storage.cache.setFile('img.new', '');
+  check('an empty value deletes the file', !('img.new' in blobs()));
+  await app.storage.cache.deleteFile('font_Noto');
+  check('deleteFile reaches the file store',
+    (sandbox.__stored.blobDelete || []).some((payload) => payload.key === 'font_Noto'));
+
+  // Everything else is a setting and stays where settings live.
+  await app.storage.cache.setFile('config.reader', '{"display_type":"auto"}');
+  check('a non-blob key still goes to Preferences',
+    sandbox.__stored.prefStore['config.reader'] === '{"display_type":"auto"}',
+    JSON.stringify(sandbox.__stored.prefStore['config.reader']));
+  check('a non-blob key never reaches the blob bridge',
+    !(sandbox.__stored.blobWrite || []).some((payload) => payload.key === 'config.reader'));
+  check('an unknown non-blob key still reads through the old path',
+    typeof (await app.storage.cache.getFile('offlineBook_x')) === 'string');
+}
+/**
+ * The cache's page-side half (§6.45.3 (5) and (7)): the four settings rows, and
+ * the listener that turns "the answer changed behind you" into a redraw.
+ *
+ * The rows are the only place a reader can see what the cache is holding, which
+ * is the whole reason the feature was invisible before this round; the listener
+ * is the second half of stale-while-revalidate, where the plugin has fresh bytes
+ * but only the page knows whether that screen is still on top.
+ */
+async function testContentCache() {
+  console.log('content cache settings rows and refresh hook');
+  const fixture = settingsPageFixture();
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, {
+    displayType: 'auto',
+    pages: { pagesetting: fixture.page },
+    cacheCleared: 5,
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(250);
+  const diag = () => String(sandbox.window.__stvDiag.text() || '');
+
+  check('the refreshed-content listener is registered',
+    typeof (sandbox.__stored.listeners || {}).contentRefreshed === 'function');
+
+  app.pushPage('pagesetting', {});
+  await tick(40);
+
+  const rows = fixture.content.querySelectorAll('.stv-cache-row');
+  check('the settings page grows a cache section with four rows', rows.length === 4,
+    String(rows.length));
+  const titles = rows.map((row) => {
+    const name = row.querySelectorAll('.settingitemtitle')[0];
+    return name ? name.textContent : '';
+  });
+  check('the rows are the four the design calls for',
+    titles.join('/') === '内容缓存占用/保留时间/保留空间/清除内容缓存', titles.join('/'));
+
+  const cellOf = (index) => {
+    const cells = rows[index].querySelectorAll('div');
+    return cells.length ? cells[cells.length - 1].textContent : '';
+  };
+  check('the usage row reports what the plugin holds',
+    cellOf(0).indexOf('1.5 MB') >= 0 && cellOf(0).indexOf('12 项') >= 0
+      && cellOf(0).indexOf('命中 9') >= 0, cellOf(0));
+  check('the retention row shows the current cap', cellOf(1) === '30 天', cellOf(1));
+  check('the space row shows the current budget in MB', cellOf(2) === '256 MB', cellOf(2));
+
+  // Tapping a row cycles it and the row redraws from what the plugin answered.
+  click(rows[1]);
+  await tick(30);
+  const retentionCalls = sandbox.__stored.cacheConfig || [];
+  check('tapping retention writes the next step up',
+    retentionCalls.length === 1 && retentionCalls[0].retentionDays === 90,
+    JSON.stringify(retentionCalls));
+  check('the retention row shows the new value', cellOf(1) === '90 天', cellOf(1));
+
+  click(rows[2]);
+  await tick(30);
+  const spaceCalls = sandbox.__stored.cacheConfig || [];
+  check('tapping space writes the next step up',
+    spaceCalls.length === 2 && spaceCalls[1].maxBytes === 512 * 1024 * 1024,
+    JSON.stringify(spaceCalls));
+  check('the space row shows the new budget', cellOf(2) === '512 MB', cellOf(2));
+
+  const readsBefore = (sandbox.__stored.cacheStats || []).length;
+  click(rows[3]);
+  await tick(30);
+  check('tapping clear empties the native cache',
+    (sandbox.__stored.clearCache || []).length === 1
+      && (sandbox.__stored.clearCache || [])[0].clear === undefined,
+    JSON.stringify(sandbox.__stored.clearCache || []));
+  check('the clear row reports how much went',
+    cellOf(3) === '已清除 5 项', cellOf(3));
+  check('the usage row is re-read after a clear',
+    (sandbox.__stored.cacheStats || []).length > readsBefore,
+    String((sandbox.__stored.cacheStats || []).length));
+
+  // Re-opening the settings page must not stack a second set of rows.
+  app.pushPage('pagesetting', {});
+  await tick(40);
+  check('a second visit does not add a second set of rows',
+    fixture.content.querySelectorAll('.stv-cache-row').length === 4,
+    String(fixture.content.querySelectorAll('.stv-cache-row').length));
+
+  // The refresh hook: the plugin says an answer changed, the page decides.
+  const list = makeContainer('bookdisplay', '');
+  list.setAttribute('from', '/mobile/booklist.php?method=history');
+  let reloads = 0;
+  list.load = () => { reloads += 1; };
+  sandbox.document.body.appendChild(list);
+
+  const fire = (event) => {
+    const handler = (sandbox.__stored.listeners || {}).contentRefreshed;
+    if (handler) { handler(event); }
+  };
+  fire({ url: 'https://sangtacviet.app/mobile/booklist.php?method=history&p=0', 'class': 'homeList' });
+  await tick(20);
+  check('a refreshed list is redrawn through the site own loader', reloads === 1,
+    String(reloads));
+  check('and the hook it used is named',
+    diag().indexOf('refreshed homeList through load()') >= 0, diag().slice(-240));
+
+  fire({ url: 'https://sangtacviet.app/mobile/bookinfo.php?hid=1&host=qidian', 'class': 'bookInfo' });
+  await tick(20);
+  check('nothing on screen owning the answer is reported, not guessed',
+    diag().indexOf('no refresh hook for bookInfo') >= 0, diag().slice(-240));
+  check('the redraw count is unchanged for an unowned answer', reloads === 1, String(reloads));
+
+  // A native cache that cannot answer must not break the settings page.
+  const failing = makeSandbox();
+  const failingFixture = settingsPageFixture();
+  const failingApp = installFakeApp(failing, {
+    displayType: 'auto',
+    pages: { pagesetting: failingFixture.page },
+    cacheStatsFails: 'cache unavailable',
+  });
+  vm.runInContext(loadBlocks().join('\n'), failing);
+  await tick(250);
+  failingApp.pushPage('pagesetting', {});
+  await tick(40);
+  const failingDiag = String(failing.window.__stvDiag.text() || '');
+  check('a failing stats read is logged rather than thrown',
+    failingDiag.indexOf('cacheStats failed') >= 0, failingDiag.slice(-240));
+  check('the rows are still drawn when stats cannot be read',
+    failingFixture.content.querySelectorAll('.stv-cache-row').length === 4,
+    String(failingFixture.content.querySelectorAll('.stv-cache-row').length));
+
+  // Coverage: the site fetches its own API through XMLHttpRequest whenever the
+  // target matches the page origin (app.v2.js:700), and those reads never reach
+  // the native cache. Counting them is the difference between "the cache is
+  // broken" and "the cache was never asked".
+  const cover = makeSandbox();
+  const opened = [];
+  function FakeXhr() {}
+  FakeXhr.prototype.open = function (method, url) { opened.push(url); };
+  cover.window.XMLHttpRequest = FakeXhr;
+  installFakeApp(cover, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), cover);
+  await tick(1200);
+  const xhr = new cover.window.XMLHttpRequest();
+  xhr.open('GET', 'https://sangtacviet.com/mobile/bookinfo.php?hid=1&host=qidian');
+  xhr.open('GET', 'https://sangtacviet.com/some/other/thing.js');
+  check('a page-level request still goes out untouched',
+    opened.length === 2, JSON.stringify(opened));
+  await tick(200);
+  const coverDiag = String(cover.window.__stvDiag.text() || '');
+  check('a request the native cache never sees is counted',
+    coverDiag.indexOf('1 site request(s) went through the page own XMLHttpRequest') >= 0,
+    coverDiag.slice(-300));
+  check('and it names the one that got away',
+    coverDiag.indexOf('bookinfo.php') >= 0, coverDiag.slice(-300));
+  check('the count is not reused for the assets around it',
+    coverDiag.indexOf('2 site request(s)') < 0, coverDiag.slice(-300));
+}
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -8743,6 +9029,8 @@ await testPopupTranslate();
   await testNativeDiagnosticsBridge();
   await testDurableDiagnostics();
   await testGoogleFreeThroughput();
+  await testSiteBlobs();
+  await testContentCache();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

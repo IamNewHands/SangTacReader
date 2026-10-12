@@ -275,6 +275,32 @@ const REQUIRED_MARKERS = [
   'function patchScrollto(',
   'function patchComicChapterListScroll(',
   'leaving the rest of this chapter to the',
+  // 2026-10-12: the content cache had no page-side half at all, which is most of
+  // why the reader could not tell whether anything was cached. These rows are the
+  // answer to "感觉没生效": they show what the plugin holds, let the reader change
+  // the retention and space budgets, and clear it.
+  'window.__stvContentCacheInstalled',
+  'stv-cache-row',
+  'content cache cleared: ',
+  // ...and the second half of stale-while-revalidate: the plugin serves the old
+  // answer immediately and refreshes behind the reader, so something has to
+  // decide whether the screen showing it is still on top. Only the page can, and
+  // the site's own renderer is in a mirrored bundle -- so this probes for it and
+  // says which hook it used, or that it found none.
+  'contentRefreshed',
+  'refreshed behind the reader: ',
+  'no refresh hook for ',
+  // The site's own blob store (images as base64, imported fonts) left
+  // UserDefaults for files: the same three methods, the same strings, and a
+  // migration that blanks the old copy only after the new one reads back.
+  'images and fonts now live in files, not in UserDefaults',
+  'moved out of the Preferences store',
+  'blob store refused ',
+  // The site's own API is fetched through XMLHttpRequest whenever the target
+  // matches the page origin (app.v2.js:700), and those requests never reach the
+  // native cache -- so the cache's coverage has to be *measured*, not assumed.
+  'went through the page own',
+  'function watchXhr(',
 ];
 
 function fail(message) {

@@ -4333,6 +4333,186 @@ ui.scrollto=function(ele,offset, scroller){
 新增断言：章节列表被包、`ui.scrollto` 在尾巴调用前已被补、没有 id 的行被临时命名且调用后复原、
 已有 id 的行按原 id 传、字符串参数原样走、同一张图两对都要只下载一次、已拒绝的图床不再被问第二次。
 
+## §6.45 第 43 轮（提交名：第四十五轮）：「缓存感觉没生效」—— 内容缓存与首屏预热的设计与落地
+
+用户 2026-10-12 的原话（要点）：
+
+> 现在是不是有做缓存？我实际用没感觉到缓存在生效，每次进应用都要黑屏挺久等首页。在看的小说也没缓存：
+> 详情页说明、图片、目录、看过的正文完全可以缓存，隔天继续读就能很快显示，可以后台再拉新数据、
+> 有变化就更新；而且应该能设保留时间和保留空间。
+
+这一节是**设计**（方案先落档，再按第七节的清单施工）。真机证据留给下一轮日志。
+
+### 6.45.1 现状：五层缓存，但没有一层是「内容」
+
+| # | 层 | 位置 | 管什么 | 跨启动存活 |
+| --- | --- | --- | --- | --- |
+| 1 | WKWebView 磁盘缓存 | WebKit 自己 | 无随机参数的静态文件（§6.23：21 个请求 1KB 上网 / 17 命中） | 是（1232KB 一天付一次，已按量否决接管） |
+| 2 | `assetCache` | `SitePatch.swift` assetCache 块 | 把站点 `?0.3719` 换成稳定 token | — |
+| 3 | `assetMirror` 本地资源镜像 | `SitePatch.swift` assetMirror 块 + `SiteAssets.swift:55-64` | **只有 8 个 JS/CSS** | 是 |
+| 4 | `ResponseCache` | `SangTacHttpPlugin.swift:229-294` | 章节正文（会话内）+ 目录（TTL 300s，`:181`） | **否（纯内存）** |
+| 5 | 站点自己的 `app.storage.cache` | `_dl_app.v2.js:534-586`（Preferences/UserDefaults 分支；SQLite 分支因无 CapacitorSQLite 依赖而死） | 设置、readhistory、bookinfo、`img.*`、`font_*` | 是 |
+
+**用户记成「首页内容镜像缓存」的就是第 3 层**（设置页那一行叫「本地资源镜像」，`SitePatch.swift:696`），它只覆盖 8 个启动文件，与首页/小说内容无关。名字与期望不符，是「感觉没生效」的第一层原因。
+
+### 6.45.2 为什么「感觉没生效」——逐条证据
+
+1. **正文只活一次运行**：`ResponseCache` 是插件实例的内存字典，章节 TTL 为 `nil`＝「会话内」，杀进程即失效（`:229-294`）。
+2. **目录 300 秒 + 重启即失效**：`:181`。§6.23 ④ 的真机日志里，同一 URL 一次启动取了 **3 次＝3474ms**。
+3. **首页第一个请求是 POST**：`POST /mobile/booklist.php?method=history`，策略里被显式排除（`:167-170`），而且 POST 没有缓存键 → 每次走网络，真机 **4034ms**（§6.23 ④）。
+4. **封面没有策略**：图片走 `Capacitor.Plugins.Http.get({responseType:'blob'})`（`_dl_app.v2.js:7328-7337`），完全不在缓存策略里 → 每次重下。
+5. **主文档每次都从网络取**：`app.v2.php` 的 TTFB ~1.2s 之后才是 253KB 的 `app.v2.js`；首屏外壳 +1225ms、站点 UI +3s、首页数据 +10s（§6.23 ①）。
+6. **唯一跨启动存在的内容在 UserDefaults 里**：bookinfo/readhistory 是小字段，正文与目录不在其中；而站点还把图片 base64（`_dl_app.v2.js:7462`）与字体（`:7158`）一起塞进 Preferences，既拖慢每次 `app.storage.get` 又常驻内存。
+
+### 6.45.3 设计
+
+原则：**内容缓存放在唯一同时看得到「请求」和「字节」的地方**——`SangTacHttpPlugin`；页面侧只负责设置行与「刷新后重渲染」。理由是图片（blob）、POST 列表、正文三者都在这个插件里汇合，页面侧拦 `app.net` 既覆盖不到图片，也没法在站点 JS 跑起来之前预热。
+
+#### (1) 键：什么进键、什么绝不能进键
+
+| 类 | 端点 | 进键 | 绝不进键 |
+| --- | --- | --- | --- |
+| chapter | `/?sajax=readchapter&h&bookid&c&key` | `sajax`、`h`、`bookid`、`c`、语言变体 | **`key=<chapterkey>`**、镜像主机名、`rescan` |
+| chapterList | `/index.php?ngmar=chapterlist&h&bookid&sajax=getchapterlist` | 同上（无 `c`） | 镜像主机名 |
+| bookInfo | `/mobile/bookinfo.php?hid&host` | 全 URL | — |
+| image | 图床 URL（blob） | 全 URL（去掉 `?r=`/`nocache=` 一类随机参数） | 镜像主机名 |
+| homeList | `POST /mobile/booklist.php?method=…` | 全 URL + **body 哈希** + 语言变体 | — |
+| userInfo | `/mobile/userinfo.php` | 全 URL + body 哈希 | — |
+| grant | `/io/grantcontext/context?hostid&bookid` | 全 URL | —（只做短 TTL） |
+
+两条理由：
+
+- **`key=<chapterkey>` 不能进键**：它来自 `/io/grantcontext/context`，按 `h-bookid` 在内存里记忆、随换书刷新（`app.v2.read.js:515-551`）。进键就等于「换一次书 key 一变全 miss」。
+- **镜像主机名不进键**：readchapter 的主机由 `bestDomain()` 决定且会漂移（§6.25），而 `h=` 已经区分书所在的内容源；跨镜像命中同一本书是正确的，最坏结果只是一次 miss。
+
+#### (2) 类策略（TTL / 过期后怎么办）
+
+| 类 | 默认 TTL | 过期后 | 依据 |
+| --- | --- | --- | --- |
+| chapter | 30 天（受「保留时间」档位缩放） | 先给本地 + 后台 `If-Modified-Since` 校验 | 正文发布后基本不变 |
+| chapterList | 6 小时 | 先给旧目录 + 后台刷新 | 115KB/次，作者更新时目录才变 |
+| bookInfo | 24 小时 | 先给旧详情 + 后台刷新 | 详情页说明/评分/字数很少变 |
+| image | 30 天 | 不校验，靠容量淘汰 | 封面/详情图 |
+| homeList | 10 分钟 | 先给 + 后台刷新 + 通知页面 | 未读数/更新时间是分钟级 |
+| userInfo | 60 秒 | 窗口外直接取网络 | 未读数是「错一下就能看出来」的数据 |
+| comment | 5 分钟 | 同上 | 只缓存首屏第一页 |
+| grant | 15 分钟 | 过期直接取网络 | 844KB/2011ms，只有「当天多次重开」才值得，令牌语义未证实 |
+
+正文的接受条件从旧的「≥4KB 且 `code` 不是 7/10002」**收紧成 `code == 0` 且带 ≥256 字符的 `data`**——这正是三个显示类渲染前自己做的判断（`chapterdisplay.js:790`、`:1813`、`:3682`）。会话内宽松一点只影响一次会话；30 天的磁盘缓存里塞进一个付费墙、验证码或登录页，那就是一个月的错。
+
+#### (3) 预算、目录、淘汰
+
+- 目录：`Library/Application Support/stv-content-cache/`。**不是 Caches**：与本地资源镜像同理，被系统清掉就等于回到今天。
+- 每条两文件：`<sha256(key)>.body` + `<sha256(key)>.meta`（JSON：类、键、status、contentType、白名单响应头、storedAt、expiresAt、validatedAt、lastAccess、size、servedBy）。
+- 预算：条目数上限 + 字节上限（默认 256MB；设置里 128MB/256MB/512MB/1GB），LRU 按 `lastAccess`；`lastAccess` 先在内存累计、每小时最多回写一次，避免每次命中写盘。
+- 站点 blob（`img.*`/`font_*`）与内容缓存共用「保留空间」这一个旋钮，但各占一个目录，统计合并展示。
+
+#### (4) 请求合并、304、SWR、rescan
+
+- **合并**：同键请求在飞行中时，后来者挂在同一个 task 上（真机证据：`getchapterlist` 一次启动 3 次、`userinfo` 背靠背 2 次）。
+- **304**：过期条目带 `If-Modified-Since`/`If-None-Match` 再问一次；304 只刷新 `storedAt`/`expiresAt`，继续用本地字节（列表类省 115KB/次）。
+- **SWR**：(2) 里标「先给」的类，命中过期条目时**立即返回本地字节**，后台再发校验/全量请求；若有变化，发 `contentRefreshed` 事件（Capacitor `notifyListeners`）。
+- **`rescan=true`**（正文的「重新取源」）：**永不读缓存**，成功后覆盖旧条目。
+- 写操作、错误码、探测类**永不入缓存**（沿用 `isCacheableChapter`/`isCacheableChapterList` 的 `accepts` 思路，逐类收紧，并把拒绝原因写成一行日志）。
+
+#### (5) 刷新钩子（页面侧，先探测后使用）
+
+新块 `contentRefresh`：`Http.addListener('contentRefreshed', …)` → 若当前页面有元素（`bookdisplay`/`bookgrid`/`infbooklist`/`booklist`）的 `from`/`src` 等于或包含该 URL，就调用站点自己的重渲染入口，并记下用的是哪个（探测 `load()` → `refresh()` → `reload()` → 派发 `refresh` 事件）；找不到就记 `no refresh hook for <url>`。
+
+理由：站点的渲染入口在镜像进来的 asset 里，不在这份仓库里，所以第一版**先探测**；拿不到钩子只是「这次不自动刷新」，不影响正确性。真机日志会给出它到底叫什么。
+
+#### (6) 启动预热（只做原生这一条）
+
+- 原生侧：webview 首次加载后 **2 秒**（外壳 +1225ms 已释放，不进启动窗口）用与页面相同的 Cookie（`nativeCookies` 已有）/Referer/UA/`x-stv-transport: app` 预热 `GET /mobile/userinfo.php`，且只在缓存条目已过期时发；站点自己已经发过同一请求时跳过，否则那是重复请求而不是预热。
+- **页面侧那条不做**（这是设计与实现之间的一处收窄，2026-10-12）：默认 tab（history）的请求体由站点自己的 `readhistory` 派生，原生拿不到；而缓存键包含 body 哈希，**手搓的 body 只要与站点那一次差一个字节就是另一个键**——那就成了一次纯浪费的请求。而 (2) 里 homeList 的 `serveStale` 已经让"第二次起的每次冷启动"都从本地出首屏，这一条的收益本来也只在安装后的第一次启动。收益小、键不匹配的风险实在，砍掉。
+- `grant` 不做预热（令牌语义未证实，见 §6.45.7）。
+
+#### (7) 设置行
+
+在设置页（`SitePatch.swift:8707` 的 `onSettingsPage`）新增「缓存」区块：
+
+| 行 | 作用 |
+| --- | --- |
+| 已用空间 / 条目数 | 点一次从 `Http.cacheStats` 读回 |
+| 保留时间 | 短（7 天）/ 中（30 天）/ 长（90 天）/ 极长（365 天），按倍率缩放 (2) 里的时间类 TTL |
+| 保留空间 | 128MB / 256MB / 512MB / 1GB |
+| 清除内容缓存 | 二次确认；不动「本地资源镜像」那两行（它们独立存在） |
+
+配置走我们自己的 `Http.setCacheConfig`（UserDefaults 自有键），不依赖 Preferences 插件的键前缀。
+
+#### (8) 把 `img.*` / `font_*` 迁出 UserDefaults
+
+包 `app.storage.cache.getFile/setFile/deleteFile`：键以 `img.` 或 `font_` 开头时走原生文件存储（`Application Support/stv-site-blobs/`，App 插件新增三个方法），其余键原样走 Preferences（`storageAccessor` 已修好读路径）。
+
+- **迁移**：首次读到 Preferences 里的旧值时，写文件 + 回读校验 + 把 Preferences 那一份置空（沿用站点自己的删除约定 `setFile(key, "")`）。
+- **保持透明**：进出仍是字符串（站点把 `img.*` 当 base64、`font_*` 当字体 base64）。
+- **不动**：`imgResIdManager`、`localFonts`（都是小索引）、其余设置类键。
+
+#### (9) 覆盖面要自证（实现期间发现的一处边界）
+
+站点的 `app.net.get/post` 只在「目标与页面 origin 不同、或镜像不存活」时才走原生插件；否则它自己发 XMLHttpRequest（`app.v2.js:700`、`:760`）。也就是说：**当页面 origin 恰好就是被选中的镜像时，列表/bookinfo 这一整条路都不进缓存**——而所有针对插件的断言仍然全绿，读者那边却照旧「缓存没生效」。
+
+`contentCache` 块因此包了 `XMLHttpRequest.prototype.open`（只读 url，不改行为），在打开后 1 秒、之后每 10 秒各报一次：
+
+```
+[CACHE] N site request(s) went through the page own XMLHttpRequest (outside the native
+        cache), first: <url>
+```
+
+下一份真机日志用它决定要不要把同源请求也收进原生层——那是一次换传输的改变（会动到 §6.23/§6.25 定下的主机选择），不在本轮。
+
+### 6.45.4 不可缓存 / 非目标
+
+| 类别 | 例子 | 为什么 |
+| --- | --- | --- |
+| 写与发布 | `jsonify.php?ajax=addbookmark/followbook`、评论发/删、`updateOldLink`、`verifycaptcha`、邀请/金币 | 副作用，缓存即错误状态 |
+| 域名探测 | `warp.php`、`checkDomains()` 排名 | 域名记忆已有自己的机制（§6.23 ⑤） |
+| 搜索 | `searchBooks` | 用户期待实时 |
+| 非目标 | 原生阅读器、站点下载逻辑、TTF/字体渲染 | 不在本轮范围 |
+
+### 6.45.5 落地清单（逐项可验证）
+
+| # | 改动 | 文件 | 验收 |
+| --- | --- | --- | --- |
+| 1 | 设计入档（本节 + P0-5 指向） | `docs/capacitor-port.md`、`docs/optimization-plan-2026-09-23.md` | 本节存在 |
+| 2 | 内容缓存本体：磁盘两级、类策略、键归一、预算 LRU | `SangTacHttpPlugin.swift` | CI 编译过 + 真机 `[CACHE] store` |
+| 3 | 请求合并 + 304 + SWR + `rescan` 绕行 + `contentRefreshed` | `SangTacHttpPlugin.swift` | 真机同一 URL 只出现一次 `in Nms`；第二次 `304 reused` |
+| 4 | 插件方法 `cacheStats`/`cacheConfig`/`clearCache` + 配置持久化 | `SangTacHttpPlugin.swift` | 设置行能读回 |
+| 5 | 启动预热（原生 userinfo + 页面抢先发默认 tab） | `SangTacHttpPlugin.swift`、`SitePatch.swift` | `[CACHE] prewarmed` |
+| 6 | 设置页「缓存」区块 | `SitePatch.swift`（`onSettingsPage`） | test-site-patch 断言 + 真机可点 |
+| 7 | 刷新钩子块 `contentRefresh` | `SitePatch.swift`（新块） | 断言 + 真机 `contentRefreshed` |
+| 8 | `img.*`/`font_*` 迁到文件（含迁移） | `SitePatch.swift`、`SangTacAppPlugin.swift` | 断言 + 真机 UserDefaults 不再增长 |
+| 9 | 守卫：标记 / 断言 / i18n 标签 | `scripts/*`、`data/site-i18n.json` | 四条 `--check` 全绿 |
+
+### 6.45.6 守卫（本机可跑，本轮已全绿）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 27 块 / 627948 字节 / 132 标记 |
+| `scripts/test-site-patch.js` | **892 条断言**全过（上一轮 851，本轮新增 41） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：legacy 图片读出后落文件、Preferences 那一份在回读成功后才清空、第二次读不再迁移、`img.`/`font_` 写入走文件、空值等于删除、非 blob 键照旧走 Preferences 且不碰 blob 桥；设置页长出的四行与四行文案、点保留时间/保留空间各写一次正确的值并重绘、清除后行内报数且重读占用、二次进设置页不重复加行、stats 读失败只落一行 ERR 而不抛；`contentRefreshed` 走站点自己的 `load()` 重绘并报出钩子名、画面上没有任何元素负责该 URL 时如实记 `no refresh hook`；XHR 覆盖面计数只数站点接口、放过其它脚本、不拦断请求本身。
+
+### 6.45.7 真机判据（一次日志就能判）
+
+- 隔天重开同一章：`[CACHE] hit class=chapter age=… bytes=…`
+- 首页列表：`[CACHE] stale class=homeList … refresh=scheduled`，随后 `[CACHE] refreshed … changed=yes|no`
+- 同一 URL 在整份日志里只出现一次 `in Nms`
+- `[CACHE] stats entries=… bytes=… hits=… misses=… stale=… evicted=…`
+- `[CACHE] prewarmed userinfo.php`
+- `[BLOB] img.… -> file (…KB)`，且 Preferences 里不再出现同名键
+
+### 6.45.8 风险与未证实
+
+- **正文落盘＝设备留档**：设置里必须能一键清除，并计入保留空间。站点自己的离线库本来就往 UserDefaults 存正文，这不是新增能力面。
+- **`key` 不进键之后，锁定章的返回必须被 `accepts` 挡住**：按站点实际返回形状收紧，并落一行拒绝原因；真机需确认「解锁后同一章能正常出文」。
+- **SWR 的自动刷新依赖站点自己的渲染入口，名字未证实**：第 7 项先探测（§6.45.3 (5)）。
+- **`grant` 的 15 分钟 TTL 是保守值**：真机要看有没有 `code 7` / 解锁提示回归。
+- **缓存只覆盖走原生插件的请求**：同源的 `app.net` 走页面自己的 XMLHttpRequest（见 (9)），那些请求不进缓存；真机日志里的覆盖面计数是下一轮决定要不要改传输层的输入。
+- **原生侧没有本地单测**（本机无 Xcode）：原生逻辑靠 CI 编译 + 真机 `[CACHE]` 行验证，这是本轮最大的验证缺口。
+
 
 
 
