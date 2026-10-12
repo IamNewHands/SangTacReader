@@ -8945,17 +8945,17 @@ async function testContentCache() {
   cover.window.XMLHttpRequest = FakeXhr;
   installFakeApp(cover, { displayType: 'auto' });
   vm.runInContext(loadBlocks().join('\n'), cover);
-  await tick(1200);
+  await tick(250);
   const xhr = new cover.window.XMLHttpRequest();
   xhr.open('GET', 'https://sangtacviet.com/mobile/bookinfo.php?hid=1&host=qidian');
   xhr.open('GET', 'https://sangtacviet.com/some/other/thing.js');
   check('a page-level request still goes out untouched',
     opened.length === 2, JSON.stringify(opened));
   await tick(200);
+  const counted = await waitFor(() => String(cover.window.__stvDiag.text() || '')
+    .indexOf('1 site request(s) went through the page own XMLHttpRequest') >= 0, 2000);
   const coverDiag = String(cover.window.__stvDiag.text() || '');
-  check('a request the native cache never sees is counted',
-    coverDiag.indexOf('1 site request(s) went through the page own XMLHttpRequest') >= 0,
-    coverDiag.slice(-300));
+  check('a request the native cache never sees is counted', counted, coverDiag.slice(-300));
   check('and it names the one that got away',
     coverDiag.indexOf('bookinfo.php') >= 0, coverDiag.slice(-300));
   check('the count is not reused for the assets around it',

@@ -12025,12 +12025,20 @@ enum SitePatch {
         }, 25);
 
         // Its own timer, because the one above stops as soon as the hooks are in
-        // place: the first report is a second in, which is after the shell has
-        // asked for its own first data, and then every ten seconds.
+        // place. The first bypass is reported on the next tick -- a report that
+        // waited for a fixed moment in time was the first version of this, and it
+        // logged nothing whenever the page reached its request late (CI and a
+        // device do not agree on when "one second in" is) -- and everything after
+        // that is reported once per ten seconds.
         var bypassTicks = 0;
+        var reportedOnce = false;
         setInterval(function () {
             bypassTicks++;
-            if (bypassTicks === 40 || bypassTicks % 400 === 0) { reportBypass(); }
+            if (!bypassed.length) { return; }
+            if (!reportedOnce || bypassTicks % 400 === 0) {
+                reportedOnce = true;
+                reportBypass();
+            }
         }, 25);
     })();
     """
