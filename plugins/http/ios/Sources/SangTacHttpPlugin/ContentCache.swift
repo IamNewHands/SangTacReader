@@ -463,7 +463,7 @@ final class ContentCache {
         guard let entry = entry else { return }
         try? FileManager.default.removeItem(at: entry.bodyFile)
         try? FileManager.default.removeItem(
-            entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
+            at: entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
     }
 
     /// LRU by last access, bounded by both the entry count and the byte budget.
@@ -504,7 +504,7 @@ final class ContentCache {
         for entry in removals {
             try? FileManager.default.removeItem(at: entry.bodyFile)
             try? FileManager.default.removeItem(
-                entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
+                at: entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
         }
         if !removals.isEmpty {
             CAPLog.print("[SangTacHttp:cache] evicted \(removals.count) entr(ies) to stay inside "
@@ -529,7 +529,7 @@ final class ContentCache {
         for entry in entries.values {
             try? FileManager.default.removeItem(at: entry.bodyFile)
             try? FileManager.default.removeItem(
-                entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
+                at: entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
         }
         return ["entries": entries.count]
     }
