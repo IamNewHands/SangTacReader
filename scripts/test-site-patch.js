@@ -2312,6 +2312,22 @@ async function testReaderFunnels() {
       && frameBox.childNodes[1].textContent === '重新加载',
     JSON.stringify(frameBox.textContent));
 
+  // The site answers a chapter it cannot serve from the source with a sentence
+  // of its own. The 2026-10-12 report is ciweimao chapter 71 of
+  // 植物人妻子别偷听我的心声了 ("Hiện không thể tải chương"), which came through this
+  // same funnel and stayed Vietnamese under a Chinese UI. The sentence is the
+  // server's, so this dictionary is the only place it can be translated.
+  const alertsBefore = alerts.length;
+  app.reader.showAlert('Hiện không thể tải chương', {});
+  check('the site answer for a chapter it cannot load is translated',
+    alerts[alertsBefore] === '当前无法加载本章', JSON.stringify(alerts[alertsBefore]));
+  // The same answer may carry a tail the dictionary has no whole-string entry
+  // for, so the longest fragment has to cover the message on its own.
+  app.reader.showAlert('Hiện không thể tải chương này', {});
+  check('and a longer form of it is covered by the fragment pass',
+    alerts[alertsBefore + 1] === '当前无法加载本章',
+    JSON.stringify(alerts[alertsBefore + 1]));
+
   // The failure response carries no prev/next, so the chapter has to be handed
   // the zeros that make the display ask the server for them.
   app.reader.handlingException({ code: '1', err: unlock }, { cid: '931290000' });
