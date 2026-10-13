@@ -310,6 +310,12 @@ const REQUIRED_MARKERS = [
   'fell back to the page transport',
   'function routeNet(',
   'stv.contentcache',
+  // The routing raced the site's own bundle: `pushPage` and the Http plugin exist
+  // long before `app.net.getCapacitor` does, and a stop condition that ignored that
+  // let a fast launch install nothing. It now stays armed, and says so when it
+  // gives up -- and a bypassing request names its caller, not just its url.
+  'no native routing',
+  'function whereFrom(',
 ];
 
 function fail(message) {

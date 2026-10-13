@@ -8981,6 +8981,8 @@ async function testContentCache() {
     coverDiag.indexOf('bookinfo.php') >= 0, coverDiag.slice(-300));
   check('the count is not reused for the assets around it',
     coverDiag.indexOf('2 site request(s)') < 0, coverDiag.slice(-300));
+  check('the counted request names its caller, not only the url',
+    coverDiag.indexOf(' [') >= 0, coverDiag.slice(-300));
 
   // The routing of §6.46: the classes the native cache can serve are taken off the
   // page's own XMLHttpRequest, which is where the 2026-10-13 log caught the chapter
@@ -9070,6 +9072,37 @@ async function testContentCache() {
   check('a cache switched off in the last session routes nothing',
     offAnswer.indexOf('page:') === 0 && offRoutes[0].via === 'page',
     JSON.stringify(offRoutes[0]));
+
+  // The routing races the site's own bundle: `pushPage` and the Http plugin exist
+  // long before `app.net.getCapacitor` does, so the poll's stop condition must not
+  // let that order decide whether the cache covers the chapter list. The
+  // 2026-10-13 log is what a lost race looks like: no routing, and the chapter
+  // list back on the page's XMLHttpRequest.
+  const lateSandbox = makeSandbox();
+  const lateRoutes = [];
+  const lateApp = installFakeApp(lateSandbox, { displayType: 'auto' });
+  lateApp.net.get = (url) => {
+    lateRoutes.push({ via: 'page', url: url });
+    return Promise.resolve('page:' + url);
+  };
+  lateApp.net.post = () => Promise.resolve('page');
+  vm.runInContext(loadBlocks().join('\n'), lateSandbox);
+  await tick(150);
+  check('with no site transport yet there is nothing to route to',
+    lateRoutes.length === 0 && lateApp.net.__stvCacheRouted !== true,
+    String(lateApp.net.__stvCacheRouted));
+  lateApp.net.getCapacitor = (url) => {
+    lateRoutes.push({ via: 'native', url: url });
+    return Promise.resolve('native:' + url);
+  };
+  lateApp.net.postCapacitor = () => Promise.resolve('native');
+  await tick(200);
+  check('the routing still installs once the site bundle defines its transport',
+    lateApp.net.__stvCacheRouted === true, String(lateApp.net.__stvCacheRouted));
+  const lateAnswer = await lateApp.net.get(listUrl);
+  check('so a late-defined transport still carries the chapter list',
+    lateAnswer === 'native:' + listUrl && lateRoutes[lateRoutes.length - 1].via === 'native',
+    JSON.stringify(lateRoutes[lateRoutes.length - 1]));
 }
 (async () => {
   await testCompatAndTtsProvider();

@@ -163,7 +163,7 @@ enum ContentPolicies {
             // reopens the app within the same quarter hour.
             return ContentPolicy(cls: cls, ttl: min(900, cap),
                                  serveStale: false, revalidate: false,
-                                 accepts: ContentCache.isJSONBody)
+                                 accepts: ContentCache.neverStored)
         }
     }
 }
@@ -664,18 +664,26 @@ final class ContentCache {
     }
 
     /**
-     A real chapter is `{"code":0,"data":"<prose>"}` -- that is exactly the test
-     the three display classes make before rendering (`chapterdisplay.js:790`,
-     `:1813`, `:3682`).
+     A real chapter is `{"code":"0","bookname":…,"data":"<prose>"}` under a
+     `Content-Type: text/html; charset=utf-8` header -- the site's own contract
+     (docs/capacitor-port.md:112), and the exact test the three display classes
+     make before rendering (`chapterdisplay.js:790`, `:1813`, `:3682`).
 
-     Tightening this from the old session-cache rule matters now that the answer
-     is kept for 30 days: a paywall (15/18/19), a captcha (21), a login prompt
-     (12/13), a busy mirror (10001/10002) or a Cloudflare interstitial all have
-     to be refused, because a stored one would be served for a month.
+     **The content type must not be part of this test.** The first version
+     rejected `text/html` on the theory that it must be an error page, and the
+     2026-10-13 device log shows what that cost: every real chapter came back as
+
+         GET /?sajax=readchapter&… -> 200 text/html; charset=utf-8 string 9558b
+         {"code":"0","bookname":" Người thực vật thê tử…
+
+     and was refused as "not the shape this class accepts", so the reader
+     re-downloaded every chapter on every launch while the cache stayed empty.
+     The JSON shape check below is what actually excludes an error page: an HTML
+     interstitial, a login page or a bot challenge does not parse as a JSON object
+     with `code == 0`, so nothing has to be inferred from the header.
      */
     static func isChapterBody(_ body: Data, _ contentType: String) -> Bool {
         guard body.count >= 4096 else { return false }
-        guard !contentType.lowercased().contains("text/html") else { return false }
         guard let object = jsonObject(body) else { return false }
         guard code(object) == 0 else { return false }
         guard let text = object["data"] as? String, text.count >= 256 else { return false }
@@ -695,12 +703,20 @@ final class ContentCache {
         return true
     }
 
-    /// The generic gate for the JSON endpoints. An empty container, an error
-    /// code in the range the site uses for failures, or a bot challenge is not
-    /// something to serve for a day.
+    /**
+     The generic gate for the JSON endpoints. An empty container, an error code in
+     the range the site uses for failures, or a bot challenge is not something to
+     serve for a day.
+
+     No content-type test, for the same reason `isChapterBody` has none: every one
+     of these endpoints answers `text/html; charset=utf-8` on this link while the
+     body is JSON -- the 2026-10-13 log has `bookinfo.php -> 200 text/html …
+     2950b {"book":{"host":"trxs",…}}`, `booklist.php?method=history -> 200
+     text/html … 8398b {"list":[…]}` and `userinfo.php -> 200 text/html … 454b
+     {"id":"306185",…}`, all three refused by that test while they were perfectly
+     good answers. What keeps a challenge page out is that it is not JSON at all.
+     */
     static func isJSONBody(_ body: Data, _ contentType: String) -> Bool {
-        let lowered = contentType.lowercased()
-        if lowered.contains("text/html") { return false }
         let data = stripped(body)
         guard data.count >= 64 else { return false }
         guard let parsed = try? JSONSerialization.jsonObject(with: data,
@@ -718,6 +734,21 @@ final class ContentCache {
         return false
     }
 
+    /**
+     `grantcontext` is deliberately never stored, and now says so instead of being
+     refused by accident (it is obfuscated JavaScript -- `(()=>{var …})()` under
+     `text/javascript`, 785-854KB in the 2026-10-13 log -- so the JSON gate above
+     rejected it, which was the right outcome for the wrong reason).
+
+     The body is what produces the `key=` that every chapter URL carries
+     (`app.v2.read.js:535-551`). Whether that token survives an app restart is
+     unproven, and a stale one costs a *failed chapter read*, so the asymmetric
+     choice is to pay 0.6-1.6s per book switch instead of risking the reader.
+     */
+    static func neverStored(_ body: Data, _ contentType: String) -> Bool {
+        return false
+    }
+
     /// The codes the site uses for "you are not getting content": login walls,
     /// paywalls, captcha, a mirror that cannot serve reads, a system that is
     /// busy, and the generic 400/401/403/5xx family.
@@ -725,6 +756,11 @@ final class ContentCache {
                                                   401, 403, 404, 429, 500, 502, 503,
                                                   10001, 10002]
 
+    /// The one class where the content type *is* informative: an image slot that
+    /// answers `text/html` is a refusal, and the 2026-10-13 log is full of them
+    /// (`GET https://www.trxs.cc/…jpeg -> 403 text/html base64 1b`) -- the image
+    /// host refuses this link, and storing that answer would make the refusal
+    /// permanent.
     static func isImageBody(_ body: Data, _ contentType: String) -> Bool {
         let lowered = contentType.lowercased()
         if lowered.contains("text/html") || lowered.contains("application/json") {

@@ -4583,3 +4583,73 @@ ui.scrollto=function(ele,offset, scroller){
 | CI 源码守卫 | 新增 `cacheLog(`：缓存决策必须走面板 |
 
 新增断言：总开关初值/切换/写入 localStorage、五行与五行文案、切到关之后的行内状态、目录与 userinfo 改道到原生、其它 URL 保持页面传输、`readchapter` 保持页面传输、原生失败回退并记一行、上一轮关掉后第一次请求就不改道。
+
+## §6.47 第 45 轮（提交名：第四十七轮）：第二份真机日志 —— 目录真的命中了，正文却被我们自己的判据拒了
+
+输入：`stv-diagnostic-20261013-084003.log`（577 行，23:50:46–08:39:56，含次日三次启动，是 App 自己那份 `Library/Application Support/SangTacReader/stv-diagnostic.log` 的导出）。
+
+### 6.47.1 成立：第一次拿到「缓存真的在工作」的证据
+
+| 证据 | 说明 |
+| --- | --- |
+| `[CACHE] chapter list and book lists: routed through the native cache`（08:38:43） | §6.46 的改道装上了，而且它自己报了 |
+| `[Http] GET dns1…/index.php?…sajax=getchapterlist -> 200 … 15671b in …ms`（08:38:51） | 改道前这条走的是页面 XHR |
+| `[CACHE] … cached class=chapterList ttl=21600s bytes=15671 / 34978` | 目录落盘，两个不同书源各一条 |
+| `[CACHE] … cache hit class=chapterList age=5s by=dns1…` / `age=14s`（08:39:00、08:39:09） | 命中，且决策行在面板里可见 → §6.46.2 的修复生效 |
+| `[Http] GET https://sangtacviet.app/index.php?…chapterlist&h=trxs&bookid=12058… -> 200 … in 0ms (cache)`（08:39:09） | **0ms，而且主机从 `dns1…` 换成了 `.app` 仍然命中** —— §6.45.3 (1) 的「跨镜像主机归一」被真机证实，这正是它存在的理由 |
+
+### 6.47.2 缺陷三（代价最大，也是我们自己的）：`text/html` 判据把正文、详情、列表全拒了
+
+`isChapterBody` / `isJSONBody` 里写着「content-type 含 `text/html` 就当错误页拒掉」。站点**所有 JSON 端点都用 `text/html` 发**——这一条 `docs/capacitor-port.md:112` 早就写过，我写 accepts 时又把它当成了防线：
+
+```
+[CACHE] GET …/?sajax=readchapter&h=trxs&bookid=12058&c=92 -> 200 bytes=9558
+        content-type=text/html; charset=utf-8 (not the shape this class accepts)
+[Http]  GET …c=92 -> 200 text/html; charset=utf-8 string 9558b {"code":"0","bookname":" Người thực vật…
+```
+
+同一条判据还拒了 `bookinfo.php`（2950b `{"book":{"host":"trxs"…}}`）、`booklist.php?method=history`（8398b `{"list":[…]}`）、`userinfo.php`（454b `{"id":"306185"…}`）——**四个类全是正常 JSON**。后果正是「缓存感觉没生效」：第二次进同一本书，c=91/92/93 三章各重新下了 590–612ms（08:39:41/42），而它们在前一次启动里刚下过。
+
+修法：两类判据**去掉 content-type 检查**，只留形状判据（能 parse 成 JSON 对象 + `code == 0` / `code` 不在失败码表里）。错误页、验证码、登录页本来就 parse 不成 JSON，不需要靠 header 猜。
+
+`isImageBody` **保留**该检查：图片槽位回 `text/html` 就是拒绝，`trxs.cc` 的 403 正是这样（`-> 403 text/html base64 1b`），把它存成「封面」才是灾难。
+
+### 6.47.3 顺带明确：`grantcontext` 不缓存，但要说清楚为什么
+
+它 785–854KB、`text/javascript`、内容是混淆 JS（`(()=>{var …})()`），决定每条章节 URL 上的 `key=`。修好 JSON 判据后它仍然**不该**被存：那把钥匙跨启动是否还有效未证实，而失败的代价是**读不出正文**，收益只有 0.6–1.6s。所以从「碰巧被 JSON 判据拒掉」改成显式的 `ContentCache.neverStored`，理由写在代码里。
+
+### 6.47.4 缺陷四：改道在某些启动里静默不装（竞态）
+
+08:39:26 那次启动**没有** `routed through the native cache` 行，而它的 XHR 计数里又冒出 `.com/index.php?ngmar=chapterlist`（08:39:39、08:39:50）与 `.com/mobile/userinfo.php`（08:39:29）。
+
+原因：安装轮询的停止条件是 `hooked && listening`，而 `app.net.getCapacitor` 由**站点的** bundle 定义，比 `pushPage` 和 Http 插件晚——快的启动里循环先停了，改道就永远没装。
+
+修法：停止条件补上 `routed`；若 20 秒仍装不上，记一行 `no native routing: the page transport still carries the chapter list and the profile row`，让「没装」这件事自己说出来，而不是靠人从缺失里推断。
+
+### 6.47.5 诊断增强：绕过的请求现在会点名
+
+XHR 计数行加上**调用栈首两帧**（`whereFrom()`，用 `String.fromCharCode(10)` 分行以保持这些块「零反斜杠」的约束）。下一次若还有请求绕过缓存，日志会直接写 `first: <url> [at fn (file:line) <- …]`——把「有东西绕过了」变成「这个函数绕过了」。
+
+### 6.47.6 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 27 块 / 635286 字节 / 138 标记 |
+| `scripts/test-site-patch.js` | **908 条断言**全过（上一轮 904，本轮新增 4） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+
+新增断言：改道在站点 bundle 迟到时仍然安装（150ms 时还没有 `getCapacitor`，250ms 后装上并接管目录请求）、绕过计数行带出调用者。
+
+### 6.47.7 下一次日志要看的四行
+
+1. `[CACHE] … cached class=chapter …` 与下一次启动的 `cache hit class=chapter age=…`
+2. `[CACHE] … cached class=homeList …`（首页列表）与其后的 `cache hit class=homeList`
+3. 正文行**不再**出现 `not cached … (not the shape this class accepts)`
+4. 若还有 `went through the page own XMLHttpRequest`，它后面的 `[at …]` 会点名是谁
+
+### 6.47.8 仍未证实
+
+- 正文落盘后的「隔天再读」体感（需要跨天两次启动的日志）
+- `grant` 不缓存的决定是否值得（若某次日志显示换书时 grant 占了大头时间，值得再做一次「仅内存复用」的尝试）
+- SWR 的自动重绘钩子名（`contentRefreshed` 至今没有在真机上触发过，因为还没有一条列表走到 stale+changed）

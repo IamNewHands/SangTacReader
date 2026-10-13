@@ -12072,7 +12072,10 @@ enum SitePatch {
                     var text = String(url || '');
                     for (var i = 0; i < NATIVE_ONLY.length; i++) {
                         if (text.indexOf(NATIVE_ONLY[i]) >= 0) {
-                            bypassed.push(text);
+                            // The caller, not just the url: the first version only
+                            // counted, which said "something bypassed the cache" and
+                            // not "this function did". One frame is enough to name it.
+                            bypassed.push(text + whereFrom());
                             break;
                         }
                     }
@@ -12082,6 +12085,24 @@ enum SitePatch {
                 return originalOpen.apply(this, arguments);
             };
             return true;
+        }
+
+        function whereFrom() {
+            try {
+                // Escape-free on purpose: these blocks may not contain a literal
+                // backslash, so the newline is built with fromCharCode.
+                var stack = String(new Error().stack || '').split(String.fromCharCode(10));
+                var frames = [];
+                for (var i = 1; i < stack.length && frames.length < 2; i++) {
+                    var frame = stack[i].trim();
+                    if (!frame || frame.indexOf('whereFrom') >= 0) { continue; }
+                    frames.push(frame.split(' ').slice(0, 3).join(' '));
+                }
+                if (!frames.length) { return ''; }
+                return ' [' + frames.join(' <- ').slice(0, 150) + ']';
+            } catch (error) {
+                return '';
+            }
         }
 
         function reportBypass() {
@@ -12104,10 +12125,24 @@ enum SitePatch {
         var timer = setInterval(function () {
             attempts++;
             watchXhr();
-            routeNet();
             var hooked = hookPushPage();
             var listening = listen();
-            if ((hooked && listening) || attempts > 800) { clearInterval(timer); }
+            // `routed` belongs in the stop condition. It did not, and the
+            // 2026-10-13 log shows the cost: `app.net.getCapacitor` is defined by
+            // the site's own bundle while `pushPage` and the Http plugin are there
+            // much earlier, so on a fast launch the loop stopped before the routing
+            // could be installed -- and that launch silently sent the chapter list
+            // and `userinfo.php` back through the page's XMLHttpRequest, which is
+            // exactly what this block exists to prevent.
+            var routed = routeNet();
+            if (hooked && listening && routed) { clearInterval(timer); }
+            else if (attempts > 800) {
+                clearInterval(timer);
+                if (!routed) {
+                    note('CACHE', 'no native routing: the page transport still carries'
+                        + ' the chapter list and the profile row');
+                }
+            }
         }, 25);
 
         // Its own timer, because the one above stops as soon as the hooks are in
