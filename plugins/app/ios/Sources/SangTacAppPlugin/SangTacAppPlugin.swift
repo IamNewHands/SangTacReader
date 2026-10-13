@@ -43,6 +43,8 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "stopSpeech", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getVoices", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getSafeArea", returnType: CAPPluginReturnPromise),
+        // Takes down the native boot overlay (see the boot overlay section).
+        CAPPluginMethod(name: "bootOverlayHide", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "settingsSave", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "settingsRestore", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "secretSave", returnType: CAPPluginReturnPromise),
@@ -85,6 +87,7 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
         })
 
         installDocumentStartScripts()
+        showBootOverlay()
     }
 
     // MARK: - Site patches
@@ -355,6 +358,131 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
                 "right": Double(insets.right)
             ])
         }
+    }
+
+    // MARK: - Boot overlay
+
+    /**
+     Covers the window between launch and the moment the page can paint.
+
+     Measured on the device (round 53): the injected blocks do not even start
+     until `performance.now()` is already ~1.3s, which is the shell HTML's TTFB,
+     and `bootShell` releases at ~1.4s. Nothing of ours exists before that, and
+     the app ships no splash plugin -- `SplashScreen.launchShowDuration: 0` in
+     capacitor.config.json is inert because `@capacitor/splash-screen` is not a
+     dependency -- so the reader spent that second looking at an empty view.
+
+     The overlay copies the HTML shell's own colours and words
+     (`html.stv-boot{--background:#101014;--color:#e8e8ea}`, hint `载入中…` at 44%
+     from the top, 14pt at 55% opacity) so the handover is invisible: neither the
+     text nor the background moves when the shell takes over.
+
+     It swallows touches while it is up, because the page underneath is unstyled
+     and invisible and a tap landing on it would open something the reader cannot
+     see. It comes down when the page says the shell is up -- not on a fixed
+     timer -- with a bounded fallback so a page that never boots cannot trap the
+     reader behind it.
+     */
+    private var bootOverlay: UIView?
+    private var bootOverlayTimer: DispatchWorkItem?
+
+    private func showBootOverlay() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.bootOverlay == nil else { return }
+            guard let host = self.bridge?.viewController?.view else {
+                // No view to cover: the reader simply gets the old blank window,
+                // which is no worse than before -- but say so, because a silent
+                // skip would look exactly like "the overlay is broken".
+                CAPLog.print("[SangTacApp] boot overlay skipped: no view controller yet")
+                return
+            }
+            let overlay = UIView(frame: host.bounds)
+            overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            overlay.backgroundColor = UIColor(red: 0x10 / 255.0, green: 0x10 / 255.0,
+                                              blue: 0x14 / 255.0, alpha: 1)
+            overlay.isAccessibilityElement = true
+            overlay.accessibilityLabel = "载入中"
+
+            let label = UILabel()
+            label.text = "载入中…"
+            label.font = UIFont.systemFont(ofSize: 14)
+            label.textColor = UIColor(red: 0xE8 / 255.0, green: 0xE8 / 255.0,
+                                      blue: 0xEA / 255.0, alpha: 0.55)
+            label.translatesAutoresizingMaskIntoConstraints = false
+            overlay.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+                // 44% of the height, the same place the HTML shell puts its hint.
+                NSLayoutConstraint(item: label, attribute: .centerY, relatedBy: .equal,
+                                   toItem: overlay, attribute: .bottom,
+                                   multiplier: 0.44, constant: 0)
+            ])
+
+            if let webView = self.bridge?.webView, webView.superview === host {
+                host.insertSubview(overlay, aboveSubview: webView)
+            } else {
+                host.addSubview(overlay)
+            }
+            self.bootOverlay = overlay
+            CAPLog.print("[SangTacApp] boot overlay shown")
+
+            // The web view may be added to this hierarchy after the plugin loads,
+            // which would put it back on top of the overlay.
+            DispatchQueue.main.async { [weak self] in
+                if let overlay = self?.bootOverlay, overlay.superview === host {
+                    host.bringSubviewToFront(overlay)
+                }
+            }
+            self.armBootOverlayTimeout()
+        }
+    }
+
+    /**
+     A backstop only: the shell normally releases in ~1.4s, and 12s is the same
+     order as the site's worst observed boot. Without it a page that never boots
+     would leave the reader behind a view that swallows every touch.
+     */
+    private func armBootOverlayTimeout() {
+        bootOverlayTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.hideBootOverlay(reason: "timeout")
+        }
+        bootOverlayTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: work)
+    }
+
+    /**
+     Called from the `bootShell` block at the moment the shell releases, which is
+     the one point at which the page can say the real UI is styled.
+
+     Deliberately NOT behind `isTrustedCaller()`: taking down a decorative view is
+     not a privileged action, and failing closed here would leave the reader
+     behind the overlay until the timeout.
+     */
+    @objc func bootOverlayHide(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { [weak self] in
+            self?.hideBootOverlay(reason: "page")
+            call.resolve()
+        }
+    }
+
+    private func hideBootOverlay(reason: String) {
+        bootOverlayTimer?.cancel()
+        bootOverlayTimer = nil
+        guard let overlay = bootOverlay else { return }
+        bootOverlay = nil
+        CAPLog.print("[SangTacApp] boot overlay hidden (\(reason))")
+        // Reduce Motion is a preference about movement, so the fade is what gets
+        // dropped, never the removal itself.
+        if UIAccessibility.isReduceMotionEnabled {
+            overlay.removeFromSuperview()
+            return
+        }
+        UIView.animate(withDuration: 0.2, animations: {
+            overlay.alpha = 0
+        }, completion: { _ in
+            overlay.removeFromSuperview()
+        })
     }
 
     // MARK: - Settings backup

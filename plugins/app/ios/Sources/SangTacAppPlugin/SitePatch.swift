@@ -11498,6 +11498,24 @@ enum SitePatch {
             var node = document.getElementById('stv-boot-hint');
             if (node && node.parentNode) { node.parentNode.removeChild(node); }
             note('BOOT', 'shell released at +' + (Date.now() - started) + 'ms (' + reason + ')');
+            // Round 54: the native boot overlay covered the window before this
+            // document existed (the site's HTML takes ~1.3s to arrive, which is
+            // earlier than any of our JavaScript can run). This is the one moment
+            // the page can say the real UI is styled, so it is also when the
+            // overlay comes down -- never on a fixed timer in the page.
+            try {
+                var plugins = window.Capacitor && window.Capacitor.Plugins;
+                if (plugins && plugins.App && typeof plugins.App.bootOverlayHide === 'function') {
+                    var pending = plugins.App.bootOverlayHide();
+                    if (pending && typeof pending.catch === 'function') {
+                        pending.catch(function () {});
+                    }
+                    // In the durable log too: CAPLog only reaches os_log, and the
+                    // handover is the one thing about the overlay worth verifying
+                    // from an exported log.
+                    note('BOOT', 'native boot overlay released');
+                }
+            } catch (e) {}
             // Round 53: the [MAIN] probe splits its stalls at this moment, so
             // "was the main thread busy before the reader could see anything"
             // is answered by the log instead of by aligning two timestamps that

@@ -5266,3 +5266,87 @@ after=1/96ms`、卡顿行列出全部候选并区分「期间落地」、`pagehi
 - 重库屏蔽**不做**（§6.53.2）；`iro` 的「弹窗前补载」钩子也没做。
 - `app.v2.comicprovider.js` 每次启动都在（34–336ms），小说用户是否需要它仍未查。
 
+## §6.54 第 52 轮（提交名：第五十四轮）：第八份真机日志 —— 注入只花 7–10ms，黑屏是站点 HTML 的 TTFB，于是用原生遮罩盖住它
+
+输入：`stv-diagnostic-20261013-132015.log`（569 行，四次启动 13:19:20 / 13:19:58 / 13:20:09 / 13:20:10，
+跑的是 13:0x 的第五十三轮包）。
+
+### 6.54.1 探针给了三个答案
+
+| 问题 | 读数 | 含义 |
+| --- | --- | --- |
+| WebKit 有 Long Tasks 吗 | 三次全 `probe=gap` | **没有**（`supportedEntryTypes` 不含 `longtask`），`busy` 是上界 |
+| 我们自己的注入多少钱 | `injection=+1568ms..+1575ms (7ms)`、`+1324ms..+1334ms (10ms)`、`+1624ms..+1633ms (9ms)` | 28 块 / 649KB 的 document-start 注入**总共 7–10ms** |
+| 它什么时候开始 | `+1.3s` | 那就是**站点外壳 HTML 的 TTFB** |
+
+第二行值得展开：`SangTacAppPlugin.swift:143` 把 `SitePatch.all` 每块包成**独立的** `WKUserScript`，
+所以 `compat` 的解析发生在它第一行之前、量到的几乎是全部成本 —— 649KB 只花 7–10ms。
+**结论：计划文档 P0-3 那条「首屏前注入解析量」的后续优化（延后块、屏蔽重库）没有任何空间**，
+因为整个注入本身才 7–10ms。§6.53.2 关闭重库那条时用的估算（446KB → 30–450ms）到此被实测取代。
+
+### 6.54.2 卡顿全部在外壳释放之后
+
+| 启动 | busy | longest | 切分 |
+| --- | --- | --- | --- |
+| 13:19:58 | 659ms | 308ms `@+1591ms` | `before=0 task(s)/0ms, after=5 task(s)/659ms` |
+| 13:20:09 | 956ms | 272ms `@+1929ms` | `before=0 task(s)/0ms, after=7 task(s)/956ms` |
+| 13:19:20 | — | — | `no task over 50ms before load` |
+
+新格式的候选列表（节选）：
+
+```
+stall +1591ms..+1899ms 308ms | candidates: api.js, app.v2.comicprovider.js, Nunito-Regular.ttf, fa-regular-400.woff2 | landed during it: manifest_app_v2.json, warp.php
+stall +1410ms..+1566ms 156ms | candidates: Nunito-Regular.ttf, fa-regular-400.woff2, fa-brands-400.woff2, fa-solid-900.woff2 | landed during it: app.v2.comicprovider.js, api.js
+```
+
+`landed during it:` 非空 → 这些是**主线程忙**，不是等网络（网络在独立进程里）。
+候选里的 `api.js` 与 `app.counter.html` 是站点自己的**计数文档**（`_stv-analysis/shell.html:5218`
+的 `analyticDoc: '/app.counter.html'`，由未镜像的 `stv.host.js` 载入），也就是同一进程里的第二个文档；
+`Nunito-Regular.ttf` / `fa-*.woff2` 是字体，`180` 是 `bookcover.yuewen.com` 的 63KB 封面。
+
+**读法**：首屏（外壳释放）已经不受影响；受影响的是「站点自己的 UI 到位」那一段，而它由站点自己的
+脚本、字体、封面与计数文档构成 —— 都不是我们的代码。
+
+### 6.54.3 于是本轮盖住那 1.3s：原生启动遮罩
+
+**事实**：`capacitor.config.json:20-22` 的 `SplashScreen.launchShowDuration: 0` 是**空配置** ——
+`@capacitor/splash-screen` 根本不在 `package.json` 依赖里，所以启动画面一消失就是空白 web view，
+而站点的 HTML 要到 +1.3s 才到、我们的注入要到那时才开始跑。这 1.3s 就是「黑屏」。
+
+**做法**（`SangTacAppPlugin.swift` 的 boot overlay 段）：`load()` 时加一个原生视图，
+颜色与文案**照抄站点自己的 HTML 外壳**（`html.stv-boot{--background:#101014;--color:#e8e8ea}`、
+提示 `载入中…` 14pt / 55% / 距顶 44%），所以交接时**文字不动、背景不变**。细节：
+
+- **吞掉触摸**：遮罩期间下面那层是无样式、看不见的页面，点中等于点到了看不见的东西。
+- **撤下时机**：由页面在**外壳释放那一刻**调用 `bootOverlayHide`（不是固定计时器）；`bootShell.release()`
+  里调用并补一行 `[BOOT] native boot overlay released`（`CAPLog` 只进 os_log，导出日志看不到）。
+- **兜底**：原生 12 秒后自行撤下 —— 页面永远起不来时，这是唯一不把读者关在遮罩后面的东西。
+- **可访问性**：遮罩带 `accessibilityLabel`；开了「减弱动态效果」时**只去掉 0.2s 淡出**，移除本身不取消。
+- **不做**：不复制站点外壳的底部 tab 骨架（多一份会做歪的东西，而它 1.4s 后就来了）。
+
+### 6.54.4 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / **649556 字节** / **146 标记**（+`plugins.App.bootOverlayHide`） |
+| `scripts/test-site-patch.js` | **938 条断言**（上一轮 935） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI | 产物标记 +`bootOverlayHide`；新增 App 插件**源码**守卫：`showBootOverlay()`、`bootOverlayHide`、`boot overlay shown` |
+
+新增断言：外壳释放**恰好一次**调用 `bootOverlayHide`（两个释放信号不会调两次）；方法不存在
+（旧包 / 旧原生）时释放照旧、不抛；交接那行进的是**落盘日志**而不是只进 os_log。
+
+### 6.54.5 下一份日志要看的行
+
+1. `[BOOT] shell released at +Nms (…)` 紧跟 `[BOOT] native boot overlay released` —— 交接点。
+2. `[MAIN] … injection=+…ms..+…ms (…ms)` —— 若仍是 7–10ms，注入这条线到顶了，不必再看。
+3. 观感（只能真机看）：启动瞬间就该是深色 + 「载入中…」，之后**文字不跳、背景不变**地变成站点外壳。
+   若出现闪白、文字位移、或遮罩一直不退（>12s），把日志给我。
+
+### 6.54.6 仍未证实 / 非目标
+
+- 遮罩的实际观感（本机无法截图，只能真机看）。
+- `busy` 仍是上界；`api.js`/`app.counter.html`（计数文档）、字体解码、封面解码各占多少没有拆开。
+- 站点 HTML 的 ~1.3s TTFB **不打算动**（§6.23 已按冷缓存实测否决「接管文档加载」）。
+

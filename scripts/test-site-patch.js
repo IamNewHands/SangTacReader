@@ -1103,6 +1103,15 @@ function installFakeApp(sandbox, options) {
         getSafeArea() {
           return Promise.resolve(options.safeArea || { top: 62, bottom: 34, left: 0, right: 0 });
         },
+        // The native boot overlay (round 54) covers the window before the site's
+        // HTML arrives and is taken down from the release path. `noBootOverlayHide`
+        // models a build whose App plugin predates the method.
+        ...(options.noBootOverlayHide ? {} : {
+          bootOverlayHide() {
+            (stored.bootOverlayHide || (stored.bootOverlayHide = [])).push(Date.now());
+            return Promise.resolve({ value: true });
+          },
+        }),
         settingsSave(payload) {
           // `settingsSaveRejects` models the native key allow-list / size cap,
           // which rejects rather than silently dropping the backup.
@@ -3215,6 +3224,25 @@ async function testBootShell() {
   check('the boot timeline is reported',
     String(diag).indexOf('[BOOT]') >= 0 && String(diag).indexOf('shell released') >= 0,
     String(diag).slice(-200));
+  // The native overlay covers the ~1.3s before this document exists, and the
+  // release is the only moment the page can say the real UI is styled. Exactly
+  // once: two release signals must not call it twice.
+  check('the release takes the native boot overlay down with it',
+    (sandbox.__stored.bootOverlayHide || []).length === 1,
+    JSON.stringify(sandbox.__stored.bootOverlayHide || []));
+  check('the handover is in the durable log, not only in os_log',
+    String(diag).indexOf('native boot overlay released') >= 0, String(diag).slice(-240));
+
+  // A build whose App plugin predates the method must still release the shell
+  // (and must not throw on the way).
+  const legacyOverlay = makeSandbox();
+  installFakeApp(legacyOverlay, { displayType: 'auto', noBootOverlayHide: true });
+  vm.runInContext(loadBlocks().join('\n'), legacyOverlay);
+  legacyOverlay.document.styleSheets.push({ href: 'https://sangtacviet.app/asset/app.v2.css?v=4' });
+  await tick(1200);
+  check('a release without the overlay method still releases the shell',
+    String(legacyOverlay.document.documentElement.className).indexOf('stv-boot') < 0,
+    String(legacyOverlay.document.documentElement.className));
 
   // Deterministic release: a stylesheet that arrives at 1.1s must take the shell
   // down then, not at the 3s sample.

@@ -46,6 +46,10 @@ const REQUIRED_MARKERS = [
   'window.__stvInjectStart',
   'candidates (bytes landed within 500ms before): ',
   'ms splits them: before=',
+  // Round 54: the native boot overlay is taken down by the page at the shell
+  // release -- the only moment the page knows the real UI is styled. Without
+  // this call the overlay stays until its 12s backstop.
+  'plugins.App.bootOverlayHide',
   // The logging switch (off by default) and the two things that make it
   // permanent: its keychain-mirrored store key, and the "view downloads" button
   // of the download-started dialog.

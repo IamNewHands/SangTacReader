@@ -221,7 +221,8 @@ jobs:
                         stvCommentTranslateInstalled stvAssetMirror \
                         stvCboxFrameInstalled stvComicGateInstalled \
                         siteAssetRefresh data-stv-mirror stv.domain.trap.off \
-                        stvCoverFallbackInstalled installLongTasks __stvShellReleaseMs; do
+                        stvCoverFallbackInstalled installLongTasks __stvShellReleaseMs \
+                        bootOverlayHide; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else
@@ -354,6 +355,18 @@ jobs:
             echo "::error::设备语言未从原生交给页面（首次启动的语言选择会退回 navigator.language）"
             exit 1
           fi
+          # 原生启动遮罩：站点 HTML 的 TTFB 约 1.3s，在那之前页面里没有任何我们的东西
+          # （app 也没有 splash 插件，capacitor.config.json 里那行是空配置），所以这段
+          # 空窗只能由原生盖住。撤下遮罩由页面在外壳释放时调用 —— 少了那个调用，遮罩会
+          # 一直挂到 12 秒兜底。
+          for marker in 'showBootOverlay()' 'bootOverlayHide' 'boot overlay shown'; do
+            if grep -q -F "$marker" plugins/app/ios/Sources/SangTacAppPlugin/SangTacAppPlugin.swift; then
+              echo "✓ $marker 还在 App 插件源码里"
+            else
+              echo "::error::$marker 缺失（原生启动遮罩被删改）"
+              exit 1
+            fi
+          done
           # 系统离线翻译的三个桥接方法名。iOS 15-17 上它们也必须在（返回
           # "unsupported" 让 JS 换联网引擎），缺了会变成不透明的桥接错误。
           for marker in translationStatus translationPrepare translationTranslate; do
