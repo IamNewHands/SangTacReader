@@ -288,7 +288,11 @@ jobs:
           # 策略（TTL 与 SWR）与接受条件在 ContentCache.swift 的 ContentPolicies /
           # isChapterListBody。所以标记分成两组，各自查自己的文件——搬走之后还按老
           # 路径查，只会红在一句「源码里没有」，而不是红在规则丢了。
-          for marker in 'sajax=getchapterlist' 'contentClass(method:'; do
+          #
+          # `cacheLog(` 是第 46 轮加上的：缓存决策第一版只写 CAPLog（Console.app），
+          # 侧载包读不到，于是真机日志里只有请求行、没有一条「命中/落盘/拒绝」，
+          # 「到底有没有生效」在唯一能拿到的证据里没有答案。它必须是走面板的那条路。
+          for marker in 'sajax=getchapterlist' 'contentClass(method:' 'cacheLog('; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
               echo "✓ $marker 还在响应缓存源码里"
             else

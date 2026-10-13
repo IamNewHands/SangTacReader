@@ -11816,6 +11816,12 @@ enum SitePatch {
             var hits = (Number(stats.hits) || 0) + (Number(stats.staleServed) || 0);
             state.retention = Number(stats.retentionDays) || 30;
             state.spaceMb = Math.round((Number(stats.maxBytes) || 0) / (1024 * 1024));
+            if (stats.enabled !== undefined) { state.enabled = !!stats.enabled; }
+            // Mirrored into localStorage so the next launch starts with the choice
+            // the reader made, before the first stats read comes back from native.
+            try { localStorage.setItem('stv.contentcache', state.enabled ? '1' : '0'); }
+            catch (error) { /* a full store must not break the settings page */ }
+            rows.enabled.cell.textContent = state.enabled ? '已开启' : '已关闭';
             rows.usage.cell.textContent = bytesText(stats.bytes) + ' · '
                 + (Number(stats.entries) || 0) + ' 项 · 命中 ' + hits;
             rows.retention.cell.textContent = state.retention + ' 天';
@@ -11832,6 +11838,7 @@ enum SitePatch {
             host.appendChild(header);
 
             var rows = {
+                enabled: addRow(host, '内容缓存', state.enabled ? '已开启' : '已关闭'),
                 usage: addRow(host, '内容缓存占用', '读取中…'),
                 retention: addRow(host, '保留时间', state.retention + ' 天'),
                 space: addRow(host, '保留空间', state.spaceMb + ' MB'),
@@ -11858,6 +11865,15 @@ enum SitePatch {
             rows.usage.item.addEventListener('click', function (event) {
                 tapped(event);
                 refresh();
+            }, true);
+
+            // The master switch. It exists because the routing below changes which
+            // transport carries the chapter list and the profile row, and a reader
+            // who would rather have the old behaviour must be able to go back
+            // without a reinstall.
+            rows.enabled.item.addEventListener('click', function (event) {
+                tapped(event);
+                configure({ enabled: !state.enabled }, 'enabled');
             }, true);
 
             rows.retention.item.addEventListener('click', function (event) {
@@ -11945,6 +11961,70 @@ enum SitePatch {
             return true;
         }
 
+        // ---- the same-origin reads the native cache never sees -------------
+        //
+        // `app.net.get/post` only reach the native plugin when the target's origin
+        // differs from the page's (app.v2.js:700, :760); everything same-origin
+        // goes through the page's own XMLHttpRequest. The 2026-10-13 device log is
+        // the proof that this matters: `[CACHE] N site request(s) went through the
+        // page own XMLHttpRequest, first: …/index.php?ngmar=chapterlist…` and
+        // `…/mobile/userinfo.php` -- so the 115KB chapter list and the unread
+        // counts bypassed the content cache completely, while `readchapter` and
+        // `booklist.php` (they go to the mirrored host) were covered.
+        //
+        // So the classes the native cache can serve are routed through the plugin
+        // here. It is the same request the site makes in its other branch:
+        // `getCapacitor` rewrites the origin to the mirrored host and the plugin
+        // attaches the httpOnly cookies from the web view's own store. `readchapter`
+        // is deliberately NOT in this list: `app.net.get` is the reader's escape
+        // hatch *after* the plugin path already failed (app.v2.read.js:615-620), and
+        // routing it would delete that second transport.
+        var ROUTED = ['sajax=getchapterlist', 'bookinfo.php', 'booklist.php',
+            'userinfo.php', 'act=readcomment'];
+
+        function routable(url) {
+            var text = String(url || '');
+            for (var i = 0; i < ROUTED.length; i++) {
+                if (text.indexOf(ROUTED[i]) >= 0) { return true; }
+            }
+            return false;
+        }
+
+        function routeNet() {
+            var app = window.app;
+            if (!app || !app.net) { return false; }
+            if (app.net.__stvCacheRouted) { return true; }
+            if (typeof app.net.getCapacitor !== 'function'
+                || typeof app.net.postCapacitor !== 'function') { return false; }
+            app.net.__stvCacheRouted = true;
+
+            function reroute(name, nativeName, label) {
+                var original = app.net[name];
+                if (typeof original !== 'function') { return; }
+                app.net[name] = function (url) {
+                    var context = this;
+                    var args = Array.prototype.slice.call(arguments);
+                    var native = app.net[nativeName];
+                    if (!state.enabled || !routable(url) || typeof native !== 'function') {
+                        return original.apply(context, args);
+                    }
+                    return Promise.resolve().then(function () {
+                        return native.apply(app.net, args);
+                    }).catch(function (error) {
+                        // One failed attempt is the whole cost of being wrong here:
+                        // the site's own transport takes over with the same args.
+                        note('CACHE', label + ': fell back to the page transport - ' + error);
+                        return original.apply(context, args);
+                    });
+                };
+                note('CACHE', label + ': routed through the native cache');
+            }
+
+            reroute('get', 'getCapacitor', 'chapter list and book lists');
+            reroute('post', 'postCapacitor', 'book lists and the profile row');
+            return true;
+        }
+
         function hookPushPage() {
             var app = window.app;
             if (!app || typeof app.pushPage !== 'function') { return false; }
@@ -12012,13 +12092,19 @@ enum SitePatch {
         }
 
         // Cap and retention are what the rows edit and what the rows display, so
-        // the value shown is the value the plugin actually holds.
-        var state = { retention: 30, spaceMb: 256 };
+        // the value shown is the value the plugin actually holds. `enabled` is read
+        // from localStorage first so that a reader who switched the cache off gets
+        // that behaviour from the first request of the next launch, not from the
+        // moment the first stats read returns.
+        var state = { retention: 30, spaceMb: 256, enabled: true };
+        try { state.enabled = localStorage.getItem('stv.contentcache') !== '0'; }
+        catch (error) { /* an unreadable store keeps the default */ }
 
         var attempts = 0;
         var timer = setInterval(function () {
             attempts++;
             watchXhr();
+            routeNet();
             var hooked = hookPushPage();
             var listening = listen();
             if ((hooked && listening) || attempts > 800) { clearInterval(timer); }

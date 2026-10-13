@@ -301,6 +301,15 @@ const REQUIRED_MARKERS = [
   // native cache -- so the cache's coverage has to be *measured*, not assumed.
   'went through the page own',
   'function watchXhr(',
+  // 2026-10-13 device log: the chapter list and `userinfo.php` were counted as
+  // page-level requests, i.e. they bypassed the native cache entirely. The classes
+  // the cache can serve are therefore routed through the plugin -- with one-step
+  // reversibility (a failed native attempt goes back to the site's transport) and a
+  // master switch, because it changes which host serves them.
+  'routed through the native cache',
+  'fell back to the page transport',
+  'function routeNet(',
+  'stv.contentcache',
 ];
 
 function fail(message) {

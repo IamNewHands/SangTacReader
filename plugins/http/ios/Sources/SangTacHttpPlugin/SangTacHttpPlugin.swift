@@ -557,7 +557,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         }
         if changed {
             contentCache.apply(config: config)
-            callLog("cache", "config retention=\(config.retentionDays)d bytes=\(config.maxBytes)"
+            cacheLog("config retention=\(config.retentionDays)d bytes=\(config.maxBytes)"
                 + " entries=\(config.maxEntries) enabled=\(config.enabled)")
         }
         call.resolve(contentCache.stats())
@@ -566,7 +566,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
     @objc func clearCache(_ call: CAPPluginCall) {
         let result = contentCache.clear()
         let cleared = result["entries"] ?? 0
-        callLog("cache", "cleared \(cleared) content entr(ies)")
+        cacheLog("cleared \(cleared) content entr(ies)")
         call.resolve(["cleared": cleared])
     }
 
@@ -641,7 +641,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                                    includeHost: SangTacHttpPlugin.includesHost(cls))
         if let existing = contentCache.entry(key),
            existing.expiresAt.map({ $0 > Date() }) ?? true {
-            callLog("cache", "prewarm skipped: \(cls.rawValue) is already fresh")
+            cacheLog("prewarm skipped: \(cls.rawValue) is already fresh")
             return
         }
         var request = URLRequest(url: url)
@@ -661,7 +661,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             self.contentCache.store(key: key, cls: cls, status: http.statusCode,
                                     contentType: contentType, headers: headerMap, body: body,
                                     ttl: policy.ttl, servedBy: url.host ?? "")
-            self.callLog("ok", "\(method) \(url.absoluteString) prewarmed class="
+            self.cacheLog("\(method) \(url.absoluteString) prewarmed class="
                 + "\(cls.rawValue) bytes=\(body.count)")
         }.resume()
     }
@@ -818,7 +818,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                     let age = Int(Date().timeIntervalSince(hit.entry.storedAt))
                     if fresh {
                         self.contentCache.noteHit()
-                        self.callLog("ok", "\(method) \(url.absoluteString) cache hit class="
+                        self.cacheLog("\(method) \(url.absoluteString) cache hit class="
                             + "\(policy.cls.rawValue) age=\(age)s by=\(hit.entry.servedBy)")
                         self.deliver(status: hit.entry.status,
                                      contentType: hit.entry.contentType,
@@ -832,7 +832,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                         // of a stale-while-revalidate window ("先显示，后台再取新
                         // 数据，有变化就更新").
                         self.contentCache.noteStaleServed()
-                        self.callLog("ok", "\(method) \(url.absoluteString) cache stale class="
+                        self.cacheLog("\(method) \(url.absoluteString) cache stale class="
                             + "\(policy.cls.rawValue) age=\(age)s refresh=scheduled")
                         self.deliver(status: hit.entry.status,
                                      contentType: hit.entry.contentType,
@@ -884,7 +884,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                         call.reject(failure)
                         return
                     }
-                    self.callLog("ok", "\(method) \(url.absoluteString) shared in-flight answer "
+                    self.cacheLog("\(method) \(url.absoluteString) shared in-flight answer "
                         + "(\(answer.body.count)b)")
                     self.deliver(status: answer.status, contentType: answer.contentType,
                                  headers: answer.headers, body: answer.body, url: url,
@@ -934,7 +934,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                    let stored = self.contentCache.lookup(key) {
                     self.contentCache.renew(key, ttl: policy.ttl)
                     self.contentCache.noteRevalidation(used304: true)
-                    self.callLog("ok", "\(method) \(url.absoluteString) 304 reused class="
+                    self.cacheLog("\(method) \(url.absoluteString) 304 reused class="
                         + "\(policy.cls.rawValue)")
                     self.finishInFlight(key, answer: SharedAnswer(
                         status: stored.entry.status,
@@ -958,11 +958,11 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                                                 contentType: contentType, headers: headerMap,
                                                 body: body, ttl: policy.ttl,
                                                 servedBy: url.host ?? "")
-                        self.callLog("ok", "\(method) \(url.absoluteString) cached class="
+                        self.cacheLog("\(method) \(url.absoluteString) cached class="
                             + "\(policy.cls.rawValue) ttl=\(Int(policy.ttl))s bytes=\(body.count)")
                     } else {
                         self.contentCache.noteReject()
-                        self.callLog("ok", "\(method) \(url.absoluteString) not cached class="
+                        self.cacheLog("\(method) \(url.absoluteString) not cached class="
                             + "\(policy.cls.rawValue) status=\(http.statusCode) "
                             + "bytes=\(body.count) content-type="
                             + "\(contentType.isEmpty ? "none" : contentType)"
@@ -1330,7 +1330,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             if http.statusCode == 304 {
                 self.contentCache.renew(key, ttl: policy.ttl)
                 self.contentCache.noteRevalidation(used304: true)
-                self.callLog("ok", "\(method) \(url.absoluteString) background refresh 304 class="
+                self.cacheLog("\(method) \(url.absoluteString) background refresh 304 class="
                     + "\(policy.cls.rawValue)")
                 return
             }
@@ -1345,7 +1345,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                                     contentType: contentType, headers: headerMap, body: fresh,
                                     ttl: policy.ttl, servedBy: url.host ?? "")
             self.contentCache.noteRevalidation(used304: false)
-            self.callLog("ok", "\(method) \(url.absoluteString) background refresh class="
+            self.cacheLog("\(method) \(url.absoluteString) background refresh class="
                 + "\(policy.cls.rawValue) changed=\(changed ? "yes" : "no")")
             guard changed else { return }
             // Only the page can re-render what it already drew, and only the page
@@ -1412,5 +1412,25 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
 
     private func callLog(_ tag: String, _ message: String) {
         CAPLog.print("[SangTacHttp:\(tag)] \(SangTacHttpPlugin.redact(message))")
+    }
+
+    /**
+     Where a cache decision has to be readable: the in-page panel and the durable
+     log behind it, not only CAPLog.
+
+     The first version of the content cache wrote every decision through
+     `callLog`, which is Console.app -- unreadable on a sideloaded build. The
+     2026-10-13 device log therefore showed the requests but none of the
+     decisions: no `cache hit`, no `cached class=`, no `not cached`, so "is it
+     hitting?" had no answer in the one artefact the reader can produce. A failed
+     image (`report("ERR", ...)`) *did* reach the panel in that same log, which is
+     what pointed at the difference.
+
+     `report` is gated on the diagnostics switch, so this costs nothing while
+     logging is off -- and when it is off, nobody is reading the panel anyway.
+     */
+    private func cacheLog(_ message: String) {
+        callLog("cache", message)
+        report("CACHE", message)
     }
 }

@@ -1249,26 +1249,33 @@ function installFakeApp(sandbox, options) {
         },
         // The content cache's own surface (§6.45.3 (7)): the settings rows read
         // it, write its budget, clear it -- and the page listens for a refresh
-        // that happened behind the reader.
+        // that happened behind the reader. The stub remembers what was written,
+        // like the plugin does: a stats read has to report the live config, or the
+        // rows would flip back to their defaults on every refresh.
         cacheStats(payload) {
           (stored.cacheStats || (stored.cacheStats = [])).push(payload);
           if (options.cacheStatsFails) {
             return Promise.reject(new Error(options.cacheStatsFails));
           }
-          return Promise.resolve(options.cacheStatsResponse
-            ? options.cacheStatsResponse()
-            : { entries: 12, bytes: 1572864, hits: 7, staleServed: 2, misses: 3,
-                retentionDays: 30, maxBytes: 268435456 });
+          if (options.cacheStatsResponse) { return Promise.resolve(options.cacheStatsResponse()); }
+          return Promise.resolve(Object.assign({
+            entries: 12, bytes: 1572864, hits: 7, staleServed: 2, misses: 3,
+            retentionDays: 30, maxBytes: 268435456, enabled: true,
+          }, stored.cacheConfigState || {}));
         },
         cacheConfig(payload) {
           (stored.cacheConfig || (stored.cacheConfig = [])).push(payload);
           if (options.cacheConfigFails) {
             return Promise.reject(new Error(options.cacheConfigFails));
           }
-          return Promise.resolve(options.cacheConfigResponse
-            ? options.cacheConfigResponse(payload)
-            : Object.assign({ entries: 12, bytes: 1572864, hits: 7, staleServed: 2,
-                misses: 3, retentionDays: 30, maxBytes: 268435456 }, payload));
+          stored.cacheConfigState = Object.assign(stored.cacheConfigState || {}, payload);
+          if (options.cacheConfigResponse) {
+            return Promise.resolve(options.cacheConfigResponse(payload));
+          }
+          return Promise.resolve(Object.assign({
+            entries: 12, bytes: 1572864, hits: 7, staleServed: 2, misses: 3,
+            retentionDays: 30, maxBytes: 268435456, enabled: true,
+          }, stored.cacheConfigState));
         },
         clearCache(payload) {
           (stored.clearCache || (stored.clearCache = [])).push(payload);
@@ -8835,51 +8842,65 @@ async function testContentCache() {
   await tick(40);
 
   const rows = fixture.content.querySelectorAll('.stv-cache-row');
-  check('the settings page grows a cache section with four rows', rows.length === 4,
+  check('the settings page grows a cache section with five rows', rows.length === 5,
     String(rows.length));
   const titles = rows.map((row) => {
     const name = row.querySelectorAll('.settingitemtitle')[0];
     return name ? name.textContent : '';
   });
-  check('the rows are the four the design calls for',
-    titles.join('/') === '内容缓存占用/保留时间/保留空间/清除内容缓存', titles.join('/'));
+  check('the rows are the five the design calls for',
+    titles.join('/') === '内容缓存/内容缓存占用/保留时间/保留空间/清除内容缓存', titles.join('/'));
 
   const cellOf = (index) => {
     const cells = rows[index].querySelectorAll('div');
     return cells.length ? cells[cells.length - 1].textContent : '';
   };
+  check('the master switch starts on', cellOf(0) === '已开启', cellOf(0));
   check('the usage row reports what the plugin holds',
-    cellOf(0).indexOf('1.5 MB') >= 0 && cellOf(0).indexOf('12 项') >= 0
-      && cellOf(0).indexOf('命中 9') >= 0, cellOf(0));
-  check('the retention row shows the current cap', cellOf(1) === '30 天', cellOf(1));
-  check('the space row shows the current budget in MB', cellOf(2) === '256 MB', cellOf(2));
+    cellOf(1).indexOf('1.5 MB') >= 0 && cellOf(1).indexOf('12 项') >= 0
+      && cellOf(1).indexOf('命中 9') >= 0, cellOf(1));
+  check('the retention row shows the current cap', cellOf(2) === '30 天', cellOf(2));
+  check('the space row shows the current budget in MB', cellOf(3) === '256 MB', cellOf(3));
 
   // Tapping a row cycles it and the row redraws from what the plugin answered.
-  click(rows[1]);
+  click(rows[2]);
   await tick(30);
   const retentionCalls = sandbox.__stored.cacheConfig || [];
   check('tapping retention writes the next step up',
     retentionCalls.length === 1 && retentionCalls[0].retentionDays === 90,
     JSON.stringify(retentionCalls));
-  check('the retention row shows the new value', cellOf(1) === '90 天', cellOf(1));
+  check('the retention row shows the new value', cellOf(2) === '90 天', cellOf(2));
 
-  click(rows[2]);
+  click(rows[3]);
   await tick(30);
   const spaceCalls = sandbox.__stored.cacheConfig || [];
   check('tapping space writes the next step up',
     spaceCalls.length === 2 && spaceCalls[1].maxBytes === 512 * 1024 * 1024,
     JSON.stringify(spaceCalls));
-  check('the space row shows the new budget', cellOf(2) === '512 MB', cellOf(2));
+  check('the space row shows the new budget', cellOf(3) === '512 MB', cellOf(3));
+
+  // The master switch turns the cache (and the routing it implies) off, and says
+  // so in localStorage as well -- the next launch has to start switched off,
+  // before any native answer arrives.
+  click(rows[0]);
+  await tick(30);
+  const switchCalls = sandbox.__stored.cacheConfig || [];
+  check('tapping the master switch turns the cache off',
+    switchCalls.length === 3 && switchCalls[2].enabled === false,
+    JSON.stringify(switchCalls.slice(-1)));
+  check('the switch row says so', cellOf(0) === '已关闭', cellOf(0));
+  check('the choice is remembered for the next launch',
+    sandbox.localStorage.getItem('stv.contentcache') === '0',
+    String(sandbox.localStorage.getItem('stv.contentcache')));
 
   const readsBefore = (sandbox.__stored.cacheStats || []).length;
-  click(rows[3]);
+  click(rows[4]);
   await tick(30);
   check('tapping clear empties the native cache',
-    (sandbox.__stored.clearCache || []).length === 1
-      && (sandbox.__stored.clearCache || [])[0].clear === undefined,
+    (sandbox.__stored.clearCache || []).length === 1,
     JSON.stringify(sandbox.__stored.clearCache || []));
   check('the clear row reports how much went',
-    cellOf(3) === '已清除 5 项', cellOf(3));
+    cellOf(4) === '已清除 5 项', cellOf(4));
   check('the usage row is re-read after a clear',
     (sandbox.__stored.cacheStats || []).length > readsBefore,
     String((sandbox.__stored.cacheStats || []).length));
@@ -8888,7 +8909,7 @@ async function testContentCache() {
   app.pushPage('pagesetting', {});
   await tick(40);
   check('a second visit does not add a second set of rows',
-    fixture.content.querySelectorAll('.stv-cache-row').length === 4,
+    fixture.content.querySelectorAll('.stv-cache-row').length === 5,
     String(fixture.content.querySelectorAll('.stv-cache-row').length));
 
   // The refresh hook: the plugin says an answer changed, the page decides.
@@ -8931,7 +8952,7 @@ async function testContentCache() {
   check('a failing stats read is logged rather than thrown',
     failingDiag.indexOf('cacheStats failed') >= 0, failingDiag.slice(-240));
   check('the rows are still drawn when stats cannot be read',
-    failingFixture.content.querySelectorAll('.stv-cache-row').length === 4,
+    failingFixture.content.querySelectorAll('.stv-cache-row').length === 5,
     String(failingFixture.content.querySelectorAll('.stv-cache-row').length));
 
   // Coverage: the site fetches its own API through XMLHttpRequest whenever the
@@ -8960,6 +8981,95 @@ async function testContentCache() {
     coverDiag.indexOf('bookinfo.php') >= 0, coverDiag.slice(-300));
   check('the count is not reused for the assets around it',
     coverDiag.indexOf('2 site request(s)') < 0, coverDiag.slice(-300));
+
+  // The routing of §6.46: the classes the native cache can serve are taken off the
+  // page's own XMLHttpRequest, which is where the 2026-10-13 log caught the chapter
+  // list and `userinfo.php`. It has to be reversible in one step -- one failed
+  // native attempt falls back to the site's own transport with the same arguments
+  // -- because it changes which host serves those requests.
+  const routes = [];
+  const netSandbox = makeSandbox();
+  const netApp = installFakeApp(netSandbox, { displayType: 'auto' });
+  netApp.net.get = (url) => {
+    routes.push({ via: 'page', url: url });
+    return Promise.resolve('page:' + url);
+  };
+  netApp.net.post = (url, data) => {
+    routes.push({ via: 'page-post', url: url, data: data });
+    return Promise.resolve('page-post:' + url);
+  };
+  netApp.net.getCapacitor = (url) => {
+    routes.push({ via: 'native', url: url });
+    if (netSandbox.__stored.nativeGetFails) {
+      return Promise.reject(new Error('mirror down'));
+    }
+    return Promise.resolve('native:' + url);
+  };
+  netApp.net.postCapacitor = (url, data) => {
+    routes.push({ via: 'native-post', url: url, data: data });
+    return Promise.resolve('native-post:' + url);
+  };
+  vm.runInContext(loadBlocks().join('\n'), netSandbox);
+  await tick(250);
+  const netDiag = () => String(netSandbox.window.__stvDiag.text() || '');
+
+  check('the routing reports itself',
+    netDiag().indexOf('chapter list and book lists: routed through the native cache') >= 0,
+    netDiag().slice(-240));
+
+  const listUrl = '/index.php?ngmar=chapterlist&h=trxs2&bookid=12058&sajax=getchapterlist';
+  const listAnswer = await netApp.net.get(listUrl);
+  check('the chapter list is taken off the page transport',
+    listAnswer === 'native:' + listUrl && routes[0].via === 'native',
+    JSON.stringify(routes[0]));
+
+  const infoAnswer = await netApp.net.post('/mobile/userinfo.php', '');
+  check('the profile row is taken off the page transport',
+    infoAnswer === 'native-post:/mobile/userinfo.php' && routes[1].via === 'native-post',
+    JSON.stringify(routes[1]));
+
+  const other = await netApp.net.get('/stv.tts.js?v=7');
+  check('everything else keeps the page transport',
+    other === 'page:/stv.tts.js?v=7' && routes[2].via === 'page', JSON.stringify(routes[2]));
+
+  // The reader's own fallback after a plugin read failed must keep its second
+  // transport: routing `readchapter` here would delete it (app.v2.read.js:615-620).
+  const chapter = await netApp.net.get('/?sajax=readchapter&h=trxs2&bookid=12058&c=90&key=x');
+  check('a chapter read keeps the page transport',
+    chapter.indexOf('page:/?sajax=readchapter') === 0 && routes[3].via === 'page',
+    JSON.stringify(routes[3]));
+
+  netSandbox.__stored.nativeGetFails = true;
+  const fellBack = await netApp.net.get('/mobile/bookinfo.php?hid=1&host=qidian');
+  check('a native attempt that fails falls back to the page transport',
+    fellBack === 'page:/mobile/bookinfo.php?hid=1&host=qidian'
+      && routes[routes.length - 1].via === 'page',
+    JSON.stringify(routes[routes.length - 1]));
+  check('the fallback is reported',
+    netDiag().indexOf('fell back to the page transport') >= 0, netDiag().slice(-260));
+
+  // Switched off in a previous session: the very first request of the next launch
+  // already uses the page transport, before any native answer arrives.
+  const offSandbox = makeSandbox();
+  offSandbox.localStorage.setItem('stv.contentcache', '0');
+  const offRoutes = [];
+  const offApp = installFakeApp(offSandbox, { displayType: 'auto' });
+  offApp.net.get = (url) => {
+    offRoutes.push({ via: 'page', url: url });
+    return Promise.resolve('page:' + url);
+  };
+  offApp.net.getCapacitor = (url) => {
+    offRoutes.push({ via: 'native', url: url });
+    return Promise.resolve('native:' + url);
+  };
+  offApp.net.post = () => Promise.resolve('page');
+  offApp.net.postCapacitor = () => Promise.resolve('native');
+  vm.runInContext(loadBlocks().join('\n'), offSandbox);
+  await tick(250);
+  const offAnswer = await offApp.net.get(listUrl);
+  check('a cache switched off in the last session routes nothing',
+    offAnswer.indexOf('page:') === 0 && offRoutes[0].via === 'page',
+    JSON.stringify(offRoutes[0]));
 }
 (async () => {
   await testCompatAndTtsProvider();

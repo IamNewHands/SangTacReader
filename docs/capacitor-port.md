@@ -4517,3 +4517,69 @@ ui.scrollto=function(ele,offset, scroller){
 
 
 
+
+
+
+## §6.46 第 44 轮（提交名：第四十六轮）：第 43 轮的第一份真机日志 —— 一个观测缺陷 + 一条覆盖面缺口
+
+输入：用户 2026-10-13 00:05 交回的日志（414 行，23:49:33–00:01:29，**安装后第一次启动**）。这一节只记这一份日志证明的事，以及接着改的两处。
+
+### 6.46.1 成立的部分
+
+| 证据 | 说明 |
+| --- | --- |
+| `[MIRROR] 8 file(s), 848KB bundled` / 逐个 `from the local copy` | 本地资源镜像照旧生效 |
+| `[BOOT] shell released at +80ms (app.v2.css (local) …)` | 外壳释放（§6.23 曾实测 +1225ms） |
+| `[ASSET] 24 static request(s) … 1KB wire / 0KB decoded, 19 from cache … 8 served locally` | 静态资源不在关键路径上 |
+| `[CACHE] settings rows added` + `retention -> {"retentionDays":90/365/7/30}` | 设置页四行（现在是五行）与写入链路在真机上能用 |
+| `[BLOB] images and fonts now live in files, not in UserDefaults` | 迁移动安装成功 |
+| `[Http] POST …/booklist.php?method=history -> 200 … 8400b in 696ms` | 首页列表走**原生插件**（`x-stv-transport: app`，目标 `.app`）→ `homeList` 类在缓存覆盖范围内 |
+| `[LOG] https://sangtacviet.app/?sajax=readchapter&h=trxs2&bookid=12058&c=90&key=…` | 正文走 `getContent2` 的插件直调（§6.45.3 (1) 的键设计正是照这条 URL 做的：主机 `.app`、`key=` 会随书刷新） |
+| `[Http] GET …/io/grantcontext/context?hostid=trxs2&bookid=12058 -> 200 … 860227b in 1661ms` | 844KB 那条也在插件路径上 → `grant` 类可缓存（TTL 保守值的必要性同时被这条 1.6s 印证） |
+
+**但这份日志是「装上之后第一次启动」**：缓存此时必然是空的，所以「没有一条命中」不能当作缓存失效的证据。要判命中，必须看**第二次**启动的日志——这也是 6.46.2 那件事必须先修的原因。
+
+### 6.46.2 缺陷一（我们自己的）：缓存决策写了 CAPLog，侧载包读不到
+
+日志里有**请求行**（`[Http] …`，来自 `report`→面板）却**一条决策行都没有**：没有 `cache hit`、没有 `cached class=`、没有 `not cached`。原因是第 43 轮把决策写在 `callLog`（`CAPLog.print`，即 Console.app），而侧载包上 Console 不可读——§6.45.7 让读者去看的那些行，恰恰是不可能出现的。
+
+同一份日志里 `[ERR] GET https://www.trxs.cc/…jpeg -> 403 …` 到了面板，说明 `report` 通道是通的、日志开关是开的。这是本轮最好的教训：**判据必须落在唯一能拿到的证据上**，否则「能不能验证」这件事本身没有被验证。
+
+修法：`SangTacHttpPlugin.cacheLog(_:)` —— 一次写两处（CAPLog + 面板 `report("CACHE", …)`），12 处决策全部改用它；CI 的源码守卫加 `cacheLog(` 一条，防止以后再搬回只写 CAPLog。
+
+### 6.46.3 缺陷二：目录与未读数从不进缓存（同源请求走页面自己的 XHR）
+
+```
+[CACHE] 2 site request(s) went through the page own XMLHttpRequest (outside the native cache),
+        first: https://sangtacviet.com/mobile/userinfo.php
+[CACHE] 2 site request(s) … first: https://sangtacviet.com/index.php?ngmar=chapterlist&h=trxs2&bookid=12058&sajax=getchapterlist
+[CACHE] 1 site request(s) … first: …&h=qidian&bookid=1044096078&sajax=getchapterlist
+```
+
+`app.net.get/post` 只在目标与页面 origin 不同、或镜像不存活时才走插件（`app.v2.js:700`、`:760`），其余走页面自己的 XMLHttpRequest。真机上页面是 `.com`，所以打向 `.com` 的**目录（115KB）与 `userinfo.php`（未读数）**完全绕开缓存；而打向 `.app` 的 `readchapter` / `booklist.php` 在覆盖范围内。用户「感觉没缓存」的直觉，正好落在这条缝上：详情页最先看的就是目录。
+
+修法（`contentCache` 块新增 `routeNet()`）：把**缓存能服务的类**从页面传输改道到插件——`getchapterlist`、`bookinfo.php`、`booklist.php`、`userinfo.php`、`readcomment`。两点约束：
+
+1. `readchapter` **故意不改道**：`app.net.get` 是阅读器在插件路径失败之后的第二条传输（`app.v2.read.js:615-620`），改道等于把这条退路删掉。
+2. **一步可回退**：原生尝试失败就带着同样的参数回到原路径并记一行 `fell back to the page transport`；设置页新增「内容缓存」总开关（写 `localStorage['stv.contentcache']` + 原生 `enabled`），上一轮关掉的话下一次启动的**第一个请求**就已经是页面传输。
+
+覆盖面计数继续留着：下一份日志里这些 URL 应当从 XHR 计数里消失、改为出现在 `[CACHE]` 的命中/落盘行上——**这就是这条改动的验收方式**。
+
+### 6.46.4 顺带记下（不在本轮改）
+
+- `[DOMAIN] networkManagerXHR remembered mirror https://sangtacviet.app did not answer the fresh probe, dropping it` 紧接着 `bestDomain … -> https://sangtacviet.app`：**刚被丢弃的镜像仍被 `bestDomain()` 返回**，与 §6.25 的修法（ban 掉的镜像不再被返回）不一致，值得单开一轮查。
+- `www.trxs.cc` 的同一张封面 403 了三次（23:49:47 / 23:50:40 / 23:50:46）：源站拒绝（`text/html base64 1b`），不是我们的缓存引入的，但「同一 URL 反复失败没有短期记忆」是可省的往返。
+- `[WARN] navigator.connection.addEventListener` 缺失（WKWebView 无 Network Information API）：无害。
+- `[ERR] onerror @:0` 一条（无信息），先记着。
+
+### 6.46.5 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 27 块 / 633296 字节 / 136 标记 |
+| `scripts/test-site-patch.js` | **904 条断言**全过（上一轮 892，本轮新增 12） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI 源码守卫 | 新增 `cacheLog(`：缓存决策必须走面板 |
+
+新增断言：总开关初值/切换/写入 localStorage、五行与五行文案、切到关之后的行内状态、目录与 userinfo 改道到原生、其它 URL 保持页面传输、`readchapter` 保持页面传输、原生失败回退并记一行、上一轮关掉后第一次请求就不改道。
