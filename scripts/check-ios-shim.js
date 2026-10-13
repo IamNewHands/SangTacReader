@@ -34,6 +34,12 @@ const REQUIRED_MARKERS = [
   // The asset cache-buster stabiliser: the site appends Math.random() to the
   // URLs of its own /asset/ bundles, which defeats the max-age=86400 it sends.
   'window.__stvAssetCache',
+  // Pricing the parser-created scripts the mirror cannot reach: Long Tasks where
+  // the engine has it, a chained timer where it does not, both reported under
+  // [MAIN] so the decision to block them rests on a measurement.
+  'function installLongTasks(',
+  'no task over ',
+  'longest tasks: ',
   // The logging switch (off by default) and the two things that make it
   // permanent: its keychain-mirrored store key, and the "view downloads" button
   // of the download-started dialog.

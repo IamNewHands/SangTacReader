@@ -5081,3 +5081,107 @@ WebKit 直接取的，它的失败对我们完全不可见，只有 `applyFilter
 - `refusals=N` 这个规模行读数（只在"这次启动存过东西"时打印；10:21:20 那次全命中，所以没打印）。
 - 落盘拒绝过了 30 分钟窗口后的重付节奏（这次只观察到 34 秒）。
 - 「隔天再读」（`siteAsset` 现在有 28 分钟的跨进程命中，但仍未跨天）。
+
+## §6.52 第 50 轮（提交名：第五十二轮）：查重库 —— 三个库是死重量，但先把 parse 定价再决定屏蔽
+
+输入：无新日志。这一轮是 `docs/optimization-plan-2026-09-23.md` §3/P1「重库延后/屏蔽」那条待办
+的**取证**（该条的前提就是文档自己写的「先确认站点是否在启动路径上调用它们」），证据源是
+5 份已有真机日志 + 站点外壳（`_stv-analysis/shell.html`）+ 随包的 8 个镜像 bundle + `stv.ui.js`
++ 2026-09 的 APK 副本。审计脚本在仓库外 `_stv-analysis/audit-heavy-libs{,2,3}.js`（已 gitignore）。
+
+### 6.52.1 逐库判定
+
+| 库 | decoded 字节（§6.23 冷缓存实测） | 启动路径是否被站点引用 | 证据 |
+| --- | --- | --- | --- |
+| `html2canvas.min.js` | 198689 | **否** | `app.v2.chapterdisplay.js:2840 loadPaper()` 的**第一行就是 `return;`** → 那处调用是死代码；唯一活调用 `stv.ui.js:4050 ui.h2img()`＝截图/分享，用户触发，且契约本来就是 Promise |
+| `materialize.min.js` | 181109 | **否** | `M.*` 与 `Materialize.*` 在 shell + 8 个镜像 bundle + `stv.ui.js` **全 0**；`app.toast`（`app.v2.js:614`）是 `app.context.info(msg,true)` 自己实现；弹窗走 **Bootstrap**（`stv.ui.js:110` 的 `$(...).modal('show')`，`bootstrap.min.js` 在加载）；tab 是站点自己的（`stv.ui.js:1568`）；连没镜像的 `jqr.js`/`stv.host.js`/`bootstrap.min.js`（APK 副本）也全 0 |
+| `crypto-js.min.js` | 48316 | **否** | 唯一使用者 `decryptAes()`（`app.v2.js:254`）在**全部**镜像 bundle 里**没有任何调用点** |
+| `iro.js` | 28249 | 用户触发 | 只在 `app.context.colorPicker`（`app.v2.js:2326`）弹窗里 `iro.ColorPicker`；**同步构造**，惰性桩不安全，要包那个函数 |
+| `gsap.min.js` | 74069 | **是** | `shell.html:3292/5147/5160` 页面切换动画 + `stv.ui.js` 16 处 tween + `app.v2.js` 5 处 → **不能碰** |
+| `materialize.min.css` | 141841 | **是** | `class="btn" x26`、`waves-effect x17`、`class="tabs" x1` 在用 → **不能碰** |
+
+（计划文档 §3/P1 写的 59/57/16/10KB 是 gzip 后的 wire 体积；上表是 decoded。）
+
+### 6.52.2 但它们已经不在网络关键路径上 —— 所以屏蔽省的是 parse
+
+5 份日志 / 6 次启动一致：
+
+```
+09:53:01 [ASSET] materialize.min.js 0KB 20ms cache @+1108ms
+09:53:01 [ASSET] materialize.min.css 0KB 18ms cache @+1108ms
+09:53:01 [ASSET] gsap.min.js 0KB 16ms cache @+1108ms
+09:53:01 [ASSET] 21 static request(s) still over the network: 1KB wire / 0KB decoded,
+                 17 from cache, last byte at +1184ms
+```
+
+`transferSize` 为 0 → 日志自己标的 `cache`：这 4 个文件**每次启动都是 0KB 上网**、WebKit 磁盘
+缓存命中、13–34ms/个；静态资源最后 1 字节落在 +1108~+1184ms，而外壳 +1225ms 就释放了。
+所以屏蔽能省的只有 **parse/compile**：446KB（194+177+47+28）。按 JSC 1MB/s 保守估 100–450ms、
+5MB/s 估 30–90ms —— **全是估算**，而 §6.23 的纪律是「理由是量出来的」。
+
+### 6.52.3 本轮改动：给 parse 定价（`assetCache` 块）
+
+新增一段主线程探针，仍是 document-start 装（块位置第 2，早于所有重库）：
+
+- **有 Long Tasks 就用它**（`PerformanceObserver.supportedEntryTypes` 含 `longtask`）：
+  直接拿 `startTime`/`duration`，这是精确值。
+- **没有就退回计时器**：链式 25ms 定时器测**迟到量**，迟到是那段窗口内忙时的**上界**——
+  方向是安全的（它不可能把一次慢启动测快）。`ticks > 2400`（60 秒）自停，避免 `load` 永不
+  触发时留下一个常驻 40Hz 定时器。
+- **归因**：打印「这次卡顿之前最后结束的那个资源」。解析器是在字节到达后立刻执行脚本的，
+  所以这是**尽力而为的归因**，日志里明确写成 `last resource ended before it: <file>`。
+- 报告在 `load + 500ms` 打一次（和 `[ASSET]` 同一节拍），并把探针停掉；
+  `reportBusy` 也挂在 `window.__stvAssetCache` 上，面板/测试可重跑。
+
+```
+[MAIN] 4 task(s) over 50ms: busy=312ms, longest=140ms at +1098ms (last resource ended before it: materialize.min.js); probe=longtask
+[MAIN] longest tasks: +1098ms 140ms after materialize.min.js | +1180ms 96ms after gsap.min.js
+```
+
+一次干净的启动打 `[MAIN] no task over 50ms before load; probe=longtask`（**不是不打**：一行都不
+打就无法区分「没卡」和「探针没装」）。`probe=` 说明这次用的是精确路径还是兜底路径。
+
+### 6.52.4 为什么把「量」放在「改」之前
+
+屏蔽这 4 个库要引入 `WKContentRuleList` + 惰性桩 —— 那是本项目**第一个「主动阻止站点资源
+加载」**的机制（`assetCache` 只改 URL，`assetMirror` 只换来源），而 `iro`/`CryptoJS` 是**同步**
+API，惰性桩无法保持同步语义（`html2canvas` 可以，它本来就是 Promise）。用一次估算去换一个
+新机制 + 一层 CI 守卫，不如先花一行日志把估算变成读数。判据已经写死在 6.52.6。
+
+### 6.52.5 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / **642892 字节** / **143 标记**（新增 `function installLongTasks(`、`no task over `、`longest tasks: `） |
+| `scripts/test-site-patch.js` | **932 条断言**（上一轮 917，新增 15） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI 产物标记 | 新增 `installLongTasks`（缺了就等于探针没编进包） |
+
+新增断言：装的是 `longtask` 观察器、模式如实记录、干净启动打的是「零任务」那行、**阈值以下的
+任务不计数**（20ms 不算）、摘要行含 `busy=` 与最长卡顿、最长卡顿被归因到它之前最后结束的资源、
+第二行逐条列出各自归因、报告说明用了哪条路径、无 Long Tasks 时退化为计时器并**真的量到**一次
+120ms 主线程占用、**报告后不再计时**（否则读者要付一整个会话的 40Hz 唤醒）、`window.performance`
+完全缺失时不抛异常且仍报 `probe=gap`。
+
+### 6.52.6 下一份日志要看的行
+
+1. `[MAIN] … task(s) over 50ms: busy=…ms, longest=…ms at +…ms (last resource ended before it: …); probe=…`
+   —— 与同一份日志里的 `[BOOT] shell released at +Nms` 对齐：**`longest` 的 `at +…ms` 小于释放
+   时刻**，那次卡顿才算在「首屏前」。
+2. `[MAIN] longest tasks: …` 里出现的文件名 —— 若是 `html2canvas.min.js`/`materialize.min.js`/
+   `crypto-js.min.js`/`iro.js`，屏蔽的收益就有了读数；若是别的文件，屏蔽它们**解决不了问题**。
+3. `probe=` 是 `longtask` 还是 `gap`：若是 `gap`，读数只是上界，判据要相应放宽。
+
+**决策规则（写在这里，下一轮照此执行）**：`busy` 在首屏前 ≥150ms 且归因落在那 4 个文件上 →
+做窄版屏蔽（`html2canvas` + `crypto-js`，两者无活调用/零调用者，语义上不可能破）+ `materialize.min.js`
+用「触碰即报 + 补载」的探针桩；`busy` 只有几十毫秒 → 在 §3/P1 那条上写「不做」，附这个读数。
+
+### 6.52.7 仍未证实 / 非目标
+
+- WebKit 到底有没有 `longtask`（`probe=` 那一位会给答案；这也是这条兜底存在的原因）。
+- 「卡顿归因」只是「之前最后结束的资源」，不是执行栈归因——同一次卡顿可能来自我们自己的注入块。
+- `app.v2.comicprovider.js` 每次启动都在（34–336ms，`[ASSET]` 行），小说用户是否需要它**未查**
+  （不在本轮范围，留作下一轮候选）。
+- 屏蔽本身**未实现**（本轮只装探针）；`iro` 的「弹窗前补载」钩子也未实现。
+

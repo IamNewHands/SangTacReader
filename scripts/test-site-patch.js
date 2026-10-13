@@ -8007,6 +8007,139 @@ async function testAssetCacheStabiliser() {
 }
 
 /**
+ * 查重库 (2026-10-13): four of the site's parser-created libraries are provably
+ * unused or user-triggered -- html2canvas (its one live caller is the
+ * screenshot/share path), crypto-js (its only user, `decryptAes`, has no
+ * callers), iro (a colour-picker popup) and materialize's JS (`M.*` and
+ * `Materialize.*` appear nowhere; the site's toasts are `app.toast`, its modals
+ * are Bootstrap) -- but the device log shows they are already free on the
+ * network: 0KB wire, 13-34ms each, straight out of WebKit's disk cache. So the
+ * only cost left to price is their *parse* time, which the resource timeline
+ * does not contain. Blocking them is only worth a native content rule list if
+ * that number is real, hence this probe.
+ *
+ * What this test protects: a number is produced whether or not the engine has
+ * the Long Tasks API, a task under the threshold is not counted, the attribution
+ * names the resource that ended last before the stall, the report says which
+ * probe produced it, and neither probe becomes a permanent timer.
+ */
+async function testMainThreadProbe() {
+  console.log('main-thread probe (查重库)');
+
+  // 1) Long Tasks available: the precise path.
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { appLanguage: 'zh' });
+  const view = sandbox.window;
+  const observers = [];
+  view.PerformanceObserver = function (callback) {
+    this.callback = callback;
+    this.observe = (options) => { this.options = options; observers.push(this); };
+  };
+  view.PerformanceObserver.supportedEntryTypes = ['longtask', 'resource'];
+  const resources = [];
+  view.performance = {
+    now: () => 1200,
+    getEntriesByType: (type) => (type === 'resource' ? resources.slice() : []),
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(30);
+
+  const cache = view.__stvAssetCache;
+  check('the probe installed the Long Tasks observer',
+    observers.length === 1 && !!observers[0].options
+      && observers[0].options.entryTypes[0] === 'longtask',
+    JSON.stringify(observers.map((o) => o.options)));
+  check('the probe records which mode it is in',
+    !!cache.busy && cache.busy.mode === 'longtask', cache.busy && cache.busy.mode);
+
+  // The report is wired to load + 500ms, not to document start: the parse being
+  // priced happens between the two.
+  sandbox.__dispatch('load', {});
+  await tick(600);
+  check('a quiet startup reports zero tasks rather than nothing',
+    String(view.__stvDiag.text() || '')
+      .indexOf('[MAIN] no task over 50ms before load; probe=longtask') >= 0,
+    String(view.__stvDiag.text() || '').slice(-200));
+
+  // Two stalls over the threshold and one under it, each with the resource that
+  // ended just before it (the parser executes a script right after its bytes
+  // arrive, which is what makes this attribution worth printing).
+  resources.push({ name: 'https://sangtacviet.com/materialize.min.js?stv2', responseEnd: 890 });
+  resources.push({ name: 'https://sangtacviet.com/gsap.min.js', responseEnd: 1170 });
+  observers[0].callback({
+    getEntries: () => [
+      { startTime: 900, duration: 140 },
+      { startTime: 1100, duration: 20 },
+      { startTime: 1180, duration: 96 },
+    ],
+  });
+  cache.reportBusy();
+
+  const text = String(view.__stvDiag.text() || '');
+  check('only tasks over the threshold are counted',
+    cache.busy.count === 2 && cache.busy.total === 236,
+    cache.busy.count + ' / ' + cache.busy.total);
+  check('the summary names the busy total and the longest stall',
+    text.indexOf('[MAIN] 2 task(s) over 50ms: busy=236ms, longest=140ms at +900ms') >= 0,
+    text.slice(-320));
+  check('the longest stall is attributed to the resource that ended last before it',
+    text.indexOf('(last resource ended before it: materialize.min.js)') >= 0, text.slice(-320));
+  check('the second line lists the stalls with their own attribution',
+    text.indexOf('longest tasks: +900ms 140ms after materialize.min.js'
+      + ' | +1180ms 96ms after gsap.min.js') >= 0,
+    text.slice(-320));
+  check('the report says which probe produced the number',
+    text.indexOf('probe=longtask') >= 0, text.slice(-200));
+
+  // 2) No Long Tasks API: the fallback still has to produce a number, and it has
+  // to be the honest upper bound. A 120ms busy loop is a stall by construction.
+  const gap = makeSandbox();
+  installFakeApp(gap, { appLanguage: 'zh' });
+  const gapView = gap.window;
+  gapView.PerformanceObserver = undefined;
+  gapView.performance = { now: () => Date.now(), getEntriesByType: () => [] };
+  vm.runInContext(loadBlocks().join('\n'), gap);
+  await tick(40);
+  check('without Long Tasks the probe falls back to a timer',
+    gapView.__stvAssetCache.busy.mode === 'gap', gapView.__stvAssetCache.busy.mode);
+
+  gap.__dispatch('load', {});
+  const until = Date.now() + 120;
+  while (Date.now() < until) { /* hold the main thread, as a parse would */ }
+  await tick(600);
+  const gapBusy = gapView.__stvAssetCache.busy;
+  const gapText = String(gapView.__stvDiag.text() || '');
+  check('the fallback prices a real stall',
+    gapBusy.count >= 1 && gapBusy.total >= 100, gapBusy.count + ' / ' + gapBusy.total);
+  check('the fallback says it is a fallback', gapText.indexOf('probe=gap') >= 0,
+    gapText.slice(-200));
+  // The fallback must not outlive its report, or a reader pays 40 timer wakeups
+  // a second for the rest of the session.
+  const settled = gapBusy.count;
+  await tick(80);
+  check('the fallback stops measuring once it has reported', gapBusy.count === settled,
+    settled + ' -> ' + gapBusy.count);
+
+  // 3) A window without `performance` at all (the stub's default): the block is
+  // installed at document start, where a throw takes the rest of the shim with it.
+  const bare = makeSandbox();
+  installFakeApp(bare, { appLanguage: 'zh' });
+  vm.runInContext(loadBlocks().join('\n'), bare);
+  await tick(40);
+  check('the probe survives a window without performance',
+    !!bare.window.__stvAssetCache.busy, String(bare.window.__stvAssetCache.busy));
+  let threw = null;
+  try { bare.window.__stvAssetCache.reportBusy(); } catch (error) { threw = String(error); }
+  check('reporting without performance does not throw', !threw, threw);
+  check('it still names its mode',
+    String(bare.window.__stvDiag.text() || '').indexOf('probe=gap') >= 0,
+    String(bare.window.__stvDiag.text() || '').slice(-200));
+  bare.__dispatch('load', {});
+  await tick(600);
+}
+
+/**
  * The injection order is a performance contract, not a style choice: every
  * block is a WKUserScript at document start, so the whole list parses and runs
  * before the page's first inline script. The blocks the first frame needs have
@@ -9242,6 +9375,7 @@ await testNotifyBookTitles();
 await testPopupTranslate();
   await testTranslateKeyStorage();
   await testAssetCacheStabiliser();
+  await testMainThreadProbe();
   await testAssetMirror();
   await testSwipeDismiss();
   testInjectionOrder();

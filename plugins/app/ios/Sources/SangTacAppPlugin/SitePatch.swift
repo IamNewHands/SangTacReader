@@ -261,6 +261,141 @@ enum SitePatch {
             }
         };
 
+        // --- what the parser-created scripts cost the main thread ---
+
+        // 查重库 (2026-10-13): the four libraries the mirror cannot reach are
+        // already free on the network -- the device log shows 0KB wire and
+        // 13-34ms each, straight out of WebKit's disk cache -- so the only cost
+        // left to price is their parse and execute time, and the resource
+        // timeline does not contain it. Long Tasks answers that directly where
+        // the engine has it; a chained timer answers it from the other side (a
+        // 25ms timer that comes back 120ms late means the main thread was busy
+        // for most of that gap). One [MAIN] line per launch, so the next device
+        // log can decide whether blocking them is worth a native content rule
+        // list -- and, if it is, which files it has to cover.
+        var BUSY_MS = 50;
+
+        function clock() {
+            if (window.performance && typeof window.performance.now === 'function') {
+                return window.performance.now();
+            }
+            return Date.now();
+        }
+
+        var busy = { mode: 'none', count: 0, total: 0, rows: [] };
+        var gapTimer = null;
+
+        function recordBusy(start, duration) {
+            // Below the threshold is timer noise, not a stall.
+            if (!(duration >= BUSY_MS)) { return; }
+            busy.count++;
+            busy.total += duration;
+            busy.rows.push([Math.round(start), Math.round(duration)]);
+        }
+
+        // Best-effort attribution, and the log says so: the parser executes a
+        // script right after its bytes arrive, so the resource that ended last
+        // before a stall is the one most likely to have caused it.
+        function lastNameBefore(when) {
+            if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
+                return '';
+            }
+            var entries = window.performance.getEntriesByType('resource') || [];
+            var best = null;
+            for (var i = 0; i < entries.length; i++) {
+                var end = entries[i].responseEnd || 0;
+                if (end <= when && (!best || end > (best.responseEnd || 0))) { best = entries[i]; }
+            }
+            if (!best) { return ''; }
+            var path = String(best.name || '').split('?')[0].split('#')[0];
+            var parts = path.split('/');
+            return parts[parts.length - 1] || '';
+        }
+
+        function installLongTasks() {
+            var watcher = window.PerformanceObserver;
+            if (typeof watcher !== 'function') { return false; }
+            var types = watcher.supportedEntryTypes;
+            if (!types || types.indexOf('longtask') < 0) { return false; }
+            try {
+                var watch = new watcher(function (list) {
+                    var entries = (list && list.getEntries) ? list.getEntries() : [];
+                    for (var i = 0; i < entries.length; i++) {
+                        recordBusy(entries[i].startTime, entries[i].duration);
+                    }
+                });
+                watch.observe({ entryTypes: ['longtask'] });
+                busy.mode = 'longtask';
+                return true;
+            } catch (e) { return false; }
+        }
+
+        function installGapProbe() {
+            // Lateness is an upper bound on the busy time inside that window,
+            // which is the safe direction: it cannot invent a fast startup.
+            busy.mode = 'gap';
+            var step = 25;
+            var ticks = 0;
+            var due = clock() + step;
+            function tick() {
+                if (!gapTimer) { return; }
+                // Bounded: a page whose `load` never fires must not leave a
+                // permanent 40Hz timer behind (2400 x 25ms = 60s).
+                ticks++;
+                if (ticks > 2400) { stopProbe(); return; }
+                var now = clock();
+                recordBusy(due, now - due);
+                due = now + step;
+                gapTimer = setTimeout(tick, step);
+            }
+            gapTimer = setTimeout(tick, step);
+        }
+
+        function stopProbe() {
+            if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
+        }
+
+        function reportBusy() {
+            if (!window.__stvDiag || busy.mode === 'none') { return; }
+            if (!busy.count) {
+                window.__stvDiag.log('MAIN', 'no task over ' + BUSY_MS + 'ms before load; probe='
+                    + busy.mode);
+                return;
+            }
+            busy.rows.sort(function (a, b) { return b[1] - a[1]; });
+            var worst = busy.rows[0];
+            var cause = lastNameBefore(worst[0]);
+            window.__stvDiag.log('MAIN', busy.count + ' task(s) over ' + BUSY_MS + 'ms: busy='
+                + Math.round(busy.total) + 'ms, longest=' + worst[1] + 'ms at +' + worst[0] + 'ms'
+                + (cause ? ' (last resource ended before it: ' + cause + ')' : '')
+                + '; probe=' + busy.mode);
+            var rows = [];
+            for (var i = 0; i < busy.rows.length && i < 3; i++) {
+                var at = busy.rows[i][0];
+                var after = lastNameBefore(at);
+                rows.push('+' + at + 'ms ' + busy.rows[i][1] + 'ms' + (after ? ' after ' + after : ''));
+            }
+            window.__stvDiag.log('MAIN', 'longest tasks: ' + rows.join(' | '));
+        }
+
+        // Exposed for the panel and for the test harness: the report is a pure
+        // function of what has been observed so far, so it can be re-run.
+        window.__stvAssetCache.busy = busy;
+        window.__stvAssetCache.reportBusy = reportBusy;
+
+        if (!installLongTasks()) { installGapProbe(); }
+
+        function reportOnce() {
+            stopProbe();
+            reportBusy();
+        }
+
+        if (document.readyState === 'complete') {
+            setTimeout(reportOnce, 500);
+        } else {
+            window.addEventListener('load', function () { setTimeout(reportOnce, 500); });
+        }
+
         // `diag` is injected after this block, so __stvDiag does not exist yet
         // here -- announce once the document is parsed instead.
         function announce() {
