@@ -39,7 +39,13 @@ const REQUIRED_MARKERS = [
   // [MAIN] so the decision to block them rests on a measurement.
   'function installLongTasks(',
   'no task over ',
-  'longest tasks: ',
+  // Round 53: the first device log answered the first question (WebKit has no
+  // Long Tasks API) and exposed a weak attribution -- one name, often a font
+  // that happened to land last. So the report now carries the candidates
+  // (plural), the injection bracket, and the split at the shell release.
+  'window.__stvInjectStart',
+  'candidates (bytes landed within 500ms before): ',
+  'ms splits them: before=',
   // The logging switch (off by default) and the two things that make it
   // permanent: its keychain-mirrored store key, and the "view downloads" button
   // of the download-started dialog.

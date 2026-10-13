@@ -251,6 +251,7 @@ self.report(tag, "...\(body.count)b in \(elapsedMs())ms " + SangTacHttpPlugin.pr
 
 - **重库延后/屏蔽**：`html2canvas`(59KB) 只在截图分享用、`iro`(10KB) 只在取色用、`crypto-js`(16KB) 只在加密用、`materialize`(57KB) 大量组件未用。用 `WKContentRuleList` 在启动阶段屏蔽、用到时再放行（规则表可按导航切换），或至少确认站点是否在启动路径上调用它们。`gsap`(28KB) 用于页面切换动画（`popPage` 250ms），不能直接屏蔽，建议保留。
   - **2026-10-13 取证结论见 `docs/capacitor-port.md` §6.52**：前三个库确实没有活的启动路径调用（`materialize` 的 JS 更极端——`M.*` 全库 0 命中，站点的 toast/modal/tab 都是自己的或 Bootstrap），但实测它们**每次启动都是 0KB 上网、WebKit 磁盘缓存命中 13–34ms**，静态资源最后 1 字节在 +1108~+1184ms、外壳 +1225ms 已释放 → 屏蔽省下的只是 parse（446KB decoded，估算 30–450ms）。因此**先装主线程探针把 parse 变成读数**（第 52 轮），屏蔽按 §6.52.6 的决策规则再定。
+  - **2026-10-13 第七份真机日志的结论见 §6.53.2：这条关闭，不做屏蔽。** 读数：这 4 个文件在 `+1300ms` 才到（`materialize.min.js 0KB 21ms cache @+1300ms`），而外壳在 `+77ms/+376ms` 就释放了——它们不在「不再黑屏」这条路径上；三次启动的最长卡顿（659/797/1543ms）单名归因分别落在 `Nunito-Regular.ttf`、`manifest_app_v2.json`、`api.js`，**一次都没落在这 4 个库上**。真正要查的账变成了「外壳释放之后那 1.8–3.5s 主线程忙时」（见 §6.53.4）。
 - **图片**：封面统一 `loading="lazy"` + `decoding="async"`，并用原生缓存层给缩略图；列表首屏不要加载全尺寸封面。
 - **TTS 去 base64**：当前每句合成走 `WAV → base64(膨胀 33%) → JSON 跨桥 → JS atob/Blob → decodeAudioData`（`NativeSpeech.swift:211`、`_dl_stv.tts.js` 里 6 处 Blob）。改用 `WKURLSchemeHandler`（如 `stvtts://`）或临时文件 URL，让 JS 直接 `fetch`/`<audio src>` 拿到音频，省掉大字符串跨桥与一次解码。
 - **PCM 批量拷贝**：`PcmAccumulator.append` 逐样本 `samples.append`（`:386-429`），再 `snapshot()` 整数组拷贝，再 `Data(bytes:)` 拷一次 = 每句 3 次大数组拷贝。改 `reserveCapacity` + `memcpy` 直填。

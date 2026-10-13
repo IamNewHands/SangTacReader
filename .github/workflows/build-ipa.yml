@@ -221,7 +221,7 @@ jobs:
                         stvCommentTranslateInstalled stvAssetMirror \
                         stvCboxFrameInstalled stvComicGateInstalled \
                         siteAssetRefresh data-stv-mirror stv.domain.trap.off \
-                        stvCoverFallbackInstalled installLongTasks; do
+                        stvCoverFallbackInstalled installLongTasks __stvShellReleaseMs; do
             if grep -q -F "$marker" "$syms.strings"; then
               echo "✓ $marker 已编入产物"
             else

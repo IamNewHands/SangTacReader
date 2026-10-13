@@ -8037,8 +8037,12 @@ async function testMainThreadProbe() {
   };
   view.PerformanceObserver.supportedEntryTypes = ['longtask', 'resource'];
   const resources = [];
+  // A monotonic stub clock: the two injection brackets (`compat` first,
+  // `coverFallback` last) are the only callers, so the span they produce is
+  // deterministic and the assertion below can name it exactly.
+  let clockMs = 1000;
   view.performance = {
-    now: () => 1200,
+    now: () => (clockMs += 10),
     getEntriesByType: (type) => (type === 'resource' ? resources.slice() : []),
   };
 
@@ -8052,6 +8056,9 @@ async function testMainThreadProbe() {
     JSON.stringify(observers.map((o) => o.options)));
   check('the probe records which mode it is in',
     !!cache.busy && cache.busy.mode === 'longtask', cache.busy && cache.busy.mode);
+  check('the first and last injected blocks bracket the whole injection',
+    view.__stvInjectStart === 1010 && view.__stvInjectDone === 1020,
+    view.__stvInjectStart + ' / ' + view.__stvInjectDone);
 
   // The report is wired to load + 500ms, not to document start: the parse being
   // priced happens between the two.
@@ -8059,13 +8066,15 @@ async function testMainThreadProbe() {
   await tick(600);
   check('a quiet startup reports zero tasks rather than nothing',
     String(view.__stvDiag.text() || '')
-      .indexOf('[MAIN] no task over 50ms before load; probe=longtask') >= 0,
-    String(view.__stvDiag.text() || '').slice(-200));
+      .indexOf('[MAIN] no task over 50ms before load; probe=longtask'
+        + ', injection=+1010ms..+1020ms (10ms)') >= 0,
+    String(view.__stvDiag.text() || '').slice(-240));
 
-  // Two stalls over the threshold and one under it, each with the resource that
-  // ended just before it (the parser executes a script right after its bytes
-  // arrive, which is what makes this attribution worth printing).
+  // Two stalls over the threshold and one under it, plus a resource whose bytes
+  // land inside the first stall -- which is what proves a stall is main-thread
+  // work rather than waiting on the network.
   resources.push({ name: 'https://sangtacviet.com/materialize.min.js?stv2', responseEnd: 890 });
+  resources.push({ name: 'https://sangtacviet.com/api.js', responseEnd: 1000 });
   resources.push({ name: 'https://sangtacviet.com/gsap.min.js', responseEnd: 1170 });
   observers[0].callback({
     getEntries: () => [
@@ -8074,23 +8083,42 @@ async function testMainThreadProbe() {
       { startTime: 1180, duration: 96 },
     ],
   });
+  view.__stvShellReleaseMs = 950;
   cache.reportBusy();
 
   const text = String(view.__stvDiag.text() || '');
   check('only tasks over the threshold are counted',
     cache.busy.count === 2 && cache.busy.total === 236,
     cache.busy.count + ' / ' + cache.busy.total);
-  check('the summary names the busy total and the longest stall',
-    text.indexOf('[MAIN] 2 task(s) over 50ms: busy=236ms, longest=140ms at +900ms') >= 0,
-    text.slice(-320));
-  check('the longest stall is attributed to the resource that ended last before it',
-    text.indexOf('(last resource ended before it: materialize.min.js)') >= 0, text.slice(-320));
-  check('the second line lists the stalls with their own attribution',
-    text.indexOf('longest tasks: +900ms 140ms after materialize.min.js'
-      + ' | +1180ms 96ms after gsap.min.js') >= 0,
-    text.slice(-320));
+  check('the summary names the busy total, the longest stall and the injection cost',
+    text.indexOf('[MAIN] 2 task(s) over 50ms: busy=236ms, longest=140ms at +900ms'
+      + '; probe=longtask, injection=+1010ms..+1020ms (10ms)') >= 0,
+    text.slice(-360));
+  check('the summary splits the stalls at the shell release',
+    text.indexOf('shell release +950ms splits them: before=1 task(s)/140ms,'
+      + ' after=1 task(s)/96ms') >= 0,
+    text.slice(-360));
+  check('a stall lists every candidate that landed just before it',
+    text.indexOf('stall +900ms..+1040ms 140ms | candidates (bytes landed within 500ms'
+      + ' before): materialize.min.js | landed during it: api.js') >= 0,
+    text.slice(-360));
+  check('the second stall gets its own window and its own candidates',
+    text.indexOf('stall +1180ms..+1276ms 96ms | candidates (bytes landed within 500ms'
+      + ' before): gsap.min.js, api.js, materialize.min.js') >= 0,
+    text.slice(-360));
   check('the report says which probe produced the number',
     text.indexOf('probe=longtask') >= 0, text.slice(-200));
+
+  // A teardown or a backgrounded web view would look like busy time to a
+  // lateness probe, so both are named in the report instead of being counted.
+  sandbox.__dispatch('pagehide', {});
+  sandbox.document.visibilityState = 'hidden';
+  sandbox.__dispatch('visibilitychange', {});
+  cache.reportBusy();
+  const noted = String(view.__stvDiag.text() || '');
+  check('a pagehide and a hidden document are reported, not silently counted',
+    noted.indexOf('(page hid at +') >= 0 && noted.indexOf('hidden at +') >= 0,
+    noted.slice(-200));
 
   // 2) No Long Tasks API: the fallback still has to produce a number, and it has
   // to be the honest upper bound. A 120ms busy loop is a stall by construction.

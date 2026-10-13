@@ -42,6 +42,18 @@ enum SitePatch {
         if (window.__stvIOSCompatInstalled) { return; }
         window.__stvIOSCompatInstalled = true;
 
+        // Round 53: `compat` is the first block in SitePatch.all and
+        // `coverFallback` is the last, so the two of them bracket the whole
+        // document-start injection. The difference is what our own 642KB of
+        // injected JavaScript costs the main thread before the page's first
+        // inline script runs -- the number that decides whether trimming or
+        // deferring blocks buys more than anything the site does. The [MAIN]
+        // line in the assetCache block prints it next to the measured stalls.
+        if (!window.__stvInjectStart) {
+            window.__stvInjectStart = (window.performance && window.performance.now)
+                ? window.performance.now() : Date.now();
+        }
+
         if (typeof window.nativeclick === 'undefined') {
             window.nativeclick = {
                 trigger: function () {},
@@ -293,23 +305,91 @@ enum SitePatch {
             busy.rows.push([Math.round(start), Math.round(duration)]);
         }
 
-        // Best-effort attribution, and the log says so: the parser executes a
-        // script right after its bytes arrive, so the resource that ended last
-        // before a stall is the one most likely to have caused it.
-        function lastNameBefore(when) {
-            if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
-                return '';
-            }
-            var entries = window.performance.getEntriesByType('resource') || [];
-            var best = null;
-            for (var i = 0; i < entries.length; i++) {
-                var end = entries[i].responseEnd || 0;
-                if (end <= when && (!best || end > (best.responseEnd || 0))) { best = entries[i]; }
-            }
-            if (!best) { return ''; }
-            var path = String(best.name || '').split('?')[0].split('#')[0];
+        function shortName(url) {
+            var path = String(url || '').split('?')[0].split('#')[0];
             var parts = path.split('/');
             return parts[parts.length - 1] || '';
+        }
+
+        // Candidates, plural. The first device log showed why one name is not
+        // enough: the longest stall was blamed on a font while the file that had
+        // actually just landed sat 70ms earlier. A script can only be parsed
+        // after its bytes arrive, so everything that landed inside the 500ms
+        // before a stall is a candidate -- and the log says exactly that.
+        function candidatesBefore(when, span, limit) {
+            var out = [];
+            if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
+                return out;
+            }
+            var entries = window.performance.getEntriesByType('resource') || [];
+            var rows = [];
+            for (var i = 0; i < entries.length; i++) {
+                var end = entries[i].responseEnd || 0;
+                if (end <= when && end >= when - span) { rows.push([end, shortName(entries[i].name)]); }
+            }
+            rows.sort(function (a, b) { return b[0] - a[0]; });
+            for (var j = 0; j < rows.length && out.length < limit; j++) {
+                if (rows[j][1] && out.indexOf(rows[j][1]) < 0) { out.push(rows[j][1]); }
+            }
+            return out;
+        }
+
+        // Bytes that arrived *during* a stall prove the stall is main-thread
+        // work: the network runs in its own process and keeps delivering while
+        // the page is blocked.
+        function arrivedDuring(from, to, limit) {
+            var out = [];
+            if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
+                return out;
+            }
+            var entries = window.performance.getEntriesByType('resource') || [];
+            for (var i = 0; i < entries.length && out.length < limit; i++) {
+                var end = entries[i].responseEnd || 0;
+                if (end > from && end <= to) {
+                    var name = shortName(entries[i].name);
+                    if (name && out.indexOf(name) < 0) { out.push(name); }
+                }
+            }
+            return out;
+        }
+
+        // What our own document-start injection cost, from `compat` (first block
+        // in SitePatch.all) to `coverFallback` (last one).
+        function injectionSpan() {
+            var start = window.__stvInjectStart;
+            var done = window.__stvInjectDone;
+            if (typeof start !== 'number' || typeof done !== 'number' || !(done >= start)) {
+                return '';
+            }
+            return ', injection=+' + Math.round(start) + 'ms..+' + Math.round(done) + 'ms ('
+                + Math.round(done - start) + 'ms)';
+        }
+
+        // The question the decision rule turns on: was the main thread busy
+        // *before* the reader could see anything, or after?
+        function shellSplit() {
+            var at = window.__stvShellReleaseMs;
+            if (typeof at !== 'number') { return ''; }
+            var before = 0;
+            var beforeMs = 0;
+            var after = 0;
+            var afterMs = 0;
+            for (var i = 0; i < busy.rows.length; i++) {
+                if (busy.rows[i][0] < at) { before++; beforeMs += busy.rows[i][1]; }
+                else { after++; afterMs += busy.rows[i][1]; }
+            }
+            return '; shell release +' + at + 'ms splits them: before=' + before + ' task(s)/'
+                + beforeMs + 'ms, after=' + after + ' task(s)/' + afterMs + 'ms';
+        }
+
+        // The gap probe measures lateness, so a teardown or a backgrounded web
+        // view would look like busy time. Both are recorded, and the report says
+        // which one happened instead of quietly counting it.
+        function stopNote() {
+            var notes = [];
+            if (typeof busy.pageHide === 'number') { notes.push('page hid at +' + busy.pageHide + 'ms'); }
+            if (typeof busy.hidden === 'number') { notes.push('hidden at +' + busy.hidden + 'ms'); }
+            return notes.length ? ' (' + notes.join(', ') + ')' : '';
         }
 
         function installLongTasks() {
@@ -355,27 +435,40 @@ enum SitePatch {
             if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
         }
 
+        window.addEventListener('pagehide', function () {
+            busy.pageHide = Math.round(clock());
+            stopProbe();
+        });
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState && document.visibilityState !== 'visible'
+                && typeof busy.hidden !== 'number') {
+                busy.hidden = Math.round(clock());
+            }
+        });
+
         function reportBusy() {
             if (!window.__stvDiag || busy.mode === 'none') { return; }
+            var head = '; probe=' + busy.mode + injectionSpan();
             if (!busy.count) {
-                window.__stvDiag.log('MAIN', 'no task over ' + BUSY_MS + 'ms before load; probe='
-                    + busy.mode);
+                window.__stvDiag.log('MAIN', 'no task over ' + BUSY_MS + 'ms before load'
+                    + head + stopNote());
                 return;
             }
             busy.rows.sort(function (a, b) { return b[1] - a[1]; });
             var worst = busy.rows[0];
-            var cause = lastNameBefore(worst[0]);
             window.__stvDiag.log('MAIN', busy.count + ' task(s) over ' + BUSY_MS + 'ms: busy='
                 + Math.round(busy.total) + 'ms, longest=' + worst[1] + 'ms at +' + worst[0] + 'ms'
-                + (cause ? ' (last resource ended before it: ' + cause + ')' : '')
-                + '; probe=' + busy.mode);
-            var rows = [];
+                + head + shellSplit() + stopNote());
             for (var i = 0; i < busy.rows.length && i < 3; i++) {
                 var at = busy.rows[i][0];
-                var after = lastNameBefore(at);
-                rows.push('+' + at + 'ms ' + busy.rows[i][1] + 'ms' + (after ? ' after ' + after : ''));
+                var end = at + busy.rows[i][1];
+                var before = candidatesBefore(at, 500, 4);
+                var during = arrivedDuring(at, end, 3);
+                window.__stvDiag.log('MAIN', 'stall +' + at + 'ms..+' + end + 'ms '
+                    + busy.rows[i][1] + 'ms | candidates (bytes landed within 500ms before): '
+                    + (before.length ? before.join(', ') : 'none')
+                    + (during.length ? ' | landed during it: ' + during.join(', ') : ''));
             }
-            window.__stvDiag.log('MAIN', 'longest tasks: ' + rows.join(' | '));
         }
 
         // Exposed for the panel and for the test harness: the report is a pure
@@ -11405,6 +11498,12 @@ enum SitePatch {
             var node = document.getElementById('stv-boot-hint');
             if (node && node.parentNode) { node.parentNode.removeChild(node); }
             note('BOOT', 'shell released at +' + (Date.now() - started) + 'ms (' + reason + ')');
+            // Round 53: the [MAIN] probe splits its stalls at this moment, so
+            // "was the main thread busy before the reader could see anything"
+            // is answered by the log instead of by aligning two timestamps that
+            // only have second resolution.
+            window.__stvShellReleaseMs = (window.performance && window.performance.now)
+                ? Math.round(window.performance.now()) : Math.round(Date.now() - started);
         }
 
         // The site's own stylesheet is the signal that the real UI is styled.
@@ -12383,6 +12482,12 @@ enum SitePatch {
             tries = tries + 1;
             if (install() || tries > 100) { clearInterval(timer); }
         }, 100);
+
+        // The other half of the bracket opened in `compat` (the first block in
+        // SitePatch.all). This block is the last one, so this is the end of the
+        // document-start injection as a whole.
+        window.__stvInjectDone = (window.performance && window.performance.now)
+            ? window.performance.now() : Date.now();
     })();
     """
 

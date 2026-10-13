@@ -5185,3 +5185,84 @@ API，惰性桩无法保持同步语义（`html2canvas` 可以，它本来就是
   （不在本轮范围，留作下一轮候选）。
 - 屏蔽本身**未实现**（本轮只装探针）；`iro` 的「弹窗前补载」钩子也未实现。
 
+## §6.53 第 51 轮（提交名：第五十三轮）：第七份真机日志 —— 探针出数了，WebKit 没有 Long Tasks，而重库那条待办到此关闭
+
+输入：`stv-diagnostic-20261013-130330.log`（1638 行；同一份落盘日志里 09:52–10:21 的旧内容
++ 13:01:50 / 13:02:49 / 13:03:07 三次新启动，跑的是 13:0x 的第五十二轮包）。
+
+### 6.53.1 探针本身：装上、出数，但走的是兜底路径
+
+三次启动都是 `probe=gap` → **WebKit 没有 Long Tasks API**（`PerformanceObserver.supportedEntryTypes`
+不含 `longtask`）。这正是兜底存在的理由，也意味着下面的 `busy` 是**上界**（迟到量含调度噪声）。
+
+| 启动 | 外壳释放 | task(s) | busy | longest |
+| --- | --- | --- | --- | --- |
+| 13:01:50 | `+376ms` | 8 | 1821ms | 659ms `@+1370ms` |
+| 13:02:49 | `+77ms` | 8 | 1980ms | 797ms `@+1695ms` |
+| 13:03:07 | `+77ms` | 5 | 3507ms | 1543ms `@+1983ms` |
+
+### 6.53.2 重库那条待办：结论是「不做」，而且是量出来的
+
+- 这 4 个文件到得很晚：`[ASSET] materialize.min.js 0KB 21ms cache @+1300ms`、`materialize.min.css
+  0KB 20ms cache @+1300ms`，而外壳在 **+77ms / +376ms** 就释放了 → **它们不在「不再黑屏」这条
+  路径上**，缓存成本 20–21ms/个。
+- 三次启动的最长卡顿按**旧格式的单名归因**分别落在 `Nunito-Regular.ttf`、`manifest_app_v2.json`、
+  `api.js` —— **一次都没有落在那 4 个库上**。
+- 按 §6.52.6 写死的决策规则：`busy ≥ 150ms` 成立，但归因不在那 4 个文件上 → **不做屏蔽**。
+  `docs/optimization-plan-2026-09-23.md` §3/P1 的那条到此关闭（已回填结论与读数）。
+
+### 6.53.3 但这份日志暴露了探针自己的两个问题，所以本轮改的是探针
+
+1. **归因太弱**：单名归因把 659ms 的卡顿算在 `Nunito-Regular.ttf` 头上，而真正刚落地的文件在
+   70ms 之前。现在每个卡顿打的是**窗口 + 窗口前 500ms 内落地的全部候选（最多 4 个）+ 卡顿期间
+   落地的文件**：
+   `stall +900ms..+1040ms 140ms | candidates (bytes landed within 500ms before): … | landed during it: …`
+   「期间落地」是**主线程忙的正面证据**：网络在独立进程里，主线程卡住时它照样在收字节。
+2. **没有一个「是不是我们自己的注入」的数**：642KB 注入 JS 是 document-start 跑完的，此前没人量过。
+   现在 `compat`（`SitePatch.all` 的第一个块）记 `window.__stvInjectStart`，`coverFallback`
+   （最后一个块）记 `window.__stvInjectDone`，`[MAIN]` 打印这段区间。
+3. **首屏前/后的分界**：`bootShell` 释放时记 `window.__stvShellReleaseMs`，`[MAIN]` 用它把卡顿切成
+   `before=` / `after=` —— 这正是 §6.52.6 决策规则依赖的那条线，以前只能靠人工对齐秒级时间戳。
+4. **假阳性**：迟到量探针最大的假阳性来源是「页面被拆掉 / 被切到后台」，以前会被当成忙时。现在
+   `pagehide` 会停表并记时刻，`visibilitychange` 到非 visible 也记时刻，报告里如实写出。
+
+### 6.53.4 这份日志里还没被解释的账（下一轮的目标）
+
+- 三次启动主线程忙 1.8–3.5s，**三个最长卡顿全部落在外壳释放之后**（+1370ms 起）。也就是说首屏
+  已经不受影响，受影响的是「站点自己的 UI 到位」那一段（`[BOOT] +1121ms app=yes config=no` →
+  `+3001ms config=yes`）。
+- 其余 5 个卡顿的位置这份日志没给（旧格式只打前 3）；下一份的 `before=`/`after=` 会给。
+- 值得注意：`api.js` 与 `app.counter.html` 不是站点的 bundle，是第三方脚本（计数/统计类）。
+
+### 6.53.5 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / **648412 字节** / **145 标记**（`longest tasks: ` 换成 `window.__stvInjectStart`、`candidates (bytes landed within 500ms before): `、`ms splits them: before=`） |
+| `scripts/test-site-patch.js` | **935 条断言**（上一轮 932） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI 产物标记 | 新增 `__stvShellReleaseMs` |
+
+新增断言：首尾两块夹住整段注入（`__stvInjectStart === 1010 && __stvInjectDone === 1020`，用单调
+桩钟钉死）、摘要行同时给出注入区间与 `busy`、`shell release +950ms splits them: before=1/140ms,
+after=1/96ms`、卡顿行列出全部候选并区分「期间落地」、`pagehide` 与 `hidden` 被写进报告而不是被
+静默计入。
+
+### 6.53.6 下一份日志要看的行
+
+1. `[MAIN] N task(s) over 50ms: busy=…ms, longest=…ms at +…ms; probe=gap, injection=+…ms..+…ms (…ms); shell release +…ms splits them: before=…, after=…`
+   —— `injection=` 是**我们自己**的 document-start 成本，`before=` 才是首屏前的账。
+2. `[MAIN] stall +…ms..+…ms …ms | candidates (bytes landed within 500ms before): … | landed during it: …`
+   —— 候选里出现 `app.v2.js`/`stv.ui.js`/`hanviet.js`/`chapterdisplay` → 脚本解析；出现 `*.ttf`/`*.jpeg`
+   → 字体/图片解码；`landed during it:` 非空 → 确认是主线程忙，不是等网络。
+3. 若出现 `(page hid at +…ms)` 或 `(hidden at +…ms)`，这份读数作废，要重取。
+
+### 6.53.7 仍未证实 / 非目标
+
+- 卡顿的**执行栈**归因（只能到「候选文件」这一层；同一次卡顿也可能来自我们自己的块或原生侧的主
+  线程工作，例如 `evaluateJavaScript` 批量日志与 800KB 级响应的解码）。
+- `busy` 是上界：25ms 定时器的迟到量包含调度噪声，不能当作精确值引用。
+- 重库屏蔽**不做**（§6.53.2）；`iro` 的「弹窗前补载」钩子也没做。
+- `app.v2.comicprovider.js` 每次启动都在（34–336ms），小说用户是否需要它仍未查。
+
