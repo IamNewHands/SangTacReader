@@ -304,10 +304,27 @@ jobs:
           #                            一行都没有。
           #   `refused again` / `noteRefusal(` —— 同一张坏封面一次启动里被画三次
           #                            （852ms/次），一分钟内的重复拒绝不再打网络。
+          # 第 50 轮的四条：
+          #   `persistedRefusalClasses` —— 拒绝记录**只给图片**落盘的那条限制。这是
+          #                            本轮唯一的风险开关：一条写下来的拒绝无法被
+          #                            「成功」清掉（正是它挡住了那个能成功、也就能
+          #                            自证错误的请求），所以只能靠固定窗口到期。
+          #                            少了这条限制，一次瞬时 5xx 会变成半小时读不出
+          #                            正文。删掉它不会有任何编译错误。
+          #   `refusal written to disk` / `remembered on disk` —— 一写一读两半，日志
+          #                            必须说清是「本进程记得」还是「上次启动写下的」，
+          #                            否则「跨启动生效了吗」在唯一能拿到的证据里没
+          #                            有答案。
+          #   `noteGrantDigest`        —— grantcontext 是打开一本书时最后一项
+          #                            0.7-1.2s（674-813KB），能不能复用取决于同一个
+          #                            URL 两次的字节是否相同；日志里的 `head=` 截断
+          #                            了，看不出来，所以逐字节摘要必须先落进日志。
           for marker in 'sajax=getchapterlist' 'contentClass(method:' 'cacheLog(' \
                         'case .reject(let why)' 'SangTacHttpPlugin.head(' \
                         '/mobile/lang/' '(HTTP error answer)' \
-                        'refused again class=' 'noteRefusal(key: key'; do
+                        'refused again class=' 'noteRefusal(key: key' \
+                        'persistedRefusalClasses' 'refusal written to disk' \
+                        'remembered on disk' 'noteGrantDigest('; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
               echo "✓ $marker 还在响应缓存源码里"
             else
@@ -316,7 +333,9 @@ jobs:
             fi
           done
           for marker in 'case chapterList' 'isChapterListBody' '6 * 3600' \
-                        'case siteAsset' 'isBlankIdentity('; do
+                        'case siteAsset' 'isBlankIdentity(' \
+                        'refusalRetention' 'storeRefusal(key:' 'RefusalRecord' \
+                        'storedRefusal('; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/ContentCache.swift; then
               echo "✓ $marker 还在内容缓存源码里"
             else

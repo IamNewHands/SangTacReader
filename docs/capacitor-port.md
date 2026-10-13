@@ -4840,3 +4840,133 @@ XHR 计数行加上**调用栈首两帧**（`whereFrom()`，用 `String.fromChar
 - `grant` 的取舍（6.49.5 第 2 条）。
 - 401/403 类错误状态被记 60 秒后，若站点中途解除封锁，封面会晚最多一分钟才回来——这是本轮接受的取舍，
   真机上没有观察到（这张封面在整份日志里一直是 403）。
+
+## §6.50 第 48 轮（提交名：第五十轮）：第五份真机日志 —— 四行全部命中，而拒绝记忆漏在「进程」这道边界上
+
+输入：`stv-diagnostic-20261013-095421.log`（821 行，09:52:25–09:54:21，两次文档加载：09:52:59 与 09:53:42）。
+这一份是 09:43 的包（第四十九轮），所以 §6.49 那四行在这里应当全部有答案。
+
+### 6.50.1 §6.49.7 里点的四行，逐条对上
+
+| 要看的行 | 实测 |
+| --- | --- |
+| `userinfo` 缓存 | `09:53:01 [CACHE] POST …/mobile/userinfo.php cached class=userInfo ttl=60s bytes=454`；第二次文档 `09:53:44 … cache hit class=userInfo age=42s` |
+| `lang/zh.json` 入缓存 | `09:52:59 [CACHE] GET …/mobile/lang/zh.json cached class=siteAsset ttl=86400s bytes=5321 \| cache now entries=20 bytes=263836 hits=0`（首次仍付 `[Http] … json 5321b in 873ms`）→ `09:53:42 … cache hit class=siteAsset age=42s` + `[Http] … in 1ms (cache)` |
+| 403 只付一次 | `09:53:04 … not cached class=image status=403 bytes=1 content-type=text/html (HTTP error answer) head= `（`in 853ms`）→ `09:53:48 refused again class=image age=2s status=403 (not retried within 60s)`、`09:53:50 age=4s`、`09:54:06 age=20s`，三次全部 `in 0ms (refused)` |
+| 规模行 | `09:53:58 … cached class=chapter ttl=2592000s bytes=9026 \| cache now entries=24 bytes=283476 hits=14` |
+
+跨进程读盘也再次成立：`09:53:05 [CACHE] GET …getchapterlist cache hit class=chapterList age=4449s` —— 74 分钟前那次会话写下的目录，这一份日志里 0ms 交付。
+
+### 6.50.2 本轮真正的新发现：60 秒窗口只覆盖「进程内」
+
+同一张封面，两个时间点：
+
+```
+09:53:04 [CACHE] GET https://www.trxs.cc/…08e0d41f….jpeg not cached class=image status=403 bytes=1 …
+09:53:04 [ERR]   GET https://www.trxs.cc/…08e0d41f….jpeg -> 403 text/html base64 1b in 853ms
+09:53:46 [CACHE] GET https://www.trxs.cc/…08e0d41f….jpeg not cached class=image status=403 bytes=1 …   ← 又真取了一次
+09:53:46 [ERR]   GET https://www.trxs.cc/…08e0d41f….jpeg -> 403 text/html base64 1b in 856ms
+09:53:48 [CACHE] GET https://www.trxs.cc/…08e0d41f….jpeg refused again class=image age=2s status=403 (not retried within 60s)
+09:53:48 [ERR]   GET https://www.trxs.cc/…08e0d41f….jpeg -> 403 text/html base64 1b in 0ms (refused)
+```
+
+09:53:46 与 09:53:04 相隔 **42 秒**，仍在 60 秒窗口内，却没有被记住；而同一进程里的 09:53:48（`age=2s`）、
+09:53:50（`age=4s`）、09:54:06（`age=20s`）全部命中并 `in 0ms` 回放。唯一能同时解释这两件事的是：
+**09:53:42 是新的进程**，内存记忆随进程清零。这条推断来自窗口算术（42s < 60s 却没被拦），不是来自某个启动标记。
+
+结论：第 49 轮那条记忆把「一次启动里画三次」压成了一次，但**每次冷启动仍要白付一次 853ms**。
+
+为什么不能靠「成功一次就清掉」来救：写下来的那条拒绝，正是挡住那个「能成功、也就能自证判断错误」的请求的东西
+—— 它生效期间根本不会产生成功，所以**固定窗口到期是唯一的边界**。因此窗口必须短，而且只给图片。
+
+### 6.50.3 这份日志里剩下的账（每次启动）
+
+| 请求 | 次数 / 耗时 | 现状 |
+| --- | --- | --- |
+| `GET /warp.php`（镜像探活 ×3 域名） | 645 / 646 / 875ms，并发；`09:53:01 ranked dns1=alive/650ms sangtacviet.app=alive/890ms sangtacviet.com=alive/652ms` | §6.25 的地盘，不动（首页列表 1ms 命中，它不在关键路径上） |
+| `GET /mobile/lang/zh.json` | 首次 873ms | ✅ 已入缓存 |
+| `POST /mobile/userinfo.php` | 541ms（另一路被 `shared in-flight answer (454b)` 合并） | ✅ 已入缓存（60s 窗口） |
+| `GET /io/grantcontext/context` | 1146 / 1240 / 767ms，674609b / 813138b / 813138b | **打开一本书最后一项大开销**（见 6.50.4） |
+| `GET www.trxs.cc/…jpeg` | 853ms × 1（同进程其余 0ms） | 本轮落盘 |
+| `bookinfo` / `chapterList` / 已读 `readchapter` | 0–2ms | ✅ |
+
+静态资源这条已经没什么可捡：`09:53:01 [ASSET] 21 static request(s) still over the network: 1KB wire / 0KB decoded,
+17 from cache, last byte at +1184ms; 7 served locally` —— 冷启动到交互约 +1.2s，其中上线只有 1KB。
+
+### 6.50.4 grant 的谜面：既不是「每请求唯一」，也不是「恒定」
+
+同一个 URL、同一本书、同一个内容站，47 秒内的两份答复：
+
+| 时间 | URL | 字节 |
+| --- | --- | --- |
+| 09:53:07 | `?hostid=trxs&bookid=12058` | 674609 |
+| 09:53:54 | `?hostid=trxs&bookid=12058` | 813138 |
+| 09:54:09 | `?hostid=trxs2&bookid=12058` | 813138 |
+
+后两份不但字节数相同，日志里 `head=` 那段混淆前缀也**逐字相同**（`(()=>{var ˋ︌︊︉︋︃='ˋ️︁︀︊︇'&'ˋ︃︎︈︋︅',…`），
+而 09:53:07 那份从变量名到长度都不同。于是：
+
+- **跨 hostid 相同** ⇒ 不是每请求唯一的 nonce；
+- **同 host+book 47 秒内变化** ⇒ 也不能当常量缓存。
+
+`head=` 只截前 80 字符，猜不出来。所以本轮**只加事实、不改行为**：给 `.grant` 那条日志行附上整份 body 的 SHA-256 前 8 位，
+以及与同一 URL 上一份的关系。下一份日志就能直接回答「同一本书两次 grant 是否同字节」，从而决定那 0.7–1.2s 能不能省。
+
+### 6.50.5 本轮改动清单（逐项）
+
+| # | 改动 | 文件 | 依据 |
+| --- | --- | --- | --- |
+| 1 | **拒绝记录落盘**：`ContentCache.refusalRetention`（30 分钟，固定不滑动）、`refusalLimit`（64 条）、`refusalBodyCap`（8KB）、`refusals.json`（键排序，保证字节稳定）；`storedRefusal` / `storedRefusalCount`；`clear()` 一并清掉它 | `ContentCache.swift` | 6.50.2 |
+| 2 | **只给图片落盘**：`persistedRefusalClasses = [.image]`；读取时也按类再判一次（写错了也不会挡住正文）；写成功才在日志尾加 `\| refusal written to disk, 1800s window` | `SangTacHttpPlugin.swift` | 6.50.2 的理由段 |
+| 3 | **拒绝行说清是哪一层**：命中内存写 `(not retried within 60s)`，命中磁盘写 `(remembered on disk, 1800s window)`；规模行加 `refusals=N` | `SangTacHttpPlugin.swift` | 否则「跨启动生效了吗」在唯一证据里没有答案 |
+| 4 | **grant 逐字节证据**：`noteGrantDigest` 输出 `sha=xxxxxxxx first` / `same as the answer 47s ago` / `differs from yyyyyyyy seen 47s ago`（每人最多 16 条 URL，纯内存，不改任何行为） | `SangTacHttpPlugin.swift` | 6.50.4 |
+| 5 | CI 源码守卫新增 8 个标记（`persistedRefusalClasses`、`refusal written to disk`、`remembered on disk`、`noteGrantDigest(`、`refusalRetention`、`storeRefusal(key:`、`RefusalRecord`、`storedRefusal(`） | `.github/workflows/build-ipa.yml` | 第 1、2 条都没有 UI，丢了只看得出「又变慢了」 |
+
+第 2 条是本轮唯一的风险开关，写清楚它为什么是安全的：一条写下来的拒绝无法被成功清除（见 6.50.2），
+所以它的寿命只能靠固定窗口；对一张被防盗链挡住的封面，最坏结果是缩略图 30 分钟不回来，
+而对正文/目录/资料行，同样的 30 分钟意味着「读不出来」。因此落盘这一层**只给 `.image`**，
+其余类保持进程内 60 秒。`rescan=true`（强制刷新）仍然绕过这两层中的任何一层 —— 那条路径在磁盘查找之前就跳过了。
+
+### 6.50.6 明确**不**做的四条（附理由，供下一轮判断）
+
+1. **仍不给 `grant` 加缓存**：本轮新增的只是两份「同字节」的旁证（跨 hostid 的 813138b），而同一 host+book
+   47 秒内确实变过。等 6.50.4 那个摘要给出答案再谈；赌错的代价仍是章节读不出来（§6.45 的不对称判断不变）。
+2. **仍不把 `/mobile/lang/` 加进 JS 的 `ROUTED`**：理由同 §6.49.5 第 1 条。而这份日志里它是
+   `09:52:59 cached` / `09:53:42 cache hit`，两次都走插件，改道的收益依旧是负的。
+3. **不延长 `userInfo` 的 60 秒 TTL**：冷启动付一次 541ms 是它的全部代价，而放宽窗口会让「关注/收藏」
+   这类由资料行驱动的状态在页面上回退，属于可见回归。
+4. **不动 `/warp.php` 的探活**：三条并发（最慢 875ms），且结果本身已被记住
+   （`09:52:59 [DOMAIN] networkManagerXHR using remembered mirror https://sangtacviet.app`），
+   首页列表又是 1ms 命中，它不在用户等待的路径上。
+
+### 6.50.7 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 27 块 / 635286 字节 / 138 标记（注入 JS 未改） |
+| `scripts/test-site-patch.js` | 908 条断言（JS 未改） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| YAML | `.github/workflows/build-ipa.yml` 通过 `yaml.safe_load` |
+| 括号平衡（剥注释与字符串后） | `ContentCache.swift` 176/176、`SangTacHttpPlugin.swift` 275/275 |
+| CI 源码守卫 | 新增 8 个标记，见 6.50.5 第 5 项 |
+
+改动全在原生侧，本机没有 Swift 工具链：编译由 CI 负责，**行为由下一份日志负责**。
+
+### 6.50.8 下一份日志要看的行
+
+1. 写：`GET …08e0d41f….jpeg not cached class=image status=403 … (HTTP error answer) head=  | refusal written to disk, 1800s window`
+2. 读（**必须是一次新的启动**）：`… refused again class=image age=…s status=403 (remembered on disk, 1800s window)`
+   紧跟 `[ERR] … in 0ms (refused)` —— 这一对才证明那 853ms 真的省下来了。
+3. 规模行：`| cache now entries=… bytes=… hits=… refusals=1`（哪怕这次没画那张封面，也该看到 `refusals=1`）。
+4. grant：`… not cached class=grant … sha=xxxxxxxx first`，同一本书第二次是
+   `sha=xxxxxxxx same as the answer …s ago`（可复用）或 `sha=zzzzzzzz differs from xxxxxxxx seen …s ago`（不可复用）。
+
+### 6.50.9 仍未证实
+
+- 「隔天再读」的体感（需要跨天两次启动；到本轮为止只做到同日跨启动 + 跨版本存活）。
+- `siteAsset` 的跨启动命中：这一份里 `age=42s` 的那次命中仍在同一进程内，**跨进程**要等下一份日志的第一次启动。
+- `contentRefreshed` 的 `changed=yes` 分支、`refreshBehind` 的 304 分支（目录 TTL 6 小时，还需更长的跨度）。
+- 落盘的拒绝被 30 分钟窗口放掉之后，若封锁仍在，会不会形成「每 30 分钟一次 853ms」的稳定节奏 —— 这是可接受的
+  （30 分钟一次），但真机上还没跨过一次完整的 30 分钟窗口。
+- `grant` 的取舍（6.50.4 / 6.50.6 第 1 条）。

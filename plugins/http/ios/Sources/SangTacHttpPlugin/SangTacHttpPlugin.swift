@@ -237,12 +237,15 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         for waiter in entry.waiters { waiter(answer) }
     }
 
-    // MARK: - Refusals (in memory, one session)
+    // MARK: - Refusals (in memory for a minute, on disk for half an hour)
 
-    /// How long a server-side refusal is remembered. Long enough to cover one
-    /// screen drawing the same broken cover three times (round-48 log: 09:01:00,
-    /// 09:01:19, 09:01:22 -- 852ms each), short enough that a block which lifts
-    /// mid-session is not remembered for the rest of it.
+    /// How long a server-side refusal is remembered **in this process**. Long
+    /// enough to cover one screen drawing the same broken cover three times
+    /// (round-48 log: 09:01:00, 09:01:19, 09:01:22 -- 852ms each), short enough
+    /// that a block which lifts mid-session is not remembered for the rest of it.
+    ///
+    /// The disk layer behind it is `ContentCache.refusalRetention` (30 minutes)
+    /// and only exists for images; see `persistedRefusalClasses`.
     private static let refusalWindow: TimeInterval = 60
 
     /// The largest refusal body worth keeping -- a 4xx answer is a sentence or,
@@ -262,7 +265,25 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         let headers: [String: String]
         let body: Data
         let at: Date
+        /// Whether this came off disk rather than out of this process's memory.
+        /// The log line says which, because "it is remembered" and "it is
+        /// remembered across launches" are two different claims and only the
+        /// first one was true before this round -- the round-49 device log shows
+        /// a 403 at 09:53:04 failing to stop the identical request at 09:53:46,
+        /// 42 seconds later, because 09:53:42 was a new process.
+        let persisted: Bool
     }
+
+    /// Which classes' refusals are worth writing down. **Images only.**
+    ///
+    /// A written-down refusal cannot be cleared by a success, because it is the
+    /// refusal itself that stops the request which would find that success: its
+    /// fixed window is the only thing that ends it. For a cover whose host
+    /// hotlink-blocks the link that is a thumbnail missing for half an hour; for
+    /// a chapter, a list or the profile row it would be "cannot read" or "cannot
+    /// see my own books" for half an hour after the server came back. Those three
+    /// keep the in-process memory only.
+    private static let persistedRefusalClasses: Set<ContentClass> = [.image]
 
     private let refusalLock = NSLock()
     private var refusals: [String: Refusal] = [:]
@@ -283,8 +304,12 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
 
      three times in one launch, because the detail page and the list each draw
      that cover. Its host hotlink-blocks this link, so 60 seconds of "do not ask
-     again" costs at most a broken cover that would have stayed broken anyway --
-     and a refusal is never written to disk, so nothing survives the process.
+     again" costs at most a broken cover that would have stayed broken anyway.
+
+     What that version missed (round-49 log): 60 seconds only helps *within* one
+     process. A cold launch in between starts with an empty memory and pays the
+     853ms again, so `notePersistedRefusal` writes the image case down and
+     `ContentCache.refusalRetention` is what ends it.
      */
     private func noteRefusal(key: String, status: Int, contentType: String,
                              headers: [String: String], body: Data) {
@@ -299,14 +324,37 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             refusals.removeValue(forKey: oldest)
         }
         refusals[key] = Refusal(status: status, contentType: contentType,
-                                headers: headers, body: body, at: now)
+                                headers: headers, body: body, at: now, persisted: false)
         refusalLock.unlock()
     }
 
-    /// The remembered refusal for `key`, or nil when there is none or it has aged
-    /// out. An aged-out entry is dropped as it is noticed, so this memory cannot
-    /// outlive its own window.
-    private func refusal(for key: String) -> Refusal? {
+    /// Write a refusal down as well, so the *next launch* does not pay for it
+    /// again. `persistedRefusalClasses` is what decides whether it is allowed to
+    /// outlive this process at all; the disk mechanics belong to the cache.
+    /// Returns whether it was actually written, so the log line can say so.
+    @discardableResult
+    private func notePersistedRefusal(key: String, cls: ContentClass, status: Int,
+                                      contentType: String, headers: [String: String],
+                                      body: Data) -> Bool {
+        guard SangTacHttpPlugin.persistedRefusalClasses.contains(cls) else { return false }
+        return contentCache.storeRefusal(key: key, status: status, contentType: contentType,
+                                         headers: headers, body: body, at: Date())
+    }
+
+    /// The remembered refusal for `key`, from this process first and from disk
+    /// second, or nil when there is none or it has aged out. An aged-out memory
+    /// entry is dropped as it is noticed, so neither layer can outlive its own
+    /// window.
+    private func refusal(for key: String, cls: ContentClass) -> Refusal? {
+        if let hit = memoryRefusal(for: key) { return hit }
+        guard SangTacHttpPlugin.persistedRefusalClasses.contains(cls),
+              let record = contentCache.storedRefusal(key) else { return nil }
+        return Refusal(status: record.status, contentType: record.contentType,
+                       headers: record.headers, body: record.body, at: record.at,
+                       persisted: true)
+    }
+
+    private func memoryRefusal(for key: String) -> Refusal? {
         let now = Date()
         refusalLock.lock()
         defer { refusalLock.unlock() }
@@ -316,6 +364,61 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             return nil
         }
         return hit
+    }
+
+    // MARK: - Grant answers (evidence, not a cache)
+
+    /// How many distinct grant URLs are compared against each other.
+    private static let grantDigestLimit = 16
+
+    private struct GrantDigest {
+        let digest: String
+        let at: Date
+    }
+
+    private let grantLock = NSLock()
+    private var grantDigests: [String: GrantDigest] = [:]
+
+    /**
+     Says whether this `grantcontext` answer is byte-identical to the previous one
+     for the same URL, and returns the sentence for the log line. Records nothing
+     else and changes no behaviour: the answer is still handed to the page exactly
+     as it arrived.
+
+     Why this is instrumentation and not a cache. `grantcontext` is the largest
+     remaining wait in the round-49 device log -- 674-813KB of obfuscated
+     JavaScript, re-downloaded every time the reader opens a book (09:53:07:
+     674609b in 1146ms; 09:53:54: 813138b in 1240ms; 09:54:09 for the other
+     mirror host: 813138b in 767ms), and it is served even when every chapter and
+     the book detail came from cache. It is deliberately never stored: it is the
+     source of the short-lived `key=` a chapter URL carries, so a stale copy is a
+     chapter that will not decrypt.
+
+     The log already says enough to guess and not enough to know. Two answers for
+     the *same* book and host differ in size and in obfuscated prefix (674609
+     then 813138), yet `hostid=trxs` and `hostid=trxs2` answered with the same
+     813138 bytes and the same prefix -- so the payload is neither request-unique
+     nor constant, and the truncated `head=` cannot settle which. A digest of the
+     whole body can, on the next launch, without risking a single read.
+     */
+    private func noteGrantDigest(key: String, body: Data) -> String {
+        let digest = String(ContentCache.bodyHash(body).prefix(8))
+        let now = Date()
+        grantLock.lock()
+        let previous = grantDigests[key]
+        if grantDigests.count >= SangTacHttpPlugin.grantDigestLimit,
+           let oldest = grantDigests.min(by: { $0.value.at < $1.value.at })?.key {
+            grantDigests.removeValue(forKey: oldest)
+        }
+        grantDigests[key] = GrantDigest(digest: digest, at: now)
+        grantLock.unlock()
+
+        guard let previous = previous else { return " sha=\(digest) first" }
+        let age = Int(now.timeIntervalSince(previous.at))
+        if previous.digest == digest {
+            return " sha=\(digest) same as the answer \(age)s ago"
+        }
+        return " sha=\(digest) differs from \(previous.digest) seen \(age)s ago"
     }
 
     // MARK: - Request policy
@@ -953,11 +1056,17 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             // reader's content, and the one thing that must not happen is a
             // remembered 403 hiding a chapter that is sitting on disk.
             if let key = cacheKey, let policy = policy, !bypassCache,
-               let refused = self.refusal(for: key) {
+               let refused = self.refusal(for: key, cls: policy.cls) {
                 let age = Int(Date().timeIntervalSince(refused.at))
+                // Which layer answered matters: "remembered in this process" and
+                // "remembered from a previous launch" are the two halves of the
+                // claim, and a log that does not say which one is in force cannot
+                // prove either.
+                let why = refused.persisted
+                    ? "remembered on disk, \(Int(ContentCache.refusalRetention))s window"
+                    : "not retried within \(Int(SangTacHttpPlugin.refusalWindow))s"
                 self.cacheLog("\(method) \(url.absoluteString) refused again class="
-                    + "\(policy.cls.rawValue) age=\(age)s status=\(refused.status) "
-                    + "(not retried within \(Int(SangTacHttpPlugin.refusalWindow))s)")
+                    + "\(policy.cls.rawValue) age=\(age)s status=\(refused.status) (\(why))")
                 self.deliver(status: refused.status, contentType: refused.contentType,
                              headers: refused.headers, body: refused.body, url: url,
                              call: call, method: method, label: "refused",
@@ -1077,11 +1186,18 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                                 + self.cacheTotalsOnce())
                         case .reject(let why):
                             self.contentCache.noteReject()
+                            // The one class that is neither stored nor free to
+                            // re-fetch: record whether this answer is the same
+                            // as the last one, so the next log can decide whether
+                            // it ever may be reused (see `noteGrantDigest`).
+                            let evidence = policy.cls == .grant
+                                ? self.noteGrantDigest(key: key, body: body) : ""
                             self.cacheLog("\(method) \(url.absoluteString) not cached class="
                                 + "\(policy.cls.rawValue) status=\(http.statusCode) "
                                 + "bytes=\(body.count) content-type="
                                 + "\(contentType.isEmpty ? "none" : contentType)"
-                                + " (\(why)) head=" + SangTacHttpPlugin.head(body))
+                                + " (\(why)) head=" + SangTacHttpPlugin.head(body)
+                                + evidence)
                         }
                     } else if http.statusCode >= 400 {
                         // An error status used to leave no trace at all: this
@@ -1089,13 +1205,21 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                         // visible behaviour *is* a refusal -- an image slot on a
                         // mirror that blocks hotlinks -- never appeared in the log
                         // even once. It also went back to the network every time;
-                        // now it is remembered for a minute.
+                        // now it is remembered for a minute, and for an image it
+                        // is written down so the next launch is spared the same
+                        // 853ms (round-49 log: 09:53:04 and 09:53:46 in two
+                        // different processes, `in 853ms` twice).
                         self.contentCache.noteReject()
+                        let written = self.notePersistedRefusal(
+                            key: key, cls: policy.cls, status: http.statusCode,
+                            contentType: contentType, headers: headerMap, body: body)
                         self.cacheLog("\(method) \(url.absoluteString) not cached class="
                             + "\(policy.cls.rawValue) status=\(http.statusCode) "
                             + "bytes=\(body.count) content-type="
                             + "\(contentType.isEmpty ? "none" : contentType)"
-                            + " (HTTP error answer) head=" + SangTacHttpPlugin.head(body))
+                            + " (HTTP error answer) head=" + SangTacHttpPlugin.head(body)
+                            + (written ? " | refusal written to disk, "
+                                + "\(Int(ContentCache.refusalRetention))s window" : ""))
                         self.noteRefusal(key: key, status: http.statusCode,
                                          contentType: contentType, headers: headerMap,
                                          body: body)
@@ -1596,7 +1720,10 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         inFlightLock.unlock()
         guard !already else { return "" }
         let stats = contentCache.stats()
+        // `refusals=` is what proves a written-down refusal survived the process
+        // on a launch that never redrew the broken image, which is the one claim
+        // this round is making.
         return " | cache now entries=\(stats["entries"] ?? 0) bytes=\(stats["bytes"] ?? 0)"
-            + " hits=\(stats["hits"] ?? 0)"
+            + " hits=\(stats["hits"] ?? 0) refusals=\(contentCache.storedRefusalCount)"
     }
 }

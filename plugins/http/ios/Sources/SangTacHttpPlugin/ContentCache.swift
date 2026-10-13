@@ -503,6 +503,181 @@ final class ContentCache {
             at: entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
     }
 
+    // MARK: - Refusals that outlive the process
+
+    /// How long a refusal written to disk is trusted. Fixed, not sliding: a hit
+    /// does not push the deadline out, so a cover that is drawn on every launch
+    /// cannot keep its own "do not ask again" alive for the life of the install.
+    static let refusalRetention: TimeInterval = 30 * 60
+
+    /// The most records kept, oldest dropped first.
+    static let refusalLimit = 64
+
+    /// The largest refusal body worth putting on disk. A 4xx answer is a sentence
+    /// or, as here, one byte; this is not a second content cache.
+    static let refusalBodyCap = 8 * 1024
+
+    static let refusalFile = "refusals.json"
+
+    /// One refusal as it is written down and read back.
+    struct RefusalRecord {
+        let status: Int
+        let contentType: String
+        let headers: [String: String]
+        let body: Data
+        let at: Date
+    }
+
+    private struct PersistedRefusal: Codable {
+        var key = ""
+        var status = 0
+        var contentType = ""
+        var headers: [String: String] = [:]
+        var body = ""
+        var at: TimeInterval = 0
+    }
+
+    private let refusalLock = NSLock()
+    private var refusalStore: [String: RefusalRecord] = [:]
+    private var refusalStoreLoaded = false
+
+    /**
+     A refusal the plugin decided is worth remembering past this process.
+
+     Why the disk half lives here and not in the plugin: this directory is this
+     type's to own. `refusals.json` sits beside the `<hash>.meta`/`<hash>.body`
+     pairs, `loadIndex` only ever reads `*.meta` so it is invisible to the entry
+     index, and "clear the cache" has to drop it too or a clean slate would still
+     answer "do not ask again" for half an hour.
+
+     Why it exists at all: the in-process memory lasts 60 seconds, which covers
+     one screen drawing the same broken cover three times, but it does not
+     survive a launch -- and the round-49 device log shows exactly that hole. A
+     403 at 09:53:04 was not remembered by the 09:53:46 request 42 seconds later,
+     because 09:53:42 was a new process; the same process then answered
+     `age=2s`/`age=4s`/`age=20s` from memory with `in 0ms (refused)`. Every cold
+     launch therefore paid 853ms once, for a host that hotlink-blocks the link
+     (`www.trxs.cc`).
+
+     Why the window is short and fixed: a written-down refusal suppresses the very
+     request that would disprove it, so there is no success to clear it with and
+     the window is the only bound. Which is also why the caller restricts this to
+     images -- the worst case there is a thumbnail for half an hour, against
+     "cannot read this chapter" for the same half hour.
+     */
+    @discardableResult
+    func storeRefusal(key: String, status: Int, contentType: String,
+                      headers: [String: String], body: Data, at: Date) -> Bool {
+        guard let root = root, config.enabled else { return false }
+        guard status >= 400, !key.isEmpty, body.count <= ContentCache.refusalBodyCap
+        else { return false }
+
+        refusalLock.lock()
+        if !refusalStoreLoaded {
+            refusalStoreLoaded = true
+            refusalStore = ContentCache.readRefusals(root: root)
+        }
+        refusalStore = refusalStore.filter {
+            at.timeIntervalSince($0.value.at) < ContentCache.refusalRetention
+        }
+        if refusalStore.count >= ContentCache.refusalLimit,
+           let oldest = refusalStore.min(by: { $0.value.at < $1.value.at })?.key {
+            refusalStore.removeValue(forKey: oldest)
+        }
+        refusalStore[key] = RefusalRecord(status: status, contentType: contentType,
+                                          headers: headers, body: body, at: at)
+        let snapshot = refusalStore
+        refusalLock.unlock()
+        return ContentCache.writeRefusals(snapshot, root: root)
+    }
+
+    /// The refusal written down for `key`, or nil when there is none or it has
+    /// aged out. The age is checked here and not only at load time: a process can
+    /// run for hours, and a record read at launch must not outlive its window.
+    func storedRefusal(_ key: String) -> RefusalRecord? {
+        guard isEnabled else { return nil }
+        guard let hit = refusalStoreSnapshot(), let record = hit[key],
+              Date().timeIntervalSince(record.at) < ContentCache.refusalRetention
+        else { return nil }
+        return record
+    }
+
+    /// How many records are on disk and still inside their window. Part of the
+    /// launch totals line, so one log answers "did that write survive the
+    /// process?" even on a launch that never draws the broken image.
+    var storedRefusalCount: Int {
+        guard isEnabled else { return 0 }
+        let now = Date()
+        return (refusalStoreSnapshot() ?? [:]).values
+            .filter { now.timeIntervalSince($0.at) < ContentCache.refusalRetention }.count
+    }
+
+    /// The on-disk records, read once. Returns a copy; callers never hold the
+    /// lock across their own work. Named `…Snapshot` rather than `refusalStore`
+    /// so it is never confused with the stored property of that name.
+    private func refusalStoreSnapshot() -> [String: RefusalRecord]? {
+        guard let root = root else { return nil }
+        refusalLock.lock()
+        defer { refusalLock.unlock() }
+        if !refusalStoreLoaded {
+            refusalStoreLoaded = true
+            refusalStore = ContentCache.readRefusals(root: root)
+        }
+        return refusalStore
+    }
+
+    private func forgetRefusals(root: URL) {
+        refusalLock.lock()
+        refusalStore = [:]
+        refusalStoreLoaded = true
+        refusalLock.unlock()
+        try? FileManager.default.removeItem(
+            at: root.appendingPathComponent(ContentCache.refusalFile))
+    }
+
+    private static func readRefusals(root: URL?) -> [String: RefusalRecord] {
+        guard let root = root,
+              let data = try? Data(contentsOf: root.appendingPathComponent(refusalFile)),
+              let records = try? JSONDecoder().decode([PersistedRefusal].self, from: data)
+        else { return [:] }
+        let now = Date()
+        var loaded: [String: RefusalRecord] = [:]
+        for record in records {
+            guard !record.key.isEmpty, record.status >= 400,
+                  let body = Data(base64Encoded: record.body) else { continue }
+            let at = Date(timeIntervalSince1970: record.at)
+            guard now.timeIntervalSince(at) < refusalRetention else { continue }
+            loaded[record.key] = RefusalRecord(status: record.status,
+                                               contentType: record.contentType,
+                                               headers: record.headers, body: body, at: at)
+        }
+        return loaded
+    }
+
+    private static func writeRefusals(_ store: [String: RefusalRecord], root: URL) -> Bool {
+        // Sorted by key so an unchanged record set produces the same bytes: a
+        // file that reshuffles itself on every write is unreadable as evidence.
+        var records: [PersistedRefusal] = []
+        for key in store.keys.sorted() {
+            guard let record = store[key] else { continue }
+            var out = PersistedRefusal()
+            out.key = key
+            out.status = record.status
+            out.contentType = record.contentType
+            out.headers = record.headers
+            out.body = record.body.base64EncodedString()
+            out.at = record.at.timeIntervalSince1970
+            records.append(out)
+        }
+        guard let data = try? JSONEncoder().encode(records) else { return false }
+        do {
+            try data.write(to: root.appendingPathComponent(refusalFile), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// LRU by last access, bounded by both the entry count and the byte budget.
     /// Access times are flushed here rather than on every hit: a list page hits
     /// this cache dozens of times and each flush would be a small disk write on
@@ -568,6 +743,10 @@ final class ContentCache {
             try? FileManager.default.removeItem(
                 at: entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
         }
+        // The remembered refusals are the other thing in this directory: a user
+        // asking for a clean slate should not keep a 30-minute-old "do not ask
+        // again" for a cover they may have just fixed on the server.
+        if let root = root { forgetRefusals(root: root) }
         return ["entries": entries.count]
     }
 
