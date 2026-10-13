@@ -902,14 +902,27 @@ final class ContentCache {
      The JSON shape check below is what actually excludes an error page: an HTML
      interstitial, a login page or a bot challenge does not parse as a JSON object
      with `code == 0`, so nothing has to be inferred from the header.
+
+     **Neither may a size floor be part of this test, and that is the same mistake
+     twice.** This gate used to demand a body of at least four kilobytes and a
+     `data` of at least 256 characters. Both are stricter than the site, whose own
+     render test is only `cdata.code == "0"` (`chapterdisplay.js:790`, `:1813`,
+     `:3682` -- there is no length test anywhere in those files). The 2026-10-13
+     19:38 device log shows what the floors cost: chapter `c=931037660` is the
+     author's one-line notice "请假一天" -- 488 bytes, 117 characters of `data`, a
+     perfectly good chapter the site renders -- and the gate refused it as "smaller
+     than 4096 bytes" on every open, so it went back to the network three times in
+     that one log (607ms, 546ms, and 618ms in the earlier session) while never
+     being stored once. A floor can only ever reject real content: the shape checks
+     below already refuse an HTML interstitial, a truncated body, a non-zero `code`
+     and a non-string `data`, so the smallest surviving answer is a genuine one.
      */
     static func isChapterBody(_ body: Data, _ contentType: String) -> Acceptance {
-        guard body.count >= 4096 else { return .reject("smaller than 4096 bytes") }
         guard let object = jsonObject(body) else { return .reject("not a JSON object") }
         guard let value = code(object) else { return .reject("no code field") }
         guard value == 0 else { return .reject("code \(value)") }
         guard let text = object["data"] as? String else { return .reject("no data field") }
-        guard text.count >= 256 else { return .reject("data only \(text.count) chars") }
+        guard !text.isEmpty else { return .reject("empty data") }
         return .accept
     }
 

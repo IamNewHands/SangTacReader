@@ -5487,12 +5487,195 @@ P1 里最后一项。原方案要 `WKURLSchemeHandler`，而 `WKWebViewConfigura
 1. `[TTS] speak result … payload=…KB base64 audio=…s (…KB/s) in …ms` —— 读上 20 句就知道
    每句多少 KB、桥上一次多久。**判据**：若 `payload` 常在 200KB 以上、`in` 常超过 100ms，
    就做原生 AAC 转码（体积约 1/5）；若只有几十 KB 且 `in` 是十几毫秒，这条待办直接标「不做」。
+   → **已在 §6.57.1 结清：两个条件分别命中一半，而回归显示成本与体积无关（0.16ms/KB，
+   截距 248ms），结论是不做。** 下面那条判据是写在这里的原始版，保留以便对照。
 2. 构建日志里的 `NSAllowsArbitraryLoads = …`（第 13 步的 `before`/`after` 与产物复查那行）。
 
 ### 6.56.5 仍未证实 / 非目标
 
-- TTS 的实际体积与耗时（等上面第 1 条）。
+- TTS 的实际体积与耗时（等上面第 1 条）。→ **已答，见 §6.57.1。**
 - Capacitor 模板到底有没有开 `NSAllowsArbitraryLoads`（下一次构建的日志会写出来；无论答案是什么，
   产物复查都已经在盯着）。
 - ATS 关掉后真机上是否有 `http://` 子资源被拦（预期没有，回滚一次提交）。
+
+## §6.57 第 55 轮（提交名：第五十七轮）：第十份真机日志 —— TTS 那条待办有了数字（结论：不做），而章节接受条件里的体积门槛正在拒收真章节
+
+这份日志一个文件里装着两段会话：`13:38–13:53` 是旧包（没有 `speak result` 那行），
+`19:38–19:39` 是 `f4f9548` 的包，而且**真的开始朗读了** —— 36 条 `[TTS] speak result`。
+上一轮挂在 §6.56.5 的三条「仍未证实」，这一份一次答掉两条，还顺手暴露一个新缺陷。
+
+### 6.57.1 B：TTS 去 base64 —— 数字到手，判据要反过来读
+
+36 句，去掉首句冷启（862ms）后的 35 句：
+
+| 量 | 读数 |
+| --- | --- |
+| 跨桥 base64 体积 | 39–238KB，中位 106KB，均值 113.8KB（总计约 4.1MB） |
+| 换来的语音 | 0.7–4.1s，均值 1.99s |
+| 桥上一次耗时 | 212–253ms，均值 231ms（首句 862ms） |
+| 每句文本 | 3–21 字，均值 9.5 字 |
+
+**上一轮 §6.56.4 写的判据（「`payload` 常在 200KB 以上且 `in` 常超过 100ms 就做」）指向了错的东西。**
+两个条件分别命中了一半（体积中位 106KB < 200KB，耗时 231ms > 100ms），照字面读会得出「做」。
+把两个量回归一下就知道该听谁：
+
+```
+ms = 248.0 + 0.0082 × payloadKB        R² = 0.64（去冷启后 0.16ms/KB）
+```
+
+- **体积不是成本**：payload 从 39KB 涨到 238KB（6.1 倍），总耗时只从 212ms 走到 253ms —— **41ms**。
+  斜率 0.16ms/KB 意味着 AAC 转码（体积约 1/5）省下的是 **0.7ms（中位）到 1.6ms（最大）**。
+- **固定底噪才是全部成本**：截距 ~248ms。这 ~230ms 是「JS 调用 → `AVSpeechSynthesizer.write` 渲染整段
+  PCM → base64 编码 → 过桥 → JS `atob`/Blob」，与句子长短基本无关。
+- **而且它不在关键路径上**：相邻两句 `speakToFile` 的启动间隔平均 **2.06s**，每句音频平均 **1.99s**。
+  若合成串行在播放之后，间隔应当是 1.99 + 0.23 ≈ 2.22s；实测 2.06s 更短，说明**合成发生在上一句
+  播放期间** —— 站点自己的 `onstart prefetchnext`（日志里每句都跟着一行）就是这么设计的。231ms 只占
+  播放间隔的 11%，而且被这段播放盖住了。
+
+**结论：P1「TTS 去 base64」不做。** 两条独立理由：省下的量（≤1.6ms/句）与动机（体积）不符；
+真正的 248ms 底噪本来就藏在播放后面。另外原方案的 `WKURLSchemeHandler` 那条路本就不通
+（`WKWebViewConfiguration` 在 web view 创建时定死，插件 `load()` 已晚），而原生 AAC 转码要动的
+正是这条 248ms 里最贵的那一段（渲染 + 编码），不是为了体积。
+
+**一个仍然值得记的观察**（不属本轮范围）：首句冷启 862ms 是**唯一**没有前一句播放可遮挡的一次，
+用户点「朗读」后要等约 0.9s 才出声。若以后有人抱怨这个，杠杆是「进阅读器时预热合成器」，
+不是 AAC —— 但这份日志里没有任何「用户觉得慢」的证据，所以只记录、不动作。
+
+### 6.57.2 量测脚手架按既有约定撤掉
+
+`speak result` 那行是第 56 轮为「先量再动」加的，现在结论到手，按第 52–55 轮撤探针的同一约定撤掉
+（`[DEBUG-sig]` 那次同理）。撤掉几乎不损失信息：原生侧本来就有一行
+`[TTS] synthesised <bytes> bytes, <seconds>s`，体积与秒数都还在，那行只多给了跨桥耗时与 base64 体积。
+
+| 撤掉的东西 | 位置 |
+| --- | --- |
+| `startedAt` 与整个 `speak result` 日志块 | `SitePatch.swift`（`IosTts.prototype.speak`） |
+| 测试桩的 `ttsPayloadBytes` 选项 | `scripts/test-site-patch.js` |
+| 那条算术断言（`payload=144KB base64 audio=2.5s (43KB/s)`） | `scripts/test-site-patch.js` |
+
+读数与判据留在本节，需要时可按此重建。
+
+### 6.57.3 新缺陷：章节接受条件里的体积门槛在拒收真章节（已修）
+
+`isChapterBody` 原先有两道体积门槛：`body.count >= 4096` 与 `data` 至少 256 字符。
+**站点自己的渲染判据只有 `cdata.code == "0"`**（`chapterdisplay.js:790`、`:1813`、`:3682`；
+那三个文件里**根本没有长度判断**，grep `256` 零命中）。
+
+这份日志里的受害者是 `c=931037660` —— 作者的一行请假条：
+
+```
+19:38:08 [CACHE] GET …c=931037660… not cached class=chapter status=200 bytes=488
+         content-type=text/html; charset=utf-8 (smaller than 4096 bytes)
+         head={"code":"0","bookname":"…","chaptername":"Giấy nghỉ phép\n","data":"…请假一天。"
+19:38:08 [Http]  …c=931037660… -> 200 string 488b in 607ms
+19:39:35 [Http]  …c=931037660… -> 200 string 488b in 546ms
+```
+
+488 字节、`data` 117 字、`code == "0"` —— 站点照常渲染，我们每次打开都拒收并重新联网。
+同一份日志里它**三次走网络**（607ms / 546ms / 618ms），一次都没落盘。这不是「少省一次请求」，
+是「30 天缓存对这类章节完全失效」。
+
+**为什么这是同一种错第二次**：第一次是「content-type 含 `text/html` 就当错误页拒掉」（§4603 记着），
+站点所有 JSON 端点都用 `text/html` 发，于是每章都被拒、缓存永远是空的。两次都是**我们的判据比站点更严**，
+而**体积门槛只可能拒掉真内容** —— 形状判断已经挡住了 HTML 拦截页、截断的 body、`code != 0` 与非字符串
+`data`，能活下来的最小答案就是真答案。
+
+修法：两道门槛都撤掉，判据回到站点自己的契约 —— JSON 对象、`code == 0`、`data` 是非空字符串：
+
+```swift
+static func isChapterBody(_ body: Data, _ contentType: String) -> Acceptance {
+    guard let object = jsonObject(body) else { return .reject("not a JSON object") }
+    guard let value = code(object) else { return .reject("no code field") }
+    guard value == 0 else { return .reject("code \(value)") }
+    guard let text = object["data"] as? String else { return .reject("no data field") }
+    guard !text.isEmpty else { return .reject("empty data") }
+    return .accept
+}
+```
+
+顺带纠正文档里一处**错误归因**：`docs/optimization-verification-2026-09-23.md:116` 与
+`capacitor-port.md:4401` 都写着「`code == 0` 且带 ≥256 字符的 data —— 这正是三个显示类渲染前自己做的判断」。
+那三处判据**只有** `code == 0`，256 字是我们自己加的，与站点无关。历史验证文档（9-23 那份）按记录性质不改，
+在此更正。`optimization-verification-2026-09-23.md:122` 那条「`code 7/10002` 先被体积门拦下」的说法也随
+门槛一起失效 —— 现在挡住它们的是 `code == 0` 本身（7 ≠ 0，10002 ≠ 0），结论不变、守卫换了人。
+
+### 6.57.4 CI 加了反向守卫：体积门槛不许回来
+
+这两道门槛**删掉不会有任何编译错误**，只是日志里多几行拒绝 —— 静态检查看不见。
+所以在 `build-ipa.yml` 的内容缓存标记之后加了一段**反向**检查：`isChapterBody` 的函数体里
+不许再出现 `.count >= ` 或 `data only `。
+
+两个细节是本地试出来的（第一版写错了）：
+
+1. **必须把范围切到函数体**，不能全局 grep。文件里别处本来就有合法的体积判断（BOM 探测的
+   `body.count >= 3`、图片接受条件的 `.count >= 512`），全局 grep 会把它们当成回归。
+2. **不能拿日志文案当标记**。函数上方那段注释里原样写着旧的拒绝文案，`grep -F 'smaller than 4096 bytes'`
+   会被自己的说明文字触发。所以盯 `.count >= ` 这种**代码形状**，并且用 `awk` 范围限定。
+
+顺带被 `check-ios-shim.js` 抓到一次真错：`echo "…「$floor」…"` —— 中文引号紧跟变量名，
+bash 会把多字节字符折进变量名，`set -u` 直接让步骤失败。改成 `${floor}`。
+
+### 6.57.5 C：grant 仍无定论，但「每次都不一样」有了直接证据
+
+`grantcontext` 这一份日志里出现两次，**同一个 URL**（`?hostid=qidian&bookid=1044096078`）：
+
+| 时刻 | 体积 | 摘要 |
+| --- | --- | --- |
+| 13:38:56 | 840229 | `sha=94d68ac0 first` |
+| 13:52:31 | 649031 | `sha=4c84c334 first` |
+
+两条都是 `first`，因为**摘要记忆是进程内的**（`grantDigests` 是插件实例变量），而这两次分属两个进程
+（`13:52:10` 那次启动的 `cache now entries=37` 是第二个实例）。所以第 49 轮设计的
+`same as the answer` / `differs from` 那条线，只有**同一次启动内打开同一本书两次**才会打出来 ——
+而用户的实际用法（一次会话开一本书）基本不会产生这种序列。
+
+不过**体积本身就比摘要更直接**：同一 URL 两次取回 840229 与 649031 字节。加上第 49 轮的
+674609 / 813138，**四个样本四个不同**。`grant` 是章节 URL 里那个短命 `key=` 的来源，缓一份陈旧的
+`key=` 就是一章解不开密 —— 源码注释里「deliberately never stored」的理由正在这里。
+
+**结论：C 也标「不做」**，依据是「同一 URL 的体积每次都不同」＋「陈旧 key 会让章节解不开」。
+不再为它加跨进程摘要落盘：那是为一个已经被体积否定的假设增加持久化机制。
+
+### 6.57.6 D：跨天复用证实了（原问题的第一条诉求）
+
+用户最初的原话是「首页内容镜像缓存似乎没效果、详情/正文不缓存」，并且要**跨天复用**。
+这一份日志直接给出了证据 —— 封面在 `19:38:04` 命中时 `age=71249s`：
+
+```
+19:38:04 [CACHE] GET https://bookcover.yuewen.com/qdbimg/349573/1044096078/180
+         cache hit class=image age=71249s by=bookcover.yuewen.com
+```
+
+71249s = 19.79h，往回推是 **2026-10-12 23:50** —— 也就是**上一个日历日**取的图，今天照旧命中。
+同一份日志里 `chapter age=21549s`（5.99h）、`bookInfo age=22699s`（6.3h）、
+`chapterList age=99s` 全是命中。跨进程、跨小时的复用成立。
+
+另一条 D 的旁证：拒绝落盘跨进程活着 —— `13:38:42` 的汇总行是 `refusals=0`，那张 403 的图在
+`13:38:44` 写下拒绝，而 `13:52:14`（**另一个进程**）的汇总行变成 `refusals=1`。
+但「`remembered on disk` 是否真的省掉了那次网络」仍未证实：19:38 那段会话没再画那张图。
+
+### 6.57.7 一个待观察的新请求（本轮不动作）
+
+`19:39:35 [Http] POST https://sangtacviet.app/io/novel/updateOldLink -> 200 string 19b in 470ms` ——
+19 字节的响应花了 470ms，纯往返。它是站点在打开章节时上报「读到哪」的写操作，
+**按设计不入缓存**（写操作永不缓存，见 §4416），所以不属缓存问题。但它是否卡在打开路径上
+（站点是否 `await` 它再渲染）这份日志证明不了。记下来，等以后有卡顿读数时再看。
+
+### 6.57.8 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / **638019 字节**（撤掉日志块后少 1538）/ 141 标记 |
+| `scripts/test-site-patch.js` | **920 条断言**（撤掉 1 条算术断言）/ 0 失败 |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| workflow | YAML 解析通过，25 步（反向守卫加在既有步骤内，不新增步骤） |
+
+### 6.57.9 仍未证实 / 非目标
+
+- `isChapterBody` 放宽后的真机效果（下一次打开那本 640 章的书，`c=931037660` 应当变成
+  `cache hit` 而不再联网）。
+- 30 分钟拒绝窗口真的省掉一次网络（`remembered on disk` 那行仍未出现过）。
+- 首句冷启 862ms 的用户体感（无证据，只记录）。
+- `updateOldLink` 是否卡在打开路径上。
 

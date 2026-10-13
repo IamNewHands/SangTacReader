@@ -366,12 +366,42 @@ jobs:
           for marker in 'case chapterList' 'isChapterListBody' '6 * 3600' \
                         'case siteAsset' 'isBlankIdentity(' \
                         'refusalRetention' 'storeRefusal(key:' 'RefusalRecord' \
-                        'storedRefusal('; do
+                        'storedRefusal(' 'empty data'; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/ContentCache.swift; then
               echo "✓ $marker 还在内容缓存源码里"
             else
               echo "::error::$marker 缺失（章节列表缓存规则被删改）"
               exit 1
+            fi
+          done
+          # 第 55 轮把 `isChapterBody` 里的两道体积门槛撤掉了，这里必须**反向**盯住
+          # 它们不许回来。理由不是风格，是同一种错犯了两次：
+          #   * 第一次是「content-type 含 text/html 就当错误页拒掉」——站点所有 JSON
+          #     端点都用 text/html 发，于是每章都被拒、缓存永远是空的。
+          #   * 第二次是 `body.count >= 4096` 加 `data` 至少 256 字符。站点自己的
+          #     渲染判据只有 `cdata.code == "0"`（chapterdisplay.js:790/:1813/:3682，
+          #     那三个文件里根本没有长度判断）。19:38 的真机日志里 c=931037660 是
+          #     作者的一行请假条：488 字节、117 字 `data`，站点照常渲染，我们却在
+          #     每次打开时拒收（607ms/546ms/618ms 三次都走网络，一次都没落盘）。
+          # 体积门槛只可能拒掉真内容——上面那些形状判断已经挡住了 HTML 拦截页、
+          # 截断的 body、`code != 0` 与非字符串 `data`，能活下来的最小答案就是真答案。
+          # 这两条**没有编译错误**：删掉它们只是日志里多几行拒绝，静态检查里看不出来。
+          # 盯的是 `isChapterBody` 这个**函数体**，而不是整个文件：文件里别处
+          # （BOM 探测的 `body.count >= 3`、图片接受条件的 `.count >= 512`）本来就有
+          # 合法的体积判断，函数上方那段注释里也原样写着旧的拒绝文案——拿全局 grep
+          # 或拿文案当标记，都会被这些正常内容误触发。
+          chapter_gate=$(awk '/static func isChapterBody/,/^    }$/' \
+            plugins/http/ios/Sources/SangTacHttpPlugin/ContentCache.swift)
+          if [ -z "$chapter_gate" ]; then
+            echo "::error::找不到 isChapterBody 的函数体（章节接受条件被改名或删除）"
+            exit 1
+          fi
+          for floor in '.count >= ' 'data only '; do
+            if printf '%s' "$chapter_gate" | grep -q -F "$floor"; then
+              echo "::error::章节接受条件里又出现了体积门槛「${floor}」（站点自己只判 code == 0，加门槛只会拒掉真章节）"
+              exit 1
+            else
+              echo "✓ 章节接受条件里没有体积门槛「${floor}」"
             fi
           done
           # 首次启动的语言选择只能由原生提供：WKWebView 的 navigator.language 是

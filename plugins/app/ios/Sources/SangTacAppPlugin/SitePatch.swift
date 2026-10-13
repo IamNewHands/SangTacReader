@@ -1993,7 +1993,6 @@ enum SitePatch {
 
         IosTts.prototype.speak = function (text, options) {
             var self = this;
-            var startedAt = Date.now();
             var merged = options || {};
             var marked = (typeof text === 'string' && text.indexOf(READER_MARK) === 0);
             var spoken = marked ? text.substring(READER_MARK.length) : text;
@@ -2013,27 +2012,6 @@ enum SitePatch {
                 // ever sees a Blob.
                 var encoded = result;
                 if (result && typeof result === 'object') { encoded = result.data; }
-                if (window.__stvDiag) {
-                    // P1「TTS 去 base64」(2026-10-13): deciding whether to
-                    // transcode natively needs three numbers, not one -- how many
-                    // bytes crossed the bridge, how many seconds of speech they
-                    // bought, and how long the call took. A 22050Hz/16-bit/mono
-                    // clip is 43KB per second, so `payload` against `audio` is the
-                    // whole argument for (or against) AAC at about a fifth of it.
-                    var chars = (typeof encoded === 'string') ? encoded.length : 0;
-                    var seconds = (result && typeof result.duration === 'number') ? result.duration : 0;
-                    window.__stvDiag.log('TTS', 'speak result kind='
-                        + (result === null ? 'null' : typeof result)
-                        + ' payload=' + (chars ? Math.round(chars / 1024) + 'KB base64'
-                            : typeof encoded)
-                        + (seconds > 0
-                            ? ' audio=' + (Math.round(seconds * 10) / 10) + 's ('
-                                + Math.round(chars * 0.75 / 1024 / seconds) + 'KB/s)'
-                            : ' audio=unknown')
-                        + ' in ' + (Date.now() - startedAt) + 'ms'
-                        + ' text=' + (spoken || '').length + ' chars'
-                        + (marked ? ' (reader sentence, mark stripped)' : ''));
-                }
                 if (typeof encoded !== 'string' || encoded.length === 0) {
                     throw new Error('iOS TTS returned no audio (got '
                         + (result === null ? 'null' : typeof result) + ')');

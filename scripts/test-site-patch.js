@@ -1083,13 +1083,9 @@ function installFakeApp(sandbox, options) {
           calls.push(payload);
           // The real plugin resolves an object, not a bare string, and reports
           // how long the clip plays so the shim never has to decode the WAV
-          // through WebAudio just to learn it. `ttsPayloadBytes` sizes the clip
-          // for the P1「TTS 去 base64」measurement (22050Hz/16-bit/mono is 43KB
-          // per second of speech).
+          // through WebAudio just to learn it.
           return Promise.resolve({
-            data: typeof options.ttsPayloadBytes === 'number'
-              ? Buffer.alloc(options.ttsPayloadBytes, 1).toString('base64')
-              : Buffer.from('RIFFfakewav').toString('base64'),
+            data: Buffer.from('RIFFfakewav').toString('base64'),
             mime: 'audio/wav',
             duration: typeof options.ttsDuration === 'number' ? options.ttsDuration : 1.5,
           });
@@ -1469,10 +1465,6 @@ async function testTtsBackgroundPlayback() {
   installFakeApp(sandbox, {
     displayType: 'pageflip',
     ttsDuration: 2.5,
-    // 2.5s of 22050Hz/16-bit/mono speech is 110250 bytes of WAV, which is the
-    // 43KB/s the measurement line reports. Sized here so the arithmetic in that
-    // line is asserted with real numbers instead of a 12-byte stub.
-    ttsPayloadBytes: 110250,
   });
 
   const calls = { webAudio: 0, decoded: 0, played: 0 };
@@ -1514,13 +1506,6 @@ async function testTtsBackgroundPlayback() {
   const blob = await provider.speak('第一句', { voice: 'v', rate: 1 });
   check('the native clip length rides along on the Blob',
     blob.__stvDuration === 2.5, String(blob.__stvDuration));
-  // P1「TTS 去 base64」: the decision needs bytes, seconds and elapsed time in
-  // one line -- 144KB of base64 for 2.5s of speech is 43KB/s, which is what a
-  // native AAC transcode would cut to about a fifth.
-  const ttsLine = String(sandbox.window.__stvDiag.text() || '')
-    .split('\n').filter((line) => line.indexOf('speak result') >= 0).pop() || '';
-  check('the TTS line prices the payload against the audio it bought',
-    ttsLine.indexOf('payload=144KB base64 audio=2.5s (43KB/s) in ') >= 0, ttsLine);
 
   const decoded = await sandbox.ttsEngine.decodeAudio(blob);
   check('our own clip is never decoded through WebAudio',
