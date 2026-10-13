@@ -46,6 +46,9 @@ enum ContentClass: String, CaseIterable {
     case userInfo
     /// `/mobile/comment.php?act=readcomment…&start=0` -- the first comment page.
     case comment
+    /// `/mobile/lang/<code>.json` -- the site's own UI strings, 5321 bytes, and
+    /// the second-largest wait in the 2026-10-13 log (see the policy below).
+    case siteAsset
     /// `/io/grantcontext/context?hostid&bookid` -- 844KB, and the source of the
     /// short-lived `key=` the chapter URLs carry (`app.v2.read.js:535-551`).
     case grant
@@ -176,6 +179,20 @@ enum ContentPolicies {
         case .comment:
             return ContentPolicy(cls: cls, ttl: min(300, cap),
                                  serveStale: false, revalidate: false,
+                                 accepts: ContentCache.isJSONBody)
+        case .siteAsset:
+            // The site's own UI strings: 5321 bytes that have not changed in
+            // months, fetched through this plugin on **every** launch of the
+            // 2026-10-13 log at 681-1716ms (`GET /mobile/lang/zh.json -> 200
+            // application/json json 5321b in 1174ms`, 7 times in 7 launches).
+            // The URLSession layer cannot help here -- the server sends no
+            // validator, so `useProtocolCachePolicy` refetches every time --
+            // which is why this is the one class that is worth a day of TTL on
+            // 5KB: within 24h the reader pays nothing and no request is made,
+            // after that they see the previous table once and it refreshes
+            // behind them.
+            return ContentPolicy(cls: cls, ttl: min(day, cap),
+                                 serveStale: true, revalidate: true,
                                  accepts: ContentCache.isJSONBody)
         case .grant:
             // The token inside may be single-use or time-limited (unproven), so
@@ -676,6 +693,11 @@ final class ContentCache {
     }
 
     /// The numeric value of a JSON `code`, whether the server sent `0` or `"0"`.
+    ///
+    /// Not every endpoint means a status by it: `userinfo.php` carries a
+    /// top-level `code` of 400 next to the account's own `id`/`name` (round-48
+    /// device log). Callers therefore read this only after positive proof of a
+    /// good answer has failed to appear -- see `isReusableJSON`.
     private static func code(_ object: [String: Any]) -> Int? {
         guard let raw = object["code"] else { return nil }
         if let number = raw as? NSNumber { return number.intValue }
@@ -773,6 +795,20 @@ final class ContentCache {
 
      A bot challenge is still refused here: that is the one shape that parsing
      cannot rule out on its own.
+
+     Loose is not loose enough to read `code` as a status here. The round-48 log
+     says what that cost, in the one line the new diagnostics were added to produce:
+
+         POST …/mobile/userinfo.php not cached class=userInfo status=200 bytes=454
+              content-type=text/html; charset=utf-8 (failure code 400)
+              head={"id":"306185","name":"mingzihaojiandan","displayname":"@baipiao","avatar":"http…
+
+     The head is a perfectly good signed-in profile, and the gate refused it
+     because the body carries a top-level `code` of 400 that is not a status at
+     all (a real `code: 400` never arrives together with the account's own `id`
+     and `name`). So identity is read first, and `code` only decides when the
+     answer does not name its owner -- which is exactly what a login wall looks
+     like.
      */
     static func isReusableJSON(_ body: Data, _ contentType: String) -> Acceptance {
         let data = stripped(body)
@@ -787,6 +823,11 @@ final class ContentCache {
                message.lowercased().contains("challenge_required") {
                 return .reject("bot challenge")
             }
+            // Positive proof first: a real profile names its own owner, and the
+            // `code` field next to it is then not a verdict on the request.
+            if let identity = object["id"], !isBlankIdentity(identity) {
+                return .accept
+            }
             if let value = code(object), rejectionCodes.contains(value) {
                 return .reject("failure code \(value)")
             }
@@ -796,6 +837,17 @@ final class ContentCache {
             return array.isEmpty ? .reject("empty array") : .accept
         }
         return .reject("not a JSON container")
+    }
+
+    /// Whether an identity field carries something rather than nothing. The site
+    /// sends `"id":"306185"` as a string here and as a number on other
+    /// endpoints, so both shapes have to be read.
+    private static func isBlankIdentity(_ raw: Any) -> Bool {
+        if let text = raw as? String {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if let number = raw as? NSNumber { return number.intValue == 0 }
+        return raw is NSNull
     }
 
     /**

@@ -4712,3 +4712,131 @@ XHR 计数行加上**调用栈首两帧**（`whereFrom()`，用 `String.fromChar
 - SWR 的自动重绘钩子（`contentRefreshed` 至今未触发：列表要先走到 stale 且内容真有变化）。
 - `grant` 不缓存的取舍是否划算（换书时 560–908KB / 0.6–1.6s 一次）。
 - 首页首屏从"黑屏等待"变成"本地出内容"的实际观感（本机无法测量观感，只能看 `[BOOT]` 与命中的时间线）。
+
+## §6.49 第 47 轮（提交名：第四十九轮）：第四份真机日志 —— 缺口补上后，答案指向三条具体的慢
+
+输入：`stv-diagnostic-20261013-092751.log`（1564 行，23:51:17–09:27:46，7 次启动）。
+
+先交代一件容易读错的事：这份日志里 **09:00/09:01/09:02 那三次启动还是第 47 轮的包**（它们的拒绝行仍写
+`(not the shape this class accepts)`，而第 48 轮的包会写具体原因）。01:14:33Z 那次发布是 **09:14 本地时间**，
+所以第 48 轮 + 本轮修的东西，只体现在 **09:26:25 / 09:27:17 两次启动**上。
+
+### 6.49.1 第 48 轮要证的三件事，都在真机上被证实了
+
+| 证据 | 说明 |
+| --- | --- |
+| `09:26:27 … not cached class=userInfo … (failure code 400) head={"id":"306185",…` | 拒绝行第一次**说清了是哪条判据**，并带上 body 形状 |
+| `09:26:43 … not cached class=grant … (not stored by design (see the comment above)) head=(()=>{var ˋ…` | `grant` 从「碰巧被拒」变成「明说不存」 |
+| `09:26:25 POST …/booklist.php?method=history cache stale class=homeList age=1545s refresh=scheduled` | **SWR 第一次在真机上走到**（§6.48.4 里那条未证实项） |
+| `09:26:25 … -> 200 … 8398b in 1ms (stale)` + `background refresh class=homeList changed=no` | 先出内容（1ms），后台再取新；内容没变则只是把时钟推回去 |
+| `09:26:44 … cached class=chapter ttl=2592000s bytes=10114 \| cache now entries=14 bytes=209718 hits=6` | 每次启动第一行落盘自带规模 |
+| `09:27:30 … cached class=chapter … bytes=9218 \| cache now entries=18 bytes=249533 hits=8` | 规模随阅读增长，18 条 ≈ 250KB |
+
+**速度上的落点**（同一份日志里冷热对比）：
+
+| 请求 | 冷（缓存前） | 热（本轮日志） |
+| --- | --- | --- |
+| `booklist.php?method=history` 首页列表 | `23:51:18 … in 544ms` | `09:27:17 … 8398b in 2ms (cache)` |
+| `getchapterlist` 目录 | `08:38:51 … 1484ms` 级 | `09:27:22 … 15671b in 2ms (cache)` / `09:27:24 … 1ms` |
+| `readchapter` 正文 | `09:27:30 c=98 in 665ms`、`09:27:37 c=90 in 774ms`（新章） | `09:27:28 c=96/95/97 in 0ms/1ms/0ms (cache)` |
+| `bookinfo.php` 详情 | — | `09:27:28 … 2950b in 0ms (cache)` |
+
+09:26/09:27 两次启动里 `went through the page own XMLHttpRequest` **0 行**。
+
+### 6.49.2 缺口补上后的第一个答案：`userinfo` 是被自己的 `code` 误伤
+
+```
+09:26:27 [CACHE] POST …/mobile/userinfo.php not cached class=userInfo status=200 bytes=454
+        content-type=text/html; charset=utf-8 (failure code 400)
+        head={"id":"306185","name":"mingzihaojiandan","displayname":"@baipiao","avatar":"http…
+```
+
+`failure code 400` 只有一条路径能产生：`code(object)` 从**顶层**读到 `code` 且落在 `rejectionCodes` 里。
+而同一行的 `head` 是一份完好的已登录资料（`id` + `name` + `avatar`）。也就是说：**`userinfo.php` 顶层带了一个
+`code=400`，它不是状态码**——真正的失败码不会和账号自己的 `id`/`name` 一起回来。第 47 轮去掉 `text/html` 判据
+之后剩下的这一条，是被「`code` 一律当状态码」读错了。
+
+修法：`isReusableJSON` 改成**身份优先**——先看这条答案有没有报出它自己的主人（顶层 `id` 非空，字符串与数字
+两种形状都读），有就直接接受；**只有**在答案说不出主人时才回头把 `code` 当状态码读（那正是登录墙的样子）。
+挑战页仍然先于两者被拒（`message` 含 `challenge_required`）。
+
+### 6.49.3 剩下的慢，按这份日志排出来的账
+
+| 请求 | 次数 | 每次 | 现状 |
+| --- | --- | --- | --- |
+| `GET /warp.php`（镜像探活，3 个域名） | 21（3/次启动） | 652 / 924 / 1636ms | §6.25 的地盘，不动 |
+| `GET /mobile/lang/zh.json`（5321b，站点自己的界面文案） | 7（**每次都下**） | 681–1716ms | **未入缓存**：`contentClass` 里没有它的规则 |
+| `POST /mobile/userinfo.php` | 8（2/次启动，1 次被合并） | 546–657ms | 被上一条误伤 |
+| `GET /io/grantcontext/context` | 9（1/次进入阅读器） | 0.6–1.6s / 559–909KB | 设计如此（见 6.49.5） |
+| `GET www.trxs.cc/…08e0d41f….jpeg`（封面） | 9（1–3/次启动） | 852ms | 403，且**同一张在一次启动里被画三次**（09:01:00 / :19 / :22） |
+| `POST /mobile/booklist.php?method=history` | 8 | 0–2ms | ✅ |
+| `GET /?sajax=readchapter` | 40 | 0–2ms | ✅ |
+
+另外顺手确认了两条只读事实：
+
+- **非 2xx 的答案以前一行都不进日志**：落盘/拒绝那个分支的前置条件是 `statusCode >= 200 && < 300`，
+  所以一个「行为本身就是被拒」的类（图片槽碰上防盗链）在这份 1564 行的日志里**一次都没有出现过**。
+  这和第 48 轮修的 `userinfo` 是同一类缺口，只是换了一道门。
+- **`[ERR] GET …jpeg -> 403 text/html base64 1b`** 里的 `base64` 是**载荷种类**（`responsePayload` 对
+  `blob`/`arraybuffer` 的输出），不是请求的 `responseType`：所以这张封面走的确实是 `.image` 那条分类，
+  只是被 403 挡在决策块之外。原以为「`base64` 没被识别成图片」的猜测是错的，记录在此以免下一轮再猜。
+
+### 6.49.4 本轮改动清单（逐项）
+
+| # | 改动 | 文件 | 依据 |
+| --- | --- | --- | --- |
+| 1 | `isReusableJSON` 身份优先：顶层 `id` 非空即接受，`code` 只在没有身份时才当状态码 | `ContentCache.swift` | 6.49.2 的那一行 |
+| 2 | 新增 `ContentClass.siteAsset` + 策略（TTL 1 天、SWR、`isJSONBody`），`/mobile/lang/*.json` 归它；`includesHost` 里与正文/目录同组（各镜像同字节） | `ContentCache.swift`、`SangTacHttpPlugin.swift` | 6.49.3 第 2 行 |
+| 3 | 非 2xx 也写一行缓存决策（`(HTTP error answer)` + `head=`），4xx/5xx 的拒绝**在内存里记 60 秒**（进程内、128 条上限、只记 ≥400、不落盘），窗口内重复请求直接回放那个拒绝（面板标签 `refused`） | `SangTacHttpPlugin.swift` | 6.49.3 第 5 行 + 「顺手确认」第 1 条 |
+| 4 | CI 源码守卫新增 6 个标记（`/mobile/lang/`、`(HTTP error answer)`、`refused again class=`、`noteRefusal(key: key`、`case siteAsset`、`isBlankIdentity(`） | `.github/workflows/build-ipa.yml` | 这四条都没有 UI，丢了只看得出「又变慢了」 |
+
+第 3 条的窗口是 60 秒，不是整场会话：一次启动里那张封面被画三次（相隔 19s / 3s）会被合并，
+而一个中途解除的封锁不会在整个会话里被记死。回放的是**服务器自己刚给的那份答复**（同一个状态码、
+同一段 body），所以页面看到的东西与不记时完全一样，省下的只是 852ms×N。
+
+### 6.49.5 明确**不**做的两条（附理由，供下一轮判断）
+
+1. **不把 `/mobile/lang/` 加进 JS 的改道清单 `ROUTED`。** 表面看能让它必定走原生插件，但改道会把请求交给
+   `app.net.getCapacitor`，若那条路径对 `lang.json` 返回的形状与站点自己那条不同，坏的是**整个界面**
+   （所有文案变 key），而收益只是「本来 7/7 次就已经走插件了」的确定性。收益不抵风险，记在这里：
+   下一份日志若出现**一次 681–1716ms 的 `lang.json` 却没有 `[CACHE]` 行**，说明那次它走的是页面自己的
+   XHR，那时再谈改道。
+2. **不给 `grant` 加 60 秒记忆。** 这份日志里同一本书在**同一个进程内**取了两次（09:26:43 与 09:27:27，
+   相隔 44s，702KB + 802KB），所以「一次进入阅读器一次」是站点自己的行为，记忆能省下一次；但
+   `grantcontext` 里的 `key=` 是章节 URL 带的令牌，它是否**一次性**、是否绑定单次阅读会话仍未证实，
+   而赌错的代价是**章节读不出来**（§6.45 的那条不对称判断仍然成立）。新增的证据只有一条：09:27:27 取了
+   `grant` 之后 09:27:30 / 09:27:37 两次真实章节读取成功 —— 说明这个令牌至少服务于**同一次阅读会话内的
+   多次读取**，但跨阅读会话复用仍无证据。要做就得先有一个能观测「读失败」的探针。
+
+### 6.49.6 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 27 块 / 635286 字节 / 138 标记（注入 JS 未改） |
+| `scripts/test-site-patch.js` | 908 条断言（JS 未改） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI 源码守卫 | 新增 6 个标记，见 6.49.4 第 4 项 |
+
+本轮改动全在原生侧，本机没有 Swift 工具链：编译与守卫由 CI 负责，**判据是否误伤由下一份日志负责**。
+
+### 6.49.7 下一份日志要看的行
+
+1. `POST …/mobile/userinfo.php cached class=userInfo ttl=60s bytes=454` → 身份优先生效；
+   若仍出现 `not cached … (…)`，那行的 `(原因) head=` 就是答案。
+2. `GET …/mobile/lang/zh.json cached class=siteAsset ttl=86400s bytes=5321`，之后每次启动
+   `cache hit class=siteAsset age=…s`（**下一次启动就该是 0ms**）。
+3. `GET …08e0d41f….jpeg … not cached class=image status=403 … (HTTP error answer) head=`，
+   紧接着同一次启动里 `refused again class=image age=…s` → 三次 852ms 变成一次。
+4. `| cache now entries=… bytes=… hits=…` 是否随条目增加而出现（第 48 轮那条规模行）。
+
+### 6.49.8 仍未证实
+
+- 「隔天再读」的体感（需要跨天两次启动；到本轮为止只做到了同日跨启动 + 跨版本存活）。
+- SWR 的自动重绘钩子 `contentRefreshed`：`changed=no` 时不该触发，所以这份日志没触发**是对的**，
+  但 `changed=yes` 的那条路仍然一次都没走过。
+- `refreshBehind` 的 304 分支（`revalidate: true` 的类要等 TTL 过期才会走到，本轮日志跨度 47 分钟，
+  目录 TTL 是 6 小时）。
+- `grant` 的取舍（6.49.5 第 2 条）。
+- 401/403 类错误状态被记 60 秒后，若站点中途解除封锁，封面会晚最多一分钟才回来——这是本轮接受的取舍，
+  真机上没有观察到（这张封面在整份日志里一直是 403）。

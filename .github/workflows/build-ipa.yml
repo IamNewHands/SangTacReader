@@ -295,8 +295,19 @@ jobs:
           # 第 48 轮又补两条：拒绝要说清是哪条判据拒的（`case .reject(let why)`），
           # 以及那条答案实际长什么样（`head=`）—— 否则「not the shape this class
           # accepts」只说明有人在拒，不说明为什么，只能再猜一轮。
+          # 第 49 轮的三条：
+          #   `/mobile/lang/`       —— 站点自己的界面文案（5321 字节）是这份日志里
+          #                            每次启动都要等 681-1716ms 的那一个请求，少了
+          #                            这条分类它就又回到「每次启动都下一次」。
+          #   `(HTTP error answer)` —— 4xx/5xx 以前完全不进决策块，于是一个「行为
+          #                            就是被拒」的类（图片槽碰上防盗链）在日志里
+          #                            一行都没有。
+          #   `refused again` / `noteRefusal(` —— 同一张坏封面一次启动里被画三次
+          #                            （852ms/次），一分钟内的重复拒绝不再打网络。
           for marker in 'sajax=getchapterlist' 'contentClass(method:' 'cacheLog(' \
-                        'case .reject(let why)' 'SangTacHttpPlugin.head('; do
+                        'case .reject(let why)' 'SangTacHttpPlugin.head(' \
+                        '/mobile/lang/' '(HTTP error answer)' \
+                        'refused again class=' 'noteRefusal(key: key'; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
               echo "✓ $marker 还在响应缓存源码里"
             else
@@ -304,7 +315,8 @@ jobs:
               exit 1
             fi
           done
-          for marker in 'case chapterList' 'isChapterListBody' '6 * 3600'; do
+          for marker in 'case chapterList' 'isChapterListBody' '6 * 3600' \
+                        'case siteAsset' 'isBlankIdentity('; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/ContentCache.swift; then
               echo "✓ $marker 还在内容缓存源码里"
             else

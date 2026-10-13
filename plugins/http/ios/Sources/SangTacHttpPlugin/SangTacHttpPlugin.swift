@@ -139,6 +139,16 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             // a visible duplicate or a skip rather than a saved round trip.
             return text.contains("start=0") ? .comment : nil
         }
+        if text.contains("/mobile/lang/") {
+            // `zh.json`, `vi.json`: the site's own UI strings, 5321 bytes, and
+            // the one URL this plugin sees on every single launch (round-48 log,
+            // 681-1716ms). GET only, and only the `.json` tables -- nothing else
+            // lives in that directory today, but a path test is cheaper than
+            // trusting that.
+            guard method.caseInsensitiveCompare("GET") == .orderedSame else { return nil }
+            guard url.pathExtension.lowercased() == "json" else { return nil }
+            return .siteAsset
+        }
         if text.contains("/io/grantcontext/context") { return .grant }
         // Covers and page images: the site fetches every one of them through
         // `Http.get({responseType: 'blob'})` (app.v2.js:7328-7337). Whether the
@@ -159,7 +169,12 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
     /// failure this cache exists to remove.
     static func includesHost(_ cls: ContentClass) -> Bool {
         switch cls {
-        case .chapter, .chapterList: return false
+        // `siteAsset` joins the two read endpoints: the same table is served
+        // byte-identically from every mirror (the round-48 log has
+        // `sangtacviet.app/mobile/lang/zh.json` and `sangtacviet.com/…` at the
+        // same 5321 bytes), so keying on the host would throw the entry away on
+        // every mirror change -- the failure this cache exists to remove.
+        case .chapter, .chapterList, .siteAsset: return false
         default: return true
         }
     }
@@ -220,6 +235,87 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         inFlightLock.unlock()
         guard let entry = entry else { return }
         for waiter in entry.waiters { waiter(answer) }
+    }
+
+    // MARK: - Refusals (in memory, one session)
+
+    /// How long a server-side refusal is remembered. Long enough to cover one
+    /// screen drawing the same broken cover three times (round-48 log: 09:01:00,
+    /// 09:01:19, 09:01:22 -- 852ms each), short enough that a block which lifts
+    /// mid-session is not remembered for the rest of it.
+    private static let refusalWindow: TimeInterval = 60
+
+    /// The largest refusal body worth keeping -- a 4xx answer is a sentence or,
+    /// as here, a single byte; a 5xx answer can be a whole HTML document, and
+    /// the point of this memory is to save a round trip, not to become a second
+    /// cache.
+    private static let refusalBodyCap = 64 * 1024
+
+    /// The most refusals held at once, oldest dropped first. A screenful of
+    /// broken covers is a handful; a bound keeps a pathological list from
+    /// growing for the life of the process.
+    private static let refusalLimit = 128
+
+    private struct Refusal {
+        let status: Int
+        let contentType: String
+        let headers: [String: String]
+        let body: Data
+        let at: Date
+    }
+
+    private let refusalLock = NSLock()
+    private var refusals: [String: Refusal] = [:]
+
+    /**
+     Remember a refusal for `refusalWindow` so the next identical request is
+     answered without touching the network.
+
+     Only a status the server itself used to say no (>= 400) goes in here. A 2xx
+     answer is the content cache's business, and the two must not be confused:
+     `grantcontext` answers 200 with 700-900KB and is deliberately not stored,
+     so it must never be picked up by this path either.
+
+     The case this exists for is in the round-48 log:
+
+         GET https://www.trxs.cc/d/file/tongren/20260810/08e0d41f…jpeg
+             -> 403 text/html base64 1b in 852ms
+
+     three times in one launch, because the detail page and the list each draw
+     that cover. Its host hotlink-blocks this link, so 60 seconds of "do not ask
+     again" costs at most a broken cover that would have stayed broken anyway --
+     and a refusal is never written to disk, so nothing survives the process.
+     */
+    private func noteRefusal(key: String, status: Int, contentType: String,
+                             headers: [String: String], body: Data) {
+        guard body.count <= SangTacHttpPlugin.refusalBodyCap else { return }
+        let now = Date()
+        refusalLock.lock()
+        refusals = refusals.filter {
+            now.timeIntervalSince($0.value.at) < SangTacHttpPlugin.refusalWindow
+        }
+        if refusals.count >= SangTacHttpPlugin.refusalLimit,
+           let oldest = refusals.min(by: { $0.value.at < $1.value.at })?.key {
+            refusals.removeValue(forKey: oldest)
+        }
+        refusals[key] = Refusal(status: status, contentType: contentType,
+                                headers: headers, body: body, at: now)
+        refusalLock.unlock()
+    }
+
+    /// The remembered refusal for `key`, or nil when there is none or it has aged
+    /// out. An aged-out entry is dropped as it is noticed, so this memory cannot
+    /// outlive its own window.
+    private func refusal(for key: String) -> Refusal? {
+        let now = Date()
+        refusalLock.lock()
+        defer { refusalLock.unlock() }
+        guard let hit = refusals[key] else { return nil }
+        if now.timeIntervalSince(hit.at) >= SangTacHttpPlugin.refusalWindow {
+            refusals.removeValue(forKey: key)
+            return nil
+        }
+        return hit
     }
 
     // MARK: - Request policy
@@ -852,6 +948,23 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 }
             }
 
+            // 1b. A refusal we have already paid for -------------------------
+            // Deliberately after the disk lookup: a stale answer is still the
+            // reader's content, and the one thing that must not happen is a
+            // remembered 403 hiding a chapter that is sitting on disk.
+            if let key = cacheKey, let policy = policy, !bypassCache,
+               let refused = self.refusal(for: key) {
+                let age = Int(Date().timeIntervalSince(refused.at))
+                self.cacheLog("\(method) \(url.absoluteString) refused again class="
+                    + "\(policy.cls.rawValue) age=\(age)s status=\(refused.status) "
+                    + "(not retried within \(Int(SangTacHttpPlugin.refusalWindow))s)")
+                self.deliver(status: refused.status, contentType: refused.contentType,
+                             headers: refused.headers, body: refused.body, url: url,
+                             call: call, method: method, label: "refused",
+                             elapsedMs: elapsedMs())
+                return
+            }
+
             // 2. The network half, shared with any identical request already on
             //    the wire ----------------------------------------------------
             var request = URLRequest(url: url)
@@ -951,24 +1064,41 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 // Keep the answer for the next launch. The class's own `accepts`
                 // is what decides, and a refusal is logged with its reason so that
                 // a "nothing is being cached" report has an answer in the log.
-                if let key = cacheKey, let policy = policy, !bypassCache,
-                   http.statusCode >= 200, http.statusCode < 300 {
-                    switch policy.accepts(body, contentType) {
-                    case .accept:
-                        self.contentCache.store(key: key, cls: policy.cls, status: http.statusCode,
-                                                contentType: contentType, headers: headerMap,
-                                                body: body, ttl: policy.ttl,
-                                                servedBy: url.host ?? "")
-                        self.cacheLog("\(method) \(url.absoluteString) cached class="
-                            + "\(policy.cls.rawValue) ttl=\(Int(policy.ttl))s bytes=\(body.count)"
-                            + self.cacheTotalsOnce())
-                    case .reject(let why):
+                if let key = cacheKey, let policy = policy, !bypassCache {
+                    if http.statusCode >= 200, http.statusCode < 300 {
+                        switch policy.accepts(body, contentType) {
+                        case .accept:
+                            self.contentCache.store(key: key, cls: policy.cls, status: http.statusCode,
+                                                    contentType: contentType, headers: headerMap,
+                                                    body: body, ttl: policy.ttl,
+                                                    servedBy: url.host ?? "")
+                            self.cacheLog("\(method) \(url.absoluteString) cached class="
+                                + "\(policy.cls.rawValue) ttl=\(Int(policy.ttl))s bytes=\(body.count)"
+                                + self.cacheTotalsOnce())
+                        case .reject(let why):
+                            self.contentCache.noteReject()
+                            self.cacheLog("\(method) \(url.absoluteString) not cached class="
+                                + "\(policy.cls.rawValue) status=\(http.statusCode) "
+                                + "bytes=\(body.count) content-type="
+                                + "\(contentType.isEmpty ? "none" : contentType)"
+                                + " (\(why)) head=" + SangTacHttpPlugin.head(body))
+                        }
+                    } else if http.statusCode >= 400 {
+                        // An error status used to leave no trace at all: this
+                        // whole block only ran for 2xx, so the one class whose
+                        // visible behaviour *is* a refusal -- an image slot on a
+                        // mirror that blocks hotlinks -- never appeared in the log
+                        // even once. It also went back to the network every time;
+                        // now it is remembered for a minute.
                         self.contentCache.noteReject()
                         self.cacheLog("\(method) \(url.absoluteString) not cached class="
                             + "\(policy.cls.rawValue) status=\(http.statusCode) "
                             + "bytes=\(body.count) content-type="
                             + "\(contentType.isEmpty ? "none" : contentType)"
-                            + " (\(why)) head=" + SangTacHttpPlugin.head(body))
+                            + " (HTTP error answer) head=" + SangTacHttpPlugin.head(body))
+                        self.noteRefusal(key: key, status: http.statusCode,
+                                         contentType: contentType, headers: headerMap,
+                                         body: body)
                     }
                 }
 
