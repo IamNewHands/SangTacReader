@@ -4478,7 +4478,7 @@ ui.scrollto=function(ele,offset, scroller){
 | 2 | 内容缓存本体：磁盘两级、类策略、键归一、预算 LRU | `SangTacHttpPlugin.swift` | CI 编译过 + 真机 `[CACHE] store` |
 | 3 | 请求合并 + 304 + SWR + `rescan` 绕行 + `contentRefreshed` | `SangTacHttpPlugin.swift` | 真机同一 URL 只出现一次 `in Nms`；第二次 `304 reused` |
 | 4 | 插件方法 `cacheStats`/`cacheConfig`/`clearCache` + 配置持久化 | `SangTacHttpPlugin.swift` | 设置行能读回 |
-| 5 | 启动预热（原生 userinfo + 页面抢先发默认 tab） | `SangTacHttpPlugin.swift`、`SitePatch.swift` | `[CACHE] prewarmed` |
+| 5 | 启动预热（原生 userinfo + 页面抢先发默认 tab） | `SangTacHttpPlugin.swift`、`SitePatch.swift` | `[CACHE] prewarmed` → **注意**：它曾经是空转的，验收点见 §6.58.2 |
 | 6 | 设置页「缓存」区块 | `SitePatch.swift`（`onSettingsPage`） | test-site-patch 断言 + 真机可点 |
 | 7 | 刷新钩子块 `contentRefresh` | `SitePatch.swift`（新块） | 断言 + 真机 `contentRefreshed` |
 | 8 | `img.*`/`font_*` 迁到文件（含迁移） | `SitePatch.swift`、`SangTacAppPlugin.swift` | 断言 + 真机 UserDefaults 不再增长 |
@@ -5674,8 +5674,117 @@ bash 会把多字节字符折进变量名，`set -u` 直接让步骤失败。改
 ### 6.57.9 仍未证实 / 非目标
 
 - `isChapterBody` 放宽后的真机效果（下一次打开那本 640 章的书，`c=931037660` 应当变成
-  `cache hit` 而不再联网）。
+  `cache hit` 而不再联网）。→ **已证，见 §6.58.1。**
 - 30 分钟拒绝窗口真的省掉一次网络（`remembered on disk` 那行仍未出现过）。
 - 首句冷启 862ms 的用户体感（无证据，只记录）。
 - `updateOldLink` 是否卡在打开路径上。
+
+## §6.58 第 56 轮（提交名：第五十八轮）：第十一份真机日志 —— 短章节那道修复在真机上成立，而启动预热一直在白写
+
+这一份是 21:46 那次启动，444 行、单进程。它做两件事：**验收上一轮那道修复**，
+并暴露一个从预热落地起就存在、但从没被读过一次的第二类缺陷。
+
+### 6.58.1 上一轮的修复在真机上成立
+
+`c=931037660`（作者的一行请假条，488 字节）在同一份日志里的完整轨迹：
+
+```
+21:46:23 [CACHE] GET …c=931037660… cached class=chapter ttl=2592000s bytes=488
+21:46:23 [Http]  …c=931037660… -> 200 string 488b in 653ms        <- 唯一一次联网，这次存下了
+21:46:29 [CACHE] GET …c=931037660… cache hit class=chapter age=5s
+21:46:29 [Http]  …c=931037660… -> 200 string 488b in 0ms (cache)  <- 0ms
+21:47:01 [CACHE] GET …c=931037660… cache hit class=chapter age=38s
+21:47:03 [CACHE] GET …c=931037660… cache hit class=chapter age=39s
+```
+
+同一份日志里 `not cached class=chapter` **0 条**、`cached class=chapter` 2 条、
+`cache hit class=chapter` 11 条。上一轮判据（「这一行从 `not cached` 变成 `cache hit` 就说明生效」）
+完全命中：**联网 1 次（653ms）→ 之后全部 0ms**。30 天缓存对短章节不再失效。
+
+### 6.58.2 新缺陷：启动预热写下的名字，阅读器永远查不到（已修）
+
+`userinfo.php` 的预热（§6.45 表第 5 行）每次启动都发一个请求，目的是让阅读器自己的请求
+命中磁盘。十份**去重后**的真机日志给出同一个读数：
+
+| 量 | 十份日志合计 |
+| --- | --- |
+| `prewarmed` 写入 | **14 次** |
+| `GET … cache hit class=userInfo`（预热被读到） | **0 次** |
+| `POST … cache hit class=userInfo`（阅读器自己写自己读） | 22 次 |
+
+也就是说：**预热从落地那天起就是一次纯浪费的往返**，每次启动一个 454 字节的请求，
+写进磁盘、然后再也没人看。
+
+原因是缓存键上**两个轴同时不匹配**（`ContentCache.key` 把 method、canonical target、
+variant、bodyHash 一起当身份）：
+
+| 轴 | 预热发的 | 阅读器发的 | 证据 |
+| --- | --- | --- | --- |
+| method | `GET` | `POST` | `app.v2.js:3998` `app.net.post("/mobile/userinfo.php", "")` |
+| host | 页面的 host `sangtacviet.com` | `bestDomain()` 选中的 `sangtacviet.app` | `[DOMAIN] route: page=https://sangtacviet.com alive=no`；14 次预热全在 `.com`，全部 22 次命中全在 `.app` |
+
+第二轴还解释了为什么这件事不可能靠「换台镜像」自愈：预热**只能**知道页面的 host
+（`bridge.webView.url`），而页面自己报 `alive=no`，站点于是把每个请求都发到
+`bestDomain()` —— 两者在结构上就是不同的名字。
+
+修法两处，都在 `SangTacHttpPlugin.swift`：
+
+1. `prewarmUserInfo()` 改用 `POST`，并补上阅读器自己的
+   `Content-Type: application/x-www-form-urlencoded; charset=utf-8`（`bodyData(for:)` 对空字符串
+   body 就是设这个），让两个请求是同一个请求。
+2. `includesHost` 把 `userInfo` 加进「不按 host 分键」那一组 —— 与 `chapter`/`chapterList`/
+   `siteAsset` 同一个理由（同内容多镜像、镜像会轮换），并补上正面证据：同一份 454 字节
+   `{"id":"306185","name":"mingzihaojiandan",…}` 在 `sangtacviet.app` 与
+   `dns1.stv-appdomain-00000001.org` 上**逐字节相同**（十份日志里 userinfo 应答只有一种体积：454）。
+
+会话隔离不受影响：`chapterVariant` 把「登录与否」保留在键里（`access`/`useri2` 只贡献
+`|in` / `|out`，不贡献值），所以登出不会被已登录的缓存命中 —— 这一条对 `userInfo` 同样成立。
+
+### 6.58.3 CI 加了三个标记，盯住「预热必须发阅读器那个请求」
+
+这一类的错误**没有编译错误**：`GET` 换成 `POST` 只是让命中率静默变成 0，日志里看不出来
+（除非像本轮这样把十份日志的写入/读取次数数出来）。所以在内容缓存标记之后补三条，
+每条查**它自己所在的那个文件**（第一版把 `includesHost` 那条写进了 `ContentCache.swift` 的
+循环里，那条 switch 其实在 `SangTacHttpPlugin.swift`，本地模拟时立刻红了）：
+
+| 标记 | 文件 | 防的是什么 |
+| --- | --- | --- |
+| `empty data` | `ContentCache.swift` | 章节接受条件回到站点契约（上一轮那两道体积门槛） |
+| `case .chapter, .chapterList, .siteAsset, .userInfo: return false` | `SangTacHttpPlugin.swift` | `userInfo` 不许再按 host 分键 |
+| `self.warmRequest(method: "POST", url: url, headers: headers)` | `SangTacHttpPlugin.swift` | 预热不许再退回 GET |
+
+### 6.58.4 这份日志里另外两件事
+
+- **TTS 撤掉量测后没有丢信息**：`speak result` 那行按 §6.57.2 撤了，而这份日志里
+  69 行 `[TTS]` 仍然完整报出 `synthesised 115754 bytes, 2.62s` 这样的体积与秒数，
+  而且 36 句里**没有一次重试**（全是 `attempt 1/3` → `attempt 1 ok`）—— 说明合成路径稳定。
+  第一次朗读落在那章 3 句的请假条上（`fallback source [pageflip page 1 of 1]`），
+  随后换到 640 章正文（`page 1 of 22`，444 句）。
+- **`[ERR] unhandledrejection`（1 条）不是我们的**：它指向
+  `blob:…app.v2.js:4937`，也就是站点自己的 `app.api.updateBookPage` 里
+  `queryBookExtStatus(bookinfo).then(status => { if (status.like) … })`。
+  `queryBookExtStatus` 在未登录时 `return null`（`app.v2.js:4880-4882`），于是 `.then` 拿到
+  `null` 再读 `status.like` 就抛。十份日志里这条只出现过这一次，而且是**站点源码**里的既有缺陷，
+  与我们注入的任何块无关（我们的 `updateBookPage` 包装在 `likedState[key]` 未定义时会直接
+  转发给原函数，不碰这条路径）。记录，不改 —— 改站点自己的函数不在我们的范围内。
+
+### 6.58.5 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / 638019 字节 / 141 标记 |
+| `scripts/test-site-patch.js` | **920 条断言** / 0 失败 |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| workflow | YAML 解析通过，25 步 |
+
+### 6.58.6 仍未证实 / 非目标
+
+- 预热改用 POST + 去掉 host 之后，阅读器自己的 POST 是否真的变成 `cache hit`
+  （下一次日志里应当出现 `POST …/mobile/userinfo.php cache hit class=userInfo`，
+  而 `prewarmed` 那行应当在**同一个 host** 上）。**这一条是本轮唯一的验收点。**
+- 30 分钟拒绝窗口真的省掉一次网络（`remembered on disk` 那行仍未出现过）。
+- 首句冷启 862ms 的用户体感（无证据，只记录）。
+- `updateOldLink`（19 字节、470ms）是否卡在打开路径上。
+- 站点自己那条 `updateBookPage` 的 `null.like`（非目标）。
 

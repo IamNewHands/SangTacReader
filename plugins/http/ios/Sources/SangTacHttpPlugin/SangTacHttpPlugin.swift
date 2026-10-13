@@ -174,7 +174,20 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
         // `sangtacviet.app/mobile/lang/zh.json` and `sangtacviet.com/…` at the
         // same 5321 bytes), so keying on the host would throw the entry away on
         // every mirror change -- the failure this cache exists to remove.
-        case .chapter, .chapterList, .siteAsset: return false
+        //
+        // `userInfo` joins them for the same reason, and the 2026-10-13 21:46
+        // device log is why it had to. The signed-in profile is served
+        // byte-identically from every mirror (454 bytes, the same
+        // `{"id":"306185","name":"mingzihaojiandan",…}` head on
+        // `sangtacviet.app` and on `dns1.stv-appdomain-00000001.org`), while the
+        // host a request *will* use is not knowable in advance: the page's
+        // `fullUrl()` (app.v2.js:110-129) prefers `window.location.origin` only
+        // while that origin is alive, and the log says it is not --
+        // `route: page=https://sangtacviet.com alive=no` -- so the site's own
+        // requests land on `bestDomain()` (`sangtacviet.app`) and never on the
+        // page's host. Keying on the host therefore made the prewarm below write
+        // under a name no reader request could ever look up.
+        case .chapter, .chapterList, .siteAsset, .userInfo: return false
         default: return true
         }
     }
@@ -777,6 +790,20 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
      Asking for it from here, a moment after the web view is up, means the
      reader's own request finds an answer on disk instead of spending a round trip
      on it.
+
+     **The request has to be the one the reader will actually issue, or this is a
+     wasted round trip rather than a warm cache** -- and until the 2026-10-13
+     21:46 device log it was exactly that. The reader asks with
+     `app.net.post("/mobile/userinfo.php", "")` (`app.v2.js:3998`), while this
+     prewarm asked with `GET`: `method` is part of the cache key
+     (`ContentCache.key`), so a GET can only ever write a name no POST will look
+     up. Ten device logs agree -- **14 `prewarmed` stores, 0 reads** of that
+     class, i.e. one wasted 454-byte request every launch since the prewarm
+     landed. Same story for the host, which is why `includesHost` now drops it for
+     this class too: the prewarm can only know the *page's* host
+     (`sangtacviet.com`, which the page itself reports `alive=no`), while the
+     reader's request goes to whatever `bestDomain()` picked
+     (`sangtacviet.app`), so the two keys named different entries.
      */
     private let userInfoLock = NSLock()
     private var sawUserInfoRequest = false
@@ -796,6 +823,11 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
 
      Skipped when the site has already asked for the same thing: a prewarm that
      races the reader's own request is a duplicated request, not a warm cache.
+
+     The window matters as much as the request: this runs at +2s and the reader's
+     own POST lands at about +6s (both in the 2026-10-13 21:46 log), which is
+     inside the class's 60-second TTL -- so once the key matches, the reader's
+     request is answered from disk rather than from the network.
      */
     private func prewarmUserInfo() {
         userInfoLock.lock()
@@ -812,13 +844,19 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 "x-stv-transport": "app",
                 "x-requested-with": "com.sangtacviet.mobilereader",
                 "User-Agent": SangTacHttpPlugin.defaultUserAgent,
+                // What `bodyData(for:)` sets for the reader's own empty-string
+                // POST body, so the two requests are the same request.
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
                 "Referer": page.absoluteString,
                 "Origin": page.scheme.map { $0 + "://" + host } ?? ("https://" + host)
             ]
             let cookieHeader = SangTacHttpPlugin.mergeCookieHeader(jsHeader: nil,
                                                                    nativeCookies: cookies)
             if !cookieHeader.isEmpty { headers["Cookie"] = cookieHeader }
-            self.warmRequest(method: "GET", url: url, headers: headers)
+            // POST, not GET: it has to be the reader's own request (see above).
+            // The empty body is what `app.net.post("/mobile/userinfo.php", "")`
+            // sends, and `bodyHash` maps both it and `nil` to the same "-".
+            self.warmRequest(method: "POST", url: url, headers: headers)
         }
     }
 

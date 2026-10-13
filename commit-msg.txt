@@ -1,40 +1,49 @@
-第五十七轮：第十份真机日志 —— TTS 去 base64 结清（不做），章节接受条件里的体积门槛正在拒收真章节
+第五十八轮：第十一份真机日志 —— 短章节那道修复在真机上成立，而启动预热一直在白写
 
-这一份日志一个文件装着两段会话，19:38 那段是新包而且真的开始朗读了（36 条 speak result）。
-上一轮挂在 §6.56.5 的三条「仍未证实」一次答掉两条，并暴露一个新缺陷。
+21:46 那次启动，444 行单进程。两件事：验收上一轮那道修复；暴露一个从预热落地起
+就存在、却从没被读过一次的第二类缺陷。
 
-B（TTS 去 base64）= 不做，而且上一轮写的判据要反过来读：
-  36 句实测，跨桥体积 39-238KB（中位 106KB），桥上一次 212-253ms（首句冷启 862ms）。
-  把两个量回归：ms = 248.0 + 0.0082 x payloadKB（去冷启后 0.16ms/KB）。
-  体积涨 6.1 倍总耗时只多 41ms -> AAC（体积约 1/5）只省 0.7-1.6ms/句。
-  固定底噪 ~248ms 才是全部成本，而它藏在播放后面：相邻两句间隔均值 2.06s，
-  每句音频均值 1.99s，合成是在上一句播放期间完成的（站点的 onstart prefetchnext）。
-  量测脚手架按第 52-55 轮撤探针的同一约定撤掉（原生侧 synthesised 那行仍在）。
+一、上一轮修复成立（判据完全命中）
+  c=931037660（作者一行请假条，488 字节）在同一份日志里：
+    21:46:23 cached class=chapter ttl=2592000s bytes=488（唯一一次联网 653ms）
+    21:46:29 cache hit age=5s  -> 0ms
+    21:47:01 cache hit age=38s -> 0ms
+    21:47:03 cache hit age=39s -> 0ms
+  同日志 not cached class=chapter = 0 条，cache hit = 11 条。联网 1 次（653ms）之后全 0ms。
 
-新缺陷（已修）：isChapterBody 的两道体积门槛在拒收真章节。
-  站点自己的渲染判据只有 cdata.code == "0"（chapterdisplay.js:790/:1813/:3682，那三个文件里
-  grep 256 零命中）。日志里的受害者 c=931037660 是作者一行请假条：488 字节、data 117 字、
-  code == "0"，站点照常渲染，我们每次打开都拒收 —— 同一份日志里三次走网络
-  （607/546/618ms），一次都没落盘。
-  这是同一种错第二次（第一次是 content-type 含 text/html 就当错误页拒掉，§4603）：
-  我们的判据比站点更严，而体积门槛只可能拒掉真内容。
-  修法：两道门槛撤掉，判据回到站点契约（JSON 对象 / code == 0 / data 非空字符串）。
-  顺带更正两处错误归因（optimization-verification-2026-09-23.md:116、capacitor-port.md:4401
-  把「≥256 字符」说成是三个显示类自己的判断 —— 它们只有 code == 0）。
+二、新缺陷（已修）：启动预热写下的名字，阅读器永远查不到
+  十份去重日志的读数：prewarmed 写入 14 次，GET + cache hit（预热被读到）0 次，
+  POST + cache hit（阅读器自己写自己读）22 次。即预热从落地起就是一次纯浪费的往返。
+  缓存键上两个轴同时不匹配：
+    method：预热发 GET，阅读器发 POST（app.v2.js:3998 app.net.post("", "")）
+    host  ：预热只知道页面 host sangtacviet.com（页面自己报 alive=no），
+            阅读器的请求走 bestDomain() 的 sangtacviet.app；
+            14 次预热全在 .com，22 次命中全在 .app
+  第二轴结构上无法自愈：预热只能知道页面的 host，而站点把请求发到 bestDomain()。
+  修法两处：
+    1. prewarmUserInfo() 改用 POST，并补上阅读器自己的
+       Content-Type: application/x-www-form-urlencoded; charset=utf-8
+       （bodyData(for:) 对空字符串 body 就是设这个）。
+    2. includesHost 把 userInfo 加进「不按 host 分键」那组（与 chapter/chapterList/
+       siteAsset 同理由），并补正面证据：同一 454 字节 profile 在 sangtacviet.app 与
+       dns1.stv-appdomain-00000001.org 上逐字节相同；十份日志里 userinfo 应答只有一种体积 454。
+  会话隔离不受影响：chapterVariant 仍把登录与否留在键里（access/useri2 只贡献 |in / |out）。
 
-CI 加反向守卫：这两道门槛删掉不会有任何编译错误，所以必须反向盯住不许回来。
-  本地试出来的两个细节：范围必须切到函数体（别处有合法的 body.count >= 3 与 .count >= 512），
-  且不能拿日志文案当标记（函数上方的注释里原样写着旧文案）。
-  check-ios-shim 还抓到一次真错：echo 里中文引号紧跟变量名会把多字节字符折进变量名，set -u 直接失败。
+三、CI 补三个标记，盯住「预热必须发阅读器那个请求」
+  这类错误没有编译错误，GET 换 POST 只让命中率静默变 0。每条查它自己所在的文件
+  （第一版把 includesHost 那条写进了 ContentCache.swift 的循环，本地模拟立刻红了）：
+    empty data                                  -> ContentCache.swift
+    case .chapter, .chapterList, .siteAsset, .userInfo: return false -> SangTacHttpPlugin.swift
+    self.warmRequest(method: "POST", url: url, headers: headers)     -> SangTacHttpPlugin.swift
 
-C（grant）= 也不做：同一 URL 两次取回 840229 / 649031 字节，加上第 49 轮的 674609 / 813138，
-  四个样本四个不同。陈旧 key 会让章节解不开，源码注释里「deliberately never stored」的理由在此。
-  两条都打 first 是因为摘要记忆是进程内的，而这两次分属两个进程。
+四、这份日志里另外两件事
+  - 撤掉 TTS 量测没丢信息：69 行 [TTS] 仍完整报 synthesised 115754 bytes, 2.62s，
+    且 36 句无一次重试（全是 attempt 1/3 -> attempt 1 ok）。
+  - 1 条 [ERR] unhandledrejection 指向 blob:…app.v2.js:4937，是站点自己的
+    updateBookPage 里 queryBookExtStatus 未登录时 return null、.then 再读 status.like 抛的。
+    十份日志只出现这一次，与注入块无关，非目标，只记录。
 
-D（跨天复用）证实：封面命中时 age=71249s，往回推是 2026-10-12 23:50，上一个日历日取的图今天照旧命中。
+守卫：check-ios-shim 28 块 / 638019 字节 / 141 标记；test-site-patch 920 断言 0 失败；
+  i18n 461/76；assets 8/906296；workflow YAML 通过，25 步。
 
-守卫：check-ios-shim 28 块 / 638019 字节 / 141 标记（撤日志块后少 1538）；
-  test-site-patch 920 断言 0 失败（撤掉 1 条算术断言）；i18n 461/76；assets 8/906296；
-  workflow YAML 通过，25 步。
-
-文档：docs/capacitor-port.md §6.57；docs/optimization-plan-2026-09-23.md 的 P1 那条标关闭。
+文档：docs/capacitor-port.md §6.58；§6.45 表第 5 行补上「它曾经是空转的」。

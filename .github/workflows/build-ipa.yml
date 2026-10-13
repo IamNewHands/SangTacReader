@@ -374,6 +374,29 @@ jobs:
               exit 1
             fi
           done
+          # `includesHost` 的 switch 在 SangTacHttpPlugin.swift 而不是 ContentCache.swift，
+          # 所以它单独查自己的文件。**为什么必须盯**：这一行的值决定「镜像换了之后缓存还认不认」，
+          # 而它错了不会有任何编译错误，只表现为「缓存命中率莫名变低」——日志里看不出来。
+          # 第 55 轮把 `userInfo` 加进「不按 host 分键」那一组：预热请求只知道**页面**的 host
+          # （sangtacviet.com，而页面自己报 alive=no），阅读器真正的请求走 bestDomain()
+          # （sangtacviet.app），按 host 分键就是给一个永远查不到的名字写缓存。
+          # 十份日志的读数：这类预热写了 14 次、被读过 0 次。
+          if grep -q -F 'case .chapter, .chapterList, .siteAsset, .userInfo: return false' \
+               plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
+            echo "✓ userInfo 与章节一样不按 host 分键"
+          else
+            echo "::error::includesHost 不再把 userInfo 排除在 host 之外（预热会写一个读不到的名字）"
+            exit 1
+          fi
+          # 预热的 method 必须是阅读器自己的那一个（POST，app.v2.js:3998）。method 是
+          # 缓存键的一部分，GET 只能写出一个 POST 永远查不到的名字——这正是那 14 次白写的另一半原因。
+          if grep -q -F 'self.warmRequest(method: "POST", url: url, headers: headers)' \
+               plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
+            echo "✓ userinfo 预热用的是阅读器自己的 POST"
+          else
+            echo "::error::userinfo 预热不再用 POST（GET 的缓存键与阅读器的 POST 不匹配，预热等于白做）"
+            exit 1
+          fi
           # 第 55 轮把 `isChapterBody` 里的两道体积门槛撤掉了，这里必须**反向**盯住
           # 它们不许回来。理由不是风格，是同一种错犯了两次：
           #   * 第一次是「content-type 含 text/html 就当错误页拒掉」——站点所有 JSON
