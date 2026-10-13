@@ -292,7 +292,11 @@ jobs:
           # `cacheLog(` 是第 46 轮加上的：缓存决策第一版只写 CAPLog（Console.app），
           # 侧载包读不到，于是真机日志里只有请求行、没有一条「命中/落盘/拒绝」，
           # 「到底有没有生效」在唯一能拿到的证据里没有答案。它必须是走面板的那条路。
-          for marker in 'sajax=getchapterlist' 'contentClass(method:' 'cacheLog('; do
+          # 第 48 轮又补两条：拒绝要说清是哪条判据拒的（`case .reject(let why)`），
+          # 以及那条答案实际长什么样（`head=`）—— 否则「not the shape this class
+          # accepts」只说明有人在拒，不说明为什么，只能再猜一轮。
+          for marker in 'sajax=getchapterlist' 'contentClass(method:' 'cacheLog(' \
+                        'case .reject(let why)' 'SangTacHttpPlugin.head('; do
             if grep -q -F "$marker" plugins/http/ios/Sources/SangTacHttpPlugin/SangTacHttpPlugin.swift; then
               echo "✓ $marker 还在响应缓存源码里"
             else

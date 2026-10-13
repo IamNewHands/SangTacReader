@@ -51,6 +51,25 @@ enum ContentClass: String, CaseIterable {
     case grant
 }
 
+/// Why a stored answer is worth keeping, per class. The verdict carries the
+/// reason a rejection happened, because a line that only says "not the shape this
+/// class accepts" cannot be acted on: the 2026-10-13 log left `userinfo.php`
+/// refused with no way to tell which guard said no.
+enum Acceptance {
+    case accept
+    case reject(String)
+
+    var isAccepted: Bool {
+        if case .accept = self { return true }
+        return false
+    }
+
+    var reason: String {
+        if case .reject(let text) = self { return text }
+        return ""
+    }
+}
+
 /// What a stored answer is worth, per class.
 struct ContentPolicy {
     let cls: ContentClass
@@ -65,7 +84,7 @@ struct ContentPolicy {
     /// of re-downloading the body.
     let revalidate: Bool
     /// The gate a response body has to pass before it is stored.
-    let accepts: (Data, String) -> Bool
+    let accepts: (Data, String) -> Acceptance
 }
 
 struct ContentCacheConfig {
@@ -148,11 +167,12 @@ enum ContentPolicies {
                                  serveStale: true, revalidate: false,
                                  accepts: ContentCache.isJSONBody)
         case .userInfo:
-            // The one class where a stale answer is visible as a wrong number,
-            // so it is only reused inside a minute-wide window.
+            // The one class where a stale answer is visible as a wrong number, so
+            // it is only reused inside a minute-wide window -- and, for the same
+            // reason, the one class whose gate is loose: see `isReusableJSON`.
             return ContentPolicy(cls: cls, ttl: min(60, cap),
                                  serveStale: false, revalidate: false,
-                                 accepts: ContentCache.isJSONBody)
+                                 accepts: ContentCache.isReusableJSON)
         case .comment:
             return ContentPolicy(cls: cls, ttl: min(300, cap),
                                  serveStale: false, revalidate: false,
@@ -682,12 +702,14 @@ final class ContentCache {
      interstitial, a login page or a bot challenge does not parse as a JSON object
      with `code == 0`, so nothing has to be inferred from the header.
      */
-    static func isChapterBody(_ body: Data, _ contentType: String) -> Bool {
-        guard body.count >= 4096 else { return false }
-        guard let object = jsonObject(body) else { return false }
-        guard code(object) == 0 else { return false }
-        guard let text = object["data"] as? String, text.count >= 256 else { return false }
-        return true
+    static func isChapterBody(_ body: Data, _ contentType: String) -> Acceptance {
+        guard body.count >= 4096 else { return .reject("smaller than 4096 bytes") }
+        guard let object = jsonObject(body) else { return .reject("not a JSON object") }
+        guard let value = code(object) else { return .reject("no code field") }
+        guard value == 0 else { return .reject("code \(value)") }
+        guard let text = object["data"] as? String else { return .reject("no data field") }
+        guard text.count >= 256 else { return .reject("data only \(text.count) chars") }
+        return .accept
     }
 
     /**
@@ -695,12 +717,13 @@ final class ContentCache {
      `code == 1` *and* a string `data` carrying the site's own `-/-` separator must
      both hold.
      */
-    static func isChapterListBody(_ body: Data, _ contentType: String) -> Bool {
-        guard let object = jsonObject(body), code(object) == 1,
-              let list = object["data"] as? String, list.contains("-/-") else {
-            return false
-        }
-        return true
+    static func isChapterListBody(_ body: Data, _ contentType: String) -> Acceptance {
+        guard let object = jsonObject(body) else { return .reject("not a JSON object") }
+        guard let value = code(object) else { return .reject("no code field") }
+        guard value == 1 else { return .reject("code \(value)") }
+        guard let list = object["data"] as? String else { return .reject("no data field") }
+        guard list.contains("-/-") else { return .reject("data carries no -/- separator") }
+        return .accept
     }
 
     /**
@@ -716,22 +739,63 @@ final class ContentCache {
      {"id":"306185",…}`, all three refused by that test while they were perfectly
      good answers. What keeps a challenge page out is that it is not JSON at all.
      */
-    static func isJSONBody(_ body: Data, _ contentType: String) -> Bool {
+    static func isJSONBody(_ body: Data, _ contentType: String) -> Acceptance {
         let data = stripped(body)
-        guard data.count >= 64 else { return false }
+        guard data.count >= 64 else { return .reject("smaller than 64 bytes") }
         guard let parsed = try? JSONSerialization.jsonObject(with: data,
                                                              options: [.fragmentsAllowed]) else {
-            return false
+            return .reject("not JSON")
         }
         if let object = parsed as? [String: Any] {
-            if object.isEmpty { return false }
-            if let value = code(object), rejectionCodes.contains(value) { return false }
+            if object.isEmpty { return .reject("empty object") }
+            if let value = code(object), rejectionCodes.contains(value) {
+                return .reject("failure code \(value)")
+            }
             if let message = object["message"] as? String,
-               message.lowercased().contains("challenge_required") { return false }
-            return true
+               message.lowercased().contains("challenge_required") {
+                return .reject("bot challenge")
+            }
+            return .accept
         }
-        if let array = parsed as? [Any] { return !array.isEmpty }
-        return false
+        if let array = parsed as? [Any] {
+            return array.isEmpty ? .reject("empty array") : .accept
+        }
+        return .reject("not a JSON container")
+    }
+
+    /**
+     `userinfo.php` gets a looser gate than its neighbours, and the reason is its
+     clock: this class is reused for 60 seconds, so the worst case of storing an
+     answer we should not have kept is one wrong unread count for a minute -- while
+     refusing a good one costs a 573ms round trip on every launch (2026-10-13 log,
+     twice per launch). The book detail (24h) and the home lists (10min) keep the
+     strict gate, where a wrong answer would outlive the mistake.
+
+     A bot challenge is still refused here: that is the one shape that parsing
+     cannot rule out on its own.
+     */
+    static func isReusableJSON(_ body: Data, _ contentType: String) -> Acceptance {
+        let data = stripped(body)
+        guard data.count >= 32 else { return .reject("smaller than 32 bytes") }
+        guard let parsed = try? JSONSerialization.jsonObject(with: data,
+                                                             options: [.fragmentsAllowed]) else {
+            return .reject("not JSON")
+        }
+        if let object = parsed as? [String: Any] {
+            if object.isEmpty { return .reject("empty object") }
+            if let message = object["message"] as? String,
+               message.lowercased().contains("challenge_required") {
+                return .reject("bot challenge")
+            }
+            if let value = code(object), rejectionCodes.contains(value) {
+                return .reject("failure code \(value)")
+            }
+            return .accept
+        }
+        if let array = parsed as? [Any] {
+            return array.isEmpty ? .reject("empty array") : .accept
+        }
+        return .reject("not a JSON container")
     }
 
     /**
@@ -745,8 +809,8 @@ final class ContentCache {
      unproven, and a stale one costs a *failed chapter read*, so the asymmetric
      choice is to pay 0.6-1.6s per book switch instead of risking the reader.
      */
-    static func neverStored(_ body: Data, _ contentType: String) -> Bool {
-        return false
+    static func neverStored(_ body: Data, _ contentType: String) -> Acceptance {
+        return .reject("not stored by design (see the comment above)")
     }
 
     /// The codes the site uses for "you are not getting content": login walls,
@@ -761,25 +825,23 @@ final class ContentCache {
     /// (`GET https://www.trxs.cc/…jpeg -> 403 text/html base64 1b`) -- the image
     /// host refuses this link, and storing that answer would make the refusal
     /// permanent.
-    static func isImageBody(_ body: Data, _ contentType: String) -> Bool {
+    static func isImageBody(_ body: Data, _ contentType: String) -> Acceptance {
         let lowered = contentType.lowercased()
-        if lowered.contains("text/html") || lowered.contains("application/json") {
-            return false
-        }
-        guard body.count >= 512 else { return false }
-        if lowered.hasPrefix("image/") { return true }
+        if lowered.contains("text/html") { return .reject("html in an image slot") }
+        if lowered.contains("application/json") { return .reject("json in an image slot") }
+        guard body.count >= 512 else { return .reject("smaller than 512 bytes") }
+        if lowered.hasPrefix("image/") { return .accept }
         // The image hosts do not always answer with a content type on this link;
         // accept the four container formats the reader actually displays.
-        guard body.count >= 8 else { return false }
         let head = [UInt8](body.prefix(12))
         let png: [UInt8] = [0x89, 0x50, 0x4E, 0x47]
         let jpeg: [UInt8] = [0xFF, 0xD8, 0xFF]
         let gif = Array("GIF8".utf8)
-        if Array(head.prefix(4)) == png { return true }
-        if Array(head.prefix(3)) == jpeg { return true }
-        if Array(head.prefix(4)) == gif { return true }
-        if head.count >= 12, Array(head.prefix(4)) == Array("RIFF".utf8),
-           Array(head[8..<12]) == Array("WEBP".utf8) { return true }
-        return false
+        if Array(head.prefix(4)) == png { return .accept }
+        if Array(head.prefix(3)) == jpeg { return .accept }
+        if Array(head.prefix(4)) == gif { return .accept }
+        if Array(head.prefix(4)) == Array("RIFF".utf8),
+           Array(head[8..<12]) == Array("WEBP".utf8) { return .accept }
+        return .reject("no image signature (content-type \(lowered.isEmpty ? "none" : lowered))")
     }
 }

@@ -4653,3 +4653,62 @@ XHR 计数行加上**调用栈首两帧**（`whereFrom()`，用 `String.fromChar
 - 正文落盘后的「隔天再读」体感（需要跨天两次启动的日志）
 - `grant` 不缓存的决定是否值得（若某次日志显示换书时 grant 占了大头时间，值得再做一次「仅内存复用」的尝试）
 - SWR 的自动重绘钩子名（`contentRefreshed` 至今没有在真机上触发过，因为还没有一条列表走到 stale+changed）
+
+## §6.48 第 46 轮（提交名：第四十八轮）：第三份真机日志 —— 正文/首页/详情全部命中，只剩一条拒绝行说不出原因
+
+输入：`stv-diagnostic-20261013-090233.log`（1032 行，23:51:11–09:02:32，含多次启动）。
+
+### 6.48.1 达成：用户最初诉求的核心，都在这一份里
+
+| 证据 | 说明 |
+| --- | --- |
+| `09:00:39 POST …/booklist.php?method=history cached class=homeList ttl=600s bytes=8398` | 首页列表落盘 |
+| `09:01:05…06 /?sajax=readchapter&…c=90/91/89 cached class=chapter ttl=2592000s bytes=8979/9305/9267` | **正文落盘（30 天）** |
+| `09:01:06 …/mobile/bookinfo.php?hid=12058&host=trxs2 cached class=bookInfo ttl=86400s` | 详情落盘 |
+| `09:01:49 …/booklist.php?method=history cache hit class=homeList age=70s` | 首页列表命中 |
+| `09:02:13…18 readchapter c=90/89/91/92/93 cache hit class=chapter age=49–68s` | **正文命中，且跨启动**（09:01:50 是新页面加载） |
+| `09:02:14 …/bookinfo.php cache hit class=bookInfo age=67s` | 详情命中 |
+| `09:02:10 …getchapterlist cache hit class=chapterList age=1398s … by=dns1…` | 目录命中，条目是**上一轮包**在 08:38:51 存的 → 跨启动 + 跨版本存活 |
+| `09:02:13 readchapter … by=sangtacviet.app` / 目录 `by=dns1.stv-appdomain-00000001.org` | 存它的主机与读它的主机不同，仍然命中（§6.45.3 (1) 的键归一） |
+| `09:00:41 …/mobile/userinfo.php shared in-flight answer (454b)` | 请求合并生效 |
+| 09:00 之后 **`went through the page own XMLHttpRequest` 0 行** | §6.46 的改道、§6.47.4 的竞态修复都在这一版上生效（08:39 那批属旧包） |
+
+09:00 之后的小结：**24 次命中 / 16 次落盘 / 7 次拒绝**，其中 grant 的拒绝是设计如此。
+
+### 6.48.2 剩下的唯一一条：`userinfo.php` 被拒，而拒绝行说不出原因
+
+`09:00:41 / 09:01:53` 各一行：
+
+```
+[CACHE] POST …/mobile/userinfo.php not cached class=userInfo status=200 bytes=454
+        content-type=text/html; charset=utf-8 (not the shape this class accepts)
+```
+
+第 47 轮已经去掉了 `text/html` 检查，它**仍然**被拒，而拒绝行只写「不是这个类接受的形状」，五种判据（太小 / 不是 JSON / 空 / 失败码 / 无图片签名）里哪一种都不说。**这是观测缺口，不是逻辑缺口**：日志里没有任何信息能判定原因，只能再猜一次——而猜错一次就又是「用户感觉没生效」的一轮。
+
+修法（本轮）：
+
+1. `accepts` 的返回值从 `Bool` 改成 `Acceptance`（`.accept` / `.reject("原因")`），拒绝行直接写原因：`(smaller than 64 bytes)`、`(not JSON)`、`(failure code 7)`、`(no image signature …)`、`(not stored by design …)`。
+2. 拒绝行再带 `head=`（body 前 80 字符，折叠空白、有界、经 `redact`）——「哪条判据拒的」与「实际长什么样」一起给。
+3. `userinfo` 单独放宽为一分钟窗口专用判据 `isReusableJSON`：它 TTL 只有 60 秒，赌错的代价是「一分钟内未读数错一次」，而拒对的代价是每次启动 573ms×2（日志实测）。`bookInfo`(24h) 与列表(10min) 保持严格判据——那里的错答案会活过犯错的寿命。
+4. 每次启动**第一次落盘**时附一行 `| cache now entries=… bytes=… hits=…`，让每份日志自带规模。
+
+### 6.48.3 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 27 块 / 635286 字节 / 138 标记 |
+| `scripts/test-site-patch.js` | 908 条断言全过 |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI 源码守卫 | 新增 `case .reject(let why)` 与 `SangTacHttpPlugin.head(`：拒绝必须说明原因并带上形状 |
+
+本轮没有新增 JS 断言：改动全在原生侧（`Acceptance` 与判据），本机没有 Swift 工具链，只能由 CI 编译 + 下一份日志的拒绝行来验证——这一条本身就是 6.48.2 那个缺口的代价，写在这里是为了下次不要再靠猜。
+
+### 6.48.4 仍未证实
+
+- `userinfo` 究竟被哪条严格判据拒（下一份日志的 `(原因) head=` 会给答案；若 `isReusableJSON` 让它落了盘，说明是误伤）。
+- 「隔天再读」的体感（需要跨天两次启动的日志；本轮只做到了同日跨启动）。
+- SWR 的自动重绘钩子（`contentRefreshed` 至今未触发：列表要先走到 stale 且内容真有变化）。
+- `grant` 不缓存的取舍是否划算（换书时 560–908KB / 0.6–1.6s 一次）。
+- 首页首屏从"黑屏等待"变成"本地出内容"的实际观感（本机无法测量观感，只能看 `[BOOT]` 与命中的时间线）。

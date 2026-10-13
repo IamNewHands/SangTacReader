@@ -653,7 +653,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                   http.statusCode >= 200, http.statusCode < 300 else { return }
             let body = data ?? Data()
             let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
-            guard policy.accepts(body, contentType) else { return }
+            guard policy.accepts(body, contentType).isAccepted else { return }
             let headerMap = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
                 if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
             }
@@ -953,20 +953,22 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 // a "nothing is being cached" report has an answer in the log.
                 if let key = cacheKey, let policy = policy, !bypassCache,
                    http.statusCode >= 200, http.statusCode < 300 {
-                    if policy.accepts(body, contentType) {
+                    switch policy.accepts(body, contentType) {
+                    case .accept:
                         self.contentCache.store(key: key, cls: policy.cls, status: http.statusCode,
                                                 contentType: contentType, headers: headerMap,
                                                 body: body, ttl: policy.ttl,
                                                 servedBy: url.host ?? "")
                         self.cacheLog("\(method) \(url.absoluteString) cached class="
-                            + "\(policy.cls.rawValue) ttl=\(Int(policy.ttl))s bytes=\(body.count)")
-                    } else {
+                            + "\(policy.cls.rawValue) ttl=\(Int(policy.ttl))s bytes=\(body.count)"
+                            + self.cacheTotalsOnce())
+                    case .reject(let why):
                         self.contentCache.noteReject()
                         self.cacheLog("\(method) \(url.absoluteString) not cached class="
                             + "\(policy.cls.rawValue) status=\(http.statusCode) "
                             + "bytes=\(body.count) content-type="
                             + "\(contentType.isEmpty ? "none" : contentType)"
-                            + " (not the shape this class accepts)")
+                            + " (\(why)) head=" + SangTacHttpPlugin.head(body))
                     }
                 }
 
@@ -1336,7 +1338,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
             }
             guard http.statusCode >= 200, http.statusCode < 300 else { return }
             let fresh = data ?? Data()
-            guard policy.accepts(fresh, contentType) else { return }
+            guard policy.accepts(fresh, contentType).isAccepted else { return }
             let headerMap = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
                 if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
             }
@@ -1432,5 +1434,39 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
     private func cacheLog(_ message: String) {
         callLog("cache", message)
         report("CACHE", message)
+    }
+
+    /**
+     A bounded look at the body of an answer that was *not* stored.
+
+     The reason string says which guard refused it; this says what the answer
+     actually was, which is the other half of the question -- the 2026-10-13 log
+     had `userinfo.php` refused seven times and no way to tell whether the body was
+     an error page, a truncated JSON document, or a perfectly good profile that a
+     guard did not understand. Bounded and whitespace-collapsed so one line stays
+     one line; `report` redacts it like every other line.
+     */
+    private static func head(_ body: Data) -> String {
+        let text = String(decoding: body.prefix(240), as: UTF8.self)
+        let collapsed = text
+            .split(whereSeparator: { $0.isNewline || $0 == "\t" })
+            .joined(separator: " ")
+        if collapsed.count <= 80 { return collapsed }
+        return String(collapsed.prefix(80)) + "..."
+    }
+
+    /// The cache's running totals, attached once per launch to the first answer
+    /// that is stored -- so a log is self-contained about how much there is.
+    private var loggedTotals = false
+
+    private func cacheTotalsOnce() -> String {
+        inFlightLock.lock()
+        let already = loggedTotals
+        loggedTotals = true
+        inFlightLock.unlock()
+        guard !already else { return "" }
+        let stats = contentCache.stats()
+        return " | cache now entries=\(stats["entries"] ?? 0) bytes=\(stats["bytes"] ?? 0)"
+            + " hits=\(stats["hits"] ?? 0)"
     }
 }
