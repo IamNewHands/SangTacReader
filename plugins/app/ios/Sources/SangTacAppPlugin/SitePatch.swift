@@ -12163,6 +12163,94 @@ enum SitePatch {
         }, 25);
     })();
     """
+    // MARK: - A cover that cannot load
+
+    /**
+     A cover that cannot load stops changing on every render.
+
+     The report (2026-10-13): "the same novel's cover keeps changing, and opening
+     it again shows yet another one". Nothing in the book's data changes between
+     those renders -- the site's own error path is what changes:
+
+     ```
+     app.v2.js:8078  var randomDefaultImg = [ 8 wallpapers on three hosts ];
+     app.v2.js:8088  function onImgError(img){
+                         img.src = randomDefaultImg[Math.floor(Math.random()*randomDefaultImg.length)];
+                         img.onerror = () => {onImgErrorAgain(img);};
+                     }
+     app.v2.js:8093  function onImgErrorAgain(img){ img.src = defaultBookCover; img.onerror = null; }
+     ```
+
+     So a failed image becomes a *random* wallpaper, and only when that wallpaper
+     fails too does the site use its own placeholder. The images that fail are the
+     covers of books sourced from `trxs`: the URL is
+     `https://www.trxs.cc/d/file/tongren/20260810/08e0d41f….jpeg` and that host
+     answers `403 text/html` 1 byte to every client and every header set --
+     measured from the device (the plugin's own log, 20 times in 29 minutes) and
+     from outside it (bare, with sangtacviet.com's Referer, with trxs.cc's own
+     Referer, with a full browser-like header set); `https://www.trxs.cc/` itself
+     is 403 as well. There is no live copy to fall back to either: the same path
+     is 404 on `static.sangtacvietcdn.xyz`, on `sangtacviet.com` and on
+     `sangtacviet.app`. The real cover is therefore unobtainable, and the choice
+     is only between "a different wallpaper every render" and "the same picture
+     every render".
+
+     This block keeps the site's own ladder and removes the dice: a failed image
+     goes straight to `defaultBookCover`, the site's own
+     `https://static.sangtacvietcdn.xyz/img/bookcover256.jpg` (measured: 200,
+     image/jpeg, 8384 bytes -- the CDN the site already serves its own assets
+     from), with `onerror` cleared exactly as the site's own last step does.
+
+     `randomDefaultImg` itself is deliberately untouched: `randomBackground()`
+     (app.v2.js:8118) draws the reader's decorative background from that same pool
+     and is *meant* to vary. Only the error path is pinned.
+
+     `app.v2.js` is a classic script that declares both handlers at its top level,
+     so replacing `window.onImgError` also replaces what the inline
+     `onerror="onImgError(this)"` attributes and the site's own bare
+     `onImgError(imTag)` calls resolve to. This block runs at document start,
+     before that script exists, hence the poll.
+     */
+    static let coverFallback = """
+    (function () {
+        if (window.__stvCoverFallbackInstalled) { return; }
+        window.__stvCoverFallbackInstalled = true;
+
+        var PLACEHOLDER = 'https://static.sangtacvietcdn.xyz/img/bookcover256.jpg';
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function pinned(img) {
+            if (!img) { return; }
+            if (String(img.src || '') !== PLACEHOLDER) { img.src = PLACEHOLDER; }
+            // The site's own onImgErrorAgain ends the same way. A placeholder that
+            // cannot be decoded either must not leave an error handler behind, or
+            // the image would keep re-entering this path for a picture that is
+            // already the last resort.
+            img.onerror = null;
+        }
+
+        function install() {
+            if (typeof window.onImgError !== 'function') { return false; }
+            if (window.onImgError === pinned) { return true; }
+            window.onImgError = pinned;
+            window.onImgErrorAgain = pinned;
+            note('PATCH', 'a cover that cannot load stops changing on every render');
+            return true;
+        }
+
+        install();
+
+        var tries = 0;
+        var timer = setInterval(function () {
+            tries = tries + 1;
+            if (install() || tries > 100) { clearInterval(timer); }
+        }, 100);
+    })();
+    """
+
     static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
@@ -12171,5 +12259,5 @@ enum SitePatch {
                                 bookmarkToggle, readerTts,
                                 pageRepair, downloadExport, commentTranslate,
                                 comicGate, contentCache,
-                                swipeDismiss, readerPrefetch]
+                                swipeDismiss, readerPrefetch, coverFallback]
 }

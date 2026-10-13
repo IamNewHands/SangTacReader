@@ -316,6 +316,13 @@ const REQUIRED_MARKERS = [
   // gives up -- and a bypassing request names its caller, not just its url.
   'no native routing',
   'function whereFrom(',
+  // A cover whose host blocks it (trxs.cc answers 403 to every client and every
+  // header set, and the path is 404 on the site's own CDN) used to become a
+  // *random* wallpaper on every render, because the site's onImgError picks from
+  // an eight-image pool: "the same novel's cover keeps changing". Pinning the
+  // error path to the site's own placeholder is the whole fix.
+  'window.__stvCoverFallbackInstalled',
+  'stops changing on every render',
 ];
 
 function fail(message) {

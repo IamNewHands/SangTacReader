@@ -4970,3 +4970,114 @@ XHR 计数行加上**调用栈首两帧**（`whereFrom()`，用 `String.fromChar
 - 落盘的拒绝被 30 分钟窗口放掉之后，若封锁仍在，会不会形成「每 30 分钟一次 853ms」的稳定节奏 —— 这是可接受的
   （30 分钟一次），但真机上还没跨过一次完整的 30 分钟窗口。
 - `grant` 的取舍（6.50.4 / 6.50.6 第 1 条）。
+
+## §6.51 第 49 轮（提交名：第五十一轮）：第六份真机日志 —— 跨进程的拒绝终于生效，而"封面不停换"是站点自己在掷骰子
+
+输入：`stv-diagnostic-20261013-102150.log`（1095 行，09:52:25–10:21:44）。
+这份是**同一份落盘日志**（第 50 轮那次的 821 行在里面）+ 追加的 10:21:00 / 10:21:20 两次启动。
+
+### 6.51.1 第 50 轮那两行，一写一读都证成了
+
+| 环节 | 实测 |
+| --- | --- |
+| 写 | `10:21:08 [CACHE] …08e0d41f….jpeg not cached class=image status=403 bytes=1 content-type=text/html (HTTP error answer) head=  \| refusal written to disk, 1800s window` |
+| 读（**另一个进程**） | `10:21:23 … refused again class=image age=14s status=403 (remembered on disk, 1800s window)` + `[ERR] … in 0ms (refused)` |
+| 之后 | `age=19s / 25s / 30s / 34s`，五次全部 `in 0ms` |
+
+写发生在 **10:21:00 那次启动**（第 762 行 document start）里，读发生在 **10:21:20 那次启动**（第 877/953 行）。
+判据不是猜的：如果那是同一个进程，10:21:08 写下的记录会命中 60 秒的**内存**层，日志就该写 `(not retried within 60s)`；
+它写的是 `remembered on disk` —— 内存层没有，磁盘层有。**跨进程生效，从写下到第一次复用只隔 15 秒。**
+
+对照上一份日志的同一件事：第 49 轮那次，同样的 403 在 42 秒后还实付了 856ms（`09:53:46 … in 856ms`）。
+这次同一个进程里一次没再付，跨进程也没再付。
+
+另外两条顺带勾掉的旧账：
+
+- `10:21:01 [CACHE] GET …/mobile/lang/zh.json cache hit class=siteAsset age=1681s` —— `siteAsset` 的**跨启动**命中，
+  §6.50.9 里"那次命中仍在同一进程内"的保留意见可以去掉（28 分钟跨度，仍是同一天）。
+- `10:21:01 … \| cache now entries=30 bytes=341441 hits=1 refusals=0` —— 这一行的 `refusals=0` 是**写之前**的读数，
+  两次启动里只有 10:21:00 那次落过盘（10:21:20 那次全部命中，没有 store，所以规模行不打印）。
+  也就是说 `refusals=1` 这个读数还没在真机上出现过；它只在"某次启动存过东西"时才会出现，这点记在 6.51.7。
+
+### 6.51.2 用户报的现象：同一本小说的封面"不停换"
+
+现象是用户报的，不是日志里的：*"同一本小说的封面会不停换，重开进去又是新的封面，按理说小说封面不会经常变动才对"*。
+
+**第一个取证：那张封面为什么失败。** 日志里 29 分钟内被请求 20 次的是同一个 URL
+`https://www.trxs.cc/d/file/tongren/20260810/08e0d41f34504731fd1440a83ba0e1d4.jpeg`，每次都 `403 text/html` 1 字节。
+在仓库外独立验证了四种头部组合：
+
+| 请求 | 结果 |
+| --- | --- |
+| 裸请求（无任何头部） | `403 text/html` 1 字节 |
+| `User-Agent: Safari/iPhone` + `Referer: https://sangtacviet.com/app.v2.php` | `403` |
+| 同上 + `Referer: https://www.trxs.cc/`（源站自己） | `403` |
+| 同上 + 完整浏览器集（`Accept: image/avif,…`、`Sec-Fetch-*`） | `403` |
+
+`https://www.trxs.cc/` 首页本身也是 `403`（Cloudflare）。也没有活拷贝：同路径在
+`static.sangtacvietcdn.xyz`、`sangtacviet.com`、`sangtacviet.app` 上都是 `404`。
+（`trxs2.cc` / `trxs3.cc` 之类不是域名，TLS 都建不起来 —— `trxs2` 是站点自己的"源键"，不是镜像域名。）
+
+**所以真封面拿不到**：设备、我的出口、任何头部都一样。而站点对"图加载失败"的处理是掷骰子：
+
+```
+app.v2.js:8078  var randomDefaultImg = [ 8 张越南仙侠/剑侠壁纸，来自 pinimg / thuthuatphanmem / haycafe ];
+app.v2.js:8088  function onImgError(img){
+                    img.src = randomDefaultImg[Math.floor(Math.random()*randomDefaultImg.length)];
+                    img.onerror = () => {onImgErrorAgain(img);};
+                }
+app.v2.js:8093  function onImgErrorAgain(img){ img.src = defaultBookCover; img.onerror = null; }
+app.v2.js:2     var defaultBookCover = "https://static.sangtacvietcdn.xyz/img/bookcover256.jpg";
+```
+
+失败的图 → **8 张里随机一张** → 那一张再失败才用站点自己的占位图。于是"重开又是新封面"根本不是数据在变，
+是错误路径里的 `Math.random()`。这也解释了为什么这份日志里只有 **1 个**图片请求走插件：网格单元上的 `<img>` 是
+WebKit 直接取的，它的失败对我们完全不可见，只有 `applyFilter` 那条（日志里的 `Loading … failed`）走原生 blob。
+
+### 6.51.3 改动清单（逐项）
+
+| # | 改动 | 文件 | 依据 |
+| --- | --- | --- | --- |
+| 1 | 新增注入块 `coverFallback`：把站点的 `onImgError` / `onImgErrorAgain` 钉到站点自己的占位图 `https://static.sangtacvietcdn.xyz/img/bookcover256.jpg`（实测 `200 image/jpeg 8384` 字节），并把 `onerror` 置空（与站点自己最后一步一致） | `SitePatch.swift` | 6.51.2 |
+| 2 | `check-ios-shim.js` 新增 2 个必需标记（`window.__stvCoverFallbackInstalled`、`stops changing on every render`） | `scripts/check-ios-shim.js` | 块丢了不会崩，只会又变回随机 |
+| 3 | 产物二进制标记 `stvCoverFallbackInstalled` | `.github/workflows/build-ipa.yml` | 同上 |
+| 4 | 9 条行为断言（`testCoverFallback`） | `scripts/test-site-patch.js` | 证明钉住的是**错误路径**，而不是那个池子 |
+
+### 6.51.4 为什么只动错误路径
+
+- `randomDefaultImg` 故意不动：`randomBackground()`（`app.v2.js:8118`）拿同一个池子做**阅读器的装饰背景**，
+  那本来就该每次不同。钉住的只有错误路径 —— 测试里有一条断言专门守这个（池子对象引用必须原样）。
+- 钉法有效的前提是 `app.v2.js` 是**经典脚本**、两个函数都在它顶层声明：全局函数声明就是全局对象上的属性，
+  所以改 `window.onImgError` 会同时改掉内联 `onerror="onImgError(this)"` 与站点自己那些
+  `onImgError(imTag)` 裸引用。我们的块在 document start 跑（那时它们还不存在），因此是轮询安装。
+- **没有**去动 `app.images.downloadAndAssign`（它把 403 的 1 字节当 blob 交给 `<img>`，日志里的
+  `Loading … failed` 就是它打的）：它在镜像 JS 里的唯一调用者是 `applyFilter`，而镜像里没有任何地方调用
+  `applyFilter`，说明召唤点在被服务端渲染的 HTML 里。调用者未知时改它的错误路径，风险大于收益。
+  判据留给下一份日志：**如果装了这个包封面仍在变，那它就不是这条路径**，日志会指出是哪一条。
+
+### 6.51.5 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / 636734 字节 / 140 标记（新增 1 块 + 2 标记） |
+| `scripts/test-site-patch.js` | 917 条断言 / 0 失败（新增 9 条） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| YAML | `.github/workflows/build-ipa.yml` 通过 `yaml.safe_load` |
+
+### 6.51.6 下一份日志要看的行
+
+1. `[PATCH] a cover that cannot load stops changing on every render` —— 注入成功才会打，一次启动一次。
+2. 肉眼判据（这一条比日志更直接）：**同一本书的封面每次都是同一张**（站点自己的占位图），不再换。
+3. `refused again class=image … (remembered on disk, 1800s window)` + `in 0ms (refused)` —— 跨进程复用的持续证据。
+4. 打开一次阅读器，看 `class=grant … sha=xxxxxxxx first`，同一本书第二次是
+   `same as the answer …s ago`（可复用）还是 `differs from … seen …s ago`（不可复用）。**这份日志里 `sha=` 出现 0 次**
+   （10:21 那两次启动都没进阅读器，三条 `class=grant` 全是第 49 轮那个包在 09:53/09:54 打的）。
+5. 若封面仍在变：那说明变的那张不是 `onImgError`，把日志给我。
+
+### 6.51.7 仍未证实
+
+- `grant` 的摘要（6.51.6 第 4 条）—— 第 50 轮加的取证，到这份日志为止**一次都没被触发过**。
+- `refusals=N` 这个规模行读数（只在"这次启动存过东西"时打印；10:21:20 那次全命中，所以没打印）。
+- 落盘拒绝过了 30 分钟窗口后的重付节奏（这次只观察到 34 秒）。
+- 「隔天再读」（`siteAsset` 现在有 28 分钟的跨进程命中，但仍未跨天）。

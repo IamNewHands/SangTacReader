@@ -4564,6 +4564,82 @@ async function testGridLayout() {
     String(sandbox.window.__stvDiag.text() || '').slice(-200));
 }
 
+/**
+ * "The same novel's cover keeps changing, and opening it again shows yet another
+ * one" (2026-10-13). The book's cover is on a host that answers 403 to everyone
+ * (`www.trxs.cc`, measured from the device and from outside it), and the site's
+ * own failure handler picks one of eight wallpapers with `Math.random()`. The
+ * block pins that error path to the site's own placeholder; what these
+ * assertions protect is (a) the pinning, (b) that the picture no longer depends
+ * on the dice, and (c) that the decorative pool the reader's background uses is
+ * still random, because that one is supposed to vary.
+ */
+async function testCoverFallback() {
+  console.log('a cover that cannot load stops changing');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(120);
+
+  const PLACEHOLDER = 'https://static.sangtacvietcdn.xyz/img/bookcover256.jpg';
+  const DEAD = 'https://www.trxs.cc/d/file/tongren/20260810/08e0d41f34504731fd1440a83ba0e1d4.jpeg';
+  // The site's own pool and handlers, defined the way app.v2.js defines them --
+  // in a classic script, at its top level, after our document-start block has
+  // already run.
+  const pool = [
+    'https://i.pinimg.com/236x/36/8f/70/368f70378e191db65611ef1d3b57800d.jpg',
+    'https://img5.thuthuatphanmem.vn/uploads/2021/12/17/hinh-anh-tien-hiep_031724704.jpg',
+    'https://haycafe.vn/wp-content/uploads/2022/04/Hinh-anh-phong-canh-co-trang-Trung-Quoc.jpg',
+  ];
+  sandbox.window.randomDefaultImg = pool;
+  sandbox.window.onImgError = function (img) {
+    img.src = pool[Math.floor(Math.random() * pool.length)];
+    img.onerror = function () { sandbox.window.onImgErrorAgain(img); };
+  };
+  sandbox.window.onImgErrorAgain = function (img) {
+    img.src = PLACEHOLDER;
+    img.onerror = null;
+  };
+  await tick(200);
+
+  check('the site own failed-image handler is replaced once it exists',
+    sandbox.window.onImgError !== undefined
+      && String(sandbox.window.onImgError).indexOf('randomDefaultImg') < 0,
+    String(sandbox.window.onImgError));
+
+  const first = makeElement('img');
+  first.src = DEAD;
+  sandbox.window.onImgError(first);
+  check('a dead cover no longer picks a wallpaper from the pool',
+    pool.indexOf(String(first.src)) < 0, String(first.src));
+  check('it lands on the site own placeholder instead',
+    String(first.src) === PLACEHOLDER, String(first.src));
+  check('nothing is left to fail again on that element',
+    first.onerror === null, String(first.onerror));
+
+  const second = makeElement('img');
+  second.src = DEAD.replace('08e0d41f', 'someothercover');
+  sandbox.window.onImgError(second);
+  check('a re-render of the same book gets the identical picture',
+    String(second.src) === String(first.src));
+
+  const again = makeElement('img');
+  again.src = PLACEHOLDER;
+  sandbox.window.onImgError(again);
+  check('a placeholder that failed too gives up rather than looping',
+    again.onerror === null && String(again.src) === PLACEHOLDER);
+
+  check('the last-resort handler is pinned as well, not only the first one',
+    String(sandbox.window.onImgErrorAgain) === String(sandbox.window.onImgError));
+
+  check('the decorative pool is left alone, because the reader background is meant to vary',
+    sandbox.window.randomDefaultImg === pool);
+
+  check('the change is reported in the panel',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('stops changing on every render') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-200));
+}
+
 async function testTabProbe() {
   console.log('inventory tab probe');
   const sandbox = makeSandbox();
@@ -9149,6 +9225,7 @@ await testEmptyUserPages();
   await testChapterRetry();
   await testKeyboardPopup();
   await testGridLayout();
+  await testCoverFallback();
   await testTabProbe();
   await testCommentTranslate();
   await testCommentTranslateFallback();
