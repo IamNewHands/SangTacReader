@@ -5350,3 +5350,80 @@ stall +1410ms..+1566ms 156ms | candidates: Nunito-Regular.ttf, fa-regular-400.wo
 - `busy` 仍是上界；`api.js`/`app.counter.html`（计数文档）、字体解码、封面解码各占多少没有拆开。
 - 站点 HTML 的 ~1.3s TTFB **不打算动**（§6.23 已按冷缓存实测否决「接管文档加载」）。
 
+## §6.55 第 53 轮（提交名：第五十五轮）：第九份真机日志 —— 遮罩交接在真机上成立，注入 8–9ms，探针功成身退
+
+输入：`stv-diagnostic-20261013-133915.log`（386 行，四次启动 13:38:39 / 13:39:06 ×2 / 13:39:07，
+跑的是 13:3x 的第五十四轮包）。
+
+### 6.55.1 三件事都验到了
+
+1. **遮罩交接成立**（第 54 轮唯一没法在本机验证的一环）：四次启动全部是
+   `[BOOT] shell released at +77ms/+78ms` 紧跟 `[BOOT] native boot overlay released`，同一秒 →
+   页面到原生的撤下调用在真机上真的走通了。
+2. **注入 8–9ms**：`injection=+1434ms..+1443ms (9ms)`、`+1461ms..+1469ms (8ms)`，与第 53 轮的
+   7–10ms 一致。
+3. **卡顿仍全在外壳之后**：两次报告都是 `before=0 task(s)/0ms`。
+
+| 启动 | busy | longest | 说明 |
+| --- | --- | --- | --- |
+| 13:38:39（装包后第一次） | 66ms | 66ms `@+5166ms` | 近乎干净，只有字体那一次 |
+| 13:39:06 | 1071ms | 284ms `@+1546ms` | 候选全是站点自己的东西 |
+
+静态资源这次也全部是 `cache`：`21/23 static request(s) … 1KB wire / 0KB decoded`、
+`materialize.min.js 0KB 20ms cache`、`fa-regular-400.woff2 0KB 14ms cache`。
+
+### 6.55.2 卡顿候选：一次都没有落在我们身上
+
+```
+stall +1546ms..+1830ms 284ms | candidates: Nunito-Regular.ttf, fa-regular-400.woff2, fa-brands-400.woff2, fa-solid-900.woff2 | landed during it: manifest_app_v2.json, warp.php, app.v2.comicprovider.js
+stall +1855ms..+2098ms 243ms | candidates: warp.php, 180, manifest_app_v2.json, api.js
+stall +2271ms..+2464ms 193ms | candidates: warp.php | landed during it: app.counter.html
+```
+
+顺带一条读法上的收获：`app.v2.comicprovider.js 0KB 155ms cache @+1540ms` —— 一个**缓存命中**的文件
+duration 却有 155ms，说明那 155ms 是主线程被占住的时间，不是它的下载时间。**resource duration 里
+包含主线程阻塞**，所以「某文件 155ms」不等于「某文件很贵」。
+
+### 6.55.3 探针按既有约定撤掉
+
+既有约定：临时诊断插桩拿到结论后即删除（2026-09-27 的 `[DEBUG-sig]` 同样处理）。探针的两个问题
+都有答案了 —— 「重库值不值得屏蔽」→ 不值得；「我们自己的注入贵不贵」→ 7–10ms；而剩下的卡顿成因
+在站点自己的脚本/字体/封面/计数文档上，**再测也不会变成我们能改的东西**。于是本轮删掉：
+
+| 删除 | 位置 |
+| --- | --- |
+| `[MAIN]` 探针整段（216 行：Long Tasks 观察器、gap 兜底、归因、注入区间、shell 切分、pagehide/hidden 记录、报告） | `assetCache` 块 |
+| `__stvInjectStart` / `__stvInjectDone` 括号 | `compat` / `coverFallback` |
+| `__stvShellReleaseMs` | `bootShell` |
+| `testMainThreadProbe` 与它的 18 条断言 | `scripts/test-site-patch.js` |
+| 5 个注入标记 / 2 个产物标记 | `scripts/check-ios-shim.js` / `.github/workflows/build-ipa.yml` |
+
+**保留**：`[BOOT] shell released at +Nms`（用户可见里程碑）、`[ASSET]` 时间线、`[MIRROR]`/`[CACHE]`
+（都是常设诊断），以及第 54 轮的原生遮罩。原处留了一条注释指向本节，重建配方在 §6.52/§6.53。
+
+### 6.55.4 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / **638516 字节** / **141 标记** |
+| `scripts/test-site-patch.js` | **920 条断言** 0 失败（上一轮 938，删掉 18 条探针断言） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| CI | 产物标记去掉 `installLongTasks` / `__stvShellReleaseMs`，保留 `bootOverlayHide` |
+
+### 6.55.5 启动这条线的现状（结论）
+
+- 用户可见的空窗 = 站点 HTML 的 TTFB ≈ **1.3s**，现在由**原生遮罩**盖住（深色 + 「载入中…」，
+  交接时文字不动、背景不变）。
+- 外壳释放 ≈ **+1.4s**（navigation 时间），此后全是站点自己的启动与渲染。
+- 我们自己的贡献：注入 7–10ms、8 个静态文件本地服务、内容缓存命中（`[CACHE]`）。
+- **没有下一步**：站点那 ~1s 的主线程忙时来自它自己的脚本、字体、封面与计数文档；§6.23 已按
+  冷缓存实测否决「接管文档加载」。将来若要再动，先看 §6.52/§6.53 的重建配方。
+
+### 6.55.6 仍未证实 / 非目标
+
+- 遮罩的实际观感（本次日志只证明交接调用发生了；观感只能真机看）。
+- `api.js` / `app.counter.html`（计数文档）与字体解码各占多少没有拆开 —— 拆开需要新的插桩，而
+  本轮的判断是「拆开也不能改」。
+- 站点 HTML 的 ~1.3s TTFB 不动。
+

@@ -42,18 +42,6 @@ enum SitePatch {
         if (window.__stvIOSCompatInstalled) { return; }
         window.__stvIOSCompatInstalled = true;
 
-        // Round 53: `compat` is the first block in SitePatch.all and
-        // `coverFallback` is the last, so the two of them bracket the whole
-        // document-start injection. The difference is what our own 642KB of
-        // injected JavaScript costs the main thread before the page's first
-        // inline script runs -- the number that decides whether trimming or
-        // deferring blocks buys more than anything the site does. The [MAIN]
-        // line in the assetCache block prints it next to the measured stalls.
-        if (!window.__stvInjectStart) {
-            window.__stvInjectStart = (window.performance && window.performance.now)
-                ? window.performance.now() : Date.now();
-        }
-
         if (typeof window.nativeclick === 'undefined') {
             window.nativeclick = {
                 trigger: function () {},
@@ -273,222 +261,14 @@ enum SitePatch {
             }
         };
 
-        // --- what the parser-created scripts cost the main thread ---
-
-        // 查重库 (2026-10-13): the four libraries the mirror cannot reach are
-        // already free on the network -- the device log shows 0KB wire and
-        // 13-34ms each, straight out of WebKit's disk cache -- so the only cost
-        // left to price is their parse and execute time, and the resource
-        // timeline does not contain it. Long Tasks answers that directly where
-        // the engine has it; a chained timer answers it from the other side (a
-        // 25ms timer that comes back 120ms late means the main thread was busy
-        // for most of that gap). One [MAIN] line per launch, so the next device
-        // log can decide whether blocking them is worth a native content rule
-        // list -- and, if it is, which files it has to cover.
-        var BUSY_MS = 50;
-
-        function clock() {
-            if (window.performance && typeof window.performance.now === 'function') {
-                return window.performance.now();
-            }
-            return Date.now();
-        }
-
-        var busy = { mode: 'none', count: 0, total: 0, rows: [] };
-        var gapTimer = null;
-
-        function recordBusy(start, duration) {
-            // Below the threshold is timer noise, not a stall.
-            if (!(duration >= BUSY_MS)) { return; }
-            busy.count++;
-            busy.total += duration;
-            busy.rows.push([Math.round(start), Math.round(duration)]);
-        }
-
-        function shortName(url) {
-            var path = String(url || '').split('?')[0].split('#')[0];
-            var parts = path.split('/');
-            return parts[parts.length - 1] || '';
-        }
-
-        // Candidates, plural. The first device log showed why one name is not
-        // enough: the longest stall was blamed on a font while the file that had
-        // actually just landed sat 70ms earlier. A script can only be parsed
-        // after its bytes arrive, so everything that landed inside the 500ms
-        // before a stall is a candidate -- and the log says exactly that.
-        function candidatesBefore(when, span, limit) {
-            var out = [];
-            if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
-                return out;
-            }
-            var entries = window.performance.getEntriesByType('resource') || [];
-            var rows = [];
-            for (var i = 0; i < entries.length; i++) {
-                var end = entries[i].responseEnd || 0;
-                if (end <= when && end >= when - span) { rows.push([end, shortName(entries[i].name)]); }
-            }
-            rows.sort(function (a, b) { return b[0] - a[0]; });
-            for (var j = 0; j < rows.length && out.length < limit; j++) {
-                if (rows[j][1] && out.indexOf(rows[j][1]) < 0) { out.push(rows[j][1]); }
-            }
-            return out;
-        }
-
-        // Bytes that arrived *during* a stall prove the stall is main-thread
-        // work: the network runs in its own process and keeps delivering while
-        // the page is blocked.
-        function arrivedDuring(from, to, limit) {
-            var out = [];
-            if (!window.performance || typeof window.performance.getEntriesByType !== 'function') {
-                return out;
-            }
-            var entries = window.performance.getEntriesByType('resource') || [];
-            for (var i = 0; i < entries.length && out.length < limit; i++) {
-                var end = entries[i].responseEnd || 0;
-                if (end > from && end <= to) {
-                    var name = shortName(entries[i].name);
-                    if (name && out.indexOf(name) < 0) { out.push(name); }
-                }
-            }
-            return out;
-        }
-
-        // What our own document-start injection cost, from `compat` (first block
-        // in SitePatch.all) to `coverFallback` (last one).
-        function injectionSpan() {
-            var start = window.__stvInjectStart;
-            var done = window.__stvInjectDone;
-            if (typeof start !== 'number' || typeof done !== 'number' || !(done >= start)) {
-                return '';
-            }
-            return ', injection=+' + Math.round(start) + 'ms..+' + Math.round(done) + 'ms ('
-                + Math.round(done - start) + 'ms)';
-        }
-
-        // The question the decision rule turns on: was the main thread busy
-        // *before* the reader could see anything, or after?
-        function shellSplit() {
-            var at = window.__stvShellReleaseMs;
-            if (typeof at !== 'number') { return ''; }
-            var before = 0;
-            var beforeMs = 0;
-            var after = 0;
-            var afterMs = 0;
-            for (var i = 0; i < busy.rows.length; i++) {
-                if (busy.rows[i][0] < at) { before++; beforeMs += busy.rows[i][1]; }
-                else { after++; afterMs += busy.rows[i][1]; }
-            }
-            return '; shell release +' + at + 'ms splits them: before=' + before + ' task(s)/'
-                + beforeMs + 'ms, after=' + after + ' task(s)/' + afterMs + 'ms';
-        }
-
-        // The gap probe measures lateness, so a teardown or a backgrounded web
-        // view would look like busy time. Both are recorded, and the report says
-        // which one happened instead of quietly counting it.
-        function stopNote() {
-            var notes = [];
-            if (typeof busy.pageHide === 'number') { notes.push('page hid at +' + busy.pageHide + 'ms'); }
-            if (typeof busy.hidden === 'number') { notes.push('hidden at +' + busy.hidden + 'ms'); }
-            return notes.length ? ' (' + notes.join(', ') + ')' : '';
-        }
-
-        function installLongTasks() {
-            var watcher = window.PerformanceObserver;
-            if (typeof watcher !== 'function') { return false; }
-            var types = watcher.supportedEntryTypes;
-            if (!types || types.indexOf('longtask') < 0) { return false; }
-            try {
-                var watch = new watcher(function (list) {
-                    var entries = (list && list.getEntries) ? list.getEntries() : [];
-                    for (var i = 0; i < entries.length; i++) {
-                        recordBusy(entries[i].startTime, entries[i].duration);
-                    }
-                });
-                watch.observe({ entryTypes: ['longtask'] });
-                busy.mode = 'longtask';
-                return true;
-            } catch (e) { return false; }
-        }
-
-        function installGapProbe() {
-            // Lateness is an upper bound on the busy time inside that window,
-            // which is the safe direction: it cannot invent a fast startup.
-            busy.mode = 'gap';
-            var step = 25;
-            var ticks = 0;
-            var due = clock() + step;
-            function tick() {
-                if (!gapTimer) { return; }
-                // Bounded: a page whose `load` never fires must not leave a
-                // permanent 40Hz timer behind (2400 x 25ms = 60s).
-                ticks++;
-                if (ticks > 2400) { stopProbe(); return; }
-                var now = clock();
-                recordBusy(due, now - due);
-                due = now + step;
-                gapTimer = setTimeout(tick, step);
-            }
-            gapTimer = setTimeout(tick, step);
-        }
-
-        function stopProbe() {
-            if (gapTimer) { clearTimeout(gapTimer); gapTimer = null; }
-        }
-
-        window.addEventListener('pagehide', function () {
-            busy.pageHide = Math.round(clock());
-            stopProbe();
-        });
-        document.addEventListener('visibilitychange', function () {
-            if (document.visibilityState && document.visibilityState !== 'visible'
-                && typeof busy.hidden !== 'number') {
-                busy.hidden = Math.round(clock());
-            }
-        });
-
-        function reportBusy() {
-            if (!window.__stvDiag || busy.mode === 'none') { return; }
-            var head = '; probe=' + busy.mode + injectionSpan();
-            if (!busy.count) {
-                window.__stvDiag.log('MAIN', 'no task over ' + BUSY_MS + 'ms before load'
-                    + head + stopNote());
-                return;
-            }
-            busy.rows.sort(function (a, b) { return b[1] - a[1]; });
-            var worst = busy.rows[0];
-            window.__stvDiag.log('MAIN', busy.count + ' task(s) over ' + BUSY_MS + 'ms: busy='
-                + Math.round(busy.total) + 'ms, longest=' + worst[1] + 'ms at +' + worst[0] + 'ms'
-                + head + shellSplit() + stopNote());
-            for (var i = 0; i < busy.rows.length && i < 3; i++) {
-                var at = busy.rows[i][0];
-                var end = at + busy.rows[i][1];
-                var before = candidatesBefore(at, 500, 4);
-                var during = arrivedDuring(at, end, 3);
-                window.__stvDiag.log('MAIN', 'stall +' + at + 'ms..+' + end + 'ms '
-                    + busy.rows[i][1] + 'ms | candidates (bytes landed within 500ms before): '
-                    + (before.length ? before.join(', ') : 'none')
-                    + (during.length ? ' | landed during it: ' + during.join(', ') : ''));
-            }
-        }
-
-        // Exposed for the panel and for the test harness: the report is a pure
-        // function of what has been observed so far, so it can be re-run.
-        window.__stvAssetCache.busy = busy;
-        window.__stvAssetCache.reportBusy = reportBusy;
-
-        if (!installLongTasks()) { installGapProbe(); }
-
-        function reportOnce() {
-            stopProbe();
-            reportBusy();
-        }
-
-        if (document.readyState === 'complete') {
-            setTimeout(reportOnce, 500);
-        } else {
-            window.addEventListener('load', function () { setTimeout(reportOnce, 500); });
-        }
-
+        // The main-thread probe that priced the parser-created libraries lived
+        // here from round 52 to round 54 (查重库). It answered its question and was
+        // removed on 2026-10-13, per the standing rule that diagnostic
+        // instrumentation goes once the conclusion is in hand. What it measured is
+        // in docs/capacitor-port.md §6.55 -- the injection costs 7-10ms, every
+        // stall sits after the shell release, and the candidates are always the
+        // site's own fonts, bundles and counter document -- and §6.52/§6.53 have
+        // the recipe if a future boot question needs pricing again.
         // `diag` is injected after this block, so __stvDiag does not exist yet
         // here -- announce once the document is parsed instead.
         function announce() {
@@ -11516,12 +11296,6 @@ enum SitePatch {
                     note('BOOT', 'native boot overlay released');
                 }
             } catch (e) {}
-            // Round 53: the [MAIN] probe splits its stalls at this moment, so
-            // "was the main thread busy before the reader could see anything"
-            // is answered by the log instead of by aligning two timestamps that
-            // only have second resolution.
-            window.__stvShellReleaseMs = (window.performance && window.performance.now)
-                ? Math.round(window.performance.now()) : Math.round(Date.now() - started);
         }
 
         // The site's own stylesheet is the signal that the real UI is styled.
@@ -12500,12 +12274,6 @@ enum SitePatch {
             tries = tries + 1;
             if (install() || tries > 100) { clearInterval(timer); }
         }, 100);
-
-        // The other half of the bracket opened in `compat` (the first block in
-        // SitePatch.all). This block is the last one, so this is the end of the
-        // document-start injection as a whole.
-        window.__stvInjectDone = (window.performance && window.performance.now)
-            ? window.performance.now() : Date.now();
     })();
     """
 

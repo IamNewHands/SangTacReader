@@ -34,18 +34,10 @@ const REQUIRED_MARKERS = [
   // The asset cache-buster stabiliser: the site appends Math.random() to the
   // URLs of its own /asset/ bundles, which defeats the max-age=86400 it sends.
   'window.__stvAssetCache',
-  // Pricing the parser-created scripts the mirror cannot reach: Long Tasks where
-  // the engine has it, a chained timer where it does not, both reported under
-  // [MAIN] so the decision to block them rests on a measurement.
-  'function installLongTasks(',
-  'no task over ',
-  // Round 53: the first device log answered the first question (WebKit has no
-  // Long Tasks API) and exposed a weak attribution -- one name, often a font
-  // that happened to land last. So the report now carries the candidates
-  // (plural), the injection bracket, and the split at the shell release.
-  'window.__stvInjectStart',
-  'candidates (bytes landed within 500ms before): ',
-  'ms splits them: before=',
+  // The main-thread probe that lived here from round 52 to round 54 (查重库) was
+  // removed once it had answered: injection 7-10ms, every stall after the shell
+  // release, candidates always the site's own files. The numbers and the recipe
+  // to rebuild it are in docs/capacitor-port.md §6.55 / §6.52 / §6.53.
   // Round 54: the native boot overlay is taken down by the page at the shell
   // release -- the only moment the page knows the real UI is styled. Without
   // this call the overlay stays until its 12s backstop.
