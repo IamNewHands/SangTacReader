@@ -5427,3 +5427,72 @@ duration 却有 155ms，说明那 155ms 是主线程被占住的时间，不是�
   本轮的判断是「拆开也不能改」。
 - 站点 HTML 的 ~1.3s TTFB 不动。
 
+## §6.56 第 54 轮（提交名：第五十六轮）：S7 的 ATS 审计落到 CI，P1 的 TTS 去 base64 先量再动
+
+这一轮做的是「优化文档里还剩什么」盘点后选定的两项（A + B）。
+
+### 6.56.1 A：S7（ATS）从「本机看不到」变成「每次构建都验」
+
+计划 §4/S7 写着「落地时应在 macOS 侧确认：禁用 `NSAllowsArbitraryLoads`，只保留必要例外」。
+仓库不含 `ios/`（`cap add ios` 生成、故意不入库），所以这条一直悬着 —— 但 CI 早就在做同类事：
+`build-ipa.yml` 用 `PlistBuddy` 往生成的 `ios/App/App/Info.plist` 里补 `UIBackgroundModes: audio`，
+又用 `plutil` 读**产物**里的 plist 复查。现在把 ATS 接到同一处：
+
+| 步骤 | 做什么 |
+| --- | --- |
+| 新步骤 `Force ATS on (audit arbitrary loads)`（第 13 步） | 先如实打印模板的 `NSAppTransportSecurity`（**这就是 S7 要的那个答案**），键存在就 `Set …NSAllowsArbitraryLoads false`，不存在就不动（缺省本来就是 ATS 生效） |
+| `Verify background audio mode is in the built app` 追加 | 读**编进 app 的那一份** plist：`NSAllowsArbitraryLoads` 为 true/1 就红。源码改过而产物没跟上（例如某插件合并了自己的 plist）只有这里能发现 |
+
+依据：站点、图床（`static.sangtacvietcdn.xyz`、`bookcover.yuewen.com`）、`warp.php` 探活与
+Turnstile 全是 https，仓库里没有任何需要明文 http 的地方。风险与回滚：若真机上出现某个
+`http://` 子资源加载失败（最坏是一张图不显示），回滚是一次提交。
+
+### 6.56.2 B：TTS 去 base64 —— 先让那一行说出三个数
+
+P1 里最后一项。原方案要 `WKURLSchemeHandler`，而 `WKWebViewConfiguration` 是 web view 创建时
+定下的（`CAPBridgeViewController.loadView()`），插件 `load()` 时已经晚了 —— 要动它就得让 CI
+改生成出来的 iOS 工程，太脆。**仓库内可达的另一条路**：原生把 `22050Hz / Int16 / 单声道`
+（`NativeSpeech.swift:444`）的 WAV 转成 AAC（约五分之一体积）再回给页面，`decodeAudioData`
+本来就吃 m4a。
+
+但在动原生之前先量。查了手上 8 份日志：**一次 `[TTS] speak result` 都没有** —— 用户进过阅读器，
+但没真正开始朗读（日志里只有 `reader TTS diagnostics installed` 与 `reader closed`），所以这条
+待办至今没有任何真机数字。
+
+于是把那一行从「只报 payload 字符数」改成三个数一起报：
+
+```
+[TTS] speak result kind=object payload=144KB base64 audio=2.5s (43KB/s) in 137ms text=42 chars
+```
+
+`payload` 是跨桥的 base64 体积、`audio` 是它换来的语音秒数、`43KB/s` 就是 22050Hz×16bit×单声道
+的原始码率 —— 这三个数放在一起，才构成「要不要转 AAC」的完整论据。
+
+### 6.56.3 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 28 块 / **639557 字节** / 141 标记 |
+| `scripts/test-site-patch.js` | **921 条断言**（上一轮 920） |
+| `scripts/gen-site-i18n.js --check` | 461 labels / 76 fragments |
+| `scripts/gen-site-assets.js --check` | 8 文件 / 906296 字节 |
+| workflow | YAML 解析通过，25 步，新步骤在第 13 位 |
+
+新增断言：那一行的算术被真实数字钉住（2.5 秒 22050Hz/16bit 单声道 = 110250 字节 WAV →
+`payload=144KB base64 audio=2.5s (43KB/s)`）；测试桩新增 `ttsPayloadBytes` 选项来喂这个体积
+（默认仍是原来的 12 字节桩，避免影响别的断言）。
+
+### 6.56.4 下一份日志要看的行
+
+1. `[TTS] speak result … payload=…KB base64 audio=…s (…KB/s) in …ms` —— 读上 20 句就知道
+   每句多少 KB、桥上一次多久。**判据**：若 `payload` 常在 200KB 以上、`in` 常超过 100ms，
+   就做原生 AAC 转码（体积约 1/5）；若只有几十 KB 且 `in` 是十几毫秒，这条待办直接标「不做」。
+2. 构建日志里的 `NSAllowsArbitraryLoads = …`（第 13 步的 `before`/`after` 与产物复查那行）。
+
+### 6.56.5 仍未证实 / 非目标
+
+- TTS 的实际体积与耗时（等上面第 1 条）。
+- Capacitor 模板到底有没有开 `NSAllowsArbitraryLoads`（下一次构建的日志会写出来；无论答案是什么，
+  产物复查都已经在盯着）。
+- ATS 关掉后真机上是否有 `http://` 子资源被拦（预期没有，回滚一次提交）。
+

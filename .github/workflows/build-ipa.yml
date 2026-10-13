@@ -101,6 +101,27 @@ jobs:
           echo "=== UIBackgroundModes ==="
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$plist"
 
+      # 优化方案 §4/S7：ATS 必须开着。站点、图床（static.sangtacvietcdn.xyz、
+      # bookcover.yuewen.com 等）与 Turnstile 全是 https，没有任何需要明文 http 的
+      # 地方；而本机看不到 ios/（故意不入库），所以这条只能在 runner 上落地。
+      # 先如实打印模板给的是什么（这就是 S7 要的那个答案），再强制关掉
+      # NSAllowsArbitraryLoads；键不存在就不动 —— 缺省本来就是 ATS 生效。
+      - name: Force ATS on (audit arbitrary loads)
+        run: |
+          set -euo pipefail
+          plist=ios/App/App/Info.plist
+          echo "=== NSAppTransportSecurity before ==="
+          /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$plist" 2>/dev/null \
+            || echo "(模板没有 NSAppTransportSecurity 键，ATS 按缺省生效)"
+          if /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity:NSAllowsArbitraryLoads" "$plist" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads false" "$plist"
+            echo "已把 NSAllowsArbitraryLoads 设为 false"
+          else
+            echo "NSAllowsArbitraryLoads 未声明，无需改动"
+          fi
+          echo "=== NSAppTransportSecurity after ==="
+          /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$plist" 2>/dev/null || true
+
       - name: Verify generated SPM manifest
         run: |
           set -euo pipefail
@@ -168,6 +189,15 @@ jobs:
           case "$modes" in
             *'"audio"'*) echo "✓ 后台音频模式已编入产物" ;;
             *) echo "::error::产物 Info.plist 缺少 UIBackgroundModes=audio（锁屏后应用会被立刻挂起）"; exit 1 ;;
+          esac
+          # S7：产物里的 ATS 也必须是真的开着。源码那一步改的是生成工程里的
+          # plist，这一步读的是**编进 app 的那一份**——两者不一致时（例如某个
+          # 插件把自己的 plist 合并进来）只有这里能发现。
+          arbitrary="$(plutil -extract NSAppTransportSecurity.NSAllowsArbitraryLoads json -o - "$plist" 2>/dev/null || echo '<absent>')"
+          echo "NSAllowsArbitraryLoads = $arbitrary"
+          case "$arbitrary" in
+            true|1) echo "::error::产物开了 NSAllowsArbitraryLoads（ATS 被关闭，S7 未落地）"; exit 1 ;;
+            *) echo "✓ 产物未开启明文加载（ATS 生效）" ;;
           esac
 
       - name: Verify native plugins are linked into the binary
