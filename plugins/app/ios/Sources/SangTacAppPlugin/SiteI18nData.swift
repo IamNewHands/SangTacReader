@@ -1476,12 +1476,12 @@ enum SiteI18nData {
         var LANG_CODE = new RegExp('^[A-Za-z][A-Za-z0-9_-]{0,11}$');
 
         // The settings row for the domain goes through the same generated handler
-        // as the language row, so it arrives here as `https://sangtacviet.com`.
+        // as the language row, so it arrives here as a full https host.
         // That is not a language and is refused either way, but calling it "a
         // language that is not one" made every 线路 tap look like a bug in the
         // panel (2026-10-25 17:12:20 / 17:17:40). A host is the row's own value
         // and is reported as what it is; the site's domain setter has already
-        // stored it by then (`app.config.ux.app_domain`).
+        // stored it by then (app.config.ux.app_domain).
         var URL_VALUE = new RegExp('^https?://', 'i');
 
         // Switching language has to re-render the page from the new cookie. The
