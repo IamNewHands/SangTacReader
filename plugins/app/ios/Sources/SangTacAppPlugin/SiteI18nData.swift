@@ -1475,6 +1475,15 @@ enum SiteI18nData {
          */
         var LANG_CODE = new RegExp('^[A-Za-z][A-Za-z0-9_-]{0,11}$');
 
+        // The settings row for the domain goes through the same generated handler
+        // as the language row, so it arrives here as `https://sangtacviet.com`.
+        // That is not a language and is refused either way, but calling it "a
+        // language that is not one" made every 线路 tap look like a bug in the
+        // panel (2026-10-25 17:12:20 / 17:17:40). A host is the row's own value
+        // and is reported as what it is; the site's domain setter has already
+        // stored it by then (`app.config.ux.app_domain`).
+        var URL_VALUE = new RegExp('^https?://', 'i');
+
         // Switching language has to re-render the page from the new cookie. The
         // site's own changeLanguage only swaps the app.text table and re-runs the
         // <text> nodes (app.v2.js:1952-1956), which leaves every hardcoded string it
@@ -1514,9 +1523,15 @@ enum SiteI18nData {
             app.text.changeLanguage = function (langCode) {
                 var code = String(langCode === undefined || langCode === null ? '' : langCode);
                 if (!LANG_CODE.test(code)) {
-                    note('PATCH', 'refused a language that is not one: '
-                        + code.substring(0, 60) + ' (the site stays on '
-                        + currentLanguage() + ')');
+                    if (URL_VALUE.test(code)) {
+                        note('DOMAIN', 'the 线路 row hands its host to the language'
+                            + ' setter as well; ignored, the host is already in'
+                            + ' app.config.ux.app_domain (' + code.substring(0, 60) + ')');
+                    } else {
+                        note('PATCH', 'refused a language that is not one: '
+                            + code.substring(0, 60) + ' (the site stays on '
+                            + currentLanguage() + ')');
+                    }
                     return null;
                 }
                 var before = currentLanguage();

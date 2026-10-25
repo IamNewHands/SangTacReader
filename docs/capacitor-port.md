@@ -5915,10 +5915,15 @@ URL 直接拼 `networkManager.bestDomain()`（`read.js:564`）、密钥同一来
 
 ### 6.61.1 一行三个判据，只有一个来自延迟
 
+> **§6.62 推翻了这一段的两处结论。**「只有 `.com` 是 ✓」错：2026-10-25 17:12 的日志里三台
+> 全是 ✓（`.com` / `.app` / `dns1` 都拿 `.com` 页面的 cookie 认证成功），会话根本不按域名区分；
+> 而且三行读数当时是从**同一条缓存**里回显的（`[CACHE] POST … cache hit … by=dns1…`），
+> 那一列当时没有分辨力。现在的探针带 `?rescan=true` 绕开原生缓存，每行是一次独立请求。
+
 | 列 | 怎么来的 | 为什么必须有 |
 | --- | --- | --- |
 | 延迟 `128ms` | `GET <host>/warp.php`，与 `verifyDomain()` 同一个探针（`app.v2.js:911-917`） | 回答「多远」。**单独用会把 §6.10 那个 bug 装回去** —— ping 最低的那台经常就是回 code 7 的那台 |
-| 会话 `✓ / ✗` | `POST <host>/mobile/userinfo.php`，头与阅读器读正文时一致（`x-stv-transport: app` + `document.cookie`，`app.v2.js:1142-1149`） | 回答「这台认不认我的登录」。cookie 属于页面 origin，所以这条通常只有 `.com` 是 ✓ —— 这正是「登录说成功但没登录」的现场证据 |
+| 会话 `✓ / ✗` | `POST <host>/mobile/userinfo.php?rescan=true`，头与阅读器读正文时一致（`x-stv-transport: app` + `document.cookie`，`app.v2.js:1142-1149`） | 回答「这台认不认我的登录」。`rescan=true` 是原生缓存的旁路（`SangTacHttpPlugin.swift:1025-1028`），否则 `userInfo` 的缓存键不含 host，三行会回显同一条 |
 | 正文 `✓ / ✗ code 7 / 未测` | 拉黑表 `window.__stvDomainBanned`（来自故障转移块）与 `stv.domain.good`（上次真出过正文的那台） | 只承认**有记录**的事：没记录就写「未测」，不写「可用」 |
 
 「未登录」时第二列显示「未登录」而不是 ✗ —— 没登录不是线路的错。
@@ -5955,3 +5960,60 @@ URL 直接拼 `networkManager.bestDomain()`（`read.js:564`）、密钥同一来
 - 站点自己那个 `.app` 选项仍在菜单里；读者手选它时本轮不会拦（只会在体检行里显示 `会话 ✗`）。
 
 
+
+---
+
+## §6.62 第 60 轮（提交名：第六十二轮）：当日两份真机日志 —— 一直是 `.app` 在给正文，而 code 7 之后那 773KB 白下了两遍
+
+两份日志：`stv-diagnostic-20261025-171321.log`（184 行，当日第一份，回答「`.com` 登录为什么要验证码」）与 `stv-diagnostic-20261025-171838.log`（467 行，第二份，下文引用的都是它）。读者按上一轮的判据做了一次对照
+实验：设 `.app` 登录 → 立刻切回 `.com` → 打开任意一章。他的原话是「加载挺久的，最后有出正文，
+但我不确定是不是自动切回 app 才出来」。**答案是：是自动切的**，而且日志把每一次失败和每一份
+白下的字节都标了出来。
+
+### 6.62.1 一章 13 秒，其中 10.9 秒是 `grantcontext`
+
+| 时间 | 主机 | 发生了什么 |
+| --- | --- | --- |
+| 17:17:51 | — | `open readchapter` |
+| 17:17:57 | `.com` | `GET /io/grantcontext/context` → **773447 字节 / 5530ms**；随后 `readchapter` → `{"code": 7,"time": 1000}`（196ms） |
+| 17:18:01 | `dns1` | 同样的 key 文件 → **891836 字节 / 4149ms**；`readchapter` → `{"code": 7}`（252ms） |
+| 17:18:03 | `.app` | 同样的 key 文件 → 773447 字节 / 1299ms；`readchapter` → `{"code": 0}` + 10709 字节正文（1026ms） |
+| 17:18:04 | `.app` | `remembered working mirror https://sangtacviet.app` |
+| 17:18:06 | `.app` | `using remembered mirror`：之后每章 513 / 722 / 497ms |
+
+两块 key 文件的字节数一样（773447），页面上算出来的 key 前缀也一样（`4b4b594d…`）——
+**`.app` 用的是 `.com` 签发的那把 key，并且它认。** 所以「key 属于某个 host」这条假设是错的：
+key 属于**书**。上一轮 §6.60 那条「页面 origin 优先」正是在这个假设上做出的，被本日志推翻。
+
+### 6.62.2 四条改动
+
+| 改动 | 位置 | 为什么 |
+| --- | --- | --- |
+| 「上次真出过正文的线路」提到页面 origin 之前 | `domainFailover` → `patchBestDomain` | 页面 origin 只证明「这一页是它发的」，不证明它会交出章节。`stv.domain.good` 是**已经交过**的那台，证据强一档；冷启动因此不再固定先吃一次 code 7 + 5.5 秒 |
+| code 7 不再丢 `cachekey` | `domainFailover` → `patchContent` | 丢它 = 重新下载 773KB-891KB 的 `grantcontext`（`app.v2.read.js:515-523`）。实测换台后同一把 key 仍然有效，所以换台只付一次 `readchapter` |
+| code 5 / 1 才重下 key，且只重下一次 | 同上 | 这两种是站点明说「key 不对」，与「这台不给正文」是两件事，不能一起处理 |
+| 设置页会话列带 `?rescan=true` | `domainProbe` → `probeSession` | `userInfo` 的缓存键不含 host（`SangTacHttpPlugin.includesHost`），三行原本回显同一条答案；17:12:39 那行甚至把「未登录」印在自己请求返回已登录账号的前一行 |
+| 线路值不再被当作非法语言 | `SiteI18nData` → `installLanguageGuard` | 站点那排设置行共用同一个生成器，线路的值也会送进 `changeLanguage`。仍然拒绝，但改报 `[DOMAIN]` 并说明线路行已经写进 `app.config.ux.app_domain`，不再让每次点线路都像一次 bug |
+
+### 6.62.3 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 30 块 / 662130 字节 / 141 标记 |
+| `scripts/test-site-patch.js` | **968 条断言** / 0 失败（新增 7 条，改 2 条） |
+| workflow | 新增**行号比较**守卫：`var good = readGood();` 必须出现在 `var page = pageOrigin();` 之前（`grep -q` 看不出顺序，退回旧序会静默吃掉 13 秒） |
+
+新增/改写的断言：出过正文的线路排在页面 origin 之前、该线路回 code 7 时退回页面 origin、
+装配不丢页面已有的 key、code 5 只重载一次且读继续进行、面板说的是「重载 key」不是「拉黑镜像」、
+会话行每行都带 `rescan=true`、线路主机不再被报成「不是语言的非法值」、真正的非法值仍被点名。
+
+### 6.62.4 结论与仍未证实
+
+- **可以只留 `.app`。** 它同时是唯一能登录（`.com` 回 captcha，`.app` 回 success）和唯一交出
+  正文的一台；`.app` 的 ping 最差（494-770ms），但另外两台回 code 7，延迟再低也没有意义。
+  所以「让读者挑」这件事本身没有价值 —— 选择器留作逃生口，默认值交给「上次出过正文的那台」。
+- **仍未证实**：`.app` 这台为什么快不起来（每章 500-1000ms，`.com` 只有 176-226ms）；是出口
+  线路还是它自己在做限速。若要查，需要在 `.app` 上分别量 `warp.php` 与 `readchapter` 的
+  首字节时间，日志里目前只有总时长。
+- **非目标**：不写死 `.app` 主机名。站点会轮换哪台能用（前天能用的是 `.com`），写死就是下一次
+  同一个故障。

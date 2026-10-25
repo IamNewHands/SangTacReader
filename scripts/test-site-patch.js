@@ -2129,9 +2129,20 @@ async function testLanguageGuard() {
   await tick(40);
   check('a domain is refused before it can become a language request',
     loads.length === 0 && refused === null, loads.join('|'));
-  check('the refusal names the value that was refused',
-    String(sandbox.window.__stvDiag.text() || '')
-      .indexOf('refused a language that is not one: https://sangtacviet.app') >= 0,
+  // The 线路 row's generated handler feeds the same setter, so a host arriving
+  // here is expected traffic, not a fault: the 2026-10-25 17:12:20 / 17:17:40
+  // device log has one of these per domain pick and it reads like a bug.
+  const afterDomain = String(sandbox.window.__stvDiag.text() || '');
+  check('a host arriving here is reported as the 线路 row, not as a bad language',
+    afterDomain.indexOf('the 线路 row hands its host to the language setter') >= 0
+      && afterDomain.indexOf('refused a language that is not one: https://') < 0,
+    afterDomain.slice(-320));
+  const garbage = app.text.changeLanguage('not a language');
+  await tick(20);
+  check('a value that is neither a language nor a host is still named as refused',
+    garbage === null && loads.length === 0
+      && String(sandbox.window.__stvDiag.text() || '')
+        .indexOf('refused a language that is not one: not a language') >= 0,
     String(sandbox.window.__stvDiag.text() || '').slice(-320));
   check('the site language is left where it was',
     app.language === 'vi', String(app.language));
@@ -3622,8 +3633,8 @@ async function testDomainFailover() {
     served.length === 2 && served[0] === bad && served[1] === good, JSON.stringify(served));
   check('the rejected mirror is never picked again',
     app.net.networkManager.bestDomain() === good, app.net.networkManager.bestDomain());
-  check('the chapter key issued by the rejected mirror is dropped',
-    app.reader.cachekey === null, String(app.reader.cachekey));
+  check('the chapter key is kept: it belongs to the book, not the mirror',
+    app.reader.cachekey === 'qidian-1', String(app.reader.cachekey));
   const diag = sandbox.window.__stvDiag.text();
   check('the failover is reported in the panel',
     diag.indexOf('mirror ' + bad + ' banned') >= 0, diag.slice(-300));
@@ -4219,6 +4230,76 @@ async function testPageOriginPinning() {
   check('an explicit 线路 pick still wins over the page origin',
     picked.app.net.networkManager.bestDomain() === APP,
     picked.app.net.networkManager.bestDomain());
+
+  // --- a mirror that already served a chapter beats the page origin --------
+  // The 2026-10-25 17:17/17:18 log: the page came from `.com`, `.com` answered
+  // code 7, `dns1` answered code 7, and the remembered `.app` served it -- after
+  // 5.5s + 4.1s of `grantcontext` and 13 seconds of blank screen. A chapter
+  // already received is the only evidence that a host will hand one over.
+  const rememberedBeatsPage = build();
+  rememberedBeatsPage.sandbox.window.location = { origin: PAGE };
+  rememberedBeatsPage.sandbox.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: APP, at: Date.now() }));
+  vm.runInContext(loadBlocks().join('\n'), rememberedBeatsPage.sandbox);
+  await tick(300);
+  check('a mirror that last served a chapter outranks the page origin',
+    rememberedBeatsPage.app.net.networkManager.bestDomain() === APP,
+    rememberedBeatsPage.app.net.networkManager.bestDomain());
+
+  // ...but the page origin is still the first guess when nothing is remembered,
+  // and the remembered mirror is still walked past once it answers code 7.
+  const rememberedDies = build();
+  rememberedDies.sandbox.window.location = { origin: PAGE };
+  rememberedDies.sandbox.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: APP, at: Date.now() }));
+  const diesServed = [];
+  rememberedDies.app.reader.getContent = function () {
+    const host = rememberedDies.app.net.networkManager.bestDomain();
+    diesServed.push(host);
+    return Promise.resolve(host === APP ? { code: 7 } : { code: 0, data: 'chapter' });
+  };
+  vm.runInContext(loadBlocks().join('\n'), rememberedDies.sandbox);
+  await tick(300);
+  const diesRead = await rememberedDies.app.reader.getContent('qidian', '1', 'c3');
+  check('a remembered mirror that answers code 7 is dropped for the page origin',
+    String(diesRead.code) === '0' && diesServed[0] === APP && diesServed[1] === PAGE,
+    JSON.stringify(diesServed));
+
+  // --- the chapter key survives a mirror change ----------------------------
+  // Reloading it costs a 773KB-891KB `grantcontext` download (5.5s / 4.1s in the
+  // log), and the key minted on one mirror is accepted by another, so a code 7
+  // must not throw it away. A key the site itself rejects (code 5 / 1) is
+  // reloaded -- once.
+  const keyCase = makeSandbox();
+  const keyApp = installFakeApp(keyCase, {
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: FAST, status: 'alive', ping: 100 },
+        { name: PAGE, status: 'alive', ping: 900 },
+        { name: APP, status: 'alive', ping: 500 },
+      ],
+      defaultDomains: [PAGE, FAST, APP],
+    },
+  });
+  keyApp.reader.cachekey = 'qidian-1';
+  keyApp.reader.chapterkey = 'KEY';
+  // Replaced before the blocks load: the wrapper captures the original once.
+  const answers = [{ code: 5 }, { code: 0, data: 'chapter' }];
+  keyApp.reader.getContent = function () { return Promise.resolve(answers.shift()); };
+  vm.runInContext(loadBlocks().join('\n'), keyCase);
+  await tick(300);
+  check('installing the failover keeps the key the page already has',
+    keyApp.reader.cachekey === 'qidian-1' && keyApp.reader.chapterkey === 'KEY',
+    JSON.stringify({ cachekey: keyApp.reader.cachekey, chapterkey: keyApp.reader.chapterkey }));
+  const afterKeyRefusal = await keyApp.reader.getContent('qidian', '1', 'c4');
+  check('a key the site rejects is downloaded again, once, and the read continues',
+    String(afterKeyRefusal.code) === '0' && keyApp.reader.cachekey === null,
+    JSON.stringify({ code: afterKeyRefusal && afterKeyRefusal.code, cachekey: keyApp.reader.cachekey }));
+  check('and the panel says the key was reloaded, not that a mirror was banned',
+    String(keyCase.window.__stvDiag.text() || '')
+      .indexOf('chapter key refused with code 5; downloading it again once') >= 0,
+    String(keyCase.window.__stvDiag.text() || '').slice(-260));
 }
 
 /**
@@ -4331,6 +4412,13 @@ async function testDomainProbeRows() {
   check('the session probe repeats the read path cookie header',
     info.length >= 3 && info.every((entry) => String(entry.cookie || '').indexOf('access=') === 0),
     JSON.stringify(info.map((entry) => String(entry.cookie || ''))));
+  // `userInfo` is cached without the host on purpose, so a plain request here
+  // gives the same answer three times -- the 2026-10-25 17:18 log shows three
+  // rows drawn from one `cache hit … by=dns1…` entry. `rescan=true` is the
+  // native cache's bypass; every row must carry it or the column is a lie.
+  check('every session row is its own request, not a replay of the first',
+    info.length >= 3 && info.every((entry) => entry.url.indexOf('?rescan=true') > 0),
+    JSON.stringify(info.map((entry) => entry.url)));
 
   // Evidence the app already has: a code-7 ban, and the mirror that last
   // served a chapter.

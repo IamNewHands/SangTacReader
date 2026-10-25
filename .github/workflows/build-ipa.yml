@@ -398,16 +398,32 @@ jobs:
             echo "::error::userinfo 预热不再用 POST（GET 的缓存键与阅读器的 POST 不匹配，预热等于白做）"
             exit 1
           fi
-          # 第 57 轮：镜像选择的第四条规则是「页面自己的 origin 优先」。cookie（access/useri2）
-          # 与 grantcontext 签发的 key 都属于设置它的那个 host，换一台镜像就是用别人签发的
-          # 状态——这是 §6.10 那个 code 7、以及「登录说 success 但其实没登录」的共同解释。
-          # 删掉它不会有任何编译错误，只会退回「最快的镜像赢」，也就是这一条要修的那个 bug。
-          # 钉的是 `location.origin`（运行时才知道），不是写死的主机名。
-          for marker in 'var page = pageOrigin();' 'outranks the ping race'; do
+          # 第 57 轮把「页面自己的 origin」放在竞速之前；第 62 轮又发现页面 origin 会
+          # 回 code 7，于是把它降为第二选择，第一名换成「上次真出过正文的那台」。
+          # 两次都只有运行时才知道主机名，所以钉的是 `location.origin` 与那次记录，
+          # 没有写死的主机名。
+          #
+          # 顺序就是规则本身：`readGood()` 必须在 `pageOrigin()` 之前，否则 2026-10-25
+          # 17:17 那段会回来——页面来自 .com 而 .com 回 code 7，先付 5.5 秒 grantcontext、
+          # 再在 dns1 上复付 4.1 秒、第三台才出字，一章 13 秒空白。grep -q 看不出顺序，
+          # 所以取行号比。
+          good_line=$(grep -n -F 'var good = readGood();' \
+            plugins/app/ios/Sources/SangTacAppPlugin/SitePatch.swift | head -1 | cut -d: -f1)
+          page_line=$(grep -n -F 'var page = pageOrigin();' \
+            plugins/app/ios/Sources/SangTacAppPlugin/SitePatch.swift | head -1 | cut -d: -f1)
+          if [ -n "$good_line" ] && [ -n "$page_line" ] && [ "$good_line" -lt "$page_line" ]; then
+            echo "✓ 上次出过正文的线路排在页面 origin 之前（行 ${good_line} < ${page_line}）"
+          else
+            echo "::error::镜像选择又让页面 origin 抢在「上次出过正文的线路」之前（good=${good_line} page=${page_line}，code 7 冷启动会再吃 13 秒）"
+            exit 1
+          fi
+          for marker in 'outranks the ping race' \
+            '(keeping the chapter key: it is per book,' \
+            '/mobile/userinfo.php?rescan=true'; do
             if grep -q -F "$marker" plugins/app/ios/Sources/SangTacAppPlugin/SitePatch.swift; then
-              echo "✓ 页面 origin 优先（${marker}）还在"
+              echo "✓ 线路规则还在（${marker}）"
             else
-              echo "::error::镜像选择不再把页面 origin 放在竞速之前（${marker} 缺失，code 7 与登录会退回旧行为）"
+              echo "::error::线路规则缺失（${marker}）：code 7 会重新下载 773KB-891KB 的 grantcontext，设置页的三行也会回显同一条缓存"
               exit 1
             fi
           done

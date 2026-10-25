@@ -1,10 +1,29 @@
-第六十一轮：设置页给每条线路一行体检 —— 延迟 + 会话 + 正文
+第六十二轮：线路记住上次出过正文的那台，code 7 不再重下 773KB 密钥
 
-- 新增注入块 domainProbe：打开设置页（pushPage('pagesetting')）时在站点自己的「域名」选择器
-  下面建行，每条线路一行，回答三个问题：warp.php 延迟（多远）、POST userinfo.php 是否认这份
-  登录（会话 ✓/✗，头与阅读器读正文一致）、正文 ✓/✗/未测（拉黑表 + 上次出过正文的那台）。
-  延迟不作为可用性判据 —— ping 最低的那台常常就是回 code 7 的那台（§6.10/§6.60）。
-- 点行重测；右侧「设为线路」写 app.config.ux.app_domain（站点自己的 setter，会持久化）。
-  不自动切换：没有会话的 host 要重新登录。
-- 故障转移块以只读方式交出拉黑表（window.__stvDomainBanned，只增不改）。
-- 测试新增 14 条断言（共 961 条）；CI 产物标记表加 stvDomainProbeInstalled。
+当日第二份真机日志（17:17:51 → 17:18:04）把「加载挺久但最后出了正文」拆开了：
+.com 回 code 7、dns1 回 code 7、.app 回 code 0；而三台各自先下载了一份
+grantcontext（773447B/5530ms、891836B/4149ms、773447B/1299ms）。这一章 10.9 秒
+花在密钥上，换台并没有换来新 key —— .app 用的就是 .com 签发的那把（4b4b594d…）。
+
+四处改动：
+
+1. domainFailover/patchBestDomain：把「上次真出过正文的线路」（stv.domain.good）
+   提到页面 origin 之前。页面 origin 只证明这一页是它发的，不证明它会交出章节；
+   §6.60 那条「page origin 优先」建立在「key 属于 host」上，已被推翻。
+2. domainFailover/patchContent：code 7 之后不再清 cachekey。清它等于让
+   app.reader.getKey（app.v2.read.js:515-523）重下 773KB-891KB；实测换台后同一把
+   key 仍被接受。code 5/1（站点明说 key 不对）才重下一次，与 code 7 分开处理。
+3. domainProbe/probeSession：会话探针改打 /mobile/userinfo.php?rescan=true。
+   userInfo 的缓存键不含 host（SangTacHttpPlugin.includesHost），三行原本回显
+   同一条 cache hit 的答案，17:12:39 甚至把「未登录」印在自己请求返回账号的前一行。
+4. SiteI18nData/installLanguageGuard：线路的值也送进 changeLanguage（同一排设置行
+   共用生成器）。仍然拒绝，但改报 [DOMAIN] 并说明线路行已写进 app.config.ux.app_domain，
+   不再让每次点线路都像一次 bug。
+
+守卫：check-ios-shim 30 块 / 662130 字节 / 141 标记；test-site-patch 968 条断言 0 失败
+（新增 7 条、改写 2 条）；workflow 新增行号比较守卫，readGood() 必须排在
+pageOrigin() 之前（grep -q 看不出顺序，退回旧序会静默吃掉 13 秒）。
+
+结论：可以只留 .app —— 它同时是唯一能登录（.com 回 captcha、.app 回 success）和唯一
+交出正文的一台；ping 最差也无所谓，因为另两台回 code 7。选择器留作逃生口，默认值交给
+那次记录，不写死主机名（站点会轮换哪台能用）。

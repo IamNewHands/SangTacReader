@@ -3563,27 +3563,24 @@ enum SitePatch {
                     }
                     return pref;
                 }
-                // The page's own origin outranks the ping race. The session
-                // cookies (access/useri2) and the chapter key `grantcontext`
-                // hands out are issued for the page's host, and only that host
-                // honours them: a mirror answers code 7 to a chapter that
-                // carries them (docs/capacitor-port.md §6.10) and silently
-                // ignores a login. The page in the reader's hands came from
-                // this origin, which is a stronger liveness signal than any
-                // /warp.php probe -- so it wins while it is neither banned nor
-                // marked dead. `list` membership is required for the same
-                // reason the remembered mirror needs it: a tampered location
-                // must not be able to point the app at a foreign host.
-                var page = pageOrigin();
-                if (page && list.indexOf(page) >= 0 && !banned[page]
-                    && !rememberedGone(this, page)) {
-                    if (!noted['page:' + page]) {
-                        noted['page:' + page] = true;
-                        note('DOMAIN', label + ' page origin ' + page
-                            + ' outranks the ping race');
-                    }
-                    return page;
-                }
+                // The mirror that last handed over a chapter outranks the page's
+                // own origin. The 2026-10-25 17:17/17:18 device log is the
+                // evidence: the page came from `sangtacviet.com`, and that origin
+                // answered `{"code": 7,"time": 1000}` to readchapter; `dns1…`
+                // answered the same; `sangtacviet.app` -- remembered from an
+                // earlier read -- answered `{"code": 0}` with the chapter. Walking
+                // past the page origin cost the reader 5.5s of `grantcontext` on
+                // the first attempt, 4.1s of it again on the next mirror, and only
+                // the third host put a character on screen: 13 seconds for one
+                // chapter.
+                //
+                // The session is not the reason to prefer the page origin either:
+                // that same log has `POST /mobile/userinfo.php` answered with the
+                // signed-in profile from three different hosts, and the chapter
+                // key minted on `.com` was accepted verbatim by `.app` (both keys
+                // are the same 4b4b594d…). So "the page came from here" says
+                // nothing about which host will hand over a chapter -- only a
+                // chapter already received does.
                 var good = readGood();
                 if (good && !banned[good.name] && list.indexOf(good.name) >= 0) {
                     if (!rememberedGone(this, good.name)) {
@@ -3596,6 +3593,23 @@ enum SitePatch {
                     note('DOMAIN', label + ' remembered mirror ' + good.name
                         + ' did not answer the fresh probe, dropping it');
                     forgetGood(good.name);
+                }
+                // Next guess: the page's own origin, which is at least a proved
+                // liveness signal (this page was served by it) even though
+                // `verifyDomain()` only ever checks /warp.php against it. It loses
+                // to a mirror that has already answered a chapter, and it is still
+                // subject to the ban list and to a fresh probe. `list` membership
+                // is required so a tampered location cannot point the app at a
+                // foreign host.
+                var page = pageOrigin();
+                if (page && list.indexOf(page) >= 0 && !banned[page]
+                    && !rememberedGone(this, page)) {
+                    if (!noted['page:' + page]) {
+                        noted['page:' + page] = true;
+                        note('DOMAIN', label + ' page origin ' + page
+                            + ' outranks the ping race');
+                    }
+                    return page;
                 }
                 var chosen = pick(list, siteChoice);
                 if (chosen && chosen !== siteChoice && !noted[siteChoice]) {
@@ -3617,6 +3631,21 @@ enum SitePatch {
             app.reader.getContent = function (h, i, c, rl) {
                 var self = this;
                 var args = arguments;
+                // The chapter key is NOT reloaded when a mirror answers code 7.
+                //
+                // `getKey()` short-circuits on `cachekey` (app.v2.read.js:515-523)
+                // and otherwise downloads `/io/grantcontext/context` -- 773KB in
+                // 5530ms from `.com`, 891KB in 4149ms from `dns1`, 773KB in 1299ms
+                // from `.app` in the 2026-10-25 17:17/17:18 log. Dropping
+                // `cachekey` on every code 7 therefore re-downloads a megabyte-class
+                // blob per mirror, and the log shows it bought nothing: the key
+                // minted on `.com` (`4b4b594d…`) was accepted verbatim by `.app`,
+                // which then served the chapter. The key belongs to the book, not
+                // to the host, so the replacement host reuses it.
+                //
+                // Code 5 / 1 are the opposite case -- the site saying the key
+                // itself is wrong -- so those do reload it, once per read.
+                var keyReloaded = 0;
                 // Retried through this same wrapper, so more than one bad mirror
                 // can be walked past in a single read. Each round either bans a
                 // new mirror (`code7Seen` is what bounds the walk) or gives up and
@@ -3630,9 +3659,16 @@ enum SitePatch {
                             code7Seen++;
                             if (!ban(used, 'readchapter answered code 7')) { return data; }
                             forgetGood(used);
-                            if (app.reader) { app.reader.cachekey = null; }
                             note('DOMAIN', 'refetching ' + h + '/' + i + ' chapter ' + c
-                                + ' after code 7');
+                                + ' after code 7 (keeping the chapter key: it is per book,'
+                                + ' not per host)');
+                            return attempt();
+                        }
+                        if ((code === '5' || code === '1') && keyReloaded < 1) {
+                            keyReloaded++;
+                            if (app.reader) { app.reader.cachekey = null; }
+                            note('DOMAIN', 'chapter key refused with code ' + code
+                                + '; downloading it again once');
                             return attempt();
                         }
                         if (!data) {
@@ -12641,8 +12677,21 @@ enum SitePatch {
             if (!http || typeof http.post !== 'function') {
                 return Promise.resolve({ session: null });
             }
+            // `rescan=true` is the native content cache's own bypass
+            // (SangTacHttpPlugin.swift:1025-1028): the lookup and the store are
+            // both skipped, and the parameter is dropped when the cache key is
+            // built (`ContentCache.droppedParams`), so this asks each host the
+            // question directly instead of replaying whichever host answered
+            // first.
+            //
+            // Without it the three rows echo one answer and the column is a lie:
+            // `userInfo` is deliberately keyed without the host
+            // (`SangTacHttpPlugin.includesHost`), and the 2026-10-25 17:18 log has
+            // all three rows drawn from one `[CACHE] POST … cache hit …
+            // by=dns1…` entry -- plus a `未登录` row printed directly above that
+            // host's own request coming back with the signed-in profile.
             return http.post({
-                url: host + '/mobile/userinfo.php',
+                url: host + '/mobile/userinfo.php?rescan=true',
                 data: '',
                 timeout: 8000,
                 headers: {
