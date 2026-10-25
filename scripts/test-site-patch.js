@@ -10005,6 +10005,68 @@ async function testContentCache() {
     lateAnswer === 'native:' + listUrl && lateRoutes[lateRoutes.length - 1].via === 'native',
     JSON.stringify(lateRoutes[lateRoutes.length - 1]));
 }
+/**
+ * The site copies every `Set-Cookie` into `document.cookie` after splitting the
+ * header on ", " (`app.v2.js:1116` / `:1222`), and an RFC 6265 date *is*
+ * `Thu, 01 Jan 2026 00:00:00 GMT` -- so the split cuts the expiry in half, the
+ * attribute stops parsing, WebKit ignores it, and the cookie that authenticates
+ * the whole run is a session cookie. The site's own login check refuses to ask
+ * the server without that cookie (`app.v2.js:3983`), which is why the
+ * 2026-10-25 20:37 log opens with "Logging out.." and no request at all.
+ */
+async function testSessionCookies() {
+  console.log('a cookie the site writes outlives the app');
+  const sandbox = makeSandbox();
+  const seen = [];
+  const descriptor = Object.getOwnPropertyDescriptor(sandbox.document, 'cookie');
+  Object.defineProperty(sandbox.document, 'cookie', {
+    configurable: true,
+    get: descriptor.get,
+    set(value) {
+      seen.push(String(value));
+      descriptor.set.call(sandbox.document, value);
+    },
+  });
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(60);
+
+  const repair = sandbox.window.__stvCookieRepair;
+  check('the block exposes the rule it applies', typeof repair === 'function');
+  if (typeof repair !== 'function') { return; }
+
+  const STALE = 'access=0123456789abcdef0123456789abcdef; path=/; HttpOnly; expires=Thu';
+  const fixed = repair(STALE);
+  check('an expiry the split cut in half is replaced with one that survives the process',
+    fixed.indexOf('max-age=31536000') > 0, fixed);
+  check('the name and value are left untouched',
+    fixed.indexOf('access=0123456789abcdef') === 0, fixed);
+
+  const FRESH = 'access=x; path=/; expires=Thu, 01 Jan 2026 00:00:00 GMT';
+  check('a cookie that states a real expiry is left exactly as written',
+    repair(FRESH) === FRESH, repair(FRESH));
+
+  const DELETE = 'access=x; path=/; max-age=0';
+  check('an explicit max-age=0 is a delete and is never extended',
+    repair(DELETE) === DELETE, repair(DELETE));
+
+  const CLEAR = 'access=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+  check('clearing a cookie stays a clear', repair(CLEAR) === CLEAR, repair(CLEAR));
+
+  const EMPTY = 'access=; path=/';
+  check('an empty value is never given a year of life', repair(EMPTY) === EMPTY, repair(EMPTY));
+
+  sandbox.document.cookie = STALE;
+  check('the write the site performs goes through the rule',
+    seen.some((text) => text.indexOf('max-age=31536000') > 0), JSON.stringify(seen));
+  check('and the cookie is readable back under its own name',
+    String(sandbox.document.cookie).indexOf('access=0123456789abcdef') >= 0,
+    String(sandbox.document.cookie));
+
+  sandbox.document.cookie = 'access=; path=/; max-age=0';
+  check('a delete written through the setter still deletes',
+    seen[seen.length - 1] === 'access=; path=/; max-age=0', seen[seen.length - 1]);
+}
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -10080,6 +10142,7 @@ await testPopupTranslate();
   await testGoogleFreeThroughput();
   await testSiteBlobs();
   await testContentCache();
+  await testSessionCookies();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

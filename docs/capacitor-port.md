@@ -6301,3 +6301,80 @@ JS 断言 988 → **991**。四个守卫全绿：shim 30 块 / 680242 字节 / 1
 仍未动：`childTab.currentTabNode is not a function`（§6.64.3，站点自己的 `try/catch` 就把它吞了）。
 trxs 封面 403 已在 §6.64.3 结案，不再是待办。
 
+## §6.66 第 64 轮：登录活不过重启 —— 站点把过期时间切掉了
+
+读者反馈：关掉 App 再进就要重新登录。这不是「服务器不认」，是**站点在发请求之前就把自己判成未登录了**。
+
+### 6.66.1 证据：冷启动时一声不问
+
+`app.v2.js:3983` 的 `if(getCookie("access").length < 32){ … return; }` —— 短于 32 字符就设
+`isLogin=false`、`syncCookie()`，**直接 return**，`/mobile/userinfo.php` 根本没发出去。
+`20:36:11 [LOG] Logging out..`（`stv-diagnostic-20261025-203700.log` 第 2 行）就是这条分支里
+`:3989` 的 `console.log`；而全篇第一条 `[Http]` 是 `20:36:15` 的书单搜索。冷启动那一刻，服务
+器从未被问过。
+
+反面对照在同一份日志里：`20:36:27` 登录成功（`-> 200 … 7b success`），`20:36:30` 的
+`userinfo.php` 就答了完整的账号（`id=306185`）—— 说明这一次运行里 `getCookie("access")` 是够长的。
+所以坏掉的不是值，是**它活不过进程**。
+
+### 6.66.2 谁把它变成了 session cookie
+
+站点自己把每个响应的 `Set-Cookie` 抄进 `document.cookie`（`app.v2.js:1112-1123`；同一段循环在
+`getCapacitor` `:1160-1167` 和 `postCapacitor` `:1219-1226` 里又各抄一遍），抄之前：
+
+```js
+var cookies = headers[key].split(', ');
+```
+
+RFC 6265 的日期是 `Thu, 01 Jan 2026 00:00:00 GMT` —— **本身就含 `", "`**。一切就把
+`expires=Thu` 切成半截，剩下那段解析不出日期，而 WebKit 对解析不出的 `expires` 的处理是
+**忽略该属性**：名字和值都在，过期时间没了 = **session cookie**。这一趟运行照常认证，进程一死就没了。
+
+顺带修正 §6.60.1 表格里那句「`access`/`useri2` 是 httpOnly，`document.cookie` 里看不到它」：服务器
+发的那份是 httpOnly，但页面上还有一份**非** httpOnly 的副本（`document.cookie` 里写 `HttpOnly` 属性
+会被忽略），而 §6.62 那三个 `会话 ✓` 正是拿页面这份认证成功的。真正决定「下次还能不能进」的，
+就是页面这份。
+
+### 6.66.3 修法：在站点写 cookie 的那个动作上补过期时间
+
+新增块 `SitePatch.sessionCookies`（第 31 块），在 document start 包住 `Document.prototype.cookie`
+的 setter（沙箱里退化到 `document` 自己的描述符）：写入串若**没有任何可用过期时间**，追加
+`; max-age=31536000`。
+
+- 补 `max-age` 而不去修那半截 `expires=`：RFC 6265 §5.3 规定两者同时存在时 **Max-Age 优先**，
+  所以不必重建站点写下的其它属性（`path` / `SameSite` / 那半截 `expires` 都原样留着）。
+- **`max-age=0` 与空值放行**：那是删除 cookie 的写法，把删除续成一年正好是这次修复的反面。
+  `expires` 只有 `Date.parse` 得出来才算「说过」。
+- 范围是**所有**名字，不挑 `access`：`.useri2` / `hstamp` 是同一段坏循环写的，只续 `access`
+  等于把会话修成半截。判断规则单独暴露成 `window.__stvCookieRepair`，断言打在规则上，
+  setter 只负责接线。
+
+### 6.66.4 这一轮怎么验
+
+JS 断言 991 → **1001**（新增 10 条：切半的换掉、名值不动、真日期原样、`max-age=0` 不续、
+清空不续、空值不续、setter 真的走了规则、写回可读、删除仍删除、规则已暴露）。
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | **31 块** / 684315 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1001 条断言** / 0 失败 |
+| `gen-site-i18n.js --check` | 461 labels / 76 fragments in sync |
+| `gen-site-assets.js --check` | 8 文件 / 906296 字节 in sync |
+
+真机上验三步：登录一次 → 从后台任务列表**杀掉** App → 重开。判据：
+
+1. 用户页直接是已登录，不再出现 `[LOG] Logging out..`；
+2. 面板里有 `[AUTH] a cookie the site writes now carries an expiry, so a restart keeps the session: access`；
+3. 启动几秒内出现 `[Http] POST …/mobile/userinfo.php`（说明 `:3983` 那道门放行了）。
+
+### 6.66.5 未证实
+
+- **切半这个机制没有从头层面直接观测过**：日志里只有响应体预览，没有 `Set-Cookie` 原文。它在
+  RFC 与站点三步代码上是唯一自洽的解释，且修复不依赖它是唯一原因 —— 服务器若本来就发 session
+  cookie，我们的 `max-age` 同样把登录留住。
+- 服务器端会话活多久不知道。若站点 24 小时就作废，客户端 cookie 留着也只是「服务器说未登录」，
+  与今天的体感一样，不会更差。
+- **重装照样掉**：侧载新包会换掉容器，cookie 与 localStorage 一起没。这一轮不碰那条路（要活得
+  过重装得进 Keychain，§6.9 已经证明那才是唯一跨重装的地方）。
+
+

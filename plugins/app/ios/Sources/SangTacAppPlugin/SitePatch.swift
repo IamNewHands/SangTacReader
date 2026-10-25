@@ -13190,6 +13190,136 @@ enum SitePatch {
     })();
     """
 
+    /**
+     关掉 App 就要重新登录，根因是站点自己的那道门把答案写在了 App 看不见的地方。
+
+     `app.user.checklogin`（app.v2.js:3968）在**发任何请求之前**先看页面上的
+     `access` cookie，短于 32 字符就直接判「未登录」并返回（`:3983-3997`）：
+     服务器还没被问过。2026-10-25 20:37 那份日志的第一行就是这个分支印出来的
+     —— `20:36:11 [LOG] Logging out..`，而全篇第一条 `[Http]` 是 20:36:15 的
+     书单搜索。冷启动时它没登录，不是因为服务器不认，而是因为 App 里没有 cookie
+     可问。
+
+     cookie 是怎么没的：站点把每个响应的 `Set-Cookie` 自己抄进 `document.cookie`
+     （`app.v2.js:1112-1123`，同一段循环在 `getCapacitor` / `postCapacitor` 里
+     又各抄一遍），抄之前用 `split(', ')` 切头。RFC 6265 的日期是
+     `Thu, 01 Jan 2026 00:00:00 GMT`，本身就含 `", "` —— 一切就把
+     `expires=Thu` 切成了半截，剩下那段解析不出日期。WebKit 对解析不出的
+     `expires` 的处理是**忽略这个属性**，于是名字和值都在、过期时间没了：
+     它存下来的是一枚 **session cookie**。这一趟运行里它照常认证，进程一死
+     就没了。
+
+     这也修正了 §6.60.1 表格里那句「`access`/`useri2` 是 httpOnly，
+     `document.cookie` 里看不到它」：服务器自己发的那份是 httpOnly，但页面上
+     还有一份 **非** httpOnly 的副本（`document.cookie` 里写 `HttpOnly` 属性会被
+     忽略），而 §6.62 那三个 `会话 ✓` 恰恰是拿页面这份认证成功的。所以「页面这份
+     能不能活过重启」就是整件事的关键。
+
+     修法放在站点写 cookie 的那个动作上：给写下去却没有有效过期时间的 cookie
+     补一个 `max-age`。补 `max-age` 而不是去修那半截 `expires=`，因为 RFC 6265
+     §5.3 规定两者同时存在时 Max-Age 优先 —— 不必重建站点写下的其他属性，
+     而自带有效过期时间（或 `max-age=0` 这种「我要删掉它」）的写入原样放行。
+
+     范围是**所有**经 `document.cookie` 的写入，不挑名字：`access` 只管那道门，
+     `.useri2` / `hstamp` 是另一段同样的坏循环写的，只修一个等于把会话修成半截。
+     */
+    static let sessionCookies = """
+    (function () {
+        if (window.__stvSessionCookiesInstalled) { return; }
+        window.__stvSessionCookiesInstalled = true;
+
+        // 一年。任何活过进程的过期时间都行；浏览器对超长 max-age 本来也是截到
+        // 这个量级，而站点自己也没有「一年那么长的会话」这种概念。
+        var KEEP_SECONDS = 31536000;
+        var noted = false;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        // 这串自己说过期时间吗？`max-age=0` 也算说过 —— 那是删除 cookie 的写法，
+        // 把删除改成一年有效期正好是这次修复的反面。`expires` 只有能解析才算
+        // 说过；切剩的 "Thu" 解析不出来。
+        function statesExpiry(text) {
+            var parts = text.split(';');
+            var i;
+            for (i = 1; i < parts.length; i++) {
+                var piece = parts[i].trim();
+                if (!piece) { continue; }
+                var eq = piece.indexOf('=');
+                var name = (eq < 0 ? piece : piece.slice(0, eq)).trim().toLowerCase();
+                var value = eq < 0 ? '' : piece.slice(eq + 1).trim();
+                if (name === 'max-age') { return true; }
+                if (name === 'expires' && !isNaN(Date.parse(value))) { return true; }
+            }
+            return false;
+        }
+
+        // 单独暴露，断言打在这条规则上，下面的 setter 只负责接线。
+        function repairCookie(text) {
+            var raw = String(text === undefined || text === null ? '' : text);
+            var eq = raw.indexOf('=');
+            // 没有名字，或者写的是空值（登出会这样清）：两种都不动。
+            if (eq <= 0) { return raw; }
+            if (raw.slice(eq + 1).split(';')[0].trim() === '') { return raw; }
+            if (statesExpiry(raw)) { return raw; }
+            return raw + '; max-age=' + KEEP_SECONDS;
+        }
+        window.__stvCookieRepair = repairCookie;
+
+        var done = false;
+        function install() {
+            if (done) { return true; }
+            var holder = null;
+            var descriptor = null;
+            try {
+                if (typeof Document === 'function' && Document.prototype) { holder = Document.prototype; }
+            } catch (e) { holder = null; }
+            if (holder) {
+                descriptor = Object.getOwnPropertyDescriptor(holder, 'cookie');
+                if (!descriptor || typeof descriptor.set !== 'function') { descriptor = null; }
+            }
+            if (!descriptor) {
+                try { holder = document; } catch (e) { holder = null; }
+                if (holder) {
+                    descriptor = Object.getOwnPropertyDescriptor(holder, 'cookie');
+                    if (!descriptor || typeof descriptor.set !== 'function') { descriptor = null; }
+                }
+            }
+            if (!descriptor) {
+                note('ERR', 'session cookies cannot survive a restart: no document.cookie setter to wrap');
+                return false;
+            }
+            var original = descriptor.set;
+            try {
+                Object.defineProperty(holder, 'cookie', {
+                    configurable: true,
+                    enumerable: descriptor.enumerable === true,
+                    get: descriptor.get,
+                    set: function (value) {
+                        var text = String(value === undefined || value === null ? '' : value);
+                        var repaired = repairCookie(text);
+                        if (repaired !== text && !noted) {
+                            noted = true;
+                            note('AUTH', 'a cookie the site writes now carries an expiry, so a restart keeps the session: '
+                                + text.split('=')[0].trim());
+                        }
+                        original.call(this, repaired);
+                    }
+                });
+            } catch (error) {
+                note('ERR', 'session cookies cannot survive a restart: '
+                    + String(error && error.message ? error.message : error));
+                return false;
+            }
+            done = true;
+            return true;
+        }
+
+        install();
+    })();
+    """
+
     static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
@@ -13199,5 +13329,5 @@ enum SitePatch {
                                 pageRepair, downloadExport, commentTranslate,
                                 comicGate, contentCache,
                                 swipeDismiss, readerPrefetch, coverFallback,
-                                failureHints, domainProbe]
+                                failureHints, domainProbe, sessionCookies]
 }
