@@ -6192,9 +6192,21 @@ host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站
 
 #### 6.64.3 两条不修的
 
-- **trxs 封面 403**：`18:59:42 GET http://www.trxs.cc/d/file/…jpeg -> 403 … bytes=1`，两本书共用
-  同一张封面都失败，并被写盘记 30 分钟。插件本来就会补一个 `Referer`（`refererFallback`），
-  所以「缺 Referer」这个解释站不住；**没有证据就不改**。
+- **trxs 封面 403 —— 已结案，源站在整域上拒绝，与 Referer 无关**：`18:59:42 GET
+  http://www.trxs.cc/d/file/…jpeg -> 403 … bytes=1`，两本书共用同一张封面都失败，并被写盘记 30 分钟。
+  §6.51.2 已经在仓库外做过这个 A/B（四种头部组合：裸请求、`Referer:
+  https://sangtacviet.com/app.v2.php`、`Referer: https://www.trxs.cc/`（源站自己）、完整浏览器头
+  `Accept: image/avif,…` + `Sec-Fetch-*`），**四个全部 403**；并且 `https://www.trxs.cc/` **首页本身**
+  也是 403（Cloudflare），同路径在 `static.sangtacvietcdn.xyz` / `.com` / `.app` 上都是 404。
+  也就是说「哪个 Referer 能取到图」这个自变量不存在，换出口 IP / UA 也不会变——**这条不是我们能修的
+  缺陷，`refererFallback` 在此处没有可改的地方**（它在别的 403 上仍然有用）。
+  这条 403 唯一造成的用户可见症状是「同一本小说封面不停换」，根因在站点：失败后从 8 张随机壁纸里
+  `Math.random()` 抽一张（`app.v2.js:8078-8088`），重开又抽一次。该症状已由注入块 `coverFallback`
+  覆盖（§6.51.2 末尾）：`window.onImgError` / `onImgErrorAgain` 被钉到站点自己的
+  `defaultBookCover`，`randomDefaultImg` 故意不动（`randomBackground()` 还要用）。
+  **保留意见**：从 `coverFallback` 落地到今天的六份日志里，这块一次都没触发过（这些天的封面要么命中
+  缓存、要么本来就正常，今天的全是 `bookcover.yuewen.com`），所以「钉住后封面不再变」这句话还只是
+  代码上的结论，日志没有证实也没有证伪。这也正是本条不再留待办的原因——没有可动的变量了。
 - **`childTab.currentTabNode is not a function`**：`app.v2.js:4623-4624`，站点自己的
   `ontabchange` 里对元素调方法，被它自己的 `try/catch` 吞掉，代价是切到首页/书签时那次
   `wakeAllNode` 不跑。日志里 `[TAB]` 索引全部正确，可见无影响；改它等于改站点代码。
@@ -6286,5 +6298,6 @@ JS 断言 988 → **991**。四个守卫全绿：shim 30 块 / 680242 字节 / 1
 2. 下一次导出日志：`ranked` 那行从 `1.` 开始按 ms 升序；任何超长行末尾带 `…[+N]`，整份日志不再
    出现「75 KB 里 36 KB 是书单」。
 
-仍未动：trxs 封面 403（§6.64.3，没有证据就不改）。
+仍未动：`childTab.currentTabNode is not a function`（§6.64.3，站点自己的 `try/catch` 就把它吞了）。
+trxs 封面 403 已在 §6.64.3 结案，不再是待办。
 
