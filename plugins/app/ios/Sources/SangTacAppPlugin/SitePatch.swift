@@ -13233,6 +13233,19 @@ enum SitePatch {
         var KEEP_SECONDS = 31536000;
         var noted = false;
 
+        // ---- Keychain：这台设备上唯一跨得过重装的存储 ----------------------
+        // 侧载新包会换掉容器，document.cookie 与 localStorage 一起清零（§6.9 已经
+        // 证明只有 Keychain 跨得过去）。会话靠的就是这三个不带头脸的名字：`access`
+        // 是那道门的钥匙，`useri2` 是站点用来认人的，`hstamp` 跟着登录一起下发。
+        var SECRET_KEY = 'stv.session';
+        var KEEP_NAMES = ['access', 'useri2', 'hstamp'];
+        var restored = {};
+        var saved = '';
+        var restoreDone = false;
+        var restorePromise = null;
+        var saveTimer = null;
+        var pendingClear = false;
+
         function note(tag, message) {
             if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
         }
@@ -13267,6 +13280,154 @@ enum SitePatch {
         }
         window.__stvCookieRepair = repairCookie;
 
+        // ---- 会话的读写 -----------------------------------------------------
+
+        function appPlugin() {
+            try {
+                var cap = window.Capacitor;
+                return (cap && cap.Plugins && cap.Plugins.App) ? cap.Plugins.App : null;
+            } catch (e) { return null; }
+        }
+
+        // 页面现在能看到的这三个名字。httpOnly 的那份这里读不到，但站点自己抄出来
+        // 的副本能读到 —— 而那份副本才是请求真正带走的（§6.66.2）。
+        function readSession() {
+            var out = {};
+            var text = '';
+            try { text = String(document.cookie || ''); } catch (e) { text = ''; }
+            var parts = text.split(';');
+            var i;
+            for (i = 0; i < parts.length; i++) {
+                var piece = parts[i].trim();
+                var eq = piece.indexOf('=');
+                if (eq <= 0) { continue; }
+                var name = piece.slice(0, eq).trim();
+                if (KEEP_NAMES.indexOf(name) < 0) { continue; }
+                out[name] = piece.slice(eq + 1).trim();
+            }
+            return out;
+        }
+
+        function writeCookie(name, value) {
+            document.cookie = name + '=' + value + '; path=/; max-age=' + KEEP_SECONDS;
+        }
+
+        function parseSession(text) {
+            var out = {};
+            if (!text) { return out; }
+            try {
+                var parsed = JSON.parse(text);
+                var i;
+                for (i = 0; i < KEEP_NAMES.length; i++) {
+                    var name = KEEP_NAMES[i];
+                    if (parsed && typeof parsed[name] === 'string' && parsed[name]) { out[name] = parsed[name]; }
+                }
+            } catch (e) { out = {}; }
+            return out;
+        }
+
+        /**
+         把当前会话镜像进 Keychain。只在看得见 `access` 时写；看不见又没登出时什么都不做
+         —— 否则一次读不到副本的启动就会把已经存在的镜像抹掉，重装之后反而没了登录。
+         登出（页面把 `access` 写成空值）是唯一允许清空的情况。
+         */
+        function persistSession(clearing) {
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.secretSave !== 'function') { return; }
+            var now = readSession();
+            var value = '';
+            if (!clearing) {
+                if (!now.access) { return; }
+                value = JSON.stringify(now);
+            }
+            if (value === saved) { return; }
+            saved = value;
+            Promise.resolve(plugin.secretSave({ key: SECRET_KEY, value: value })).then(function () {
+                note('AUTH', value
+                    ? 'the session is mirrored into the Keychain, so a reinstall keeps the login'
+                    : 'the session left the Keychain together with the logout');
+            }, function (error) {
+                note('ERR', 'session mirror failed: '
+                    + String(error && error.message ? error.message : error));
+            });
+        }
+
+        function schedulePersist(clearing) {
+            if (!restoreDone) { return; }
+            if (clearing) { pendingClear = true; }
+            if (saveTimer) { clearTimeout(saveTimer); }
+            saveTimer = setTimeout(function () {
+                saveTimer = null;
+                var clearingNow = pendingClear;
+                pendingClear = false;
+                persistSession(clearingNow);
+            }, 400);
+        }
+
+        /**
+         重装之后的第一件事：把 Keychain 里的会话装回 document.cookie。页面已经有的
+         名字不动 —— 容器在的时候页面才是更新的那一份。
+         */
+        function restoreSession() {
+            if (restorePromise) { return restorePromise; }
+            var plugin = appPlugin();
+            if (!plugin || typeof plugin.secretLoad !== 'function') {
+                restoreDone = true;
+                restorePromise = Promise.resolve(false);
+                return restorePromise;
+            }
+            restorePromise = Promise.resolve(plugin.secretLoad({ key: SECRET_KEY })).then(function (result) {
+                var value = result && typeof result.value === 'string' ? result.value : '';
+                var session = parseSession(value);
+                var present = readSession();
+                var names = [];
+                var i;
+                for (i = 0; i < KEEP_NAMES.length; i++) {
+                    var name = KEEP_NAMES[i];
+                    if (!session[name] || present[name]) { continue; }
+                    writeCookie(name, session[name]);
+                    // 写在 setter 之后：那次写入会清掉同名条目，这里再放回来，作为
+                    // 「页面读不到时」的兜底（比如副本没落地的那几毫秒）。
+                    restored[name] = session[name];
+                    names.push(name);
+                }
+                restoreDone = true;
+                saved = session.access ? JSON.stringify(readSession()) : '';
+                if (names.length) {
+                    note('AUTH', 'the session came back from the Keychain, so a reinstall no longer costs a login: '
+                        + names.join(', '));
+                }
+                return names.length > 0;
+            }, function (error) {
+                restoreDone = true;
+                note('ERR', 'the Keychain session could not be read: '
+                    + String(error && error.message ? error.message : error));
+                return false;
+            });
+            return restorePromise;
+        }
+
+        /**
+         `getCookie` 是站点唯一读会话的地方（`app.v2.js:3960` / `:3983`），它在
+         `app.v2.js` 里是个顶层 function 声明，比本块晚。包住它之后，「Keychain 值
+         已经拿到、cookie 还没落地」这个窗口里那道门也不会把读者判成未登录。
+         */
+        function installGetter() {
+            if (typeof window.getCookie !== 'function') { return false; }
+            if (window.getCookie.__stvSessionAware) { return true; }
+            var original = window.getCookie;
+            var wrapper = function (name) {
+                var value = original.apply(this, arguments);
+                if (typeof value === 'string' && value) { return value; }
+                var key = String(name === undefined || name === null ? '' : name);
+                if (restored[key]) { return restored[key]; }
+                return value;
+            };
+            wrapper.__stvSessionAware = true;
+            window.getCookie = wrapper;
+            return true;
+        }
+
         var done = false;
         function install() {
             if (done) { return true; }
@@ -13299,10 +13460,19 @@ enum SitePatch {
                     set: function (value) {
                         var text = String(value === undefined || value === null ? '' : value);
                         var repaired = repairCookie(text);
+                        var eq = text.indexOf('=');
+                        var name = eq > 0 ? text.slice(0, eq).trim() : '';
                         if (repaired !== text && !noted) {
                             noted = true;
                             note('AUTH', 'a cookie the site writes now carries an expiry, so a restart keeps the session: '
-                                + text.split('=')[0].trim());
+                                + name);
+                        }
+                        // 页面现在自己管这个名字了：兜底值让位，登出才不会被一个
+                        // 旧的镜像值顶回来。
+                        if (name && KEEP_NAMES.indexOf(name) >= 0) {
+                            delete restored[name];
+                            schedulePersist(name === 'access'
+                                && text.slice(eq + 1).split(';')[0].trim() === '');
                         }
                         original.call(this, repaired);
                     }
@@ -13317,6 +13487,13 @@ enum SitePatch {
         }
 
         install();
+        restoreSession();
+
+        var getterTries = 0;
+        var getterTimer = setInterval(function () {
+            getterTries = getterTries + 1;
+            if (installGetter() || getterTries > 1200) { clearInterval(getterTimer); }
+        }, 250);
     })();
     """
 

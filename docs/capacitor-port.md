@@ -6351,13 +6351,13 @@ RFC 6265 的日期是 `Thu, 01 Jan 2026 00:00:00 GMT` —— **本身就含 `", 
 
 ### 6.66.4 这一轮怎么验
 
-JS 断言 991 → **1001**（新增 10 条：切半的换掉、名值不动、真日期原样、`max-age=0` 不续、
-清空不续、空值不续、setter 真的走了规则、写回可读、删除仍删除、规则已暴露）。
+JS 断言 1001 → **1010**（新增 9 条：会话装回页面、三个名字一起回来、可读回、`getCookie` 兜底、
+页面值优先、没有会话时不写镜像、登录写镜像、镜像带齐三个名字、登出连带清 Keychain）。
 
 | 守卫 | 结果 |
 | --- | --- |
-| `scripts/check-ios-shim.js` | **31 块** / 684315 字节 / 141 markers |
-| `scripts/test-site-patch.js` | **1001 条断言** / 0 失败 |
+| `scripts/check-ios-shim.js` | **31 块** / 691859 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1010 条断言** / 0 失败 |
 | `gen-site-i18n.js --check` | 461 labels / 76 fragments in sync |
 | `gen-site-assets.js --check` | 8 文件 / 906296 字节 in sync |
 
@@ -6365,16 +6365,41 @@ JS 断言 991 → **1001**（新增 10 条：切半的换掉、名值不动、�
 
 1. 用户页直接是已登录，不再出现 `[LOG] Logging out..`；
 2. 面板里有 `[AUTH] a cookie the site writes now carries an expiry, so a restart keeps the session: access`；
-3. 启动几秒内出现 `[Http] POST …/mobile/userinfo.php`（说明 `:3983` 那道门放行了）。
+3. 启动几秒内出现 `[Http] POST …/mobile/userinfo.php`（说明 `:3983` 那道门放行了）；
+4. 再**重装一次同一个包**（覆盖安装即可），进 App 仍是登录态，面板里有
+   `[AUTH] the session came back from the Keychain, so a reinstall no longer costs a login: access, useri2, hstamp`。
 
-### 6.66.5 未证实
+### 6.66.5 重装也不掉：会话镜像进 Keychain
+
+`max-age` 只解决「进程死」，解决不了「容器被换」：侧载新包会清掉
+`document.cookie` 与 localStorage，§6.9 已经证明这台设备上**只有 Keychain 跨得过去**
+（`settingsBackup` 用的就是这条路）。所以同一个块里再挂两条：
+
+- **写**：`document.cookie` 的 setter 里出现 `access` / `useri2` / `hstamp` 时，
+  400ms 去抖后把这三个名字的当前值 `JSON.stringify` 存进 `secretSave({key:
+  'stv.session'})`（`AfterFirstUnlockThisDeviceOnly`，不进 iCloud/备份）。
+  看不见 `access` 又没登出时**什么都不写** —— 否则一次读不到副本的启动就会把已有镜像
+  抹掉，重装之后反而没了登录。登出（页面把 `access` 写成空值）是唯一允许清空的情形。
+- **读**：启动时 `secretLoad` 一次，页面还没有的名字用
+  `name=value; path=/; max-age=31536000` 写回 `document.cookie`；页面已经有的不动
+  （容器在的时候页面才是新的那份）。同时包住站点的 `getCookie`（`app.v2.js` 里的顶层
+  function，比注入块晚出现，所以轮询 250ms 装上）：本地读不到时返回刚取回的值，
+  使 `app.v2.js:3983` 那道门在「值到手、cookie 还没落地」的窗口里也不会误判。
+
+登录态因此有三层：本次运行（内存）→ 重启（`max-age` 的持久 cookie）→ 重装（Keychain）。
+面板话术分别是 `a cookie the site writes now carries an expiry…` /
+`the session came back from the Keychain…` / `the session is mirrored into the Keychain…`。
+
+### 6.66.6 未证实
 
 - **切半这个机制没有从头层面直接观测过**：日志里只有响应体预览，没有 `Set-Cookie` 原文。它在
   RFC 与站点三步代码上是唯一自洽的解释，且修复不依赖它是唯一原因 —— 服务器若本来就发 session
   cookie，我们的 `max-age` 同样把登录留住。
 - 服务器端会话活多久不知道。若站点 24 小时就作废，客户端 cookie 留着也只是「服务器说未登录」，
-  与今天的体感一样，不会更差。
-- **重装照样掉**：侧载新包会换掉容器，cookie 与 localStorage 一起没。这一轮不碰那条路（要活得
-  过重装得进 Keychain，§6.9 已经证明那才是唯一跨重装的地方）。
+  与今天的体感一样，不会更差。重装那条同理：镜像能把 cookie 装回页面，**装不回服务器端的会话**。
+- Keychain 这条路要求那份 entitlement 在侧载包上可用。`secretSave` 失败只会写一行
+  `[ERR] session mirror failed: …`，登录本身不受影响（`settingsSave` 早就有同款退路）。
+- 三个名字是读站点源码定的（`app.v2.js:3960` / `:3983` 只认 `access`，`useri2` 是缓存变体
+  用的身份，`hstamp` 跟着登录一起下发）；站点若新增一枚同样必需的 cookie，这张名单要补。
 
 

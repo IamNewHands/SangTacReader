@@ -10067,6 +10067,71 @@ async function testSessionCookies() {
   check('a delete written through the setter still deletes',
     seen[seen.length - 1] === 'access=; path=/; max-age=0', seen[seen.length - 1]);
 }
+
+/**
+ * 侧载新包会换掉容器，`document.cookie` 与 localStorage 一起清零，只有 Keychain
+ * 跨得过去（§6.9）。所以会话要在登录后镜像进 Keychain，并在下一次启动的第一时间
+ * 装回页面 —— 站点那道门（`app.v2.js:3983`）读的是页面上的 cookie。
+ */
+async function testSessionSurvivesReinstall() {
+  console.log('a reinstall does not cost a login');
+  const access = 'a'.repeat(40);
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  // 上一次运行留下的镜像：容器已经换了，页面上什么都没有。
+  sandbox.__secrets['stv.session'] = JSON.stringify({
+    access: access, useri2: 'u'.repeat(24), hstamp: 'h'.repeat(16),
+  });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(120);
+
+  check('the session is written back into the page cookie jar',
+    sandbox.__cookies.access === access, String(sandbox.__cookies.access));
+  check('every name the requests travel with comes back, not only access',
+    sandbox.__cookies.useri2 === 'u'.repeat(24) && sandbox.__cookies.hstamp === 'h'.repeat(16),
+    JSON.stringify(sandbox.__cookies));
+  check('the jar is left readable under the name the site asks for',
+    String(sandbox.document.cookie).indexOf('access=' + access) >= 0,
+    String(sandbox.document.cookie));
+
+  // 站点自己的读取函数：`app.v2.js` 里是顶层 function 声明，比注入块晚出现。
+  sandbox.window.getCookie = () => '';
+  await tick(400);
+  check('the injection point the site reads the session from answers for the restored jar',
+    sandbox.window.getCookie('access') === access, String(sandbox.window.getCookie('access')));
+  sandbox.window.getCookie = () => 'page-owns-this';
+  await tick(400);
+  check('a value the page itself has always wins over the restored one',
+    sandbox.window.getCookie('access') === 'page-owns-this',
+    String(sandbox.window.getCookie('access')));
+
+  // 往后的登录要自己进 Keychain，登出要把条目清掉。
+  const live = makeSandbox();
+  installFakeApp(live, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), live);
+  await tick(120);
+  check('nothing is mirrored before there is a session',
+    live.__secrets['stv.session'] === undefined, String(live.__secrets['stv.session']));
+
+  const fresh = 'z'.repeat(40);
+  // 登录响应到达时站点自己抄进 document.cookie 的三个名字（`app.v2.js:1223`
+  // 那段循环，一次响应三枚）。三枚都要进镜像，只存 access 等于把会话存成半截。
+  live.document.cookie = 'access=' + fresh + '; path=/; HttpOnly; expires=Thu';
+  live.document.cookie = 'useri2=' + 'u'.repeat(24) + '; path=/; HttpOnly; expires=Thu';
+  live.document.cookie = 'hstamp=' + 'h'.repeat(16) + '; path=/; HttpOnly; expires=Thu';
+  await tick(600);
+  const mirrored = live.__secrets['stv.session'];
+  check('a login mirrors the session into the Keychain',
+    typeof mirrored === 'string' && mirrored.indexOf(fresh) >= 0, String(mirrored));
+  check('and the mirror carries the other two names from the same jar',
+    typeof mirrored === 'string' && mirrored.indexOf('hstamp') >= 0
+      && mirrored.indexOf('useri2') >= 0, String(mirrored));
+
+  live.document.cookie = 'access=; path=/; max-age=0';
+  await tick(600);
+  check('a logout takes the Keychain entry with it, so the next install is not logged in',
+    live.__secrets['stv.session'] === undefined, String(live.__secrets['stv.session']));
+}
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -10143,6 +10208,7 @@ await testPopupTranslate();
   await testSiteBlobs();
   await testContentCache();
   await testSessionCookies();
+  await testSessionSurvivesReinstall();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
