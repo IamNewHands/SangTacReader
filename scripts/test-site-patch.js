@@ -22,6 +22,9 @@
  *     an existing localStorage value, and mirrors `app.storage.set` writes
  *   - the bookmark button cancels (probing removal actions) instead of re-adding
  *     when the book is already bookmarked
+ *   - a readchapter that answers code 7 names the line setting instead of a
+ *     device the site never checks, and a login that answers `captcha` says so
+ *     instead of doing nothing
  *
  * Run: node scripts/test-site-patch.js
  */
@@ -3986,6 +3989,118 @@ async function testDomainFailover() {
     String(noApp.localStorage.getItem('stv.domain.trap.off')));
   check('and reloads once so the next launch works without it',
     noApp.__reloaded === true, String(noApp.__reloaded));
+}
+
+/**
+ * §6.59: two paths used to end with nothing on screen -- `readchapter`
+ * answering code 7 (the site's fallback names a device/version check that it
+ * never performs) and login answering `captcha` (the site's branch for that
+ * answer is empty). Both keep their requests intact and only add a sentence.
+ */
+async function testFailureHints() {
+  console.log('code 7 and login captcha say something');
+
+  const SITE_TEXT = 'Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời';
+  const sandbox = makeSandbox();
+  const app = installFakeApp(sandbox, { displayType: 'pageflip' });
+
+  const handled = [];
+  const alerts = [];
+  let notLoading = 0;
+  app.reader.handlingException = function (x) {
+    handled.push(x);
+    return 'site-handler';
+  };
+  app.reader.showAlert = function (msg, view) { alerts.push({ msg: String(msg), view }); };
+  app.reader.setNotLoading = function () { notLoading += 1; };
+
+  let nextAnswer = 'success';
+  // Replaced before the blocks run, so the wrapper the block installs wraps
+  // this one and the answer can be steered per call.
+  app.net.post = function (url, body) {
+    sandbox.__stored.posts = (sandbox.__stored.posts || []).concat([{ url, body }]);
+    return Promise.resolve(nextAnswer);
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await waitFor(() => app.reader.handlingException.__stvHintWrapped === true
+    && app.net.post.__stvHintWrapped === true);
+  check('the reader handler and the login call are both wrapped',
+    app.reader.handlingException.__stvHintWrapped === true
+      && app.net.post.__stvHintWrapped === true,
+    JSON.stringify([app.reader.handlingException.__stvHintWrapped,
+      app.net.post.__stvHintWrapped]));
+  check('and the alert funnel is wrapped with them',
+    app.reader.showAlert.__stvHintWrapped === true,
+    String(app.reader.showAlert.__stvHintWrapped));
+
+  // --- code 7 ---------------------------------------------------------------
+  const view = { id: 'chapterview' };
+  const first = app.reader.handlingException({ code: 7, time: 1000 }, view);
+  check('code 7 sends the reader to the line setting instead of the phone',
+    alerts.length === 1 && alerts[0].msg.indexOf('线路不可用') >= 0
+      && alerts[0].msg.indexOf('sangtacviet.com') >= 0, JSON.stringify(alerts));
+  check('the sentence that blamed the device is gone',
+    alerts.length === 1 && alerts[0].msg.indexOf(SITE_TEXT) < 0, JSON.stringify(alerts));
+  check('the alert keeps the site view, so its reload button still works',
+    alerts.length === 1 && alerts[0].view === view);
+  check('the site code-7 handler is not run as well', handled.length === 0,
+    JSON.stringify(handled));
+  check('the reader is taken out of the loading state the same way',
+    notLoading === 1, String(notLoading));
+  check('code 7 is reported in the panel',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('code 7 survived every mirror') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-240));
+  check('the handler answers undefined, as the site one does',
+    first === undefined, String(first));
+
+  app.reader.handlingException({ code: 7, err: 'mirror refused' }, view);
+  check('a refusal that carried text keeps the site words next to the hint',
+    alerts.length === 2 && alerts[1].msg.indexOf('站点原话：mirror refused') >= 0,
+    JSON.stringify(alerts[1]));
+
+  const before = handled.length;
+  app.reader.handlingException({ code: 12 }, view);
+  check('every other code still runs the site handler untouched',
+    handled.length === before + 1 && alerts.length === 2,
+    JSON.stringify(handled));
+
+  app.reader.showAlert(SITE_TEXT, view);
+  check('the device sentence is replaced even when another caller shows it',
+    alerts.length === 3 && alerts[2].msg.indexOf('线路不可用') >= 0,
+    JSON.stringify(alerts[2]));
+  app.reader.showAlert('站点自己的别的提示', view);
+  check('and every other alert is passed through word for word',
+    alerts.length === 4 && alerts[3].msg === '站点自己的别的提示',
+    JSON.stringify(alerts[3]));
+
+  // --- login / register captcha --------------------------------------------
+  nextAnswer = 'captcha';
+  const answer = await app.net.post('/?ajax=login', 'username=a&psw=b');
+  check('the login answer still reaches the site unchanged', answer === 'captcha', String(answer));
+  const toasts = () => sandbox.__stored.toasts || [];
+  check('the button is no longer silent',
+    toasts().some((t) => t.indexOf('人机验证') >= 0), JSON.stringify(toasts()));
+  check('and the panel names which call was refused',
+    String(sandbox.window.__stvDiag.text() || '').indexOf('login answered captcha') >= 0,
+    String(sandbox.window.__stvDiag.text() || '').slice(-240));
+
+  const quietFrom = toasts().length;
+  nextAnswer = 'success';
+  const ok = await app.net.post('/?ajax=login', 'username=a&psw=b');
+  check('a working login stays quiet',
+    ok === 'success' && toasts().length === quietFrom,
+    JSON.stringify(toasts().slice(quietFrom)));
+
+  nextAnswer = 'captcha';
+  const other = await app.net.post('/mobile/userinfo.php', '');
+  check('a captcha answer to any other endpoint says nothing',
+    other === 'captcha' && toasts().length === quietFrom,
+    JSON.stringify(toasts().slice(quietFrom)));
+
+  await app.net.post('/?ajax=register', 'username=a&psw=b&repsw=b');
+  check('register reports the same wall, with its own words',
+    toasts().some((t) => t.indexOf('注册没有完成') >= 0), JSON.stringify(toasts()));
 }
 
 async function testDownloadRowControls() {
@@ -9242,6 +9357,7 @@ await testBootShell();
   await testOfflineBookDetailPage();
 await testEmptyUserPages();
   await testDomainFailover();
+  await testFailureHints();
   await testDownloadRowControls();
   await testStorageAccessor();
   await testDownloadRange();

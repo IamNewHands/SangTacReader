@@ -5788,3 +5788,67 @@ variant、bodyHash 一起当身份）：
 - `updateOldLink`（19 字节、470ms）是否卡在打开路径上。
 - 站点自己那条 `updateBookPage` 的 `null.like`（非目标）。
 
+## §6.59 第 57 轮（提交名：第五十九轮）：两处「什么都不说」有了句子 —— code 7 指线路，登录 captcha 不再当没发生
+
+这一轮没有新日志。起点是试用反馈的两句现象：首页能进，点进小说弹「设备不兼容或应用版本过旧」；
+点登录一直没反应（iPhone 15 Pro Max / iPad，iOS 17、26、27 都复现，而 iOS 27.0.1 的
+iPhone 17 Pro 正常）。查证下来是两处**静默**，各补一句人话。
+
+### 6.59.1 「设备不兼容」不是设备判定
+
+那句是站点前端自己的兜底串（`app.v2.read.js:747`，`x.err || x.info || "…"`）：只有响应
+`code == 7` 且没有 `err`/`info` 文本时才显示。站点前端从不读版本号 —— 三个 bundle 里没有任何
+version/appversion 判断；我们发出去的也只有 `x-stv-transport`、`x-requested-with`、UA、Referer、
+Cookie（`app.v2.js:1142-1149`），签名也不是门槛（无签名 code 5、假签名 code 1，§2 证据链）。
+所以它不可能是「版本校验」，iOS 26/27 与 iPad 一并复现也印证了这一点。
+
+真因 §6.10 已定过性：`code 7` 跟着**镜像**走。`verifyDomain()` 只探 `/warp.php`，而且
+**只看 HTTP 状态码、不看 body**（`app.v2.js:911-917` / `:1012-1021`），`bestDomain()` 再按 ping
+取最小（`:944-955`）；正文 URL 直接拼这个域名（`app.v2.read.js:564`），而章节 key 是
+`grantcontext` 在选中那个域名上签发的、Cookie 属于页面 origin —— 落到别的镜像，服务器就以
+「设备/上下文不符」回 code 7。`domainFailover` 已经会先走一遍镜像，所以这段文案还能出现，就说明
+**所有镜像都拒了**：此时读者唯一能做的是换线路，而原句把他指向了手机。
+
+### 6.59.2 登录的 captcha 分支是空的
+
+`showLogin` 的登录回调里 `else if (d == "captcha") { }`（`_page_vip.html:4652-4653`）——空分支，
+注册那份同样（`:4673-4674`）。服务器一旦回 `captcha`，按钮就是彻底没反应，和「卡住」在屏幕上
+长得一模一样。
+
+### 6.59.3 修法：只加句子，不改请求（新块 `failureHints`）
+
+| 路径 | 原来 | 现在 |
+| --- | --- | --- |
+| `handlingException` code 7 | 站点兜底串（指向设备） | 「正文线路不可用（站点回 code 7）。请到「设置 → 网络 → 域名」选择 sangtacviet.com，或换一条网络后重试。」；站点若给了 `err`/`info` 就附在后面 |
+| `showAlert` 收到那句原文 | 原样显示 | 同一句换成上面的提示。整串精确匹配，避免误伤 i18n 片段 |
+| 登录 / 注册回 `captcha` | 什么都不发生 | toast 说明需要人机验证、App 内没有这个入口；应答仍原样交回站点 |
+
+两条约束是有意为之：
+
+1. **请求形状不变**：code 7 仍交给 `showAlert`（站点的「Tải lại」按钮保留），其余 code 仍走原函数，
+   包括每个 code 都会执行的 `setNotLoading`（`read.js:788`）—— 漏掉它阅读器会一直挂在「载入中」；
+2. **应答不变**：`captcha` 原样返回给站点自己的回调，将来站点补上那个分支也不用动我们。
+
+安装时机：`app.reader` 由阅读器模块（`app.v2.read.js`）建立，比 `app.net` 晚，所以用 250ms 轮询，
+两个都包上就停；5 分钟还没见到阅读器模块就放弃并在面板里写明。
+
+包装 `app.net.post` 时会**继承** `__stvFailoverWrapped` 标记：镜像故障转移那层仍在链上，
+「这条请求走不走故障转移」的答案不该因为外面多包了一层就变成 `undefined`。
+
+### 6.59.4 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 29 块 / 643899 字节 / 141 标记 |
+| `scripts/test-site-patch.js` | **939 条断言** / 0 失败（新增 19 条） |
+| workflow | 产物标记表新增 `stvFailureHintsInstalled` |
+
+### 6.59.5 仍未证实 / 非目标
+
+- 真机上那两个提示的实际样子（下一份日志里应当出现
+  `[DOMAIN] code 7 survived every mirror` 与 `[AUTH] login answered captcha` 两行）。
+- **没做**：把带 Cookie 的请求钉在页面 origin（`sangtacviet.com`）。那是根因侧的修法，会改变
+  登录/正文由哪台镜像服务，属于下一轮单独的判断；本轮只保证失败时说的是人话。
+- 登录 10s 超时（`postCapacitor` 的 timeout）走站点自己的 catch toast，本轮不动。
+
+

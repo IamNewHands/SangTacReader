@@ -12269,6 +12269,169 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Two failures that used to say nothing
+
+    /**
+     Both of these end in front of the reader with an empty screen:
+
+       * `readchapter` answering `{"code":7}`. The site's code-7 branch
+         (app.v2.read.js:747) falls back to its own
+         "Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời", which
+         describes a device/version check the site never performs -- it sends
+         the reader to look at the phone while the cause is the mirror the
+         request landed on (docs/capacitor-port.md §6.10). `domainFailover`
+         already walks the mirrors before that text can appear, so once it does
+         appear every mirror has refused: the only thing left for the reader to
+         do is pick another line, and the text has to say so.
+       * login answering `captcha`. The site's own handler
+         (_page_vip.html:4652-4653, `else if (d == "captcha") { }`) is an empty
+         branch -- the button does nothing at all. Register has the same hole
+         (:4673-4674). Whatever the server's reason, silence is not an answer.
+
+     The repair is deliberately text-only, so no request changes shape:
+
+       * code 7 still goes to `showAlert`, keeping the site's reload
+         affordance, and every other code still runs the original handler --
+         including the tail call to `setNotLoading` that all codes share;
+       * the captcha answer is still returned to the site's handler untouched,
+         so a future site revision that fills that branch keeps working.
+
+     `showAlert` is wrapped as well as `handlingException` because the same
+     dead-end sentence can be produced by a caller that never goes through the
+     handler. That wrapper matches the string exactly; a substring match would
+     also catch the translated fragments the i18n overlay is built from.
+
+     Both hooks wait for `app.reader`, which is assembled when the reader's own
+     module loads (app.v2.read.js) -- later than `app.net`. Hence the poll:
+     `app.net.post` is wrapped on the first pass, `app.reader` on whichever
+     pass sees it, and the poll stops once both are in. If the reader module
+     never loads it gives up after five minutes and says so in the panel.
+     */
+    static let failureHints = """
+    (function () {
+        if (window.__stvFailureHintsInstalled) { return; }
+        window.__stvFailureHintsInstalled = true;
+
+        // Verbatim from app.v2.read.js:747.
+        var SITE_CODE7_TEXT = 'Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời';
+        var CODE7_HINT = '正文线路不可用（站点回 code 7）。请到「设置 → 网络 → 域名」选择 sangtacviet.com，或换一条网络后重试。';
+        var LOGIN_CAPTCHA_HINT = '登录没有完成：站点要求人机验证（captcha），App 内没有这个入口。请稍后再试。';
+        var REGISTER_CAPTCHA_HINT = '注册没有完成：站点要求人机验证（captcha），App 内没有这个入口。请稍后再试。';
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function toast(text) {
+            if (window.app && typeof window.app.toast === 'function') {
+                window.app.toast(text);
+                return true;
+            }
+            return false;
+        }
+
+        function currentReader() {
+            return (window.app && window.app.reader) || null;
+        }
+
+        // ---- code 7: name the cause ------------------------------------------
+        function patchShowAlert(target) {
+            if (!target || typeof target.showAlert !== 'function') { return false; }
+            if (target.showAlert.__stvHintWrapped) { return true; }
+            var original = target.showAlert;
+            var wrapper = function (msg, view) {
+                var text = String(msg === undefined || msg === null ? '' : msg);
+                if (text === SITE_CODE7_TEXT) {
+                    note('DOMAIN', 'the code-7 device sentence was replaced with the line hint');
+                    return original.call(this, CODE7_HINT, view);
+                }
+                return original.call(this, msg, view);
+            };
+            wrapper.__stvHintWrapped = true;
+            target.showAlert = wrapper;
+            return true;
+        }
+
+        function patchHandler(target) {
+            if (!target || typeof target.handlingException !== 'function') { return false; }
+            if (target.handlingException.__stvHintWrapped) { return true; }
+            var original = target.handlingException;
+            var wrapper = function (x, f) {
+                var code = x ? String(x.code) : '';
+                if (code !== '7') { return original.apply(this, arguments); }
+                note('DOMAIN', 'code 7 survived every mirror; telling the reader which line to pick');
+                var text = CODE7_HINT;
+                // The site's own words survive when it had any: they are the only
+                // thing that tells one refusal from another on the device.
+                if (x && (x.err || x.info)) {
+                    text = text + '（站点原话：' + String(x.err || x.info) + '）';
+                }
+                if (typeof target.showAlert === 'function') {
+                    target.showAlert(text, f);
+                } else if (!toast(text) && window.alert) {
+                    window.alert(text);
+                }
+                // Every code path ends here in the site's version (read.js:788).
+                // Skipping it would leave the reader marked as still loading.
+                if (typeof target.setNotLoading === 'function') { target.setNotLoading(f); }
+                return undefined;
+            };
+            wrapper.__stvHintWrapped = true;
+            target.handlingException = wrapper;
+            return true;
+        }
+
+        // ---- login / register: the site's empty captcha branch ---------------
+        function patchPost(net) {
+            if (!net || typeof net.post !== 'function') { return false; }
+            if (net.post.__stvHintWrapped) { return true; }
+            var original = net.post;
+            var wrapper = function (url) {
+                var target = String(url === undefined || url === null ? '' : url);
+                var kind = target.indexOf('ajax=login') >= 0 ? 'login'
+                    : (target.indexOf('ajax=register') >= 0 ? 'register' : '');
+                var result = original.apply(this, arguments);
+                if (!kind || !result || typeof result.then !== 'function') { return result; }
+                return result.then(function (answer) {
+                    if (String(answer) === 'captcha') {
+                        note('AUTH', kind + ' answered captcha; the site branch for it is empty');
+                        toast(kind === 'login' ? LOGIN_CAPTCHA_HINT : REGISTER_CAPTCHA_HINT);
+                    }
+                    return answer;
+                }, function (error) { throw error; });
+            };
+            wrapper.__stvHintWrapped = true;
+            // `domainFailover` may already have wrapped this function, and its
+            // marker answers "is the mirror failover in this chain". It still
+            // is -- the wrapper that carries it sits underneath this one -- so
+            // the answer is carried forward rather than dropped.
+            if (original.__stvFailoverWrapped) { wrapper.__stvFailoverWrapped = true; }
+            net.post = wrapper;
+            return true;
+        }
+
+        function install() {
+            var target = currentReader();
+            var a = target ? patchShowAlert(target) && patchHandler(target) : false;
+            var net = window.app && window.app.net ? window.app.net : null;
+            var b = net ? patchPost(net) : false;
+            return a && b;
+        }
+
+        install();
+
+        var tries = 0;
+        var timer = setInterval(function () {
+            tries = tries + 1;
+            if (install()) { clearInterval(timer); return; }
+            if (tries > 1200) {
+                clearInterval(timer);
+                note('PATCH', 'reader module never appeared: the code-7 hint is not installed');
+            }
+        }, 250);
+    })();
+    """
+
     static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
@@ -12277,5 +12440,6 @@ enum SitePatch {
                                 bookmarkToggle, readerTts,
                                 pageRepair, downloadExport, commentTranslate,
                                 comicGate, contentCache,
-                                swipeDismiss, readerPrefetch, coverFallback]
+                                swipeDismiss, readerPrefetch, coverFallback,
+                                failureHints]
 }

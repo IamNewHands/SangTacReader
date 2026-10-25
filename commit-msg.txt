@@ -1,49 +1,10 @@
-第五十八轮：第十一份真机日志 —— 短章节那道修复在真机上成立，而启动预热一直在白写
+第五十九轮：两处静默补上句子 —— code 7 指线路，登录 captcha 不再静默
 
-21:46 那次启动，444 行单进程。两件事：验收上一轮那道修复；暴露一个从预热落地起
-就存在、却从没被读过一次的第二类缺陷。
-
-一、上一轮修复成立（判据完全命中）
-  c=931037660（作者一行请假条，488 字节）在同一份日志里：
-    21:46:23 cached class=chapter ttl=2592000s bytes=488（唯一一次联网 653ms）
-    21:46:29 cache hit age=5s  -> 0ms
-    21:47:01 cache hit age=38s -> 0ms
-    21:47:03 cache hit age=39s -> 0ms
-  同日志 not cached class=chapter = 0 条，cache hit = 11 条。联网 1 次（653ms）之后全 0ms。
-
-二、新缺陷（已修）：启动预热写下的名字，阅读器永远查不到
-  十份去重日志的读数：prewarmed 写入 14 次，GET + cache hit（预热被读到）0 次，
-  POST + cache hit（阅读器自己写自己读）22 次。即预热从落地起就是一次纯浪费的往返。
-  缓存键上两个轴同时不匹配：
-    method：预热发 GET，阅读器发 POST（app.v2.js:3998 app.net.post("", "")）
-    host  ：预热只知道页面 host sangtacviet.com（页面自己报 alive=no），
-            阅读器的请求走 bestDomain() 的 sangtacviet.app；
-            14 次预热全在 .com，22 次命中全在 .app
-  第二轴结构上无法自愈：预热只能知道页面的 host，而站点把请求发到 bestDomain()。
-  修法两处：
-    1. prewarmUserInfo() 改用 POST，并补上阅读器自己的
-       Content-Type: application/x-www-form-urlencoded; charset=utf-8
-       （bodyData(for:) 对空字符串 body 就是设这个）。
-    2. includesHost 把 userInfo 加进「不按 host 分键」那组（与 chapter/chapterList/
-       siteAsset 同理由），并补正面证据：同一 454 字节 profile 在 sangtacviet.app 与
-       dns1.stv-appdomain-00000001.org 上逐字节相同；十份日志里 userinfo 应答只有一种体积 454。
-  会话隔离不受影响：chapterVariant 仍把登录与否留在键里（access/useri2 只贡献 |in / |out）。
-
-三、CI 补三个标记，盯住「预热必须发阅读器那个请求」
-  这类错误没有编译错误，GET 换 POST 只让命中率静默变 0。每条查它自己所在的文件
-  （第一版把 includesHost 那条写进了 ContentCache.swift 的循环，本地模拟立刻红了）：
-    empty data                                  -> ContentCache.swift
-    case .chapter, .chapterList, .siteAsset, .userInfo: return false -> SangTacHttpPlugin.swift
-    self.warmRequest(method: "POST", url: url, headers: headers)     -> SangTacHttpPlugin.swift
-
-四、这份日志里另外两件事
-  - 撤掉 TTS 量测没丢信息：69 行 [TTS] 仍完整报 synthesised 115754 bytes, 2.62s，
-    且 36 句无一次重试（全是 attempt 1/3 -> attempt 1 ok）。
-  - 1 条 [ERR] unhandledrejection 指向 blob:…app.v2.js:4937，是站点自己的
-    updateBookPage 里 queryBookExtStatus 未登录时 return null、.then 再读 status.like 抛的。
-    十份日志只出现这一次，与注入块无关，非目标，只记录。
-
-守卫：check-ios-shim 28 块 / 638019 字节 / 141 标记；test-site-patch 920 断言 0 失败；
-  i18n 461/76；assets 8/906296；workflow YAML 通过，25 步。
-
-文档：docs/capacitor-port.md §6.58；§6.45 表第 5 行补上「它曾经是空转的」。
+- 新增注入块 failureHints：code 7 的兜底文案原本指向「设备/版本」，换成
+  「正文线路不可用…设置 → 网络 → 域名 选 sangtacviet.com，或换网络」，站点 err/info 原文附后；
+  showAlert 收到同一句原文时整串替换（精确匹配，不误伤 i18n 片段）。
+- 登录/注册回 captcha 时 toast 说明需要人机验证、App 内没有入口（站点那个分支是空的）。
+  请求形状与应答都不变：code 7 仍走 showAlert 保留重载按钮，其余 code 仍走原函数含
+  setNotLoading，captcha 仍原样交回站点。
+- 包装 app.net.post 时继承 __stvFailoverWrapped，镜像故障转移仍在链上。
+- 测试新增 19 条断言（共 939 条）；CI 产物标记表加 stvFailureHintsInstalled。
