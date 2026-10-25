@@ -6460,4 +6460,92 @@ JS 断言 1001 → **1021**（新增 20 条：会话装回页面、三个名字�
 - 三个名字是读站点源码定的（`app.v2.js:3960` / `:3983` 只认 `access`，`useri2` 是缓存变体
   用的身份，`hstamp` 跟着登录一起下发）；站点若新增一枚同样必需的 cookie，这张名单要补。
 
+## §6.67 第 65 轮：杀掉重进有几秒是「未登录」—— 登录被排在跨线路探测后面
+
+读者反馈：每次杀掉重进，都有几秒是未登录的样子，然后才变回登录；以前没有。上一轮那三层
+（内存 / 重启 / 重装）都还在，坏的不是会话，是**登录态落定的时机**。
+
+### 6.67.1 证据：五秒的账
+
+`stv-diagnostic-20261025-221450.log`（273 行，`---- this launch ----` 之后是这次启动）：
+
+| 时刻 | 行 | 说明 |
+| --- | --- | --- |
+| 22:14:32 | `[BOOT] +11ms document start` | 这次启动从这里开始 |
+| 22:14:32 | `[BOOT] shell released at +248ms (app.v2.css (local) …)` / `native boot overlay released` | 真 UI 已经上屏，而登录态还是 `null` |
+| 22:14:33 | `[TAP] tap i.fas.fa-user` → `[TAB] after index=3/4` | 用户点了「用户」：渲染出来的是**未登录** |
+| 22:14:33-35 | `warp.php` 三条线路各一次：808ms / 1896ms / 2907ms | 这就是那五秒的来源 |
+| 22:14:37 | `[DOMAIN] networkManager ranked 1.…app=alive/816ms 2.…=alive/1903ms 3.…com=alive/2910ms` | 探测**到齐** |
+| 22:14:37 | `[CACHE] POST …/mobile/userinfo.php cache hit class=userInfo age=28s` → `in 1ms (cache)` | 真正的账号查询只花了 **1 毫秒** |
+
+结论摆在一起就是这句：**一个同步的 cookie 判断 + 一个 1ms 的缓存命中，被排在三秒的跨线路
+探测后面才发生**。全篇没有 `[LOG] Logging out..` —— 会话是好的，只是没人早点去问。
+
+### 6.67.2 谁在等谁
+
+`app.v2.js:3968` 的 `checklogin` 第一句就是：
+
+```js
+await app.net.networkManagerXHR.checkDomains();
+```
+
+而 `checkDomains()`（`:1060`）**每次都先把 `this.domains = []` 清空**，再对
+`defaultDomains` 里三条线路各 `verifyDomain()` 一次（`/warp.php`），`await Promise.all`
+—— 最慢那条说了算。它本来就够慢，而 `:1124` 在脚本加载时已经发过一轮，`checklogin`
+并不复用那一轮，于是自己又探一轮。登录判断（`:3983`，读 `getCookie("access")`）就卡在它后面。
+
+这跟上一轮修的 cookie 是两件事：cookie 现在活得过重启（`重启后 ✓（上次写下的）` 为证），
+但**它活过来之后没人问**。
+
+### 6.67.3 修法：不等那三秒，自己先问
+
+新增块 `SitePatch.fastLogin`（第 32 块，排在 `sessionCookies` 之后）。它只做一件事：
+站点脚本解析完（`app.net` / `app.user` 就位）就自己发那一个 `userinfo`。
+
+- 时机：25ms 一轮等 `window.app.user` 出现。`app.user.checklogin(true)`（`:4064`）是同一次
+  同步解析里调用的，注入块抢不到它前面；抢在它**后面 25ms** 已经够了 —— 它此刻正卡在
+  `checkDomains` 上，要三秒后才走到登录判断。
+- 请求：`app.net.post('/mobile/userinfo.php', '')`，与站点 `:3998` 逐字一致，走原生缓存
+  （日志里 `in 1ms (cache)`），线上没有缓存的启也只多几百毫秒。
+- 落定：把 `isLogin` / `info` / `isAdmin` 按站点 `:3999-4004` 的写法填上，并重画已经打开的
+  `#mainview div[view=userme]`（站点那条路在 `background=true` 时**不重画**，`:4011`）。
+  站点自己那次 `checklogin` 之后会看到 `app.user.info` 已经有值，走 `:3974` 的短路分支 ——
+  所以**总共只有一次查询**。
+- 不越界：站点的答案在先就**不覆盖**；服务端答的不是 `code == 400` 时**什么都不写**，
+  登出仍归站点自己那条路；没有会话 cookie 时一个请求都不发，轮询立刻收工。
+
+判断与落定各自暴露成可断言的部分（`window.__stvFastLoginInstalled` 自守、`prime` 只发一次），
+断言打在行为上。
+
+### 6.67.4 这一轮怎么验
+
+JS 断言 1021 → **1030**（新增 9 条：没有会话不发请求、有会话立刻发一条、发的就是站点那个
+请求、答案是站点读的登录态、已经打开的用户页会被重画、只发一次、站点已知的登录态不覆盖、
+服务端否认时不擅自登入、admin 标记跟着走）。
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | **32 块** / 702611 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1030 条断言** / 0 失败 |
+| `gen-site-i18n.js --check` | 461 labels / 76 fragments in sync |
+| `gen-site-assets.js --check` | 8 文件 / 906296 字节 in sync |
+
+真机上验（不用重装，同一个包覆盖安装即可）：
+
+1. 从后台任务列表**杀掉** App，重开，立刻点「用户」：应当直接是已登录，不该先看到登录/未登录态；
+2. 面板里应出现 `[AUTH] the login was settled at +xxxms …, without waiting for it: userid 306185`，
+   且这个 `+xxxms` 明显小于 `[DOMAIN] networkManager ranked` 那一行的时间；
+3. 对照：`[CACHE] POST …/mobile/userinfo.php cache hit` 仍应出现在 `ranked` **之前**。
+
+### 6.67.5 未证实与边界
+
+- **没能证明「以前没有」**：手上 20:37 / 21:58 / 22:14 三份日志里都没有 `document start` →
+  `userinfo` 的对照（前两份缺 `document start` 行），所以「什么时候变慢的」只能说清楚机理，
+  不能说清楚日期。机理本身是可测的：`checkDomains` 在 `checklogin` 之前 await，与版本无关。
+- **`warp.php` 那三秒是网络，不是我们能缩的**：本轮的改动不是让探测变快，而是让登录态不必等它。
+  探测本身仍会在后台跑完并排名（`ranked` 那行照旧）。
+- **首屏比站点脚本更早**：如果用户在 `app.v2.js` 解析完之前就点开用户页（真机约 +0.5s 内），
+  那一刻页面里还没有 `app.user`，本块也没有答案可填；这条没有修，属于「App 还没起来」。
+  若体感上仍然能看到，下一步是把原生遮罩多留到 `app.user` 就绪，代价是首屏晚约 0.3 秒。
+
 

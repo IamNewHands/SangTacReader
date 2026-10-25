@@ -13668,6 +13668,103 @@ enum SitePatch {
     })();
     """
 
+    // 第 65 轮：杀掉重进之后，用户页有几秒长得像「未登录」。
+    //
+    // 站点在 app.v2.js:3968 的 checklogin() 开头 await checkDomains()，而
+    // checkDomains()（:1060）每次都把 domains 清空、重新探测三条线路的
+    // /warp.php，最慢那条三秒。于是「有没有登录」这个一个 cookie 就能回答的
+    // 问题，被压在跨线路探测后面才落定；站点那边落定之前，用户页渲染出来的
+    // 就是未登录。
+    //
+    // 22:14:32 那次启动（stv-diagnostic-20261025-221450.log）的账：
+    //   +11ms   document start
+    //   +248ms  shell released —— 已经是真 UI，而 app.user.info 还是 null
+    //   +1s     用户点了「用户」标签，渲染出来的是未登录
+    //   +3.0s   最慢那条线路的 warp.php 才回来
+    //   +5s     userinfo.php 终于发出，1ms 就从原生缓存命中，登录态才翻过来
+    //
+    // 这里不等它：站点脚本一解析完（app.net 就位）就自己发那一个 userinfo。
+    // 请求走原生缓存，日志里一直是 1ms；站点自己那次 checklogin 之后会看到
+    // app.user.info 已经有了，走 :3974 的短路分支，不会再发第二次。
+    static let fastLogin = """
+    (function () {
+        if (window.__stvFastLoginInstalled) { return; }
+        window.__stvFastLoginInstalled = true;
+
+        var tries = 0;
+        var timer = null;
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function now() {
+            try { return Math.round(performance.now()); } catch (e) { return -1; }
+        }
+
+        // 站点那道门用的就是这个判断（app.v2.js:3983）。cookie 在不在是同步的，
+        // 不需要任何网络。
+        function cookieSession() {
+            try {
+                if (typeof window.getCookie !== 'function') { return false; }
+                return String(window.getCookie('access') || '').length >= 32;
+            } catch (e) { return false; }
+        }
+
+        function rerenderUserPage() {
+            var app = window.app;
+            if (!app || typeof app.rerender !== 'function') { return; }
+            var list = null;
+            try {
+                list = (typeof window.q === 'function')
+                    ? window.q('#mainview div[view=userme]')
+                    : document.querySelectorAll('#mainview div[view=userme]');
+            } catch (e) { return; }
+            if (!list) { return; }
+            for (var i = 0; i < list.length; i++) {
+                try { app.rerender(list[i]); } catch (e) {}
+            }
+        }
+
+        // 与站点的成功分支逐字一致（app.v2.js:3999-4004）；唯一让路的地方是
+        // 站点自己已经先写了 info —— 那份更新，不动。
+        function fill(data) {
+            var app = window.app;
+            if (!app || !app.user) { return false; }
+            if (app.user.info) { return false; }
+            if (!data || data.code != 400) { return false; }
+            app.user.isLogin = true;
+            app.user.info = data;
+            if (data.perm === 'admin') { app.user.isAdmin = true; }
+            rerenderUserPage();
+            return true;
+        }
+
+        // 只发一次。返回 true 表示本块已经没事可做，轮询就此停下。
+        function prime() {
+            var app = window.app;
+            if (!app || !app.user) { return false; }
+            if (app.user.info) { return true; }
+            var net = app.net;
+            if (!net || typeof net.post !== 'function') { return false; }
+            if (!cookieSession()) { return true; }
+            net.post('/mobile/userinfo.php', '').then(function (data) {
+                if (!fill(data)) { return; }
+                var at = now();
+                note('AUTH', 'the login was settled '
+                    + (at < 0 ? 'before the domain probe finished' : 'at +' + at + 'ms')
+                    + ', without waiting for it: userid ' + data.id);
+            }).catch(function () {});
+            return true;
+        }
+
+        timer = setInterval(function () {
+            tries = tries + 1;
+            if (prime() || tries > 1200) { clearInterval(timer); }
+        }, 25);
+    })();
+    """
+
     static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
@@ -13677,5 +13774,6 @@ enum SitePatch {
                                 pageRepair, downloadExport, commentTranslate,
                                 comicGate, contentCache,
                                 swipeDismiss, readerPrefetch, coverFallback,
-                                failureHints, domainProbe, sessionCookies]
+                                failureHints, domainProbe, sessionCookies,
+                                fastLogin]
 }

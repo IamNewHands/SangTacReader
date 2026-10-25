@@ -10230,6 +10230,98 @@ async function testKeychainReadyLate() {
     sandbox.window.__stvSessionLayer().indexOf('✗') < 0,
     sandbox.window.__stvSessionLayer());
 }
+/**
+ * 2026-10-25 22:14:32 那次启动的账：document start 到 userinfo.php 之间隔了五秒。
+ * 站点在 checklogin()（app.v2.js:3968）开头 await checkDomains()，而那是三条
+ * 线路各一次 /warp.php 探测，最慢那条三秒；这五秒里用户页画出来的是未登录。
+ *
+ * 登录态本来就只取决于一个同步的 cookie 判断，不该排在跨线路探测后面。
+ */
+async function testFastLogin() {
+  console.log('the login state does not wait for the domain probe');
+  const access = 'f'.repeat(40);
+
+  function bench(sessionCookie) {
+    const sandbox = makeSandbox();
+    installFakeApp(sandbox, { displayType: 'auto' });
+    const calls = [];
+    const rendered = [];
+    const view = makeElement('div');
+    sandbox.window.getCookie = () => (sessionCookie ? access : '');
+    sandbox.window.q = () => [view];
+    sandbox.window.app = {
+      user: { isLogin: false, info: null },
+      net: {
+        post(url, body) {
+          return new Promise((resolve) => { calls.push({ url, body, resolve }); });
+        },
+      },
+      rerender(node) { rendered.push(node); },
+    };
+    return { sandbox, calls, rendered, view };
+  }
+
+  // 没有会话 cookie：一个请求都不发，轮询立刻收工。
+  const idle = bench(false);
+  vm.runInContext(loadBlocks().join('\n'), idle.sandbox);
+  await tick(300);
+  check('without a session cookie nothing is asked of the server',
+    idle.calls.length === 0, String(idle.calls.length));
+
+  // 有 cookie：请求立刻发出，不等任何线路探测（这里根本没有东西在探测）。
+  const live = bench(true);
+  vm.runInContext(loadBlocks().join('\n'), live.sandbox);
+  await tick(120);
+  check('a session cookie turns into one userinfo request right away',
+    live.calls.length === 1 && live.calls[0].url === '/mobile/userinfo.php',
+    JSON.stringify(live.calls.map((call) => call.url)));
+  check('and the request is the one the site itself makes',
+    String(live.calls[0].body) === '', String(live.calls[0].body));
+
+  live.calls[0].resolve({ code: 400, id: '306185', perm: 'vip' });
+  await tick(50);
+  const user = live.sandbox.window.app.user;
+  check('the answer is the login state the site reads',
+    user.isLogin === true && user.info && user.info.id === '306185',
+    JSON.stringify(user.info && user.info.id));
+  check('and the open user page is redrawn, so it stops looking logged out',
+    live.rendered.length === 1 && live.rendered[0] === live.view,
+    String(live.rendered.length));
+
+  // 一次就够：轮询不许在这里变成每 25ms 一个请求。
+  await tick(300);
+  check('the login is only ever asked for once', live.calls.length === 1,
+    String(live.calls.length));
+
+  // 站点自己已经查过了：不插队，也不覆盖那份更新的答案。
+  const known = bench(true);
+  known.sandbox.window.app.user.info = { id: '999', code: 400 };
+  vm.runInContext(loadBlocks().join('\n'), known.sandbox);
+  await tick(120);
+  check('a login the site already knows is left alone',
+    known.calls.length === 0, String(known.calls.length));
+
+  // 服务端说没登录：本块不下结论，让站点自己那条路去登出。
+  const refused = bench(true);
+  vm.runInContext(loadBlocks().join('\n'), refused.sandbox);
+  await tick(120);
+  refused.calls[0].resolve({ code: 401 });
+  await tick(50);
+  const after = refused.sandbox.window.app.user;
+  check('a refused session is left to the site, not turned into a login',
+    after.isLogin === false && after.info === null, JSON.stringify(after.info));
+
+  // admin 这一层跟着站点走，别漏。
+  const admin = bench(true);
+  vm.runInContext(loadBlocks().join('\n'), admin.sandbox);
+  await tick(120);
+  admin.calls[0].resolve({ code: 400, id: '7', perm: 'admin' });
+  await tick(50);
+  check('an admin answer still sets the admin flag',
+    admin.sandbox.window.app.user.isAdmin === true,
+    String(admin.sandbox.window.app.user.isAdmin));
+}
+
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -10309,6 +10401,7 @@ await testPopupTranslate();
   await testSessionSurvivesReinstall();
   await testSessionStateRow();
   await testKeychainReadyLate();
+  await testFastLogin();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
