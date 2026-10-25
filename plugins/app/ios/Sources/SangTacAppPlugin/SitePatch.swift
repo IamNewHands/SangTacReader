@@ -3212,6 +3212,11 @@ enum SitePatch {
         }
 
         var banned = {};
+        // Read-only view for the settings probe (`domainProbe`), which reports
+        // "this line answered code 7" from the same set the failover keeps. The
+        // map is never replaced, only added to, so handing out the reference is
+        // safe.
+        window.__stvDomainBanned = banned;
         var MAX_BANS = 3;
         // Code 7 refetches this read has already spent. Kept apart from the ban
         // list: a mirror banned for stalling must not eat the retry budget that
@@ -12465,6 +12470,344 @@ enum SitePatch {
     })();
     """
 
+    // MARK: - Which line actually works
+
+    /**
+     The settings page already carries the site's own line picker (设置 → 网络 →
+     域名: auto / sangtacviet.com / sangtacviet.app, _page_vip.html:1517-1521), and
+     it says nothing about which line works. The numbers exist -- the panel's
+     `[DOMAIN] … ranked dns1=alive/100ms …` line -- but only with logging on.
+
+     This block puts them where the choice is made: one row per line in the site's
+     own `defaultDomains`, each answering the two questions the reader actually has.
+
+       1. how far away is it -- `/warp.php` round trip, the same probe
+          `verifyDomain()` runs (app.v2.js:911-917). Latency alone is NOT "usable":
+          the mirror that pings 100ms is routinely the one that answers `code 7`
+          to every chapter (§6.10, §6.60).
+       2. would it see my login -- `POST /mobile/userinfo.php` on that host with
+          the headers the read path sends (`x-stv-transport: app` plus
+          `document.cookie`, app.v2.js:1142-1149). This is the column that explains
+          a login that "succeeds" and changes nothing: the cookies belong to the
+          page origin, so a second host answers "not logged in".
+
+     Chapter health is read from evidence the app already has, never guessed: the
+     `code 7` ban set the failover block keeps (`window.__stvDomainBanned`) and the
+     mirror that last returned a chapter (`stv.domain.good`). A line is marked
+     正文 ✓ only when there is a record of it serving one; "not seen failing" is
+     printed as 未测.
+
+     Tap a row to measure it again; 设为线路 writes `app.config.ux.app_domain` --
+     the site's own setter, which persists the choice (app.v2.config.js:77-82) and
+     is exactly what `fullUrl()`/`bestDomain()` already read. Nothing is switched
+     automatically: a host without the session has to be logged into again, and
+     that needs the reader's password.
+
+     Rows are built when the settings page opens (`pushPage('pagesetting')`, the
+     same hook the comment-translation block uses), so nothing runs at boot.
+     */
+    static let domainProbe = """
+    (function () {
+        if (window.__stvDomainProbeInstalled) { return; }
+        window.__stvDomainProbeInstalled = true;
+
+        var ROW = 'stv-domainprobe-row';
+        var RUN = 'stv-domainprobe-run';
+        var GOOD_KEY = 'stv.domain.good';
+
+        function note(tag, message) {
+            if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
+        }
+
+        function appObject() { return window.app || null; }
+
+        function toast(text) {
+            var app = appObject();
+            if (app && typeof app.toast === 'function') { app.toast(text); return true; }
+            return false;
+        }
+
+        function httpPlugin() {
+            return (window.Capacitor && window.Capacitor.Plugins
+                && window.Capacitor.Plugins.Http) || null;
+        }
+
+        function stop(event) {
+            if (!event) { return; }
+            if (typeof event.stopPropagation === 'function') { event.stopPropagation(); }
+            if (typeof event.preventDefault === 'function') { event.preventDefault(); }
+        }
+
+        function pageOrigin() {
+            try { return String((window.location && window.location.origin) || ''); } catch (e) { return ''; }
+        }
+
+        function shortName(url) {
+            var text = String(url === undefined || url === null ? '' : url);
+            if (text.indexOf('https://') === 0) { return text.slice(8); }
+            if (text.indexOf('http://') === 0) { return text.slice(7); }
+            return text;
+        }
+
+        // The site's own list (app.v2.js:932 / :1035), plus the page origin when
+        // the site has since dropped it. No literal host is added here.
+        function lines() {
+            var app = appObject();
+            var mgr = app && app.net
+                ? (app.net.networkManagerXHR || app.net.networkManager) : null;
+            var list = mgr && mgr.defaultDomains ? mgr.defaultDomains.slice() : [];
+            var page = pageOrigin();
+            if (page && list.indexOf(page) < 0) { list.unshift(page); }
+            return list;
+        }
+
+        function banned() { return window.__stvDomainBanned || {}; }
+
+        function lastWorking() {
+            try {
+                var raw = window.localStorage ? (window.localStorage.getItem(GOOD_KEY) || '') : '';
+                if (!raw) { return ''; }
+                var entry = JSON.parse(raw);
+                return entry && typeof entry.name === 'string' ? entry.name : '';
+            } catch (e) { return ''; }
+        }
+
+        function loggedIn() {
+            var app = appObject();
+            return !!(app && app.user && app.user.isLogin);
+        }
+
+        function pickedLine() {
+            var app = appObject();
+            var ux = app && app.config ? app.config.ux : null;
+            return ux ? String(ux.app_domain || '') : '';
+        }
+
+        function paint(row) {
+            var value = row.__stvValue;
+            var state = row.__stvState || {};
+            if (!value) { return; }
+            var parts = [];
+            if (state.ms === null || state.ms === undefined) {
+                parts.push(state.why ? state.why : '…');
+            } else {
+                parts.push(state.ms + 'ms');
+            }
+            if (!loggedIn()) {
+                parts.push('未登录');
+            } else if (state.session === true) {
+                parts.push('会话 ✓');
+            } else if (state.session === false) {
+                parts.push('会话 ✗');
+            } else {
+                parts.push('会话 …');
+            }
+            var host = row.getAttribute('data-stv-domain');
+            if (banned()[host]) { parts.push('正文 ✗ code 7'); }
+            else if (lastWorking() === host) { parts.push('正文 ✓'); }
+            else { parts.push('正文 未测'); }
+            var text = parts.join(' · ');
+            if (pickedLine() === host) { text = '● ' + text; }
+            value.textContent = text;
+        }
+
+        // ---- the two probes ---------------------------------------------------
+        function probeWarp(host) {
+            var http = httpPlugin();
+            var started = Date.now();
+            if (!http || typeof http.get !== 'function') {
+                return Promise.resolve({ ms: null, why: '插件不可用' });
+            }
+            return http.get({
+                url: host + '/warp.php',
+                timeout: 5000,
+                headers: {
+                    'x-stv-transport': 'web',
+                    'x-requested-with': 'com.sangtacviet.mobilereader'
+                }
+            }).then(function (response) {
+                if (!response || response.status < 200 || response.status >= 300) {
+                    return { ms: null, why: 'HTTP ' + String(response && response.status) };
+                }
+                return { ms: Date.now() - started };
+            }, function (error) {
+                var text = String(error && error.message ? error.message : '');
+                return { ms: null, why: text ? text.slice(0, 18) : '不通' };
+            });
+        }
+
+        function probeSession(host) {
+            var http = httpPlugin();
+            if (!http || typeof http.post !== 'function') {
+                return Promise.resolve({ session: null });
+            }
+            return http.post({
+                url: host + '/mobile/userinfo.php',
+                data: '',
+                timeout: 8000,
+                headers: {
+                    'x-stv-transport': 'app',
+                    'x-requested-with': 'com.sangtacviet.mobilereader',
+                    'Cookie': document.cookie || '',
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            }).then(function (response) {
+                if (!response || response.status < 200 || response.status >= 300) {
+                    return { session: false };
+                }
+                var body = String(response.data === undefined || response.data === null
+                    ? '' : response.data);
+                var parsed = null;
+                try { parsed = JSON.parse(body); } catch (e) { parsed = null; }
+                var head = parsed && parsed.head ? parsed.head : parsed;
+                return { session: !!(head && (head.id || head.name)) };
+            }, function () {
+                return { session: false };
+            });
+        }
+
+        function measure(row) {
+            if (!row || row.__stvBusy) { return Promise.resolve(); }
+            row.__stvBusy = true;
+            var host = row.getAttribute('data-stv-domain');
+            row.__stvState = { ms: null, why: '测试中…', session: null };
+            paint(row);
+            return Promise.all([probeWarp(host), probeSession(host)]).then(function (results) {
+                row.__stvBusy = false;
+                row.__stvState = {
+                    ms: results[0].ms,
+                    why: results[0].why,
+                    session: results[1].session
+                };
+                paint(row);
+                note('DOMAIN', 'probe ' + shortName(host) + ': ' + row.__stvValue.textContent);
+            }, function (error) {
+                row.__stvBusy = false;
+                row.__stvState = { ms: null, why: '测试失败', session: false };
+                paint(row);
+                note('DOMAIN', 'probe ' + shortName(host) + ' failed: '
+                    + String(error && error.message ? error.message : error));
+            });
+        }
+
+        function measureAll(page) {
+            var rows = page && page.querySelectorAll ? page.querySelectorAll('.' + ROW) : [];
+            for (var i = 0; i < rows.length; i++) { measure(rows[i]); }
+        }
+
+        // ---- the rows ---------------------------------------------------------
+        function choose(host) {
+            var app = appObject();
+            if (!app || !app.config || !app.config.ux
+                || typeof app.config.saveUxSetting !== 'function') {
+                toast('设置模块还没准备好，稍后再试');
+                return false;
+            }
+            app.config.ux.app_domain = host;
+            note('DOMAIN', 'probe picked ' + host + ' as the line');
+            toast('线路已设为 ' + shortName(host));
+            return true;
+        }
+
+        function makeRow(host, page) {
+            var row = document.createElement('div');
+            row.className = 'settingitem ' + ROW;
+            row.setAttribute('data-stv-domain', host);
+            row.__stvPage = page;
+
+            var title = document.createElement('div');
+            title.className = 'settingitemtitle';
+            title.textContent = shortName(host);
+
+            var value = document.createElement('div');
+            value.style.cssText = 'font-size:12px;opacity:0.85;';
+            value.textContent = '点这里测速';
+
+            var pick = document.createElement('div');
+            pick.className = 'stv-domainprobe-pick';
+            pick.style.cssText = 'font-size:12px;opacity:0.9;color:#7fdc7f;';
+            pick.textContent = '设为线路';
+
+            row.appendChild(title);
+            row.appendChild(value);
+            row.appendChild(pick);
+            row.__stvValue = value;
+
+            row.addEventListener('click', function (event) {
+                stop(event);
+                measure(row);
+            }, true);
+            pick.addEventListener('click', function (event) {
+                stop(event);
+                if (choose(host)) { paint(row); }
+            }, true);
+            return row;
+        }
+
+        function makeRunRow(page) {
+            var row = document.createElement('div');
+            row.className = 'settingitem ' + RUN;
+            row.innerHTML = '<div class="settingitemtitle">测速全部线路</div>';
+            row.__stvPage = page;
+            row.addEventListener('click', function (event) {
+                stop(event);
+                measureAll(page);
+            }, true);
+            return row;
+        }
+
+        function build(page) {
+            if (!page || page.nodeType !== 1 || !page.querySelector) { return false; }
+            if (page.querySelector('.' + ROW)) { return true; }
+            // Right under the site's own picker, so "which line" and "which line
+            // works" are one block on screen.
+            var picker = page.querySelector('contextmenu[value="app.config.ux.app_domain"]');
+            var anchor = picker ? picker.parentNode : null;
+            var host = anchor ? anchor.parentNode : null;
+            if (!host) { return false; }
+            var cursor = anchor;
+            var run = makeRunRow(page);
+            host.insertBefore(run, cursor.nextSibling);
+            cursor = run;
+            var list = lines();
+            for (var i = 0; i < list.length; i++) {
+                var row = makeRow(list[i], page);
+                host.insertBefore(row, cursor.nextSibling);
+                cursor = row;
+            }
+            note('DOMAIN', 'line probe rows added (' + list.length + ')');
+            return true;
+        }
+
+        function hook() {
+            var app = appObject();
+            if (!app || typeof app.pushPage !== 'function') { return false; }
+            if (app.__stvDomainProbeHooked) { return true; }
+            app.__stvDomainProbeHooked = true;
+            var original = app.pushPage;
+            app.pushPage = function (name) {
+                var page = original.apply(this, arguments);
+                try {
+                    if (name === 'pagesetting' && build(page)) { measureAll(page); }
+                } catch (error) {
+                    note('ERR', 'line probe: '
+                        + String(error && error.message ? error.message : error));
+                }
+                return page;
+            };
+            return true;
+        }
+
+        hook();
+
+        var tries = 0;
+        var timer = setInterval(function () {
+            tries = tries + 1;
+            if (hook() || tries > 1200) { clearInterval(timer); }
+        }, 250);
+    })();
+    """
+
     static let all: [String] = [compat, assetCache, diag, assetMirror,
                                 storageAccessor, readerDefaults, safeArea,
                                 domainFailover, bootShell, SiteI18nData.script,
@@ -12474,5 +12817,5 @@ enum SitePatch {
                                 pageRepair, downloadExport, commentTranslate,
                                 comicGate, contentCache,
                                 swipeDismiss, readerPrefetch, coverFallback,
-                                failureHints]
+                                failureHints, domainProbe]
 }

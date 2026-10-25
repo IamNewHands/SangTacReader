@@ -1,11 +1,10 @@
-第六十轮：镜像竞速之前加一条 —— 页面自己的 origin 优先
+第六十一轮：设置页给每条线路一行体检 —— 延迟 + 会话 + 正文
 
-- 根因修法：cookie（access/useri2）与 grantcontext 签发的章节 key 都属于设置它的那个
-  host，而 bestDomain() 只按 /warp.php 延迟排序，于是正文与登录会被改写到别的镜像，
-  带着一份不属于它的会话 —— 这就是 code 7 与「登录 success 但没登录」的共同解释。
-- patchBestDomain 新增一条：页面 origin（location.origin）在站点镜像名单里、没被拉黑、
-  这次探活没标 dead 时直接返回它，排在「手选线路」之后、「记忆镜像」与竞速之前。
-  名单成员资格防篡改；页面 origin 回 code 7 仍会被拉黑并换镜像（不无限重试）。
-- 测试新增 8 条断言（共 947 条）：更快的镜像不再赢、正文落在页面 origin、面板写出规则名、
-  页面 origin 回 code 7 仍能换镜像、探活 dead 不钉、非站点 origin 不生效、手选线路仍优先。
-- workflow 新增源码守卫：var page = pageOrigin(); 与 outranks the ping race。
+- 新增注入块 domainProbe：打开设置页（pushPage('pagesetting')）时在站点自己的「域名」选择器
+  下面建行，每条线路一行，回答三个问题：warp.php 延迟（多远）、POST userinfo.php 是否认这份
+  登录（会话 ✓/✗，头与阅读器读正文一致）、正文 ✓/✗/未测（拉黑表 + 上次出过正文的那台）。
+  延迟不作为可用性判据 —— ping 最低的那台常常就是回 code 7 的那台（§6.10/§6.60）。
+- 点行重测；右侧「设为线路」写 app.config.ux.app_domain（站点自己的 setter，会持久化）。
+  不自动切换：没有会话的 host 要重新登录。
+- 故障转移块以只读方式交出拉黑表（window.__stvDomainBanned，只增不改）。
+- 测试新增 14 条断言（共 961 条）；CI 产物标记表加 stvDomainProbeInstalled。

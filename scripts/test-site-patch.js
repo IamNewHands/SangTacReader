@@ -28,6 +28,8 @@
  *   - the page's own origin wins the mirror race, because the session cookies
  *     and the chapter key belong to that host; a page origin that refuses, or
  *     that the probe marks dead, still falls back to the mirrors
+ *   - 设置 → 网络 gets one row per line with a latency and a "does it see my
+ *     login" verdict, built from the site's own list; nothing switches by itself
  *
  * Run: node scripts/test-site-patch.js
  */
@@ -4217,6 +4219,151 @@ async function testPageOriginPinning() {
   check('an explicit 线路 pick still wins over the page origin',
     picked.app.net.networkManager.bestDomain() === APP,
     picked.app.net.networkManager.bestDomain());
+}
+
+/**
+ * §6.61: 设置 → 网络 gets one row per line showing latency and whether that host
+ * sees the reader's login. Latency alone is not "usable" (§6.60), so chapter
+ * health only claims what the app has evidence for, and nothing switches lines
+ * by itself -- a host without the session would mean logging in again.
+ */
+async function testDomainProbeRows() {
+  console.log('settings line probe');
+
+  const PAGE = 'https://sangtacviet.com';
+  const FAST = 'https://dns1.stv-appdomain-00000001.org';
+  const APP = 'https://sangtacviet.app';
+
+  // The site's own settings page shape: a section, then the item that owns the
+  // 域名 picker (_page_vip.html:1514-1522).
+  const page = makeElement('div');
+  page.className = 'page';
+  const section = makeElement('div');
+  section.className = 'settingsection mt-3';
+  const item = makeElement('div');
+  item.className = 'settingitem';
+  const picker = makeElement('contextmenu');
+  picker.setAttribute('value', 'app.config.ux.app_domain');
+  item.appendChild(picker);
+  page.appendChild(section);
+  page.appendChild(item);
+
+  const sandbox = makeSandbox();
+  sandbox.window.location = { origin: PAGE };
+  sandbox.document.cookie = 'access=0123456789abcdef0123456789abcdef';
+  const app = installFakeApp(sandbox, {
+    displayType: 'pageflip',
+    pages: { pagesetting: page },
+    networkManager: {
+      domains: [
+        { name: FAST, status: 'alive', ping: 100 },
+        { name: PAGE, status: 'alive', ping: 900 },
+        { name: APP, status: 'alive', ping: 500 },
+      ],
+      defaultDomains: [PAGE, FAST, APP],
+    },
+  });
+  app.user = { isLogin: true };
+
+  const saved = [];
+  // The site builds app.config.ux out of per-key accessors whose setter calls
+  // saveUxSetting (app.v2.config.js:66-83); modelling that is what makes "the
+  // choice persists" a real assertion instead of a property write.
+  app.config.ux = { _app_domain: 'auto' };
+  Object.defineProperty(app.config.ux, 'app_domain', {
+    configurable: true,
+    enumerable: true,
+    get() { return this._app_domain; },
+    set(value) { this._app_domain = value; app.config.saveUxSetting(); },
+  });
+  app.config.saveUxSetting = function () { saved.push(app.config.ux.app_domain); };
+
+  const probes = [];
+  sandbox.Capacitor.Plugins.Http = {
+    get(request) {
+      probes.push({ kind: 'warp', url: request.url });
+      return Promise.resolve({ status: 200, data: 'yes' });
+    },
+    post(request) {
+      probes.push({
+        kind: 'userinfo',
+        url: request.url,
+        cookie: request.headers ? request.headers.Cookie : undefined,
+      });
+      return Promise.resolve({
+        status: 200,
+        data: request.url.indexOf(PAGE) === 0
+          ? '{"id":"306185","name":"mingzihaojiandan"}' : '',
+      });
+    },
+  };
+
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(300);
+
+  check('nothing is probed until the settings page opens', probes.length === 0,
+    String(probes.length));
+
+  app.pushPage('pagesetting');
+  await tick(150);
+
+  const rows = page.querySelectorAll('.stv-domainprobe-row');
+  const hostOf = (row) => String(row.getAttribute('data-stv-domain'));
+  const valueOf = (host) => {
+    const row = rows.filter((entry) => hostOf(entry) === host)[0];
+    return row ? String(row.__stvValue.textContent || '') : '(no row)';
+  };
+
+  check('one row per line, in the site own order',
+    rows.length === 3 && hostOf(rows[0]) === PAGE && hostOf(rows[1]) === FAST
+      && hostOf(rows[2]) === APP, JSON.stringify(rows.map(hostOf)));
+  check('and a row that measures all of them',
+    !!page.querySelector('.stv-domainprobe-run'));
+
+  check('the page origin shows a latency and sees the login',
+    /\d+ms/.test(valueOf(PAGE)) && valueOf(PAGE).indexOf('会话 ✓') >= 0, valueOf(PAGE));
+  check('a mirror that does not carry the session says so',
+    valueOf(FAST).indexOf('会话 ✗') >= 0, valueOf(FAST));
+  check('and no line claims chapter health it has no evidence for',
+    valueOf(FAST).indexOf('正文 未测') >= 0, valueOf(FAST));
+
+  const info = probes.filter((entry) => entry.kind === 'userinfo');
+  check('the session probe repeats the read path cookie header',
+    info.length >= 3 && info.every((entry) => String(entry.cookie || '').indexOf('access=') === 0),
+    JSON.stringify(info.map((entry) => String(entry.cookie || ''))));
+
+  // Evidence the app already has: a code-7 ban, and the mirror that last
+  // served a chapter.
+  sandbox.window.__stvDomainBanned[FAST] = true;
+  sandbox.localStorage.setItem('stv.domain.good', JSON.stringify({ name: APP, at: Date.now() }));
+  click(rows[1]);
+  await tick(80);
+  check('a line that answered code 7 is marked as such',
+    valueOf(FAST).indexOf('正文 ✗') >= 0, valueOf(FAST));
+  click(rows[2]);
+  await tick(80);
+  check('the line that last served a chapter says so',
+    valueOf(APP).indexOf('正文 ✓') >= 0, valueOf(APP));
+
+  check('opening the page switches nothing by itself',
+    app.config.ux.app_domain === 'auto', String(app.config.ux.app_domain));
+
+  const pick = rows[1].children.filter(
+    (node) => String(node.className).indexOf('stv-domainprobe-pick') >= 0)[0];
+  check('every row carries its own 设为线路 control', !!pick);
+  click(pick);
+  check('and it writes the site own setting, which persists',
+    app.config.ux.app_domain === FAST && saved.indexOf(FAST) >= 0,
+    JSON.stringify({ value: app.config.ux.app_domain, saved }));
+  check('the chosen line is marked in the list',
+    valueOf(FAST).indexOf('●') === 0, valueOf(FAST));
+
+  // Re-opening must not stack a second set of rows.
+  app.pushPage('pagesetting');
+  await tick(80);
+  check('a second visit does not add a second set of rows',
+    page.querySelectorAll('.stv-domainprobe-row').length === 3,
+    String(page.querySelectorAll('.stv-domainprobe-row').length));
 }
 
 async function testDownloadRowControls() {
@@ -9475,6 +9622,7 @@ await testEmptyUserPages();
   await testDomainFailover();
   await testFailureHints();
   await testPageOriginPinning();
+  await testDomainProbeRows();
   await testDownloadRowControls();
   await testStorageAccessor();
   await testDownloadRange();
