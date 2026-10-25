@@ -503,6 +503,27 @@ final class ContentCache {
             at: entry.bodyFile.deletingPathExtension().appendingPathExtension("meta"))
     }
 
+    /**
+     Drop every stored profile answer (`POST /mobile/userinfo.php`).
+
+     The key tells signed-in from signed-out (`chapterVariant` ends in `|in` or
+     `|out`) but it cannot tell one account from another, and its 60-second TTL
+     is long enough to see the switch: sign out, sign in as someone else, and the
+     `|in` entry written for the first reader is still on disk. Signing in is the
+     one moment that becomes visible, so the plugin drops the class there rather
+     than keying on values the server reissues.
+
+     Returns how many entries were dropped, for the log line that proves it ran.
+     */
+    @discardableResult
+    func forgetProfiles() -> Int {
+        lock.lock()
+        let keys = index.compactMap { $0.value.cls == .userInfo ? $0.key : nil }
+        lock.unlock()
+        for key in keys { forget(key) }
+        return keys.count
+    }
+
     // MARK: - Refusals that outlive the process
 
     /// How long a refusal written to disk is trusted. Fixed, not sliding: a hit

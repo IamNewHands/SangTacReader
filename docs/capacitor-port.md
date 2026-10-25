@@ -6129,3 +6129,85 @@ host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站
 `/?ajax=login` 且面板写明被哪台拒、网络故障不换主机重放。守卫：30 块 / 676361 字节 /
 **988 条断言**。
 
+
+### 6.64 19:00 日志：登录恢复，但「会话」列在替我猜
+
+`stv-diagnostic-20261025-190020.log`（18:59–19:00）—— 上一节的两处修复兑现了：
+
+```
+18:59:30 [AUTH] login is sent to https://sangtacviet.app whatever 域名 says
+18:59:30 [Http] POST https://sangtacviet.app/index.php?ajax=login -> 200 … 7b … success
+19:00:01 [PAGE] open readchapter
+19:00:03 [Http] GET https://sangtacviet.app/?sajax=readchapter&h=trxs2&bookid=11728&c=11
+          -> 200 … {"code":"0",…}
+```
+
+一次 POST、无 403、无回退；正文 c=10/11/12 全 `code 0`。日志里另有四条值得写下来的东西，
+两条修了，两条是别人的。
+
+#### 6.64.1 设置页「会话」列：三行里只有第一行真的问了
+
+```
+19:00:13 [CACHE] POST https://sangtacviet.com/mobile/userinfo.php?rescan=true shared in-flight answer (454b)
+19:00:13 [Http]  POST https://sangtacviet.com/mobile/userinfo.php?rescan=true -> 200 … 328ms (shared)
+19:00:13 [CACHE] POST https://sangtacviet.app/mobile/userinfo.php?rescan=true shared in-flight answer (454b)
+19:00:13 [Http]  POST https://sangtacviet.app/mobile/userinfo.php?rescan=true -> 200 … 328ms (shared)
+19:00:13 [Http]  POST https://dns1.stv-appdomain-00000001.org/mobile/userinfo.php?rescan=true -> 200 … 330ms
+```
+
+只有 `dns1` 那行没有 `(shared)`，也只有它是真的往返。19:00:16 一轮完全同样。原因是三件事叠在
+一起，且是**确定性**的，不是竞态：
+
+1. `measureAll()` 在同一个 tick 里把三行全部 `measure()`；
+2. `userInfo` 的缓存键故意不含主机（`includesHost`，见 §6.62 的理由）；
+3. `rescan` 在 `droppedParams` 里被从键里删掉；
+
+于是三条 POST 的键完全相同，第一条上飞机、后两条挂上去。`bypassCache`（`rescan=true`）只管住了
+「读缓存」和「写缓存」两处，没管住第三处：`registerInFlight`。这正是 §6.63 里那句注释
+「each host 直接问一遍」被自己的日志推翻的地方。
+
+修法：`bypassCache` 覆盖整个请求，不只是查表 —— 不再 `registerInFlight`，也不再
+`finishInFlight`（否则它那个可能 403 的答案会去叫醒**别的**主机在同名键上的等待者）。四处
+`if let key = cacheKey` 全部加上 `!bypassCache`。
+
+代价：打开设置页多两个 454 字节的 POST。收益：那一列重新是测量而不是回声 —— 读者靠它决定把
+哪台设成线路，而「✓」意味着那台认我的 cookie。
+
+#### 6.64.2 登录后那一分钟：我在 19:23 说的原因错了
+
+当时我说的是「登录成功后 60 秒内可能仍是登录前的 profile」。查了键才知道**这条不成立**：
+`chapterVariant()` 末尾就是 `|in` / `|out`（靠 `access`/`useri2` 两个 cookie 的有无），签出再
+签入换了键，签出前那份根本不可能被端上来。18:59:31 那次 `cache hit age=12s` 两边都是 `|in`，
+只是因为读者本来就是登录状态。
+
+真正的洞窄得多：**`in` → 另一个账号的 `in`**。键分得出「登录/未登录」，分不出「谁」。签出、
+换号、再签入，`|in` 又被复用，60 秒窗口里新账号会看到上一个账号的昵称、头像和 `id`。而
+`?ajax=login` 是唯一能看见 `|in` 背后换了人的时刻，所以在那里把 `userInfo` 整个类丢掉
+（`ContentCache.forgetProfiles()`）：只在 2xx 且 body 不是 `captcha` 时丢，`register` 一起算
+（站点自己的表单把两者当同一件事），多丢一次的成本是 454 字节。
+
+日志证据：`19:00:13 [Http] POST …/userinfo.php?rescan=true -> 200 … {"id":"306185",…}` —— 同一
+时刻 `.com`/`dns1` 也被问过，三份回答逐字相同，所以这个类确实该按「主机无关」缓存；错的只是
+「谁」不进键。
+
+#### 6.64.3 两条不修的
+
+- **trxs 封面 403**：`18:59:42 GET http://www.trxs.cc/d/file/…jpeg -> 403 … bytes=1`，两本书共用
+  同一张封面都失败，并被写盘记 30 分钟。插件本来就会补一个 `Referer`（`refererFallback`），
+  所以「缺 Referer」这个解释站不住；**没有证据就不改**。
+- **`childTab.currentTabNode is not a function`**：`app.v2.js:4623-4624`，站点自己的
+  `ontabchange` 里对元素调方法，被它自己的 `try/catch` 吞掉，代价是切到首页/书签时那次
+  `wakeAllNode` 不跑。日志里 `[TAB]` 索引全部正确，可见无影响；改它等于改站点代码。
+
+`{"data":[…],"code":400}`（18:59:58）也不是异常：`bookmanage.php?act=getallhost` 的固有写法，
+`data` 照用，三个来源 tab 正常出现（见 §6.12）。
+
+#### 6.64.4 这一轮怎么验
+
+改的是原生层，JS 断言数不变（988），验证靠两处：
+
+1. CI 编译通过（Swift 语法/类型）；
+2. 下一份真机日志里，打开设置页应当出现**三条都不带 `(shared)`** 的
+   `POST …/mobile/userinfo.php?rescan=true`；登录成功后应出现一行
+   `POST …/index.php?ajax=login retired N stored profile answer(s)`。若仍是两条 `(shared)`，
+   说明 `bypassCache` 和我以为的不是同一件事。

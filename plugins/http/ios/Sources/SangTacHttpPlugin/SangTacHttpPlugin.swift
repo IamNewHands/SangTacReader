@@ -106,6 +106,37 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
     }
 
     /**
+     Whether this answer is the site telling us the reader signed in.
+
+     The login form posts to `?ajax=login` -- the 2026-10-25 18:59 device log has
+     `POST https://sangtacviet.app/index.php?ajax=login -> 200 … 7b … success` --
+     and `?ajax=register` is the same form on its other tab. The method is part of
+     the test because `?ajax=` also carries reads (`ajax=loadhistory`,
+     `ajax=topic`), and none of those can change who the reader is.
+
+     Only the response path calls this, and only for a 2xx whose body is not
+     `captcha`: a refused answer leaves the session exactly as it was, and dropping
+     the stored profile there would cost a request for nothing.
+     */
+    static func answeringSignIn(method: String, url: URL) -> Bool {
+        guard method.uppercased() == "POST" else { return false }
+        let text = url.absoluteString
+        return text.contains("ajax=login") || text.contains("ajax=register")
+    }
+
+    /// Whether a sign-in answer is the site's `captcha` refusal: a 200 whose whole
+    /// body is that one word. The page's own wrapper compares the same text
+    /// (`String(answer) === 'captcha'`), and the bound keeps a chapter body from
+    /// ever being decoded to answer a question it cannot be the answer to.
+    static func isCaptchaAnswer(_ body: Data) -> Bool {
+        guard body.count <= 64 else { return false }
+        let text = String(decoding: body, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return text == "captcha"
+    }
+
+    /**
      Which class of answer this request is asking for, or nil for everything that
      must never be answered from a stored copy.
 
@@ -1136,7 +1167,22 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 request.httpBody = body
             }
 
-            if let key = cacheKey {
+            // A `rescan` is a question addressed to one host, so it must reach
+            // that host: it is neither answered by an identical request already
+            // on the wire nor folded into one -- including a request this same
+            // tick sent somewhere else. The settings page's 会话 column is that
+            // case. `measureAll` starts three probes in one tick, `userInfo` is
+            // keyed without the host (`includesHost`) and `rescan` is dropped
+            // from the key (`ContentCache.droppedParams`), so all three named
+            // one entry: the 2026-10-25 19:00 device log has only `dns1`
+            // reaching the network, while `.com` and `.app` were handed
+            // `shared in-flight answer (454b)` and the panel printed 会话 ✓ for a
+            // question neither host was asked.
+            //
+            // The bypass therefore covers the whole request, not just the
+            // lookup: registering it here would also let its answer (possibly a
+            // 403) complete a *different* host's waiter for the same key.
+            if let key = cacheKey, !bypassCache {
                 let elected = self.registerInFlight(key) { answer in
                     if let failure = answer.failure {
                         self.callLog("err", "\(method) \(url.absoluteString) shared request failed: "
@@ -1162,7 +1208,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                     self.callLog("err", "\(method) \(url.absoluteString) -> \(message)")
                     self.report("ERR", "\(method) \(url.absoluteString) FAILED in "
                         + "\(elapsedMs())ms: \(message)", force: true)
-                    if let key = cacheKey {
+                    if let key = cacheKey, !bypassCache {
                         self.finishInFlight(key, answer: SangTacHttpPlugin.failedAnswer(message))
                     }
                     call.reject(message, nil, error)
@@ -1171,7 +1217,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 guard let http = response as? HTTPURLResponse else {
                     self.report("ERR", "\(method) \(url.absoluteString) no HTTP response",
                                 force: true)
-                    if let key = cacheKey {
+                    if let key = cacheKey, !bypassCache {
                         self.finishInFlight(
                             key, answer: SangTacHttpPlugin.failedAnswer("No HTTP response"))
                     }
@@ -1185,6 +1231,32 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                 let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
                 let headerMap = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
                     if let key = pair.key as? String { acc[key] = String(describing: pair.value) }
+                }
+
+                // A sign-in retires the profile we kept. The cache key already
+                // separates signed-in from signed-out (`chapterVariant` ends in
+                // `|in` / `|out`), so a first login can never be answered from a
+                // signed-out copy -- what it cannot separate is one account from
+                // another, and the 60-second TTL is long enough to see the
+                // switch: sign out, sign in as someone else, and the `|in` entry
+                // written for the first reader is still there. The answer to
+                // `?ajax=login` is the only moment the identity behind `|in` is
+                // seen to change, so the profile goes now and the site's own
+                // `userinfo.php` call in the `.then` behind this request reaches
+                // the network. `register` is dropped too: the site's own form
+                // treats it as a login, and a needless drop costs 454 bytes.
+                //
+                // A `captcha` answer comes back 200 with that one word as the
+                // body and leaves the session exactly as it was, so it does not
+                // count: nothing has changed to retire. Both tests come before
+                // any decoding, so a chapter body is never turned into a String
+                // to answer this question.
+                if http.statusCode >= 200, http.statusCode < 300,
+                   SangTacHttpPlugin.answeringSignIn(method: method, url: url),
+                   !SangTacHttpPlugin.isCaptchaAnswer(body) {
+                    let dropped = self.contentCache.forgetProfiles()
+                    self.cacheLog("\(method) \(url.absoluteString) retired "
+                        + "\(dropped) stored profile answer(s)")
                 }
 
                 // 304: the copy we already had is still current. Restart its clock
@@ -1264,7 +1336,7 @@ public class SangTacHttpPlugin: CAPPlugin, CAPBridgedPlugin, WKHTTPCookieStoreOb
                     }
                 }
 
-                if let key = cacheKey {
+                if let key = cacheKey, !bypassCache {
                     self.finishInFlight(key, answer: SharedAnswer(
                         status: http.statusCode, contentType: contentType,
                         headers: headerMap, body: body,
