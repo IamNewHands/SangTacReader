@@ -12625,9 +12625,19 @@ enum SitePatch {
         }
 
         // Drop whatever origin the site put in front and put the pinned one back.
-        // The login URL reaches this wrapper as `index.php?ajax=login`, and if
-        // `fullUrl()` already resolved it to the page's own origin -- .com -- the
-        // request never leaves the webview and .com answers `captcha`.
+        // The login URL reaches this wrapper as `/?ajax=login` (or
+        // `index.php?ajax=login`), and if `fullUrl()` already resolved it to the
+        // page's own origin -- .com -- the request never leaves the webview and
+        // .com answers `captcha`.
+        //
+        // The bare root is rewritten to `/index.php`, and that is not cosmetic:
+        // the 2026-10-25 18:38 log has `POST https://sangtacviet.app/?ajax=login`
+        // answered `403` with Cloudflare's "Just a moment..." challenge, four
+        // times per tap, while the exact same endpoint as
+        // `/index.php?ajax=login` answered `200 … success` twice (17:12:53,
+        // 17:57:01). The page origin maps `/` to index.php itself, so this is the
+        // same request the site always made -- just addressed the way the app
+        // domain accepts it.
         function absoluteOn(url, host) {
             var s = String(url === undefined || url === null ? '' : url);
             if (!s) { return s; }
@@ -12639,7 +12649,14 @@ enum SitePatch {
                 path = cut >= 0 ? rest.slice(cut) : '/';
             }
             if (path.charAt(0) !== '/') { path = '/' + path; }
+            if (path === '/' || path.indexOf('/?') === 0) {
+                path = '/index.php' + path.slice(1);
+            }
             return host + path;
+        }
+
+        function here() {
+            try { return String((window.location && window.location.origin) || ''); } catch (e) { return ''; }
         }
 
         function patchPost(net) {
@@ -12652,6 +12669,7 @@ enum SitePatch {
                     : (target.indexOf('ajax=register') >= 0 ? 'register' : '');
                 if (!kind) { return original.apply(this, arguments); }
                 var host = loginHost();
+                var self = this;
                 var args = Array.prototype.slice.call(arguments);
                 var previous = window.__stvLoginHost;
                 if (!host) {
@@ -12693,7 +12711,38 @@ enum SitePatch {
                         toast(kind === 'login' ? LOGIN_CAPTCHA_HINT : REGISTER_CAPTCHA_HINT);
                     }
                     return answer;
-                }, function (error) { done(); throw error; });
+                }, function (error) {
+                    done();
+                    // A pin is a guess about which host accepts a password, and a
+                    // guess must never be able to lock the reader out. The
+                    // 2026-10-25 18:38 log is the case: every pinned attempt came
+                    // back `403` from Cloudflare's challenge page, so the reader
+                    // had no way in -- and switching 域名 could not help, because
+                    // the pin ignores that setting by design. One HTTP-level
+                    // rejection (not a network failure, not a `captcha` answer)
+                    // therefore falls back to the address the site itself asked
+                    // for, which is the request that worked before this change.
+                    // Exactly one fallback: a 403 has run nothing server side, so
+                    // the second attempt cannot sign the reader in twice.
+                    var text = String(error && error.message ? error.message : error);
+                    if (host && text.indexOf('HTTP error:') >= 0 && here() && here() !== host) {
+                        note('AUTH', kind + ' was refused by ' + host + ' (' + text
+                            + '); asking the page origin instead');
+                        window.__stvLoginHost = previous ? previous : '';
+                        var retryArgs = [String(url === undefined || url === null ? '' : url)];
+                        for (var j = 1; j < args.length; j++) { retryArgs.push(args[j]); }
+                        var second = original.apply(self, retryArgs);
+                        if (!second || typeof second.then !== 'function') { throw error; }
+                        return second.then(function (answer) {
+                            if (String(answer) === 'captcha') {
+                                note('AUTH', kind + ' answered captcha on the page origin; the site branch for it is empty');
+                                toast(kind === 'login' ? LOGIN_CAPTCHA_HINT : REGISTER_CAPTCHA_HINT);
+                            }
+                            return answer;
+                        }, function (again) { throw again; });
+                    }
+                    throw error;
+                });
             };
             wrapper.__stvHintWrapped = true;
             // `domainFailover` may already have wrapped this function, and its

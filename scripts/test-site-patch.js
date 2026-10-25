@@ -4451,7 +4451,10 @@ async function testLoginPinning() {
   };
   vm.runInContext(loadBlocks().join('\n'), explicit.sandbox);
   await waitFor(() => explicit.app.net.post.__stvHintWrapped === true);
-  await explicit.app.net.post('/index.php?ajax=login', 'username=a&psw=b');
+  // The site posts the bare root (`/?ajax=login`); the app domain answers that
+  // with Cloudflare's 403 challenge, so the wrapper addresses index.php -- the
+  // URL that answered `success` twice in the device log.
+  await explicit.app.net.post('/?ajax=login', 'username=a&psw=b');
   check('a 线路 pick of .com does not decide where the password goes',
     chosen.length === 1 && chosen[0].url === APP + '/index.php?ajax=login'
       && chosen[0].during === APP,
@@ -4480,6 +4483,43 @@ async function testLoginPinning() {
     String(foreign.sandbox.window.__stvDiag.text() || '')
       .indexOf('is not one of the site mirrors') >= 0,
     String(foreign.sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // --- the app domain can refuse the request too ---------------------------
+  // 2026-10-25 18:38: the pinned attempt came back `403` from Cloudflare's
+  // "Just a moment..." challenge, four times per tap, and the reader had no way
+  // in -- 域名 could not help because the pin ignores it. One HTTP-level
+  // rejection has to fall back to the address the site itself asked for.
+  const refused = build();
+  const tries = [];
+  refused.app.net.post = function (url) {
+    tries.push(url);
+    return tries.length === 1
+      ? Promise.reject(new Error('HTTP error: 403'))
+      : Promise.resolve('success');
+  };
+  vm.runInContext(loadBlocks().join('\n'), refused.sandbox);
+  await waitFor(() => refused.app.net.post.__stvHintWrapped === true);
+  const rescued = await refused.app.net.post('/?ajax=login', 'username=a&psw=b');
+  check('a refusal from the app domain falls back to the address the site asked for',
+    rescued === 'success' && tries[0] === APP + '/index.php?ajax=login'
+      && tries[1] === '/?ajax=login', JSON.stringify(tries));
+  check('and the panel names the refusal, so the reader is not guessing',
+    String(refused.sandbox.window.__stvDiag.text() || '')
+      .indexOf('login was refused by ' + APP) >= 0,
+    String(refused.sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  const offline = build();
+  const noFallback = [];
+  offline.app.net.post = function (url) {
+    noFallback.push(url);
+    return Promise.reject(new Error('Network error'));
+  };
+  vm.runInContext(loadBlocks().join('\n'), offline.sandbox);
+  await waitFor(() => offline.app.net.post.__stvHintWrapped === true);
+  let threw = false;
+  try { await offline.app.net.post('/?ajax=login', 'username=a&psw=b'); } catch (e) { threw = true; }
+  check('a network failure is not replayed on another host',
+    threw && noFallback.length === 1, JSON.stringify(noFallback));
 }
 
 /**

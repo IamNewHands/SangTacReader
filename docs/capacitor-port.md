@@ -6104,3 +6104,28 @@ host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站
   也仍只标显式选择的那台 —— 所以 auto 时三行都不带 `●`，而请求其实落在 `.app`。要标记「实际
   生效的那台」是另一件事，没有在本轮做。
 
+### 6.63.6 第一版翻车：`/?ajax=login` 在 `.app` 上是 Cloudflare 403
+
+`stv-diagnostic-20261025-183813.log`（18:36–18:38，读者反馈「现在登录不了了，切换域名也不行」）：
+
+```
+18:36:52 [AUTH] login is sent to https://sangtacviet.app whatever 域名 says
+18:36:52 [AUTH] login is pinned to https://sangtacviet.app
+18:36:52 [ERR] POST https://sangtacviet.app/?ajax=login -> 403 … <title>Just a moment...</title>
+```
+
+四次一发、每次四下，全是 Cloudflare 的挑战页。两个错叠在一起：
+
+1. **地址少了 `index.php`。** 站点把登录发给 `/?ajax=login`，而页面 origin 自己会把 `/` 映射到
+   `index.php`；`.app` 不映射，裸根路径直接被 WAF 拦。日志里两次成功的登录都是
+   `https://sangtacviet.app/index.php?ajax=login`（17:12:53、17:57:01）—— 所以
+   `absoluteOn()` 现在把 `/` 与 `/?…` 改成 `/index.php`。
+2. **pin 没有逃生口。** 读者「切换域名也不行」正是 pin 的副作用：它按设计忽略这个设置，于是
+   四条路全撞同一堵墙。现在 `net.post` 被 HTTP 层拒绝（`HTTP error:` 开头的错误，**不包括**
+   网络故障、也不包括 `captcha` 应答）时，回退一次到站点原本给的地址；只回退一次，因为 403
+   意味着服务端什么都没执行，第二次尝试不可能把读者登录两遍。
+
+新增断言：`/?ajax=login` 被改写成 `/index.php?ajax=login`、`.app` 回 403 时回退到
+`/?ajax=login` 且面板写明被哪台拒、网络故障不换主机重放。守卫：30 块 / 676361 字节 /
+**988 条断言**。
+

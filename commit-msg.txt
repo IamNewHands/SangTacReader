@@ -1,17 +1,16 @@
-「域名=自动」的选线路由现在落到站点自己的域名（.app），不用读者去改
+修登录 403：登录地址要带 index.php，且 pin 被拒时要能退回站点原本的地址
 
-没有去写 app.config.ux.app_domain = https://sangtacviet.app：那会把「从没选过」变成一次
-显式选择并落盘，站点哪天轮换域名，老用户就永远钉在旧主机上；读者还会在设置里看到一个他
-没选过的值。改成调整选线路由：
+18:38 那份日志里每次登录都是：
+  [ERR] POST https://sangtacviet.app/?ajax=login -> 403 … <title>Just a moment...</title>
+两个错叠在一起：
 
-  手工选的线路 -> 登录 pin -> 记住的镜像 -> 站点自己的域名(STV_SERVER) -> 页面 origin -> 竞速
+1. 站点把登录发给 /?ajax=login，页面 origin 自己会把 / 映射到 index.php，而 .app 不映射，
+   裸根路径直接被 Cloudflare 拦。日志里两次成功的登录都是 /index.php?ajax=login
+   （17:12:53、17:57:01）。absoluteOn() 现在把 / 与 /?… 改写成 /index.php。
+2. pin 按设计忽略「域名」设置，所以四条路全撞同一堵墙 —— 读者说的「切换域名也不行」就是它。
+   现在 net.post 被 HTTP 层拒绝时回退一次到站点原本给的地址；只回退一次，因为 403 意味着
+   服务端什么都没执行，不可能把读者登录两遍。网络故障与 captcha 应答不回退。
 
-页面 origin 从第 2 位掉到第 5 位，依据是 17:17 那份日志：页面由 .com 发出、.com 自己回
-{"code": 7}，而 STV_SERVER 那台回 {"code": 0} + 正文。「这页是它发的」不证明「它会交章节」，
-验证这一点要付 5.5s + 4.1s 的 grantcontext。STV_SERVER 先过站点镜像表（shippedDomain），
-表外当作常量过期直接跳过；记住的镜像仍压过它。
-
-守卫：check-ios-shim 30 块 / 673180 字节；test-site-patch 985 条断言 0 失败
-（新增 5 条：站点域名压过页面 origin、面板说明理由、表外常量被忽略、记住的镜像仍压过它，
-以及登录 pin 清掉后请求路径回到普通规则）。
-docs/capacitor-port.md 新增 §6.63.5。
+守卫：check-ios-shim 30 块 / 676361 字节；test-site-patch 988 条断言 0 失败
+（新增 3 条：/?ajax=login 改写为 /index.php?ajax=login、403 时回退且面板写明被哪台拒、
+网络故障不换主机重放）。docs/capacitor-port.md 新增 §6.63.6。
