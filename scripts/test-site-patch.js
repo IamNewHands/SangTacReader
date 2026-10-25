@@ -4303,6 +4303,130 @@ async function testPageOriginPinning() {
 }
 
 /**
+ * 2026-10-25 17:56 log: 域名=auto, the page came from `sangtacviet.com`, and the
+ * login POST was answered `captcha` with no HTTP request in the log at all --
+ * the URL had resolved to the page's own origin, so it left through the webview
+ * and .com answered it. Four attempts on .com, four `captcha`; the two on .app
+ * answered `success`. Reaching .app meant switching the 线路 setting by hand
+ * first, so a login is now taken out of that setting: it is aimed at the app's
+ * own domain, `window.STV_SERVER`, for the length of the call.
+ */
+async function testLoginPinning() {
+  console.log('the login is sent to the app domain');
+
+  const PAGE = 'https://sangtacviet.com';
+  const FAST = 'https://dns1.stv-appdomain-00000001.org';
+  const APP = 'https://sangtacviet.app';
+
+  const build = (mirrors) => {
+    const sandbox = makeSandbox();
+    const app = installFakeApp(sandbox, {
+      displayType: 'pageflip',
+      networkManager: {
+        domains: mirrors || [
+          { name: FAST, status: 'alive', ping: 100 },
+          { name: PAGE, status: 'alive', ping: 900 },
+          { name: APP, status: 'alive', ping: 500 },
+        ],
+        defaultDomains: [PAGE, FAST, APP],
+      },
+    });
+    sandbox.window.location = { origin: PAGE };
+    sandbox.window.STV_SERVER = APP;
+    return { sandbox, app };
+  };
+
+  // --- 域名=auto: the pin decides, not the page origin ----------------------
+  const auto = build();
+  const sent = [];
+  let during = '';
+  let release = null;
+  auto.app.net.post = function (url, body) {
+    sent.push({ url, body });
+    // What the site would resolve inside this call is what the device log
+    // shows, and what the request would really use.
+    during = auto.app.net.networkManager.bestDomain();
+    return new Promise((resolve) => { release = resolve; });
+  };
+  vm.runInContext(loadBlocks().join('\n'), auto.sandbox);
+  await waitFor(() => auto.app.net.post.__stvHintWrapped === true);
+
+  const pending = auto.app.net.post('/index.php?ajax=login', 'username=a&psw=b');
+  check('the login is aimed at the app domain, not the page own mirror',
+    sent.length === 1 && sent[0].url === APP + '/index.php?ajax=login',
+    JSON.stringify(sent));
+  check('and the mirror choice agrees for the length of the call',
+    during === APP, during);
+  check('the panel says the login was taken out of the line setting',
+    String(auto.sandbox.window.__stvDiag.text() || '').indexOf('login is sent to ' + APP) >= 0,
+    String(auto.sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  release('success');
+  const answer = await pending;
+  check('the answer still reaches the site unchanged', answer === 'success', String(answer));
+  check('the pin is gone once the answer is in, so chapters keep their line',
+    !auto.sandbox.window.__stvLoginHost
+      && auto.app.net.networkManager.bestDomain() === PAGE,
+    JSON.stringify([auto.sandbox.window.__stvLoginHost,
+      auto.app.net.networkManager.bestDomain()]));
+
+  // --- every other endpoint is untouched -----------------------------------
+  const others = build();
+  const untouched = [];
+  others.app.net.post = function (url) {
+    untouched.push({ url, during: others.app.net.networkManager.bestDomain() });
+    return Promise.resolve('{"id":"1"}');
+  };
+  vm.runInContext(loadBlocks().join('\n'), others.sandbox);
+  await waitFor(() => others.app.net.post.__stvHintWrapped === true);
+  await others.app.net.post('/mobile/userinfo.php', '');
+  check('a request that is not a login keeps the address the site gave it',
+    untouched.length === 1 && untouched[0].url === '/mobile/userinfo.php'
+      && untouched[0].during === PAGE,
+    JSON.stringify(untouched));
+
+  // --- 域名=.com picked by hand: still not the login's business -------------
+  const explicit = build();
+  explicit.app.config.ux = { app_domain: PAGE };
+  const chosen = [];
+  explicit.app.net.post = function (url) {
+    chosen.push({ url, during: explicit.app.net.networkManager.bestDomain() });
+    return Promise.resolve('captcha');
+  };
+  vm.runInContext(loadBlocks().join('\n'), explicit.sandbox);
+  await waitFor(() => explicit.app.net.post.__stvHintWrapped === true);
+  await explicit.app.net.post('/index.php?ajax=login', 'username=a&psw=b');
+  check('a 线路 pick of .com does not decide where the password goes',
+    chosen.length === 1 && chosen[0].url === APP + '/index.php?ajax=login'
+      && chosen[0].during === APP,
+    JSON.stringify(chosen));
+  check('a captcha from the app domain is still reported, naming the host',
+    String(explicit.sandbox.window.__stvDiag.text() || '')
+      .indexOf('login answered captcha on ' + APP) >= 0,
+    String(explicit.sandbox.window.__stvDiag.text() || '').slice(-260));
+
+  // --- a server domain the site does not know -------------------------------
+  const foreign = build();
+  foreign.sandbox.window.STV_SERVER = 'https://mirror.example';
+  const kept = [];
+  foreign.app.net.post = function (url) {
+    kept.push({ url, during: foreign.app.net.networkManager.bestDomain() });
+    return Promise.resolve('success');
+  };
+  vm.runInContext(loadBlocks().join('\n'), foreign.sandbox);
+  await waitFor(() => foreign.app.net.post.__stvHintWrapped === true);
+  await foreign.app.net.post('/index.php?ajax=login', 'username=a&psw=b');
+  check('a host outside the site mirror list is not sent a password',
+    kept.length === 1 && kept[0].url === '/index.php?ajax=login'
+      && kept[0].during === PAGE,
+    JSON.stringify(kept));
+  check('and the panel says the line choice stands',
+    String(foreign.sandbox.window.__stvDiag.text() || '')
+      .indexOf('is not one of the site mirrors') >= 0,
+    String(foreign.sandbox.window.__stvDiag.text() || '').slice(-260));
+}
+
+/**
  * §6.61: 设置 → 网络 gets one row per line showing latency and whether that host
  * sees the reader's login. Latency alone is not "usable" (§6.60), so chapter
  * health only claims what the app has evidence for, and nothing switches lines
@@ -9710,6 +9834,7 @@ await testEmptyUserPages();
   await testDomainFailover();
   await testFailureHints();
   await testPageOriginPinning();
+  await testLoginPinning();
   await testDomainProbeRows();
   await testDownloadRowControls();
   await testStorageAccessor();

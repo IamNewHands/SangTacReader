@@ -3392,6 +3392,48 @@ enum SitePatch {
             } catch (e) { return ''; }
         }
 
+        // ---- the mirror a login has to use -----------------------------------
+        //
+        // The 2026-10-25 17:56 device log, 域名=auto: the page came from
+        // sangtacviet.com, the reader tapped 登录, and `net.post` was answered
+        // `captcha` with no HTTP request in the log at all -- the URL resolved to
+        // the page's own origin, so it left through the webview rather than the
+        // Capacitor bridge, and the answer came from .com. That log has four
+        // attempts on .com and every one of them answered `captcha`
+        // (17:12:32, 17:12:36, 17:56:45, 17:56:48), while the two on .app
+        // answered `success` (17:12:53, 17:57:01). Logging in was only possible
+        // by switching 域名 to .app by hand first -- and it worked, both times.
+        //
+        // So the login stops asking. `failureHints` owns the login call and sets
+        // `window.__stvLoginHost` around it; this answers that host before the
+        // explicit line, the remembered mirror, the page origin and the ping
+        // race, so the choice the reader made for chapters cannot decide whether
+        // they can sign in. Only for the length of the call: the flag is cleared
+        // when the answer arrives, and every other request is untouched.
+        //
+        // Not gated on `banned`: that set is built from chapters and payloads, and
+        // a mirror that refuses a chapter is not a mirror that refuses a password.
+        // It IS gated on membership, because a name that is not one of the site's
+        // own mirrors is a stale flag, not a host.
+        function loginPinned(mgr, list) {
+            var want = '';
+            try { want = String(window.__stvLoginHost || ''); } catch (e) { want = ''; }
+            if (!want) { return ''; }
+            var known = (list && list.length) ? list : candidates(mgr);
+            if (known.indexOf(want) < 0) {
+                if (!noted['login:none:' + want]) {
+                    noted['login:none:' + want] = true;
+                    note('AUTH', 'login asked for ' + want + ', which is not one of the site mirrors; the line choice stands');
+                }
+                return '';
+            }
+            if (!noted['login:' + want]) {
+                noted['login:' + want] = true;
+                note('AUTH', 'login is pinned to ' + want + ': the 2026-10-25 log answers captcha on .com 4 times out of 4 and success on .app 2 out of 2');
+            }
+            return want;
+        }
+
         // Which of `fullUrl()`'s three host sources the app actually used is not
         // visible in the device log, and the 2026-09-23 one shows every data
         // request landing on .app for three minutes straight while the site's own
@@ -3544,6 +3586,10 @@ enum SitePatch {
                 var list = candidates(this);
                 rankNote(this, label);
                 routeNote(label);
+                // A login in flight outranks every other source, including the
+                // line the reader picked by hand -- see `loginPinned`.
+                var pinned = loginPinned(this, list);
+                if (pinned) { return pinned; }
                 // The reader picked this line by hand. The site honours it only
                 // while that mirror answers /warp.php (app.v2.js:937-943,
                 // :1040-1046), and that answer is the newest measurement there is,
@@ -12362,13 +12408,26 @@ enum SitePatch {
          branch -- the button does nothing at all. Register has the same hole
          (:4673-4674). Whatever the server's reason, silence is not an answer.
 
-     The repair is deliberately text-only, so no request changes shape:
+     The repair is text-only for code 7, and text plus one routing decision for
+     the login:
 
        * code 7 still goes to `showAlert`, keeping the site's reload
          affordance, and every other code still runs the original handler --
-         including the tail call to `setNotLoading` that all codes share;
+         including the tail call of `setNotLoading` that all codes share;
        * the captcha answer is still returned to the site's handler untouched,
-         so a future site revision that fills that branch keeps working.
+         so a future site revision that fills that branch keeps working;
+       * the login itself no longer asks 域名 which host to use. The 2026-10-25
+         17:56 log has 域名=auto, the page served by `sangtacviet.com`, and the
+         login POST answered `captcha` four times out of four -- with no HTTP
+         request in the log at all, because the URL resolved to the page's own
+         origin and left through the webview. The same credentials on
+         `sangtacviet.app` answered `success`, twice (17:12:53, 17:57:01), and
+         getting there needed a manual switch of the 线路 setting first. So the
+         login is aimed at the app's own domain: `window.STV_SERVER`, the value
+         app.v2.js:1 hard-codes, checked against the site's mirror list;
+         `domainFailover` honours the pin inside `bestDomain()` for the length
+         of the call. A host outside the list, or a request that is not a login,
+         is untouched.
 
      `showAlert` is wrapped as well as `handlingException` because the same
      dead-end sentence can be produced by a caller that never goes through the
@@ -12456,6 +12515,80 @@ enum SitePatch {
         }
 
         // ---- login / register: the site's empty captcha branch ---------------
+        //
+        // Two things ride on this one wrapper, because it is the only place that
+        // knows a login is happening:
+
+        var LOGIN_HOST = 'https://sangtacviet.app';
+        var loginNoted = {};
+
+        // `window.STV_SERVER` is the first global app.v2.js declares and the
+        // domain the app's own assets are served from, so it needs no fresh
+        // probe to be believed. The literal is what that constant held in every
+        // log the app has (app.v2.js:1).
+        function serverHost() {
+            var server = '';
+            try { server = String(window.STV_SERVER || ''); } catch (e) { server = ''; }
+            var i = server.indexOf('://');
+            if (i < 0) { return ''; }
+            var rest = server.slice(i + 3);
+            var cut = rest.indexOf('/');
+            if (cut >= 0) { rest = rest.slice(0, cut); }
+            return rest ? server.slice(0, i + 3) + rest : '';
+        }
+
+        // The site's own mirrors, as far as this page knows them. A host outside
+        // this list is a stale constant, not a place to send a password.
+        function mirrorNames() {
+            var app = window.app;
+            var net = app && app.net ? app.net : null;
+            var out = [];
+            var push = function (mgr) {
+                if (!mgr) { return; }
+                var i;
+                var known = mgr.defaultDomains || [];
+                for (i = 0; i < known.length; i++) {
+                    if (out.indexOf(known[i]) < 0) { out.push(known[i]); }
+                }
+                var seen = mgr.domains || [];
+                for (i = 0; i < seen.length; i++) {
+                    var d = seen[i];
+                    if (d && typeof d.name === 'string' && out.indexOf(d.name) < 0) { out.push(d.name); }
+                }
+            };
+            push(net && net.networkManager);
+            push(net && net.networkManagerXHR);
+            return out;
+        }
+
+        function loginHost() {
+            var host = serverHost() || LOGIN_HOST;
+            var known = mirrorNames();
+            // No list yet: this block runs at document start, the managers are
+            // built later, and the first login of a launch can come first. The
+            // app domain is still the host the app itself came from.
+            if (known.length && known.indexOf(host) < 0) { return ''; }
+            return host;
+        }
+
+        // Drop whatever origin the site put in front and put the pinned one back.
+        // The login URL reaches this wrapper as `index.php?ajax=login`, and if
+        // `fullUrl()` already resolved it to the page's own origin -- .com -- the
+        // request never leaves the webview and .com answers `captcha`.
+        function absoluteOn(url, host) {
+            var s = String(url === undefined || url === null ? '' : url);
+            if (!s) { return s; }
+            var path = s;
+            var i = s.indexOf('://');
+            if (i >= 0) {
+                var rest = s.slice(i + 3);
+                var cut = rest.indexOf('/');
+                path = cut >= 0 ? rest.slice(cut) : '/';
+            }
+            if (path.charAt(0) !== '/') { path = '/' + path; }
+            return host + path;
+        }
+
         function patchPost(net) {
             if (!net || typeof net.post !== 'function') { return false; }
             if (net.post.__stvHintWrapped) { return true; }
@@ -12464,15 +12597,50 @@ enum SitePatch {
                 var target = String(url === undefined || url === null ? '' : url);
                 var kind = target.indexOf('ajax=login') >= 0 ? 'login'
                     : (target.indexOf('ajax=register') >= 0 ? 'register' : '');
-                var result = original.apply(this, arguments);
-                if (!kind || !result || typeof result.then !== 'function') { return result; }
+                if (!kind) { return original.apply(this, arguments); }
+                var host = loginHost();
+                var args = Array.prototype.slice.call(arguments);
+                var previous = window.__stvLoginHost;
+                if (!host) {
+                    if (!loginNoted[kind + ':none']) {
+                        loginNoted[kind + ':none'] = true;
+                        note('AUTH', kind + ' keeps the address the site gave it: '
+                            + (serverHost() || 'STV_SERVER') + ' is not one of the site mirrors');
+                    }
+                } else {
+                    // Kept for the whole round trip: if the site builds the URL
+                    // after the first tick, the pin has to still be there.
+                    window.__stvLoginHost = host;
+                    args[0] = absoluteOn(args[0], host);
+                    if (!loginNoted[kind + ':' + host]) {
+                        loginNoted[kind + ':' + host] = true;
+                        note('AUTH', kind + ' is sent to ' + host
+                            + ' whatever 域名 says: it is the only host the 2026-10-25 log shows answering success');
+                    }
+                }
+                var result;
+                try {
+                    result = original.apply(this, args);
+                } catch (error) {
+                    window.__stvLoginHost = previous;
+                    throw error;
+                }
+                if (!result || typeof result.then !== 'function') {
+                    window.__stvLoginHost = previous;
+                    return result;
+                }
+                var done = function () {
+                    window.__stvLoginHost = previous ? previous : '';
+                };
                 return result.then(function (answer) {
+                    done();
                     if (String(answer) === 'captcha') {
-                        note('AUTH', kind + ' answered captcha; the site branch for it is empty');
+                        note('AUTH', kind + ' answered captcha on ' + (host || 'the site address')
+                            + '; the site branch for it is empty');
                         toast(kind === 'login' ? LOGIN_CAPTCHA_HINT : REGISTER_CAPTCHA_HINT);
                     }
                     return answer;
-                }, function (error) { throw error; });
+                }, function (error) { done(); throw error; });
             };
             wrapper.__stvHintWrapped = true;
             // `domainFailover` may already have wrapped this function, and its

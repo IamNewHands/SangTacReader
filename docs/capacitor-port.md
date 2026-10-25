@@ -6016,4 +6016,65 @@ key 属于**书**。上一轮 §6.60 那条「页面 origin 优先」正是在�
   线路还是它自己在做限速。若要查，需要在 `.app` 上分别量 `warp.php` 与 `readchapter` 的
   首字节时间，日志里目前只有总时长。
 - **非目标**：不写死 `.app` 主机名。站点会轮换哪台能用（前天能用的是 `.com`），写死就是下一次
-  同一个故障。
+  同一个故障。**（§6.63 起有一个例外：登录这一次跟着 `window.STV_SERVER` 走 —— 那是站点自己
+  的常量，不是我们写死的名字；章节仍然不写死。）**
+
+## §6.63 第 61 轮（提交名：第六十三轮）：登录不再问「域名」—— captcha 是 `.com` 在拦，而它连一次请求都没发出去
+
+读者的话：「我选择域名自动，登录时提示有验证码，得手工选择 `.app` 才行，登录时为什么不直接固定
+`.app`，不看域名那边的选择」。日志是 `stv-diagnostic-20261025-175736.log`（906 行，17:12 那轮
+起一直记到 17:57）。
+
+### 6.63.1 日志里最关键的一件事：四次 captcha，零次 HTTP
+
+| 时间 | 域名设置 | 结果 | 日志里有没有 `[Http]` |
+| --- | --- | --- | --- |
+| 17:12:32 | 手工 `.com` | `captcha` | **没有** |
+| 17:12:36 | 手工 `.com` | `captcha` | **没有** |
+| 17:12:53 | 手工 `.app` | `success`（`index.php?ajax=login … 7b` / 855ms） | 有 |
+| 17:56:45 | auto | `captcha` | **没有** |
+| 17:56:48 | auto | `captcha` | **没有** |
+| 17:57:01 | 手工 `.app` | `success`（`… 7b` / 832ms） | 有 |
+
+同一秒里别的主机请求都有 `[Http]` 行（`warp.php`、`userinfo.php?rescan=true`），所以不是日志关了。
+最可能的解释：登录那个 POST 的地址被解析成了**页面自己的 origin**（`route:` 那行写明
+`page=https://sangtacviet.com`），同源请求走 WKWebView 自己的 XHR，不经过 Capacitor 的
+`Http` 插件，于是没有 `[Http]` 行；答案 `.captcha` 是 `.com` 服务端给的。换成 `.app` 之后
+请求变成跨源，才走 Capacitor，也才有那行日志、也才成功。
+
+结论：**captcha 不是「App 缺少验证码入口」，是「这台主机不给过」。** 这与上一轮 §6.62 的
+`code 7` 是同一类事实：`.com` 能发页面、能答 `userinfo`，但登录和正文都拒。
+
+### 6.63.2 改动：登录这一次，不看线路选择
+
+| 改动 | 位置 | 为什么 |
+| --- | --- | --- |
+| 登录 / 注册的 URL 改成绝对地址，主机 = `window.STV_SERVER` | `failureHints` → `patchPost` | 相对地址会被解析回页面 origin（`.com`），跨源才走 Capacitor；这也是唯一能解释「没有 `[Http]` 行」的路径 |
+| 请求期间置 `window.__stvLoginHost` | 同上 | `fullUrl()` 可能把绝对地址再改写一遍，所以 `bestDomain()` 也要被说服 |
+| `bestDomain()` 先答这个 pin，优先于手工选的线路、记住的镜像、页面 origin、竞速 | `domainFailover` → `patchBestDomain` | 读者要的就是「登录时不看那个选择」。章节仍然按原逻辑挑线路，pin 只活到这次请求结束 |
+| 主机不在站点自己的镜像表里就不 pin | `failureHints` → `loginHost` + `mirrorNames` | `STV_SERVER` 是站点常量，不是「我们写死的名字」；万一它指向一个表外主机，那是指针过期，不能把密码送过去 |
+| 表里没有 `.app`、或本来就不是登录请求 | 同上 | 原样放行，并在面板写清「保持站点给的地址」 |
+
+host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站点换域名时它跟着换，
+字面量 `https://sangtacviet.app` 只在常量缺失时兜底。**这也修正了 §6.62.4「非目标：不写死
+.app」那条**：写死主机名仍然不做，但「登录跟着站点自己的常量走」不是写死。
+
+### 6.63.3 守卫
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 30 块 / 669959 字节 / 141 标记 |
+| `scripts/test-site-patch.js` | **978 条断言** / 0 失败（新增 10 条） |
+
+新增断言：auto 下登录发往 `.app` 而不是页面 origin 那台、请求进行中 `bestDomain()` 也答 `.app`、
+面板写明「登录不看域名」、答案仍原样交给站点、答完 pin 清掉（章节照旧用页面 origin）、
+非登录请求原样放行、手工选 `.com` 也不影响登录、`.app` 回的 captcha 仍报且带上主机名、
+镜像表外的主机不给密码、此时面板说「线路选择有效」。
+
+### 6.63.4 仍需真机确认
+
+- `[AUTH] login is sent to https://sangtacviet.app whatever 域名 says` 出现，且**紧跟**一行
+  `[Http] POST https://sangtacviet.app/index.php?ajax=login -> 200 … success`；
+  域名保持 auto，不要手工切。
+- 如果 `.app` 这次回 `captcha`，日志会是 `login answered captcha on https://sangtacviet.app`，
+  那就说明拦的不是主机而是账号/IP，本轮的锁主机方案不足以解释。
