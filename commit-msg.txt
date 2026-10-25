@@ -1,10 +1,11 @@
-第五十九轮：两处静默补上句子 —— code 7 指线路，登录 captcha 不再静默
+第六十轮：镜像竞速之前加一条 —— 页面自己的 origin 优先
 
-- 新增注入块 failureHints：code 7 的兜底文案原本指向「设备/版本」，换成
-  「正文线路不可用…设置 → 网络 → 域名 选 sangtacviet.com，或换网络」，站点 err/info 原文附后；
-  showAlert 收到同一句原文时整串替换（精确匹配，不误伤 i18n 片段）。
-- 登录/注册回 captcha 时 toast 说明需要人机验证、App 内没有入口（站点那个分支是空的）。
-  请求形状与应答都不变：code 7 仍走 showAlert 保留重载按钮，其余 code 仍走原函数含
-  setNotLoading，captcha 仍原样交回站点。
-- 包装 app.net.post 时继承 __stvFailoverWrapped，镜像故障转移仍在链上。
-- 测试新增 19 条断言（共 939 条）；CI 产物标记表加 stvFailureHintsInstalled。
+- 根因修法：cookie（access/useri2）与 grantcontext 签发的章节 key 都属于设置它的那个
+  host，而 bestDomain() 只按 /warp.php 延迟排序，于是正文与登录会被改写到别的镜像，
+  带着一份不属于它的会话 —— 这就是 code 7 与「登录 success 但没登录」的共同解释。
+- patchBestDomain 新增一条：页面 origin（location.origin）在站点镜像名单里、没被拉黑、
+  这次探活没标 dead 时直接返回它，排在「手选线路」之后、「记忆镜像」与竞速之前。
+  名单成员资格防篡改；页面 origin 回 code 7 仍会被拉黑并换镜像（不无限重试）。
+- 测试新增 8 条断言（共 947 条）：更快的镜像不再赢、正文落在页面 origin、面板写出规则名、
+  页面 origin 回 code 7 仍能换镜像、探活 dead 不钉、非站点 origin 不生效、手选线路仍优先。
+- workflow 新增源码守卫：var page = pageOrigin(); 与 outranks the ping race。

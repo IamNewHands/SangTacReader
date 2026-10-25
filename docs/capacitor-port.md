@@ -5847,8 +5847,65 @@ Cookie（`app.v2.js:1142-1149`），签名也不是门槛（无签名 code 5、�
 
 - 真机上那两个提示的实际样子（下一份日志里应当出现
   `[DOMAIN] code 7 survived every mirror` 与 `[AUTH] login answered captcha` 两行）。
-- **没做**：把带 Cookie 的请求钉在页面 origin（`sangtacviet.com`）。那是根因侧的修法，会改变
-  登录/正文由哪台镜像服务，属于下一轮单独的判断；本轮只保证失败时说的是人话。
+- **没做**（本轮）：把带 Cookie 的请求钉在页面 origin（`sangtacviet.com`）。那是根因侧的修法，
+  会改变登录/正文由哪台镜像服务 —— **已在 §6.60 做掉。**
 - 登录 10s 超时（`postCapacitor` 的 timeout）走站点自己的 catch toast，本轮不动。
+
+## §6.60 第 58 轮（提交名：第六十轮）：镜像竞速之前加一条 —— 页面自己的 origin 优先
+
+§6.59 只把失败说清楚了。这一轮修根因：**为什么这台设备会选中回 code 7 的镜像**。
+
+### 6.60.1 状态是有 host 的
+
+三样东西都绑在「设置它的那个 host」上：
+
+| 东西 | 谁签发的 | 换 host 之后 |
+| --- | --- | --- |
+| `access` / `useri2`（会话 cookie） | 页面自己（`sangtacviet.com`），且 httpOnly | `document.cookie` 里看不到它；原生层也只能按请求 host 取 |
+| 章节 key（`getKey` → `/io/grantcontext/context`） | `bestDomain()` 选中的那台（`app.v2.read.js:539`） | 旧 key 对新 host 无效 |
+| 登录（`app.net.post("/?ajax=login")`） | `postCapacitor` 把它改写到 `bestDomain()`（`app.v2.js:1186-1190`），Cookie 头却是页面 origin 的 | 服务器收到的是一份不属于它的会话 |
+
+`verifyDomain()` 只探 `/warp.php`、而且只看状态码（`:911-917` / `:1012-1021`），`bestDomain()`
+再按 ping 取最小（`:944-955`）——「最快的那台」与「状态在哪台」是两件互不相干的事。而正文
+URL 直接拼 `networkManager.bestDomain()`（`read.js:564`）、密钥同一来源（`:539`）、登录经
+`postCapacitor` 改写（`app.v2.js:1190`）：三条路全都跟着竞速走。
+
+### 6.60.2 修法：页面 origin 排在竞速之前
+
+`patchBestDomain` 新增一条，位置在「手选线路」之后、「记忆镜像」与竞速之前：
+
+- 条件：`pageOrigin()`（即 `location.origin`）**在站点自己的镜像名单里**、没被拉黑、且这次
+  探活没有把它标成 dead；
+- 命中即返回它，并写一行 `[DOMAIN] … page origin … outranks the ping race`；
+- 名单成员资格是安全约束，和「记忆镜像」同一个理由：篡改 `location` 不能把 App 指到别的 host。
+
+为什么「页面从哪儿加载」可以当存活证据：WKWebView 里这一页就是从那个 origin 拿到的，比每轮
+一次的 `/warp.php` 探测更硬。反过来，页面 origin 真不可达时，站点自己的探活会把它标 dead，
+规则自然让位给镜像——不会把 App 钉死在一个连不上的 host 上。
+
+顺序里没变的部分：手选线路仍排第一（读者明确点过）；拉黑与失败判定仍由 §6.10 那三条管。
+页面 origin 回了 code 7 也会被拉黑，然后照旧换镜像重取——**不会**因为「它是页面 origin」就
+无限重试。
+
+### 6.60.3 守卫（本轮）
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | 29 块 / 645234 字节 / 141 标记 |
+| `scripts/test-site-patch.js` | **947 条断言** / 0 失败（新增 8 条） |
+| workflow | 新增源码守卫：`var page = pageOrigin();` 与 `outranks the ping race` |
+
+新增的 8 条断言覆盖：更快的镜像不再赢、正文落在页面 origin、面板写出规则名、页面 origin
+回 code 7 时仍换镜像并成功、探活标 dead 时不钉、非站点 origin 不生效且面板不出声、手选线路
+仍优先。
+
+### 6.60.4 仍未证实 / 非目标
+
+- 真机体感两项：登录后**立刻**是登录态、章节不再 code 7。下一份日志里应当出现
+  `[DOMAIN] networkManager page origin https://sangtacviet.com outranks the ping race`。
+- **速度**是这一轮换来的代价：如果某台设备上 `sangtacviet.com` 的数据面比镜像慢，这份慢会变成
+  常态。判据是 `ranked` 那行与翻章耗时；真要退，手选线路仍是逃生口。
+- 站点自己的 `app.config.ux.app_domain` 菜单只有 auto / .com / .app 三档，没有镜像；读者手选到
+  `.app` 时登录仍会踩同一条 cookie 归属问题（站点菜单的限制，不在客户端修）。
 
 

@@ -3148,7 +3148,8 @@ enum SitePatch {
      "Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời" and the chapter
      never appears.
 
-     The repairs, all driven by the server's own answer rather than a hard-coded
+     The repairs, all driven by what the app already knows -- the server's own
+     answers and the origin the page was loaded from -- rather than a hard-coded
      host list:
 
        1. `bestDomain()` never returns a mirror that already answered code 7.
@@ -3168,6 +3169,17 @@ enum SitePatch {
           as well, and a mirror the reader picked by hand in the site's own 线路
           row outranks the remembered one -- in that log two taps on that row
           (23:14:14, 23:14:16) changed nothing at all.
+       4. the page's own origin outranks every mirror. This is the one rule that
+          does not come from a server answer, and it is what makes the others
+          safe: `document.cookie` (`access`/`useri2`) and the key `grantcontext`
+          issues are scoped to the host that set them, so a chapter fetched from
+          a different mirror carries state that mirror never issued -- which is
+          the cheapest available explanation for `code 7` on a request that has
+          a perfectly good key, and for a login that answers `success` without
+          the app ever being logged in. Only the page's own origin answers on
+          that host, and the page itself is proof it is reachable. `location`,
+          never a literal: the rule cannot pin a host that the app was not
+          loaded from.
 
      A ping comparison deliberately plays no part in any of that. The mirror that
      wins the site's race is routinely the one that answers code 7 to every
@@ -3545,6 +3557,27 @@ enum SitePatch {
                         note('DOMAIN', label + ' explicit domain ' + pref);
                     }
                     return pref;
+                }
+                // The page's own origin outranks the ping race. The session
+                // cookies (access/useri2) and the chapter key `grantcontext`
+                // hands out are issued for the page's host, and only that host
+                // honours them: a mirror answers code 7 to a chapter that
+                // carries them (docs/capacitor-port.md §6.10) and silently
+                // ignores a login. The page in the reader's hands came from
+                // this origin, which is a stronger liveness signal than any
+                // /warp.php probe -- so it wins while it is neither banned nor
+                // marked dead. `list` membership is required for the same
+                // reason the remembered mirror needs it: a tampered location
+                // must not be able to point the app at a foreign host.
+                var page = pageOrigin();
+                if (page && list.indexOf(page) >= 0 && !banned[page]
+                    && !rememberedGone(this, page)) {
+                    if (!noted['page:' + page]) {
+                        noted['page:' + page] = true;
+                        note('DOMAIN', label + ' page origin ' + page
+                            + ' outranks the ping race');
+                    }
+                    return page;
                 }
                 var good = readGood();
                 if (good && !banned[good.name] && list.indexOf(good.name) >= 0) {

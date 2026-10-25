@@ -25,6 +25,9 @@
  *   - a readchapter that answers code 7 names the line setting instead of a
  *     device the site never checks, and a login that answers `captcha` says so
  *     instead of doing nothing
+ *   - the page's own origin wins the mirror race, because the session cookies
+ *     and the chapter key belong to that host; a page origin that refuses, or
+ *     that the probe marks dead, still falls back to the mirrors
  *
  * Run: node scripts/test-site-patch.js
  */
@@ -4101,6 +4104,119 @@ async function testFailureHints() {
   await app.net.post('/?ajax=register', 'username=a&psw=b&repsw=b');
   check('register reports the same wall, with its own words',
     toasts().some((t) => t.indexOf('注册没有完成') >= 0), JSON.stringify(toasts()));
+}
+
+/**
+ * §6.60: the page's own origin wins the mirror race. Cookies (`access`/`useri2`)
+ * and the key `grantcontext` issues are scoped to the host that set them, so a
+ * chapter -- or a login -- answered by another mirror carries state that mirror
+ * never issued. That is the cheapest explanation for code 7 on a request that
+ * has a perfectly good key.
+ */
+async function testPageOriginPinning() {
+  console.log('the page origin outranks the mirror race');
+
+  const PAGE = 'https://sangtacviet.com';
+  const FAST = 'https://dns1.stv-appdomain-00000001.org';
+  const APP = 'https://sangtacviet.app';
+
+  const build = (options) => {
+    const sandbox = makeSandbox();
+    const app = installFakeApp(sandbox, Object.assign({
+      displayType: 'pageflip',
+      networkManager: {
+        domains: [
+          { name: FAST, status: 'alive', ping: 100 },
+          { name: PAGE, status: 'alive', ping: 900 },
+          { name: APP, status: 'alive', ping: 500 },
+        ],
+        defaultDomains: [PAGE, FAST, APP],
+      },
+    }, options || {}));
+    return { sandbox, app };
+  };
+
+  // --- the page origin beats a mirror that pings faster ---------------------
+  const first = build();
+  first.sandbox.window.location = { origin: PAGE };
+  const served = [];
+  first.app.reader.getContent = function () {
+    const host = first.app.net.networkManager.bestDomain();
+    served.push(host);
+    return Promise.resolve(host === PAGE ? { code: 0, data: 'chapter' } : { code: 7 });
+  };
+  vm.runInContext(loadBlocks().join('\n'), first.sandbox);
+  await tick(300);
+
+  check('a chapter is asked of the page own origin, not the fastest mirror',
+    first.app.net.networkManager.bestDomain() === PAGE,
+    first.app.net.networkManager.bestDomain());
+  const read = await first.app.reader.getContent('qidian', '1', 'c1');
+  check('and the read lands there',
+    String(read.code) === '0' && served[0] === PAGE, JSON.stringify(served));
+  check('the panel says which rule decided it',
+    String(first.sandbox.window.__stvDiag.text() || '')
+      .indexOf('page origin ' + PAGE + ' outranks the ping race') >= 0,
+    String(first.sandbox.window.__stvDiag.text() || '').slice(-300));
+
+  // --- a page origin that refuses is still walked past ----------------------
+  const refused = build();
+  refused.sandbox.window.location = { origin: PAGE };
+  const refusedServed = [];
+  refused.app.reader.getContent = function () {
+    const host = refused.app.net.networkManager.bestDomain();
+    refusedServed.push(host);
+    return Promise.resolve(host === PAGE ? { code: 7 } : { code: 0, data: 'chapter' });
+  };
+  vm.runInContext(loadBlocks().join('\n'), refused.sandbox);
+  await tick(300);
+  const recovered = await refused.app.reader.getContent('qidian', '1', 'c2');
+  check('a page origin that answers code 7 is left for a mirror',
+    String(recovered.code) === '0' && refusedServed[0] === PAGE
+      && refusedServed[1] === FAST, JSON.stringify(refusedServed));
+
+  // --- a page origin the probe could not reach is not pinned to -------------
+  const dead = build({
+    networkManager: {
+      domains: [
+        { name: PAGE, status: 'dead', ping: -1 },
+        { name: FAST, status: 'alive', ping: 100 },
+        { name: APP, status: 'alive', ping: 500 },
+      ],
+      defaultDomains: [PAGE, FAST, APP],
+    },
+  });
+  dead.sandbox.window.location = { origin: PAGE };
+  vm.runInContext(loadBlocks().join('\n'), dead.sandbox);
+  await tick(300);
+  check('a page origin the fresh probe could not reach is not pinned to',
+    dead.app.net.networkManager.bestDomain() === FAST,
+    dead.app.net.networkManager.bestDomain());
+
+  // --- an origin the site does not own cannot pin anything -----------------
+  const foreign = build();
+  foreign.sandbox.window.location = { origin: 'https://example.test' };
+  vm.runInContext(loadBlocks().join('\n'), foreign.sandbox);
+  await tick(300);
+  // The diagnostic buffer is a durable sink shared by every sandbox in this
+  // run, so "said nothing" has to be read from the length captured here.
+  const panelMark = String(foreign.sandbox.window.__stvDiag.text() || '').length;
+  const foreignChoice = foreign.app.net.networkManager.bestDomain();
+  const foreignPanel = String(foreign.sandbox.window.__stvDiag.text() || '');
+  check('an origin outside the site mirrors is ignored', foreignChoice === FAST, foreignChoice);
+  check('and nothing is claimed about it in the panel',
+    foreignPanel.slice(panelMark).indexOf('outranks the ping race') < 0,
+    foreignPanel.slice(panelMark).slice(-200));
+
+  // --- the 线路 pick still outranks the page -------------------------------
+  const picked = build();
+  picked.sandbox.window.location = { origin: PAGE };
+  picked.app.config.ux = { app_domain: APP };
+  vm.runInContext(loadBlocks().join('\n'), picked.sandbox);
+  await tick(300);
+  check('an explicit 线路 pick still wins over the page origin',
+    picked.app.net.networkManager.bestDomain() === APP,
+    picked.app.net.networkManager.bestDomain());
 }
 
 async function testDownloadRowControls() {
@@ -9358,6 +9474,7 @@ await testBootShell();
 await testEmptyUserPages();
   await testDomainFailover();
   await testFailureHints();
+  await testPageOriginPinning();
   await testDownloadRowControls();
   await testStorageAccessor();
   await testDownloadRange();
