@@ -10132,6 +10132,70 @@ async function testSessionSurvivesReinstall() {
   check('a logout takes the Keychain entry with it, so the next install is not logged in',
     live.__secrets['stv.session'] === undefined, String(live.__secrets['stv.session']));
 }
+
+/**
+ * 设置页那一行。要回答的是「登录态停在哪一层」：本次运行 / 重启后 / 重装后。头两层
+ * 从补过 `max-age` 之后一起成立，真正会缺的是第三层，所以它必须是**有证据才打勾**
+ * —— Keychain 写失败、镜像还没写、镜像是上一个会话，三种都要说出来，不能沉默。
+ */
+async function testSessionStateRow() {
+  console.log('the settings row says which layer the session is on');
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(120);
+
+  check('with no session the row says so',
+    sandbox.window.__stvSessionLayer().indexOf('未登录') >= 0,
+    sandbox.window.__stvSessionLayer());
+
+  const access = 'm'.repeat(40);
+  sandbox.document.cookie = 'access=' + access + '; path=/; HttpOnly; expires=Thu';
+  await tick(600);
+  const line = sandbox.window.__stvSessionLayer();
+  check('a live session names the two layers that hold it',
+    line.indexOf('本次运行 ✓') >= 0 && line.indexOf('重启后 ✓') >= 0
+      && line.indexOf('已补过期时间') >= 0, line);
+  check('and the Keychain mirror is the third', line.indexOf('重装后 ✓') >= 0, line);
+
+  // Keychain 拒绝时第三层必须是 ✗，而不是沉默地当作通过。
+  const broken = makeSandbox();
+  installFakeApp(broken, { displayType: 'auto' });
+  broken.Capacitor.Plugins.App.secretSave = () => Promise.reject(new Error('keychain write failed'));
+  broken.Capacitor.Plugins.App.secretLoad = () => Promise.reject(new Error('keychain read failed'));
+  vm.runInContext(loadBlocks().join('\n'), broken);
+  await tick(120);
+  broken.document.cookie = 'access=' + access + '; path=/; expires=Thu';
+  await tick(600);
+  const brokenLine = broken.window.__stvSessionLayer();
+  check('a Keychain that refuses is reported instead of the reinstall layer being assumed',
+    brokenLine.indexOf('重装后 ✗') >= 0, brokenLine);
+
+  // 设置页上的那一行。假 page 只提供本块真正用到的那两个查询。
+  const inserted = [];
+  const host = { insertBefore(node) { inserted.push(node); } };
+  const anchor = { parentNode: host, nextSibling: null };
+  const picker = { parentNode: anchor };
+  const page = {
+    querySelector(selector) {
+      if (selector.indexOf('stv-sessionstate-row') >= 0) { return inserted[0] || null; }
+      if (selector.indexOf('contextmenu') >= 0) { return picker; }
+      return null;
+    },
+  };
+  check('the row is added to the settings page',
+    sandbox.window.__stvSessionStateRow(page) === true && inserted.length === 1,
+    String(inserted.length));
+  sandbox.window.__stvSessionStateRow(page);
+  check('opening the page twice does not add it twice', inserted.length === 1,
+    String(inserted.length));
+
+  const row = inserted[0];
+  check('the row is titled 登录态 and carries the sentence as its value',
+    row && row.children[0] && row.children[0].textContent === '登录态'
+      && row.children[1] && row.children[1].textContent === sandbox.window.__stvSessionLayer(),
+    row && row.children[1] && row.children[1].textContent);
+}
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -10209,6 +10273,7 @@ await testPopupTranslate();
   await testContentCache();
   await testSessionCookies();
   await testSessionSurvivesReinstall();
+  await testSessionStateRow();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);

@@ -13246,6 +13246,13 @@ enum SitePatch {
         var saveTimer = null;
         var pendingClear = false;
 
+        // 设置页那一行要说的三件事，都只有本块知道：这一趟有没有写过会话、镜像
+        // 里现在是不是同一个值、上一次写镜像为什么失败。
+        var writtenThisRun = false;
+        var mirroredValue = '';
+        var mirrorFailed = false;
+        var lastMirrorError = '';
+
         function note(tag, message) {
             if (window.__stvDiag) { window.__stvDiag.log(tag, message); }
         }
@@ -13333,7 +13340,11 @@ enum SitePatch {
          */
         function persistSession(clearing) {
             var plugin = appPlugin();
-            if (!plugin || typeof plugin.secretSave !== 'function') { return; }
+            if (!plugin || typeof plugin.secretSave !== 'function') {
+                mirrorFailed = true;
+                lastMirrorError = '原生密钥存储不可用';
+                return;
+            }
             var now = readSession();
             var value = '';
             if (!clearing) {
@@ -13343,12 +13354,19 @@ enum SitePatch {
             if (value === saved) { return; }
             saved = value;
             Promise.resolve(plugin.secretSave({ key: SECRET_KEY, value: value })).then(function () {
+                mirroredValue = value ? now.access : '';
+                mirrorFailed = false;
+                lastMirrorError = '';
                 note('AUTH', value
                     ? 'the session is mirrored into the Keychain, so a reinstall keeps the login'
                     : 'the session left the Keychain together with the logout');
             }, function (error) {
-                note('ERR', 'session mirror failed: '
-                    + String(error && error.message ? error.message : error));
+                // 写失败不回滚 `saved`：下一次同样的值要能再试一次，而不是被当成
+                // 「已经写过」永远跳过。
+                saved = '';
+                mirrorFailed = true;
+                lastMirrorError = String(error && error.message ? error.message : error);
+                note('ERR', 'session mirror failed: ' + lastMirrorError);
             });
         }
 
@@ -13373,6 +13391,8 @@ enum SitePatch {
             var plugin = appPlugin();
             if (!plugin || typeof plugin.secretLoad !== 'function') {
                 restoreDone = true;
+                mirrorFailed = true;
+                lastMirrorError = '原生密钥存储不可用';
                 restorePromise = Promise.resolve(false);
                 return restorePromise;
             }
@@ -13393,6 +13413,7 @@ enum SitePatch {
                 }
                 restoreDone = true;
                 saved = session.access ? JSON.stringify(readSession()) : '';
+                mirroredValue = session.access || '';
                 if (names.length) {
                     note('AUTH', 'the session came back from the Keychain, so a reinstall no longer costs a login: '
                         + names.join(', '));
@@ -13471,6 +13492,7 @@ enum SitePatch {
                         // 旧的镜像值顶回来。
                         if (name && KEEP_NAMES.indexOf(name) >= 0) {
                             delete restored[name];
+                            writtenThisRun = true;
                             schedulePersist(name === 'access'
                                 && text.slice(eq + 1).split(';')[0].trim() === '');
                         }
@@ -13486,6 +13508,76 @@ enum SitePatch {
             return true;
         }
 
+        // ---- 设置页那一行：登录态停在哪一层 --------------------------------
+        var ROW = 'stv-sessionstate-row';
+
+        /**
+         三层：本次运行（内存）· 重启后（`max-age` 持久 cookie）· 重装后（Keychain）。
+         头两层从本块装上之后就一起成立 —— 每次写入都补了过期时间，所以现在有会话，
+         重启就还在。真正会缺的是第三层：镜像还没写、写失败、或者镜像里还是上一个
+         会话（换了账号，或登出没清干净）。
+         */
+        function layerLine() {
+            var session = readSession();
+            var live = typeof session.access === 'string' ? session.access : '';
+            if (live.length < 32) { return '未登录（本次运行没有会话）'; }
+            var parts = ['本次运行 ✓'];
+            parts.push(writtenThisRun ? '重启后 ✓（已补过期时间）' : '重启后 ✓（上次写下的）');
+            if (mirrorFailed) { parts.push('重装后 ✗（Keychain 写入失败）'); }
+            else if (mirroredValue && mirroredValue === live) { parts.push('重装后 ✓'); }
+            else if (mirroredValue) { parts.push('重装后 ✗（镜像是上一个会话）'); }
+            else { parts.push('重装后 ✗（还没镜像）'); }
+            return parts.join(' · ');
+        }
+        window.__stvSessionLayer = layerLine;
+
+        function buildStateRow(page) {
+            if (!page || typeof page.querySelector !== 'function') { return false; }
+            if (page.querySelector('.' + ROW)) { return true; }
+            // 挂在站点自己的「域名」选择器下面，与线路体检那几行做邻居。找不到就不
+            // 加：设置页不该因为这一行而变形。
+            var picker = page.querySelector('contextmenu[value="app.config.ux.app_domain"]');
+            var anchor = picker ? picker.parentNode : null;
+            var host = anchor ? anchor.parentNode : null;
+            if (!host || typeof host.insertBefore !== 'function') { return false; }
+            var row = document.createElement('div');
+            row.className = 'settingitem ' + ROW;
+            var title = document.createElement('div');
+            title.className = 'settingitemtitle';
+            title.textContent = '登录态';
+            var value = document.createElement('div');
+            value.style.cssText = 'font-size:12px;opacity:0.85;';
+            value.textContent = layerLine();
+            row.appendChild(title);
+            row.appendChild(value);
+            // 失败原因藏在长按提示里，屏幕上只留一句人话。
+            if (lastMirrorError) { row.setAttribute('title', lastMirrorError); }
+            host.insertBefore(row, anchor.nextSibling || null);
+            note('AUTH', 'login state row: ' + value.textContent
+                + (lastMirrorError ? ' (' + lastMirrorError + ')' : ''));
+            return true;
+        }
+        window.__stvSessionStateRow = buildStateRow;
+
+        function hookSettings() {
+            var app = window.app;
+            if (!app || typeof app.pushPage !== 'function') { return false; }
+            if (app.__stvSessionStateHooked) { return true; }
+            app.__stvSessionStateHooked = true;
+            var original = app.pushPage;
+            app.pushPage = function (name) {
+                var page = original.apply(this, arguments);
+                try {
+                    if (name === 'pagesetting') { buildStateRow(page); }
+                } catch (error) {
+                    note('ERR', 'login state row: '
+                        + String(error && error.message ? error.message : error));
+                }
+                return page;
+            };
+            return true;
+        }
+
         install();
         restoreSession();
 
@@ -13493,6 +13585,12 @@ enum SitePatch {
         var getterTimer = setInterval(function () {
             getterTries = getterTries + 1;
             if (installGetter() || getterTries > 1200) { clearInterval(getterTimer); }
+        }, 250);
+
+        var hookTries = 0;
+        var hookTimer = setInterval(function () {
+            hookTries = hookTries + 1;
+            if (hookSettings() || hookTries > 1200) { clearInterval(hookTimer); }
         }, 250);
     })();
     """

@@ -6351,13 +6351,14 @@ RFC 6265 的日期是 `Thu, 01 Jan 2026 00:00:00 GMT` —— **本身就含 `", 
 
 ### 6.66.4 这一轮怎么验
 
-JS 断言 1001 → **1010**（新增 9 条：会话装回页面、三个名字一起回来、可读回、`getCookie` 兜底、
-页面值优先、没有会话时不写镜像、登录写镜像、镜像带齐三个名字、登出连带清 Keychain）。
+JS 断言 1001 → **1017**（新增 16 条：会话装回页面、三个名字一起回来、可读回、`getCookie` 兜底、
+页面值优先、没有会话时不写镜像、登录写镜像、镜像带齐三个名字、登出连带清 Keychain、
+未登录时的行话术、三层各自的门槛、Keychain 拒绝时第三层必须是 ✗、设置页只加一行）。
 
 | 守卫 | 结果 |
 | --- | --- |
-| `scripts/check-ios-shim.js` | **31 块** / 691859 字节 / 141 markers |
-| `scripts/test-site-patch.js` | **1010 条断言** / 0 失败 |
+| `scripts/check-ios-shim.js` | **31 块** / 696247 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1017 条断言** / 0 失败 |
 | `gen-site-i18n.js --check` | 461 labels / 76 fragments in sync |
 | `gen-site-assets.js --check` | 8 文件 / 906296 字节 in sync |
 
@@ -6367,7 +6368,9 @@ JS 断言 1001 → **1010**（新增 9 条：会话装回页面、三个名字�
 2. 面板里有 `[AUTH] a cookie the site writes now carries an expiry, so a restart keeps the session: access`；
 3. 启动几秒内出现 `[Http] POST …/mobile/userinfo.php`（说明 `:3983` 那道门放行了）；
 4. 再**重装一次同一个包**（覆盖安装即可），进 App 仍是登录态，面板里有
-   `[AUTH] the session came back from the Keychain, so a reinstall no longer costs a login: access, useri2, hstamp`。
+   `[AUTH] the session came back from the Keychain, so a reinstall no longer costs a login: access, useri2, hstamp`；
+5. 打开设置页，「域名」选择器下面多一行 **登录态**：`本次运行 ✓ · 重启后 ✓（已补过期时间）· 重装后 ✓`，
+   同一句话也会写进面板（`[AUTH] login state row: …`）。
 
 ### 6.66.5 重装也不掉：会话镜像进 Keychain
 
@@ -6390,7 +6393,28 @@ JS 断言 1001 → **1010**（新增 9 条：会话装回页面、三个名字�
 面板话术分别是 `a cookie the site writes now carries an expiry…` /
 `the session came back from the Keychain…` / `the session is mirrored into the Keychain…`。
 
-### 6.66.6 未证实
+### 6.66.6 设置页那一行：登录态停在哪一层
+
+三层里有两层是代码保证的，第三层要靠 Keychain 真的写成 —— 而它会在侧载包缺 entitlement
+时静默失败。所以这一行不当装饰，它是**判据**：打开设置页就能看出来，不必导出日志。
+
+挂点与线路体检同一处（`app.pushPage` → `pagesetting`，插在站点自己的
+`contextmenu[value="app.config.ux.app_domain"]` 下面），一行 `登录态` + 一句小字：
+
+| 屏上的话 | 含义 |
+| --- | --- |
+| `未登录（本次运行没有会话）` | `access` 缺失或短于 32 字符，与站点那道门同一判据 |
+| `本次运行 ✓` | 现在有会话 |
+| `重启后 ✓（已补过期时间）/（上次写下的）` | 本块装上之后每次写入都补了 `max-age`；写成「上次写下的」说明这枚 cookie 是上一趟留下的 |
+| `重装后 ✓` | Keychain 里的 `access` 与当前会话**是同一个值** |
+| `重装后 ✗（还没镜像）` | 登录还没满 400ms 去抖，或者镜像没写成 |
+| `重装后 ✗（镜像是上一个会话）` | 换了账号 / 登出没清干净 |
+| `重装后 ✗（Keychain 写入失败）` | 原生拒绝，原因在长按提示（`title`）里 |
+
+判断规则单独暴露成 `window.__stvSessionLayer()`，行本身是 `window.__stvSessionStateRow(page)`，
+两者都能直接断言。找不到那个选择器就不插这一行：设置页不该因为这一行变形。
+
+### 6.66.7 未证实
 
 - **切半这个机制没有从头层面直接观测过**：日志里只有响应体预览，没有 `Set-Cookie` 原文。它在
   RFC 与站点三步代码上是唯一自洽的解释，且修复不依赖它是唯一原因 —— 服务器若本来就发 session
