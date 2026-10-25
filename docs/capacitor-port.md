@@ -6351,14 +6351,15 @@ RFC 6265 的日期是 `Thu, 01 Jan 2026 00:00:00 GMT` —— **本身就含 `", 
 
 ### 6.66.4 这一轮怎么验
 
-JS 断言 1001 → **1017**（新增 16 条：会话装回页面、三个名字一起回来、可读回、`getCookie` 兜底、
+JS 断言 1001 → **1021**（新增 20 条：会话装回页面、三个名字一起回来、可读回、`getCookie` 兜底、
 页面值优先、没有会话时不写镜像、登录写镜像、镜像带齐三个名字、登出连带清 Keychain、
-未登录时的行话术、三层各自的门槛、Keychain 拒绝时第三层必须是 ✗、设置页只加一行）。
+未登录时的行话术、三层各自的门槛、Keychain 拒绝时第三层必须是 ✗、设置页只加一行、
+原生存储晚到要等而不是判死）。
 
 | 守卫 | 结果 |
 | --- | --- |
-| `scripts/check-ios-shim.js` | **31 块** / 696247 字节 / 141 markers |
-| `scripts/test-site-patch.js` | **1017 条断言** / 0 失败 |
+| `scripts/check-ios-shim.js` | **31 块** / 699691 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1021 条断言** / 0 失败 |
 | `gen-site-i18n.js --check` | 461 labels / 76 fragments in sync |
 | `gen-site-assets.js --check` | 8 文件 / 906296 字节 in sync |
 
@@ -6414,7 +6415,40 @@ JS 断言 1001 → **1017**（新增 16 条：会话装回页面、三个名字�
 判断规则单独暴露成 `window.__stvSessionLayer()`，行本身是 `window.__stvSessionStateRow(page)`，
 两者都能直接断言。找不到那个选择器就不插这一行：设置页不该因为这一行变形。
 
-### 6.66.7 未证实
+### 6.66.7 21:58 真机日志：三层在设备上成立，但第三层要会等
+
+`stv-diagnostic-20261025-215856.log`（709 行，4 次 document start）。按时间读：
+
+| 时刻 | 行 | 说明 |
+| --- | --- | --- |
+| 21:58:21→23 | `tap i.fas.fa-sign-out` + 确认框 → `[LOG] Logging out..` | 这一次是**主动登出**，不是缺陷 |
+| 21:58:34-35 | `[AUTH] login is sent to https://sangtacviet.app` → `ajax=login -> 200 … 7b success` | 登录 pin 生效 |
+| 21:58:35 | `[AUTH] a cookie the site writes now carries an expiry … : access` | **setter 修复在真机上生效** |
+| 21:58:35 | `[AUTH] the session is mirrored into the Keychain …` | 400ms 去抖后镜像写成 |
+| 21:58:36 | `userinfo.php -> 200 … {"id":"306185"}` | 登录态有效 |
+| 21:58:40 | `[AUTH] login state row: 本次运行 ✓ · 重启后 ✓（已补过期时间） · 重装后 ✓` | 三层全绿 |
+| 21:58:45-49 | `[BOOT] +11ms document start`（整页重载，本日志共 4 次） | 站点登录后自己 reload |
+| 21:58:49 | `[SETTINGS] keychain restore: 0 written, 9 kept` | 同一份 document 里 Keychain **可用** |
+| 21:58:54 | `[AUTH] login state row: 本次运行 ✓ · 重启后 ✓（上次写下的） · 重装后 ✗（Keychain 写入失败）(原生密钥存储不可用)` | **缺陷** |
+
+最后一行是这一轮的收获，也是这一轮要修的：整页重载之后，本块在 document start 拿
+`window.Capacitor.Plugins.App` 拿到的是 `null`，于是直接判「原生密钥存储不可用」并**不再重试**
+—— 而 5 秒前同一份 document 的 `keychain restore` 明明成功了。`settingsBackup` 之所以没事，
+是因为它的 `hook()` 返回 `false` 时会重试。
+
+修法：新增 `whenSecretPlugin(callback, what)` —— 250ms 一轮、最多 240 轮（60 秒）等原生存储
+就绪，就绪后一次性兑现所有等待者；`restoreSession` 与 `persistSession` 都走它。两种状态分开报：
+
+- 没就绪 ≠ 失败：行上写 `重装后 …（等原生存储）`，等的时间里攒下的写入记成 `pendingMirror`，
+  就绪后补写一次；
+- 真的 60 秒没出现才写 `重装后 ✗（原生存储一直没就绪）`，真正的调用失败写
+  `重装后 ✗（Keychain 调用失败）`，原因仍在长按提示里。
+
+顺带一条正面证据：`重启后 ✓（上次写下的）` 说明那枚 cookie 是上一趟写下的、这一趟没再写过
+—— 补过 `max-age` 之后它活过了一次整页重载。**但「活过进程」仍没有直接证据**：整页重载与
+杀进程共用同一个 WKWebView cookie store（内存那份），所以这条要到下次杀进程重开才能确认。
+
+### 6.66.8 未证实
 
 - **切半这个机制没有从头层面直接观测过**：日志里只有响应体预览，没有 `Set-Cookie` 原文。它在
   RFC 与站点三步代码上是唯一自洽的解释，且修复不依赖它是唯一原因 —— 服务器若本来就发 session

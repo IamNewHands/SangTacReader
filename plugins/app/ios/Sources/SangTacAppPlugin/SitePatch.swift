@@ -13333,18 +13333,70 @@ enum SitePatch {
             return out;
         }
 
+        // ---- 原生存储什么时候才就绪 ------------------------------------------
+        // `window.Capacitor.Plugins.App` 在 document start **不一定**在。2026-10-25
+        // 21:58 那份日志里整页重载之后，本块第一趟拿到的是 null，于是把「原生密钥存储
+        // 不可用」写进了设置页那一行 —— 可同一份日志 21:58:49 的
+        // `[SETTINGS] keychain restore: 0 written, 9 kept` 证明 Keychain 那次是好的，
+        // 只是晚了几百毫秒。一次拿不到不等于没有：这里等，并且把「还在等」和「真失败」
+        // 分成两句，行上不谎报。
+        var keychainWaiting = false;
+        var keychainMissing = false;
+        var pendingMirror = false;
+        var readyWaiters = [];
+        var readyPolling = false;
+
+        function secretPlugin() {
+            var plugin = appPlugin();
+            return (plugin && typeof plugin.secretLoad === 'function'
+                && typeof plugin.secretSave === 'function') ? plugin : null;
+        }
+
+        function whenSecretPlugin(callback, what) {
+            var plugin = secretPlugin();
+            if (plugin) { callback(plugin); return; }
+            keychainWaiting = true;
+            readyWaiters.push({ fn: callback, what: what });
+            if (readyPolling) { return; }
+            readyPolling = true;
+            var tries = 0;
+            var timer = setInterval(function () {
+                tries = tries + 1;
+                var ready = secretPlugin();
+                if (!ready) {
+                    if (tries > 240) {
+                        clearInterval(timer);
+                        readyPolling = false;
+                        keychainWaiting = false;
+                        keychainMissing = true;
+                        var waiting = readyWaiters;
+                        readyWaiters = [];
+                        var i;
+                        for (i = 0; i < waiting.length; i++) {
+                            note('ERR', waiting[i].what + ': the native key store never became available');
+                        }
+                    }
+                    return;
+                }
+                clearInterval(timer);
+                readyPolling = false;
+                keychainWaiting = false;
+                keychainMissing = false;
+                var list = readyWaiters;
+                readyWaiters = [];
+                var j;
+                for (j = 0; j < list.length; j++) { list[j].fn(ready); }
+            }, 250);
+        }
+
         /**
          把当前会话镜像进 Keychain。只在看得见 `access` 时写；看不见又没登出时什么都不做
          —— 否则一次读不到副本的启动就会把已经存在的镜像抹掉，重装之后反而没了登录。
          登出（页面把 `access` 写成空值）是唯一允许清空的情况。
+
+         原生存储没就绪**不算失败**：记下要写什么，等它就绪再补一次（`whenSecretPlugin`）。
          */
         function persistSession(clearing) {
-            var plugin = appPlugin();
-            if (!plugin || typeof plugin.secretSave !== 'function') {
-                mirrorFailed = true;
-                lastMirrorError = '原生密钥存储不可用';
-                return;
-            }
             var now = readSession();
             var value = '';
             if (!clearing) {
@@ -13352,6 +13404,19 @@ enum SitePatch {
                 value = JSON.stringify(now);
             }
             if (value === saved) { return; }
+            var plugin = secretPlugin();
+            if (!plugin) {
+                pendingMirror = true;
+                if (clearing) { pendingClear = true; }
+                whenSecretPlugin(function () {
+                    if (!pendingMirror) { return; }
+                    pendingMirror = false;
+                    var clearingNow = pendingClear;
+                    pendingClear = false;
+                    persistSession(clearingNow);
+                }, 'session mirror');
+                return;
+            }
             saved = value;
             Promise.resolve(plugin.secretSave({ key: SECRET_KEY, value: value })).then(function () {
                 mirroredValue = value ? now.access : '';
@@ -13388,42 +13453,48 @@ enum SitePatch {
          */
         function restoreSession() {
             if (restorePromise) { return restorePromise; }
-            var plugin = appPlugin();
-            if (!plugin || typeof plugin.secretLoad !== 'function') {
-                restoreDone = true;
-                mirrorFailed = true;
-                lastMirrorError = '原生密钥存储不可用';
-                restorePromise = Promise.resolve(false);
-                return restorePromise;
-            }
-            restorePromise = Promise.resolve(plugin.secretLoad({ key: SECRET_KEY })).then(function (result) {
-                var value = result && typeof result.value === 'string' ? result.value : '';
-                var session = parseSession(value);
-                var present = readSession();
-                var names = [];
-                var i;
-                for (i = 0; i < KEEP_NAMES.length; i++) {
-                    var name = KEEP_NAMES[i];
-                    if (!session[name] || present[name]) { continue; }
-                    writeCookie(name, session[name]);
-                    // 写在 setter 之后：那次写入会清掉同名条目，这里再放回来，作为
-                    // 「页面读不到时」的兜底（比如副本没落地的那几毫秒）。
-                    restored[name] = session[name];
-                    names.push(name);
-                }
-                restoreDone = true;
-                saved = session.access ? JSON.stringify(readSession()) : '';
-                mirroredValue = session.access || '';
-                if (names.length) {
-                    note('AUTH', 'the session came back from the Keychain, so a reinstall no longer costs a login: '
-                        + names.join(', '));
-                }
-                return names.length > 0;
-            }, function (error) {
-                restoreDone = true;
-                note('ERR', 'the Keychain session could not be read: '
-                    + String(error && error.message ? error.message : error));
-                return false;
+            restorePromise = new Promise(function (resolve) {
+                whenSecretPlugin(function (plugin) {
+                    Promise.resolve(plugin.secretLoad({ key: SECRET_KEY })).then(function (result) {
+                        var value = result && typeof result.value === 'string' ? result.value : '';
+                        var session = parseSession(value);
+                        var present = readSession();
+                        var names = [];
+                        var i;
+                        for (i = 0; i < KEEP_NAMES.length; i++) {
+                            var name = KEEP_NAMES[i];
+                            if (!session[name] || present[name]) { continue; }
+                            writeCookie(name, session[name]);
+                            // 写在 setter 之后：那次写入会清掉同名条目，这里再放回来，作为
+                            // 「页面读不到时」的兜底（比如副本没落地的那几毫秒）。
+                            restored[name] = session[name];
+                            names.push(name);
+                        }
+                        restoreDone = true;
+                        saved = session.access ? JSON.stringify(readSession()) : '';
+                        mirroredValue = session.access || '';
+                        if (names.length) {
+                            note('AUTH', 'the session came back from the Keychain, so a reinstall no longer costs a login: '
+                                + names.join(', '));
+                        }
+                        // 等原生存储的那段时间里攒下的写入，现在补上。
+                        if (pendingMirror) {
+                            pendingMirror = false;
+                            var clearingNow = pendingClear;
+                            pendingClear = false;
+                            persistSession(clearingNow);
+                        }
+                        resolve(names.length > 0);
+                    }, function (error) {
+                        restoreDone = true;
+                        mirrorFailed = true;
+                        lastMirrorError = 'Keychain 读取失败: '
+                            + String(error && error.message ? error.message : error);
+                        note('ERR', 'the Keychain session could not be read: '
+                            + String(error && error.message ? error.message : error));
+                        resolve(false);
+                    });
+                }, 'session read');
             });
             return restorePromise;
         }
@@ -13523,7 +13594,9 @@ enum SitePatch {
             if (live.length < 32) { return '未登录（本次运行没有会话）'; }
             var parts = ['本次运行 ✓'];
             parts.push(writtenThisRun ? '重启后 ✓（已补过期时间）' : '重启后 ✓（上次写下的）');
-            if (mirrorFailed) { parts.push('重装后 ✗（Keychain 写入失败）'); }
+            if (mirrorFailed) { parts.push('重装后 ✗（Keychain 调用失败）'); }
+            else if (keychainMissing) { parts.push('重装后 ✗（原生存储一直没就绪）'); }
+            else if (keychainWaiting) { parts.push('重装后 …（等原生存储）'); }
             else if (mirroredValue && mirroredValue === live) { parts.push('重装后 ✓'); }
             else if (mirroredValue) { parts.push('重装后 ✗（镜像是上一个会话）'); }
             else { parts.push('重装后 ✗（还没镜像）'); }

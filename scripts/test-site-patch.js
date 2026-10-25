@@ -10196,6 +10196,40 @@ async function testSessionStateRow() {
       && row.children[1] && row.children[1].textContent === sandbox.window.__stvSessionLayer(),
     row && row.children[1] && row.children[1].textContent);
 }
+
+/**
+ * 2026-10-25 21:58:54 那份日志的真身：整页重载之后，document start 拿不到
+ * `Capacitor.Plugins.App`，旧代码于是把「原生密钥存储不可用」写进了设置页那一行 ——
+ * 可同一份日志 21:58:49 的 `[SETTINGS] keychain restore: 0 written, 9 kept` 证明
+ * Keychain 那次是好的，只是晚了几百毫秒。一次拿不到不等于没有。
+ */
+async function testKeychainReadyLate() {
+  console.log('a native store that arrives late is waited for, not written off');
+  const access = 'k'.repeat(40);
+  const sandbox = makeSandbox();
+  installFakeApp(sandbox, { displayType: 'auto' });
+  const app = sandbox.Capacitor.Plugins.App;
+  const secretLoad = app.secretLoad;
+  delete app.secretLoad;
+  sandbox.__secrets['stv.session'] = JSON.stringify({ access: access });
+  vm.runInContext(loadBlocks().join('\n'), sandbox);
+  await tick(150);
+
+  const waiting = sandbox.window.__stvSessionLayer();
+  check('nothing is claimed about the reinstall layer while the native store is missing',
+    waiting.indexOf('未登录') >= 0, waiting);
+
+  app.secretLoad = secretLoad;
+  await tick(900);
+  check('the session is restored once the store shows up',
+    sandbox.__cookies.access === access, String(sandbox.__cookies.access));
+  check('and the row counts the reinstall layer from then on',
+    sandbox.window.__stvSessionLayer().indexOf('重装后 ✓') >= 0,
+    sandbox.window.__stvSessionLayer());
+  check('no failure was ever reported for the wait',
+    sandbox.window.__stvSessionLayer().indexOf('✗') < 0,
+    sandbox.window.__stvSessionLayer());
+}
 (async () => {
   await testCompatAndTtsProvider();
   await testTtsProviderRespectsStoredChoice();
@@ -10274,6 +10308,7 @@ await testPopupTranslate();
   await testSessionCookies();
   await testSessionSurvivesReinstall();
   await testSessionStateRow();
+  await testKeychainReadyLate();
   console.log('');
   if (failures > 0) {
     console.error(`::error::${failures} site-patch assertion(s) failed`);
