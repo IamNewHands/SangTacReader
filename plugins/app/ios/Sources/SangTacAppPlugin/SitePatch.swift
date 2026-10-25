@@ -790,6 +790,15 @@ enum SitePatch {
 
         var NL = String.fromCharCode(10);
         var MAX = 800;
+        // MAX bounds how many lines are kept, never how long one is, and the
+        // console tee below hands over whatever the site printed. The site logs
+        // its whole book list on every load: `[LOG] Booklist loaded` is 36 676
+        // characters in the 2026-10-25 19:53 export -- 49% of a 75 KB file for
+        // one line whose first 200 characters already say everything. Capping
+        // here covers the tee, the native batches and every note() alike, so one
+        // log call cannot push the rest of the session out of the 800-line
+        // buffer.
+        var LINE_MAX = 1000;
         // localStorage is the only store readable synchronously at document
         // start. app.storage is Capacitor Preferences and resolves a tick later,
         // which is too late to decide whether the floating window should exist.
@@ -1260,6 +1269,9 @@ enum SitePatch {
         // ---- logging ---------------------------------------------------------
 
         function raw(text, isError) {
+            if (text.length > LINE_MAX) {
+                text = text.slice(0, LINE_MAX) + ' …[+' + (text.length - LINE_MAX) + ']';
+            }
             var line = stamp() + ' ' + text;
             lines.push(line);
             while (lines.length > MAX) { lines.shift(); }
@@ -3487,18 +3499,43 @@ enum SitePatch {
         function rankNote(mgr, label) {
             var known = mgr && mgr.domains ? mgr.domains : [];
             if (!known.length) { return; }
-            var parts = [];
+            var entries = [];
             for (var i = 0; i < known.length; i++) {
                 var d = known[i];
                 if (d && typeof d.name === 'string') {
-                    parts.push(d.name + '=' + d.status + '/' + d.ping + 'ms');
+                    entries.push(d.name + '=' + d.status + '/' + d.ping + 'ms');
                 }
             }
-            parts.sort();
-            var sig = parts.join(' ');
+            if (!entries.length) { return; }
+            // The dedupe key is the name-sorted snapshot, exactly as before: any
+            // change -- a ping included -- is worth one new line.
+            var key = entries.slice();
+            key.sort();
+            var sig = key.join(' ');
             if (rankedSeen[label] === sig) { return; }
             rankedSeen[label] = sig;
-            note('DOMAIN', label + ' ranked ' + sig);
+            // Printed by ping, because the line says "ranked". It used to print
+            // `entries.sort()`, which sorts the formatted "host=alive/Nms"
+            // strings and is therefore alphabetical: the 2026-10-25 19:53 export
+            // has dns1=alive/709ms sangtacviet.app=alive/1580ms
+            // sangtacviet.com=alive/688ms -- the fastest mirror last, and the
+            // reader told a star is instant. A ping the site has not measured
+            // sorts behind every one it has.
+            var order = known.filter(function (entry) {
+                return entry && typeof entry.name === 'string';
+            }).slice();
+            order.sort(function (a, b) {
+                var pa = typeof a.ping === 'number' && isFinite(a.ping) ? a.ping : Infinity;
+                var pb = typeof b.ping === 'number' && isFinite(b.ping) ? b.ping : Infinity;
+                if (pa === pb) { return 0; }
+                return pa < pb ? -1 : 1;
+            });
+            var ranked = [];
+            for (var r = 0; r < order.length; r++) {
+                ranked.push((r + 1) + '.' + order[r].name + '=' + order[r].status + '/'
+                    + order[r].ping + 'ms');
+            }
+            note('DOMAIN', label + ' ranked ' + ranked.join(' '));
         }
 
         function usedHost() {
@@ -13022,10 +13059,28 @@ enum SitePatch {
                 toast('设置模块还没准备好，稍后再试');
                 return false;
             }
+            // The property write IS the save: `app.config.ux` is built with one
+            // __defineSetter__ per key and that setter calls saveUxSetting itself
+            // (app.v2.config.js:77-82). saveUxSetting is looked up above as a
+            // readiness check, not to be called again here.
             app.config.ux.app_domain = host;
             note('DOMAIN', 'probe picked ' + host + ' as the line');
             toast('线路已设为 ' + shortName(host));
             return true;
+        }
+
+        // The row listens for clicks in the capture phase, so this decides
+        // whether a tap belongs to the 设为线路 control nested inside it.
+        function pickOf(node, row) {
+            var cursor = node;
+            while (cursor && cursor !== row) {
+                if (cursor.className
+                    && String(cursor.className).indexOf('stv-domainprobe-pick') >= 0) {
+                    return cursor;
+                }
+                cursor = cursor.parentNode;
+            }
+            return null;
         }
 
         function makeRow(host, page) {
@@ -13052,13 +13107,21 @@ enum SitePatch {
             row.appendChild(pick);
             row.__stvValue = value;
 
+            // One handler owns the tap. The row has to listen in the capture
+            // phase to keep the tap away from the site's own handlers, and a
+            // capture listener on the row runs before anything inside it does.
+            // stopPropagation() there does not merely mute the bubble: it keeps
+            // the event from reaching the target at all, so a second listener on
+            // `pick` never ran. The 2026-10-25 19:53 export shows what that
+            // costs -- three taps on 设为线路 (19:52:57, 19:53:00, 19:53:01), no
+            // "probe picked" line for any of them, and each row re-measured
+            // instead, because the row handler had already taken the tap.
+            // A capture listener on `pick` would not help either: the row's runs
+            // first. So the control is dispatched from here.
             row.addEventListener('click', function (event) {
                 stop(event);
+                if (pickOf(event.target, row) && choose(host)) { paint(row); return; }
                 measure(row);
-            }, true);
-            pick.addEventListener('click', function (event) {
-                stop(event);
-                if (choose(host)) { paint(row); }
             }, true);
             return row;
         }

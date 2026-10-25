@@ -164,18 +164,32 @@ function makeElement(tagName) {
     // `{ capture: true }` because ui.smtab()'s bubble-phase touchstart on the
     // inventory tab stops propagation; the stub keeps the two phases apart the
     // same way a real target would run them (capture first).
+    //
+    // The third argument is `true` in most blocks -- the boolean shorthand is
+    // the same thing to a browser and used to be silently ignored here, which
+    // put every capture handler in the bubble bucket. That is how 设为线路
+    // stayed dead through 989 green assertions: the row's capture handler looked
+    // like a bubble handler, so a child's click reached the child first.
     addEventListener(type, handler, options) {
-      const capture = Boolean(options && typeof options === 'object' && options.capture);
+      const capture = options === true
+        || Boolean(options && typeof options === 'object' && options.capture);
       const bucket = capture ? this.captureListeners : this.listeners;
       bucket[type] = (bucket[type] || []).concat([handler]);
     },
     removeEventListener() {},
     // The injected blocks attach click handlers to buttons they create, so the
     // stub has to be able to fire them.
+    //
+    // Both phases run, in phase order: one node's listeners are reached before
+    // any propagation decision matters, and a real `stopPropagation()` does not
+    // keep the *same* node's other listeners from running (only
+    // stopImmediatePropagation does). `__capture` on the event still forces the
+    // capture bucket first for the callers that already relied on it.
     __fire(type, event) {
-      const capture = Boolean(event && typeof event === 'object' && event.__capture);
-      const handlers = (capture ? this.captureListeners : this.listeners)[type] || [];
-      for (const handler of handlers) { handler(event); }
+      const phases = [this.captureListeners[type] || [], this.listeners[type] || []];
+      for (const handlers of phases) {
+        for (const handler of handlers) { handler(event); }
+      }
     },
     // The download-list jump drives the tab bar by dispatching a click on the
     // tabitem, exactly as a finger would. Set `__capture: true` on the event to
@@ -1641,6 +1655,16 @@ async function testDiagPanel() {
   sandbox.console.log('hello from the site');
   check('the console is captured while logging is on',
     diag.text().includes('hello from the site'), diag.text().slice(-200));
+  // The site logs its whole book list on every load: the 2026-10-25 19:53 export
+  // carries one 36 676-character `[LOG] Booklist loaded` line -- 49% of a 75 KB
+  // file for a line whose first 200 characters say everything. MAX bounds the
+  // number of lines, never the length of one, so one call could push the rest of
+  // the session out of the buffer.
+  sandbox.console.log('x'.repeat(5000));
+  const capped = diag.lines().filter((line) => line.indexOf('xxxxx') >= 0).pop() || '';
+  check('a runaway console line is capped instead of kept whole',
+    capped.length > 0 && capped.length < 1400 && /…\[\+\d+\]$/.test(capped),
+    JSON.stringify([capped.length, capped.slice(-16)]));
   diag.hide();
   check('hiding closes the panel', panel.style.display === 'none');
   diag.show();
@@ -3840,6 +3864,36 @@ async function testDomainFailover() {
     stall.window.__stvDiag.text().indexOf(' ranked ') >= 0,
     stall.window.__stvDiag.text().slice(-400));
 
+  // "ranked" has to mean ordered by the ping. It used to print `parts.sort()`,
+  // which sorts the formatted "host=alive/Nms" strings -- alphabetical -- and
+  // the 2026-10-25 19:53 device export shows what that reads like:
+  // dns1=alive/709ms sangtacviet.app=alive/1580ms sangtacviet.com=alive/688ms,
+  // the fastest mirror last. These three hosts are in the opposite order
+  // alphabetically, so an alphabetical sort cannot pass here.
+  const rank = makeSandbox();
+  const rankApp = installFakeApp(rank, {
+    displayType: 'pageflip',
+    networkManager: {
+      domains: [
+        { name: 'https://sangtacviet.app', status: 'alive', ping: 1580 },
+        { name: 'https://dns1.stv-appdomain-00000001.org', status: 'alive', ping: 709 },
+        { name: 'https://sangtacviet.com', status: 'alive', ping: 688 },
+      ],
+      defaultDomains: ['https://sangtacviet.com', 'https://sangtacviet.app'],
+      bestDomain() { return 'https://sangtacviet.com'; },
+    },
+  });
+  vm.runInContext(loadBlocks().join('\n'), rank);
+  await tick(300);
+  rankApp.net.networkManager.bestDomain();
+  const rankedLine = rank.window.__stvDiag.lines()
+    .filter((line) => line.indexOf(' ranked ') >= 0).pop() || '';
+  check('the ranking is ordered by ping, not by the host alphabet',
+    rankedLine.indexOf('1.https://sangtacviet.com=alive/688ms') > 0
+      && rankedLine.indexOf('2.https://dns1.stv-appdomain-00000001.org=alive/709ms') > 0
+      && rankedLine.indexOf('3.https://sangtacviet.app=alive/1580ms') > 0,
+    rankedLine);
+
   // A request that is not aimed at one of the site's own mirrors must not be
   // able to ban one: translation and cover fetches fail all the time.
   const external = makeSandbox();
@@ -4659,10 +4713,18 @@ async function testDomainProbeRows() {
   const pick = rows[1].children.filter(
     (node) => String(node.className).indexOf('stv-domainprobe-pick') >= 0)[0];
   check('every row carries its own 设为线路 control', !!pick);
-  click(pick);
+  // A real tap, not `click()`: the row owns the tap in the capture phase, so a
+  // click that only reaches the pick's own listener proves nothing about the
+  // device. With the capture path modelled, a row handler that calls
+  // stopPropagation() and leaves the child to fend for itself fails here.
+  const probesBefore = probes.length;
+  clickThrough(pick);
   check('and it writes the site own setting, which persists',
     app.config.ux.app_domain === FAST && saved.indexOf(FAST) >= 0,
     JSON.stringify({ value: app.config.ux.app_domain, saved }));
+  check('and the tap on 设为线路 does not fall through to a measurement',
+    probes.length === probesBefore,
+    JSON.stringify(probes.slice(probesBefore)));
   check('the chosen line is marked in the list',
     valueOf(FAST).indexOf('●') === 0, valueOf(FAST));
 
@@ -6763,6 +6825,52 @@ function click(node) {
     stopPropagation() {},
     stopImmediatePropagation() {},
   });
+}
+
+/**
+ * Click travelled the way a finger travels: the capture listeners of every
+ * ancestor, then the target, then the bubble listeners back up -- and a
+ * stopPropagation() in the capture phase really does keep the target's own
+ * listeners from running.
+ *
+ * `click()` models none of that: it fires the node's own listeners and gives
+ * `stopPropagation` nothing to stop. A handler that swallows the clicks of a
+ * control nested inside it therefore looks healthy under `click()` and is dead
+ * on the device -- which is exactly what 设为线路 was until 2026-10-25.
+ */
+function clickThrough(node) {
+  const path = [];
+  for (let cursor = node; cursor; cursor = cursor.parentNode) { path.unshift(cursor); }
+  const target = path[path.length - 1];
+  const event = {
+    type: 'click',
+    target: node,
+    stopped: false,
+    preventDefault() {},
+    stopPropagation() { this.stopped = true; },
+    // Modelled as "stop the event", not "stop the rest of this node": the two
+    // differ only for a node with several handlers in the same phase, and no
+    // block under test registers two.
+    stopImmediatePropagation() { this.stopped = true; },
+  };
+  const run = (list) => {
+    for (const handler of list || []) {
+      if (event.stopped) { return; }
+      handler(event);
+    }
+  };
+  for (const ancestor of path.slice(0, -1)) {
+    if (event.stopped) { break; }
+    run(ancestor.captureListeners.click);
+  }
+  if (!event.stopped) {
+    run(target.captureListeners.click);
+    run(target.listeners.click);
+  }
+  for (let i = path.length - 2; i >= 0 && !event.stopped; i--) {
+    run(path[i].listeners.click);
+  }
+  return event;
 }
 
 /** The Edge translatetext shape: one object per input string. */

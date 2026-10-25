@@ -6211,3 +6211,80 @@ host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站
    `POST …/mobile/userinfo.php?rescan=true`；登录成功后应出现一行
    `POST …/index.php?ajax=login retired N stored profile answer(s)`。若仍是两条 `(shared)`，
    说明 `bypassCache` 和我以为的不是同一件事。
+
+### 6.65 19:53 日志：「设为线路」是死按钮，外加三处日志自己在说假话
+
+前一轮那两处修在日志里都生效了：`(shared)` 出现 0 次（上一份 2 次），11 次 `?rescan=true` 各自
+独立，三条线路各回各的 454 字节；`19:52:46 [CACHE] POST …/index.php?ajax=login retired 3 stored
+profile answer(s)`。下面这四条是同一份日志里另外的东西。
+
+#### 6.65.1 「设为线路」点了完全没用
+
+证据：`19:52:57` / `19:53:00` / `19:53:01` 三次 `tap div.stv-domainprobe-pick`，全篇没有一行
+`[DOMAIN] probe picked`；每一次点下去反而把按钮所在那一行重测了一遍（81–83 是 dns1，85–87 是
+.com，89–91 是 .app）—— 那是**行**的动作，不是按钮的动作。
+
+原因：行的 click 监听注册在**捕获**阶段（`addEventListener('click', fn, true)`），父节点先于子节点
+跑，而它的第一件事是 `stopPropagation()`。捕获阶段的 `stopPropagation()` 不是「只掐掉冒泡」，它让
+事件根本到不了目标，所以 `pick` 自己的监听永远不执行。给 `pick` 也加捕获监听也没用 —— 行的先跑。
+
+修法：行是唯一 handler，用 `pickOf(event.target, row)` 判断这一下是不是落在那个控件上：是就走
+`choose()` 再 `paint(row)`，不是才 `measure(row)`。
+
+顺带解释了同一段日志里另外三行 `tap div.settingitemtitle`（62/72/76）：`describe()` 只打 class，
+而「测速全部线路」那一行和每条线路行的标题都是 `settingitemtitle`。62 是那条 run 行（三条一起测，
+69–71 就是被落在后面的 .app），72/76 是两条线路行的标题（各测一条）。
+
+#### 6.65.2 收回上一轮的第 2 项：`choose()` 不需要调 `saveUxSetting`
+
+我上一轮报的「`choose()` 从没调用 `saveUxSetting()`，所以选择不会持久化」是**误报**。`app.config.ux`
+是逐键 `__defineSetter__` 建的，setter 自己就调 `app.config.saveUxSetting()`（`app.v2.config.js:77-82`），
+所以那句属性赋值**就是**持久化；`typeof … === 'function'` 只是就绪判断。测试替身早就这么建模
+（`set(value){ this._app_domain = value; app.config.saveUxSetting(); }`），代码里 12806 行的注释也
+早就写对了。已在 `choose()` 里写明这一点，免得下次再有人（包括我）"修"一遍。
+
+#### 6.65.3 988 条断言为什么看不见它
+
+测试替身有两处偏离浏览器，正好把这一类 bug 藏住：
+
+1. `addEventListener(type, handler, true)` 的**布尔简写不认**，只认 `{capture:true}` 对象，于是
+   所有捕获监听都落进了冒泡桶；
+2. `click(node)` 只触发该节点自己的监听，`stopPropagation` 是空函数，没有祖先链可走。
+
+于是 `click(pick)` 直接命中 `pick` 自己的监听 —— 测试绿，真机死。
+
+修法三处：替身按布尔 `true` 认捕获；`__fire` 两个阶段都跑（同一个节点上 `stopPropagation` 本来
+就不拦它的其它监听，只有 `stopImmediatePropagation` 拦）；新增 `clickThrough(node)`，走「祖先捕获
+→ 目标 → 祖先冒泡」并让捕获阶段的 stop 真的截断。
+
+这条守卫**验证过会咬人**：把行的 handler 退回旧写法跑一遍，`clickThrough` 下 3 条断言 FAIL
+（`app_domain` 仍是 `auto`、`saved` 为空、那一行被重测）。
+
+#### 6.65.4 `ranked` 不是按速度排的
+
+`19:52:35 [DOMAIN] networkManager ranked dns1=alive/709ms https://sangtacviet.app=alive/1580ms
+https://sangtacviet.com=alive/688ms` —— 最快的 `.com` 排在最后。原因：`parts.sort()` 排的是
+`"host=alive/Nms"` 整串，那是字母序（dns1 < sangtacviet.app < sangtacviet.com），不是名次。
+改成按 ping 升序打印并带名次（`1.… 2.…`），站点没测过的那台排最后；去重键仍是原来那串名字
+快照（含 ping），所以日志行数不变。
+
+#### 6.65.5 一行日志占了半个文件
+
+`19:52:37 [LOG] Booklist loaded` 一行 **36 676 字符**，占这份 75 KB 日志的 49%。`MAX = 800` 限的
+是行数，不是行长，而 `tee` 把 `console.log` 的参数原样交上去。新增 `LINE_MAX = 1000`，在 `raw()`
+里截断并标 ` …[+N]` —— 放在 `raw()` 而不是 `tee()`，是为了连原生批量行和所有 `note()` 一起护住。
+
+#### 6.65.6 这一轮怎么验
+
+JS 断言 988 → **991**。四个守卫全绿：shim 30 块 / 680242 字节 / 141 markers；site-patch 991 条
+0 失败；i18n 461 labels / 76 fragments in sync；site-assets 8 文件 / 906296 字节 in sync。
+
+真机上验两件事：
+
+1. 设置 → 网络 → 域名，点某一行的「设为线路」：应当出现 `[DOMAIN] probe picked <host> as the
+   line`，那一行前面出现 `●`，并且**不再**触发测速（该次点击不产生新的 `probe <host>:` 行）。
+2. 下一次导出日志：`ranked` 那行从 `1.` 开始按 ms 升序；任何超长行末尾带 `…[+N]`，整份日志不再
+   出现「75 KB 里 36 KB 是书单」。
+
+仍未动：trxs 封面 403（§6.64.3，没有证据就不改）。
+
