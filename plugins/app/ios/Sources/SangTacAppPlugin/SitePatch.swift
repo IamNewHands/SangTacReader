@@ -3392,6 +3392,26 @@ enum SitePatch {
             } catch (e) { return ''; }
         }
 
+        // The origin of `window.STV_SERVER`, the domain app.v2.js:1 ships with --
+        // the host this page's own assets came from. Kept to the site's mirror
+        // list (`list`), so a stale or tampered constant answers '' rather than
+        // sending the app somewhere the site does not own. `failureHints` reads
+        // the same constant for the login pin and the code-7 sentence; the three
+        // copies are deliberate -- each block is its own closure, and a shared
+        // helper would have to be a third global.
+        function shippedDomain(list) {
+            var server = '';
+            try { server = String(window.STV_SERVER || ''); } catch (e) { server = ''; }
+            var i = server.indexOf('://');
+            if (i < 0) { return ''; }
+            var rest = server.slice(i + 3);
+            var cut = rest.indexOf('/');
+            if (cut >= 0) { rest = rest.slice(0, cut); }
+            var host = rest ? server.slice(0, i + 3) + rest : '';
+            if (!host) { return ''; }
+            return (list || []).indexOf(host) >= 0 ? host : '';
+        }
+
         // ---- the mirror a login has to use -----------------------------------
         //
         // The 2026-10-25 17:56 device log, 域名=auto: the page came from
@@ -3639,6 +3659,27 @@ enum SitePatch {
                     note('DOMAIN', label + ' remembered mirror ' + good.name
                         + ' did not answer the fresh probe, dropping it');
                     forgetGood(good.name);
+                }
+                // Next guess: the domain this app ships with. `STV_SERVER` is
+                // `app.v2.js:1`, the host the page's own assets came from, so it
+                // is alive by construction and needs no probe. The 2026-10-25
+                // 17:17 log is why it goes before the page origin: the page was
+                // served by `.com`, and `.com` answered `readchapter` with
+                // `{"code": 7,"time": 1000}` -- as did `dns1` -- while `.app`
+                // answered `code 0` with the chapter. Being the page's own origin
+                // is not evidence that a host hands over chapters, and finding
+                // out costs 5.5s + 4.1s of `grantcontext`. Checked against `list`
+                // so a stale constant cannot point the app at a foreign host, and
+                // reached only when nothing has served a chapter yet: a
+                // remembered mirror still outranks it.
+                var shipped = shippedDomain(list);
+                if (shipped && !banned[shipped] && !rememberedGone(this, shipped)) {
+                    if (!noted['shipped:' + shipped]) {
+                        noted['shipped:' + shipped] = true;
+                        note('DOMAIN', label + ' app domain ' + shipped
+                            + ' outranks the page origin: it is the host this app ships with');
+                    }
+                    return shipped;
                 }
                 // Next guess: the page's own origin, which is at least a proved
                 // liveness signal (this page was served by it) even though

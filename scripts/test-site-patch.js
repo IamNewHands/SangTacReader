@@ -4184,6 +4184,43 @@ async function testPageOriginPinning() {
       .indexOf('page origin ' + PAGE + ' outranks the ping race') >= 0,
     String(first.sandbox.window.__stvDiag.text() || '').slice(-300));
 
+  // --- the domain the app ships with comes before the page origin ----------
+  // `.com` served the page and answered `{"code": 7,"time": 1000}` to the
+  // chapter; the domain in `window.STV_SERVER` answered `code 0` with it. A cold
+  // start should not spend 5.5s + 4.1s of `grantcontext` learning that again.
+  const shipped = build();
+  shipped.sandbox.window.location = { origin: PAGE };
+  shipped.sandbox.window.STV_SERVER = APP;
+  vm.runInContext(loadBlocks().join('\n'), shipped.sandbox);
+  await tick(300);
+  check('the domain the app ships with outranks the page origin',
+    shipped.app.net.networkManager.bestDomain() === APP,
+    shipped.app.net.networkManager.bestDomain());
+  check('and the panel says why',
+    String(shipped.sandbox.window.__stvDiag.text() || '')
+      .indexOf('app domain ' + APP + ' outranks the page origin') >= 0,
+    String(shipped.sandbox.window.__stvDiag.text() || '').slice(-300));
+
+  const staleShipped = build();
+  staleShipped.sandbox.window.location = { origin: PAGE };
+  staleShipped.sandbox.window.STV_SERVER = 'https://mirror.example';
+  vm.runInContext(loadBlocks().join('\n'), staleShipped.sandbox);
+  await tick(300);
+  check('a shipped domain the site does not list is ignored',
+    staleShipped.app.net.networkManager.bestDomain() === PAGE,
+    staleShipped.app.net.networkManager.bestDomain());
+
+  const shippedVsRemembered = build();
+  shippedVsRemembered.sandbox.window.location = { origin: PAGE };
+  shippedVsRemembered.sandbox.window.STV_SERVER = APP;
+  shippedVsRemembered.sandbox.localStorage.setItem('stv.domain.good',
+    JSON.stringify({ name: FAST, at: Date.now() }));
+  vm.runInContext(loadBlocks().join('\n'), shippedVsRemembered.sandbox);
+  await tick(300);
+  check('a mirror that already served a chapter still outranks the shipped domain',
+    shippedVsRemembered.app.net.networkManager.bestDomain() === FAST,
+    shippedVsRemembered.app.net.networkManager.bestDomain());
+
   // --- a page origin that refuses is still walked past ----------------------
   const refused = build();
   refused.sandbox.window.location = { origin: PAGE };
@@ -4376,9 +4413,12 @@ async function testLoginPinning() {
   release('success');
   const answer = await pending;
   check('the answer still reaches the site unchanged', answer === 'success', String(answer));
-  check('the pin is gone once the answer is in, so chapters keep their line',
-    !auto.sandbox.window.__stvLoginHost
-      && auto.app.net.networkManager.bestDomain() === PAGE,
+  check('the pin is gone once the answer is in',
+    !auto.sandbox.window.__stvLoginHost, String(auto.sandbox.window.__stvLoginHost));
+  check('and the request path is back on the ordinary rules: the app domain, not the pin',
+    auto.app.net.networkManager.bestDomain() === APP
+      && String(auto.sandbox.window.__stvDiag.text() || '')
+        .indexOf('outranks the page origin: it is the host this app ships with') >= 0,
     JSON.stringify([auto.sandbox.window.__stvLoginHost,
       auto.app.net.networkManager.bestDomain()]));
 
@@ -4386,7 +4426,11 @@ async function testLoginPinning() {
   const others = build();
   const untouched = [];
   others.app.net.post = function (url) {
-    untouched.push({ url, during: others.app.net.networkManager.bestDomain() });
+    untouched.push({
+      url,
+      during: others.app.net.networkManager.bestDomain(),
+      pin: others.sandbox.window.__stvLoginHost,
+    });
     return Promise.resolve('{"id":"1"}');
   };
   vm.runInContext(loadBlocks().join('\n'), others.sandbox);
@@ -4394,7 +4438,7 @@ async function testLoginPinning() {
   await others.app.net.post('/mobile/userinfo.php', '');
   check('a request that is not a login keeps the address the site gave it',
     untouched.length === 1 && untouched[0].url === '/mobile/userinfo.php'
-      && untouched[0].during === PAGE,
+      && !untouched[0].pin,
     JSON.stringify(untouched));
 
   // --- 域名=.com picked by hand: still not the login's business -------------
