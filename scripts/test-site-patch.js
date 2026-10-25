@@ -4055,7 +4055,10 @@ async function testFailureHints() {
   const first = app.reader.handlingException({ code: 7, time: 1000 }, view);
   check('code 7 sends the reader to the line setting instead of the phone',
     alerts.length === 1 && alerts[0].msg.indexOf('线路不可用') >= 0
-      && alerts[0].msg.indexOf('sangtacviet.com') >= 0, JSON.stringify(alerts));
+      && alerts[0].msg.indexOf('sangtacviet.app') >= 0, JSON.stringify(alerts));
+  check('and no longer names the host that answered code 7 itself',
+    alerts.length === 1 && alerts[0].msg.indexOf('sangtacviet.com') < 0,
+    JSON.stringify(alerts[0]));
   check('the sentence that blamed the device is gone',
     alerts.length === 1 && alerts[0].msg.indexOf(SITE_TEXT) < 0, JSON.stringify(alerts));
   check('the alert keeps the site view, so its reload button still works',
@@ -4089,6 +4092,15 @@ async function testFailureHints() {
   check('and every other alert is passed through word for word',
     alerts.length === 4 && alerts[3].msg === '站点自己的别的提示',
     JSON.stringify(alerts[3]));
+
+  // The name in that sentence follows the site's own constant, so a rotated
+  // domain does not leave the reader picking a host the app no longer uses.
+  sandbox.window.STV_SERVER = 'https://sangtacviet.net';
+  app.reader.handlingException({ code: 7 }, view);
+  check('the line the sentence names comes from STV_SERVER, not from a literal',
+    alerts.length === 5 && alerts[4].msg.indexOf('sangtacviet.net') >= 0
+      && alerts[4].msg.indexOf('sangtacviet.app') < 0,
+    JSON.stringify(alerts[4]));
 
   // --- login / register captcha --------------------------------------------
   nextAnswer = 'captcha';

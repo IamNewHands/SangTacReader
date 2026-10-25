@@ -6054,6 +6054,7 @@ key 属于**书**。上一轮 §6.60 那条「页面 origin 优先」正是在�
 | `bestDomain()` 先答这个 pin，优先于手工选的线路、记住的镜像、页面 origin、竞速 | `domainFailover` → `patchBestDomain` | 读者要的就是「登录时不看那个选择」。章节仍然按原逻辑挑线路，pin 只活到这次请求结束 |
 | 主机不在站点自己的镜像表里就不 pin | `failureHints` → `loginHost` + `mirrorNames` | `STV_SERVER` 是站点常量，不是「我们写死的名字」；万一它指向一个表外主机，那是指针过期，不能把密码送过去 |
 | 表里没有 `.app`、或本来就不是登录请求 | 同上 | 原样放行，并在面板写清「保持站点给的地址」 |
+| code 7 的提示改指 `window.STV_SERVER` 那台 | `failureHints` → `code7Hint()` | 原来写的是 `.com` —— 而 `.com` 正是日志里回 code 7 的那台，等于把读者指去加重故障。名字跟着站点常量走，不写死 |
 
 host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站点换域名时它跟着换，
 字面量 `https://sangtacviet.app` 只在常量缺失时兜底。**这也修正了 §6.62.4「非目标：不写死
@@ -6063,13 +6064,14 @@ host 取自 `window.STV_SERVER`（`app.v2.js:1`），不是写死字符串：站
 
 | 守卫 | 结果 |
 | --- | --- |
-| `scripts/check-ios-shim.js` | 30 块 / 669959 字节 / 141 标记 |
-| `scripts/test-site-patch.js` | **978 条断言** / 0 失败（新增 10 条） |
+| `scripts/check-ios-shim.js` | 30 块 / 670612 字节 / 141 标记 |
+| `scripts/test-site-patch.js` | **980 条断言** / 0 失败（新增 12 条） |
 
 新增断言：auto 下登录发往 `.app` 而不是页面 origin 那台、请求进行中 `bestDomain()` 也答 `.app`、
 面板写明「登录不看域名」、答案仍原样交给站点、答完 pin 清掉（章节照旧用页面 origin）、
 非登录请求原样放行、手工选 `.com` 也不影响登录、`.app` 回的 captcha 仍报且带上主机名、
-镜像表外的主机不给密码、此时面板说「线路选择有效」。
+镜像表外的主机不给密码、此时面板说「线路选择有效」、code 7 的句子不再点 `.com`、
+句子里那台主机名确实来自 `STV_SERVER`。
 
 ### 6.63.4 仍需真机确认
 

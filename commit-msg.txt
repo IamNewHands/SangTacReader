@@ -1,13 +1,9 @@
-修复 CI：语言守卫的改动要落在生成器里，不是 SiteI18nData.swift
+code 7 的提示不再把读者指去 .com —— 那正是回 code 7 的那台
 
-#187 挂在 step 8：`SiteI18nData.swift is out of sync with data/site-i18n.json`。
-那份 Swift 文件是 `scripts/gen-site-i18n.js` 的产物（整个中文覆盖脚本都是它生成的），
-上一轮直接改了产物，CI 的 `--check` 立刻发现——守卫是对的，改错了地方。
+原来那句写死「请到设置里选 sangtacviet.com」，而 2026-10-25 日志里 .com 自己就是回
+{"code": 7} 的主机；读者照着做只会再撞一次。现在句子里那台主机名取自 window.STV_SERVER
+（站点自己的常量，常量缺失时退回 https://sangtacviet.app），与登录固定的那台同一个来源。
 
-- 把 URL_VALUE 判断与 `[DOMAIN] the 线路 row hands its host …` 那段搬进
-  `scripts/gen-site-i18n.js` 的模板，重新生成产物。
-- 模板是一整个 JS 模板字符串，注释里写反引号会直接掐断它（第一次 regenerate 就
-  SyntaxError）。本轮注释一律不用反引号。
-
-本地：`gen-site-i18n --check` 同步（461 labels / 76 fragments / 92684 bytes）；
-`check-ios-shim` 30 块 / 662120 字节 / 141 标记；`test-site-patch` 968 条断言 0 失败。
+守卫：check-ios-shim 30 块 / 670612 字节；test-site-patch 980 条断言 0 失败
+（新增 2 条：句子不再出现 sangtacviet.com、主机名确实跟着 STV_SERVER 变）。
+docs/capacitor-port.md §6.63.2 / §6.63.3 同步。

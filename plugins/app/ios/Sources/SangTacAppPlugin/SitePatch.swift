@@ -12447,7 +12447,19 @@ enum SitePatch {
 
         // Verbatim from app.v2.read.js:747.
         var SITE_CODE7_TEXT = 'Thiết bị không phù hợp hoặc phiên bản ứng dụng đã lỗi thời';
-        var CODE7_HINT = '正文线路不可用（站点回 code 7）。请到「设置 → 网络 → 域名」选择 sangtacviet.com，或换一条网络后重试。';
+        // The line this sentence sends the reader to is the one the app itself
+        // came from, not a name written here: §6.63 has the site's own constant
+        // (`window.STV_SERVER`) as the only host that logs in AND serves
+        // chapters, and .com -- the name this used to print -- is the host that
+        // answered code 7 in the 2026-10-25 log. Telling the reader to pick it
+        // was advice to make the failure worse.
+        function code7Hint() {
+            var host = serverHost() || LOGIN_HOST;
+            var i = host.indexOf('://');
+            if (i >= 0) { host = host.slice(i + 3); }
+            return '正文线路不可用（站点回 code 7）。请到「设置 → 网络 → 域名」选择 '
+                + host + '，或换一条网络后重试。';
+        }
         var LOGIN_CAPTCHA_HINT = '登录没有完成：站点要求人机验证（captcha），App 内没有这个入口。请稍后再试。';
         var REGISTER_CAPTCHA_HINT = '注册没有完成：站点要求人机验证（captcha），App 内没有这个入口。请稍后再试。';
 
@@ -12476,7 +12488,7 @@ enum SitePatch {
                 var text = String(msg === undefined || msg === null ? '' : msg);
                 if (text === SITE_CODE7_TEXT) {
                     note('DOMAIN', 'the code-7 device sentence was replaced with the line hint');
-                    return original.call(this, CODE7_HINT, view);
+                    return original.call(this, code7Hint(), view);
                 }
                 return original.call(this, msg, view);
             };
@@ -12493,7 +12505,7 @@ enum SitePatch {
                 var code = x ? String(x.code) : '';
                 if (code !== '7') { return original.apply(this, arguments); }
                 note('DOMAIN', 'code 7 survived every mirror; telling the reader which line to pick');
-                var text = CODE7_HINT;
+                var text = code7Hint();
                 // The site's own words survive when it had any: they are the only
                 // thing that tells one refusal from another on the device.
                 if (x && (x.err || x.info)) {
