@@ -301,11 +301,24 @@ async function getChapterListOnline(host,id,force){
 }
 async function getChapterList(host,id,force){
 	var cacheKey = `chapterList_${host}_${id}`;
-	if(app.platform.haveNetwork){
-		var clist = await getChapterListOnline(host,id,force);
-		if(clist.length > 0){
-			app.storage.cache.set(cacheKey,JSON.stringify(clist));
-			return clist;
+	// offline: the stored list is all we have, do not wait for a request that
+	// cannot succeed (this is what makes downloaded books readable without network)
+	if(navigator.onLine !== false && app.platform.haveNetwork){
+		try{
+			var clist = await Promise.race([
+				getChapterListOnline(host,id,force),
+				new Promise(function(resolve){
+					setTimeout(function(){
+						resolve([]);
+					}, app.chapterListTimeout || 12000);
+				})
+			]);
+			if(clist.length > 0){
+				app.storage.cache.set(cacheKey,JSON.stringify(clist));
+				return clist;
+			}
+		}catch(e){
+			console.log(e);
 		}
 	}
 	var chapterList = await app.storage.cache.getCacheOrPersist(cacheKey);
@@ -334,7 +347,34 @@ async function getchapterlist(host,id,force,container, touchOffset = 90, compare
 	var preloader = app.createPreloader("Đang tải...");
 	container.appendChild(preloader);
 	var list = await getChapterList(host,id,force);
-	container.removeChild(preloader);
+	// the page can be closed (or re-initialised) while the list is loading
+	if(preloader.parentNode == container){
+		container.removeChild(preloader);
+	}
+	if(!container.isConnected){
+		return;
+	}
+	// a downloaded book can always be read: if the chapter list itself is not
+	// cached (expired cache, old download), build it from the downloaded chapters
+	if(list.length == 0 && app.offlineBook && app.offlineBook.isBookExist(host,id)){
+		try{
+			var offlineOnly = app.offlineBook.getExistedBook({host: host, id: id});
+			if(offlineOnly){
+				var downloadedIds = await offlineOnly.getChapterDownloaded();
+				if(downloadedIds.length == 0){
+					downloadedIds = await offlineOnly.getChapterDownloadedWithOldBug();
+				}
+				list = downloadedIds.map(function(cid){
+					return {
+						cid: cid,
+						title: app.text.w.chapter + " " + cid,
+					};
+				});
+			}
+		}catch(e){
+			console.log(e);
+		}
+	}
 	if(list.length == 0){
 		container.appendChild(app.createNodata("Không thể tải danh sách chương!"))
 		return;
@@ -351,11 +391,13 @@ async function getchapterlist(host,id,force,container, touchOffset = 90, compare
 		container.appendChild(part);
 		app.applySleepWake(part, obs);
 		partContent.className = "clistpart";
+		// the observer sleeps a part by removing its content: keep the holder so
+		// rows are never written into a detached node
+		partContent.parentPart = part;
 		return partContent;
 	}
 	var elecount = 0;
 	var maxPerPart = 50;
-	var currentPart = createPart();
 	var offsetFromTop = 0;
 	var isCompareBigInt = false;
 	var lastreadNum = parseInt(lastread);
@@ -370,8 +412,53 @@ async function getchapterlist(host,id,force,container, touchOffset = 90, compare
 			id: id
 		});
 		if(offlineBook){
-			downloadedList = arrToObj(await offlineBook.getChapterDownloadedWithOldBug());
+			// repaired books know their chapters: the shared "undefined" list of
+			// the old bug belongs to other books and must not mark foreign ids
+			var ownDownloaded = await offlineBook.getChapterDownloaded();
+			downloadedList = arrToObj(ownDownloaded.length > 0 ? ownDownloaded : await offlineBook.getChapterDownloadedWithOldBug());
+			// old downloads lost their chapter list: recover it from the files
+			// that are still on the device, then mark the rows that show up
+			if(offlineBook.baseObject.totalDownloaded > 0){
+				offlineBook.repairDownloadedChapters(list).then(function(ids){
+					if(!ids || !ids.length){
+						return;
+					}
+					var marked = arrToObj(ids);
+					container.qq(".clistpart > div").forEach(function(row){
+						if(row.getAttribute("cid") in marked){
+							row.classList.add("downloaded");
+						}
+					});
+				}).catch(function(e){
+					console.log(e);
+				});
+			}
 		}
+	}
+	// the first part must be created after the last await: a part that is
+	// observed while it is still empty counts as hidden, the observer sleeps it
+	// and every row would then be written into a detached node - that aborted
+	// the build after 50 chapters and left a list that could not scroll
+	var currentPart = createPart();
+	// the observer sleeps a part by removing its content: re-attach it before
+	// writing into it, otherwise parentElement is null and the build dies
+	var partHolder = function(){
+		var holder = currentPart.parentPart;
+		if(holder && !currentPart.parentElement){
+			holder.appendChild(currentPart);
+			holder.isSleep = false;
+			holder.sleepChild = [];
+		}
+		return currentPart.parentElement;
+	}
+	var closePart = function(){
+		var holder = partHolder();
+		if(holder){
+			holder.style.height = (elecount*40)+"px";
+			holder.setAttribute("offset", offsetFromTop);
+		}
+		offsetFromTop += elecount*40;
+		elecount = 0;
 	}
 	for(var i=0; i < list.length; i++){
 		var chap = list[i];
@@ -411,21 +498,51 @@ async function getchapterlist(host,id,force,container, touchOffset = 90, compare
 		currentPart.appendChild(r);
 		elecount++;
 		if(elecount >= maxPerPart){
-			currentPart.parentElement.style.height = (elecount*40)+"px";
-			currentPart.parentElement.setAttribute("offset", offsetFromTop);
-			offsetFromTop+=elecount*40;
+			closePart();
 			currentPart = createPart();
-			elecount = 0;
 		}
 	}
-	currentPart.parentElement.style.height = (elecount*40)+"px";
-	currentPart.parentElement.setAttribute("offset", offsetFromTop);
-	p.style.height = p.scrollHeight;
-	container.style.height = p.scrollHeight;
-	container.style.width = p.scrollWidth;
+	closePart();
+	// a list built while the page is still hidden (drawer opened during the page
+	// transition) has no scroll height yet: keep the css height and size it as
+	// soon as it has been laid out.
+	// the container is taken out of the flow, so it has to be pinned to the
+	// chapter list as well: an absolutely positioned box with auto left/width
+	// shrinks to fit the widest row, which pushed the rows past the drawer and
+	// stopped the names from being ellipsized
 	container.style.position = "absolute";
-	var divheight = p.scrollHeight - 40;
-	var scrollheight = 40 * list.length + 40  - p.scrollHeight;
+	container.style.top = "0";
+	container.style.left = "0";
+	container.style.width = "100%";
+	container.style.boxSizing = "border-box";
+	var totalHeight = 40 * list.length + 40;
+	var buildHeight = 0;
+	var applySize = function(){
+		var h = p.scrollHeight;
+		if(!h){
+			return;
+		}
+		buildHeight = h;
+		p.style.height = h;
+		container.style.height = h;
+		// never size to the content: a long chapter name would widen the list
+		container.style.width = "100%";
+		container.scrollheight = totalHeight - h;
+		container.divheight = h - 40;
+	};
+	applySize();
+	if(!buildHeight){
+		var sizeTries = 0;
+		var sizeTimer = setInterval(function(){
+			sizeTries++;
+			if(p.scrollHeight || sizeTries > 10){
+				clearInterval(sizeTimer);
+				applySize();
+			}
+		}, 300);
+	}
+	var divheight = (buildHeight || totalHeight) - 40;
+	var scrollheight = totalHeight - (buildHeight || totalHeight);
 	container.scrollheight = scrollheight;
 	container.divheight = divheight;
 	if(list.length > 50){
@@ -1246,6 +1363,14 @@ app.toast = function(msg){
 (function(app){
 	app.search = app.search || {};
 	app.search.minc = 0;
+	// 0 = no upper bound, the parameter is not sent at all
+	app.search.maxc = 0;
+	app.search.ignores = "";
+	app.search.ignoreStorageKey = "stv_search_ignores";
+	app.search.tagQuery = "";
+	app.search.tagCollapsed = true;
+	app.search.hostLimit = 12;
+	app.search.tagLimit = 24;
 	app.search.category = "";
 	app.search.findinname = "";
 	app.search.findincontent = "";
@@ -1271,6 +1396,9 @@ app.toast = function(msg){
 	}
 	app.search.reset = function(){
 		app.search.minc = 0;
+		app.search.maxc = 0;
+		app.search.tagQuery = "";
+		app.search.tagCollapsed = true;
 		app.search.category = "";
 		app.search.findinname = "";
 		app.search.findincontent = "";
@@ -1279,8 +1407,23 @@ app.toast = function(msg){
 		app.search.tag = [];
 		app.search.result = [];
 		app.search.page = 0;
-		this.assignView(app.topPageUntil('searchfilter'));
-		q("input.booksearch")[0].value = "";
+		var page = app.topPageUntil('searchfilter') || app.topPage();
+		if(!page || !page.classList || !page.classList.contains("fpage")){
+			page = null;
+		}
+		this.assignView(page);
+		if(page){
+			var tags = page.q(".taglist");
+			if(tags){
+				tags.innerHTML = "";
+			}
+			this.updateTagToggle(page);
+		}
+		var searchInput = q("input.booksearch")[0];
+		if(searchInput){
+			searchInput.value = "";
+			this.updateSearchClear();
+		}
 	}
 	app.search.select = function(e,t){
 		if(!e || !e.hasAttribute("v")){
@@ -1315,7 +1458,6 @@ app.toast = function(msg){
 	app.search.applyfilter = function(){
 		var p = app.topPage();
 		this.findincontent = p.q(".findincontent").value;
-		this.host = (p.q(".hostselect") || "").value || "";
 		//app.search.get(true);
 		this.doNewQuery();
 		app.goback();
@@ -1323,15 +1465,235 @@ app.toast = function(msg){
 	app.search.assignView = function(t){
 		if(!t) return;
 		this.select(t.q(`.minc[v="${this.minc}"]`));
+		this.select(t.q(`.maxc[v="${this.maxc || 0}"]`));
 		this.select(t.q(`.category[v="${this.category}"]`));
 		this.select(t.q(`.sort[v="${this.sort}"]`));
 		this.select(t.q(`.step[v="${this.step}"]`));
 		t.q(`.findincontent`) && (t.q(`.findincontent`).value = this.findincontent);
-		t.q(`.hostselect`) && (t.q(`.hostselect`).value = this.host);
+		this.renderIgnoreSummary(t);
+		var tagfilter = t.q(".tagfilter");
+		if(tagfilter){
+			tagfilter.value = this.tagQuery = "";
+		}
+		this.tagCollapsed = true;
+		this.renderHosts(t);
+		t.qq(".taglist .tag").forEach(function(e){
+			e.removeAttribute("selected");
+			e.classList.remove("thidden");
+		});
 		for(var i=0; i<this.tag.length; i++){
 			var tag = t.q(`.tag[v="${this.tag[i]}"]`);
 			tag && tag.setAttribute("selected", "true");
 		}
+	}
+	// ---- skipped keywords ---------------------------------------------------
+	// the list is saved so the user does not have to type it again on every launch
+	app.search.normalizeIgnores = function(raw){
+		var parts = String(raw || "").split(/[,\n\r;]+/);
+		var seen = {};
+		var list = [];
+		for(var i = 0; i < parts.length; i++){
+			var word = parts[i].trim();
+			if(!word){
+				continue;
+			}
+			var key = word.toLowerCase();
+			if(seen[key]){
+				continue;
+			}
+			seen[key] = true;
+			list.push(word);
+		}
+		return list;
+	}
+	app.search.ignoreList = function(){
+		return this.normalizeIgnores(this.ignores);
+	}
+	app.search.loadIgnores = function(){
+		var raw = "";
+		try{
+			raw = app.storage.getItem(this.ignoreStorageKey) || "";
+		}catch(e){}
+		this.ignores = this.normalizeIgnores(raw).join(", ");
+	}
+	app.search.setIgnores = function(raw){
+		var list = this.normalizeIgnores(raw);
+		this.ignores = list.join(", ");
+		try{
+			app.storage.setItem(this.ignoreStorageKey, this.ignores);
+		}catch(e){}
+		this.renderIgnoreSummary(app.topPage());
+	}
+	app.search.renderIgnoreSummary = function(page){
+		page = page || app.topPage();
+		var btn = page && page.q(".ignorebtn");
+		if(!btn){
+			return;
+		}
+		var list = this.ignoreList();
+		var label = btn.q(".ignorelabel");
+		var count = btn.q(".ignorecount");
+		if(label){
+			label.textContent = list.length ? list.join(", ") : "Chưa có từ khoá nào";
+		}
+		if(count){
+			count.textContent = list.length ? String(list.length) : "";
+		}
+		btn.classList.toggle("empty", list.length === 0);
+	}
+	app.search.editIgnores = function(){
+		var list = this.ignoreList();
+		var template = {
+			title: "Từ khoá loại trừ",
+			body: `<div class="ignorehint">Mỗi dòng một từ khoá (hoặc cách nhau bằng dấu phẩy).<br>Truyện chứa các từ này sẽ bị ẩn khỏi kết quả.</div>
+				<textarea class="ignorelist browser-default" rows="6" placeholder="Đấu La&#10;Trọng sinh"></textarea>`,
+			button: `<button action=cancel>Hủy</button><button action=apply>Lưu</button>`,
+			action: {
+				apply: function(p){
+					app.search.setIgnores(p.q(".ignorelist").value);
+					this.cancel(p);
+				},
+				cancel: function(p){
+					p.parentElement.hide();
+				}
+			},
+			data: { ignorelist: list.join("\n") },
+			focus: "ignorelist"
+		};
+		app.context.showPopup(template);
+	}
+	// the source list has ~100 entries, render it as a chip grid that opens in
+	// place instead of a dropdown with one row per source
+	app.search.renderHosts = function(page){		page = page || app.topPage();
+		var grid = page && page.q("#hostgrid");
+		if(!grid){
+			return;
+		}
+		var list = app.context.hostlist();
+		var current = this.host || "";
+		grid.innerHTML = "";
+		for(var i = 0; i < list.length; i++){
+			(function(item){
+				var chip = document.createElement("div");
+				chip.className = "sfchip hostchip" + (item.value === current ? " selected" : "");
+				chip.setAttribute("v", item.value);
+				chip.textContent = item.name;
+				chip.addEventListener("click", function(){
+					app.platform.nativeClick();
+					app.search.setHost(item.value);
+				});
+				grid.appendChild(chip);
+			})(list[i]);
+		}
+		grid.__all = list.length;
+		this.updateHostToggle(grid);
+	}
+	app.search.updateHostToggle = function(grid){
+		var btn = grid.parentNode && grid.parentNode.q(".fmore");
+		if(!btn){
+			return;
+		}
+		var hidden = grid.children.length - this.hostLimit;
+		if(hidden <= 0){
+			btn.style.display = "none";
+			return;
+		}
+		btn.style.display = "";
+		btn.innerHTML = grid.classList.contains("collapsed")
+			? `Xem thêm ${hidden} nguồn <i class="fas fa-chevron-down"></i>`
+			: `Thu gọn <i class="fas fa-chevron-up"></i>`;
+	}
+	app.search.toggleHosts = function(btn){
+		var grid = btn.parentNode && btn.parentNode.q(".hostgrid");
+		if(!grid){
+			return;
+		}
+		grid.classList.toggle("collapsed");
+		this.updateHostToggle(grid);
+	}
+	app.search.setHost = function(value){
+		this.host = value || "";
+		var page = app.topPage();
+		var grid = page && page.q("#hostgrid");
+		// update the selection in place so the grid keeps its scroll position
+		if(grid){
+			var chips = grid.querySelectorAll(".hostchip");
+			for(var i = 0; i < chips.length; i++){
+				chips[i].classList.toggle("selected", chips[i].getAttribute("v") === this.host);
+			}
+		}
+		this.onHostChange(this.host);
+	}
+	app.search.updateTagToggle = function(page){
+		page = page || app.topPage();
+		var list = page && page.q(".taglist");
+		if(!list){
+			return;
+		}
+		var btn = page.q(".tagmore");
+		var filter = page.q(".ftagfilter");
+		var total = list.children.length;
+		if(filter){
+			filter.style.display = total ? "" : "none";
+		}
+		// while searching the tags the whole list is on screen, no folding
+		if(this.tagQuery){
+			list.classList.remove("collapsed");
+			if(btn){
+				btn.style.display = "none";
+			}
+			return;
+		}
+		var hidden = total - this.tagLimit;
+		list.classList.toggle("collapsed", hidden > 0 && this.tagCollapsed !== false);
+		if(hidden <= 0){
+			if(btn){
+				btn.style.display = "none";
+			}
+			return;
+		}
+		if(!btn){
+			btn = document.createElement("button");
+			btn.type = "button";
+			btn.className = "fmore tagmore";
+			btn.addEventListener("click", function(){
+				app.search.tagCollapsed = !app.search.tagCollapsed;
+				app.search.updateTagToggle(page);
+			});
+			list.parentNode.insertBefore(btn, list.nextSibling);
+		}
+		btn.style.display = "";
+		btn.innerHTML = list.classList.contains("collapsed")
+			? `Xem thêm ${hidden} nhãn <i class="fas fa-chevron-down"></i>`
+			: `Thu gọn <i class="fas fa-chevron-up"></i>`;
+	}
+	// tags are diacritic-insensitive: "dau la" finds "Đấu La"
+	app.search.filterTags = function(value){
+		var page = app.topPage();
+		var list = page && page.q(".taglist");
+		if(!list){
+			return;
+		}
+		var query = slugVietnamese(value || "");
+		this.tagQuery = query;
+		var chips = list.children;
+		var visible = 0;
+		for(var i = 0; i < chips.length; i++){
+			var chip = chips[i];
+			if(chip.__q == null){
+				chip.__q = slugVietnamese(chip.textContent) + " " + chip.textContent.toLowerCase();
+			}
+			var match = !query || chip.__q.indexOf(query) >= 0;
+			chip.classList.toggle("thidden", !match);
+			if(match){
+				visible++;
+			}
+		}
+		var empty = page.q(".fempty");
+		if(empty){
+			empty.style.display = query && !visible && chips.length ? "" : "none";
+		}
+		this.updateTagToggle(page);
 	}
 	app.search.onloadHandler = function(suc){
 		if(app.search.inf){
@@ -1395,9 +1757,16 @@ app.toast = function(msg){
 			tag: this.tag.join(","),
 			step: this.step
 		};
+		// 0 means "no upper bound", let the server keep its default
+		if(this.maxc > 0){
+			query.maxc = this.maxc;
+		}
 		return app.serialize(query);
 	}
 	app.search.doNewQuery = function(){
+		if(!this.currentLoader || !this.searchcontainer){
+			return;
+		}
 		this.currentLoader.setBaseLink("/io/searchtp/searchBooks?" + this.getQuery());
 		this.currentLoader.reset();
 		this.searchcontainer.scrollTop = 0;
@@ -1421,14 +1790,68 @@ app.toast = function(msg){
 				app.search.doNewQuery();
 			}, 500);
 		});
+		this.searchinname.addEventListener("input", function(){
+			app.search.updateSearchClear();
+		});
+		this.searchinname.addEventListener("keydown", function(e){
+			if(e.key == "Enter" || e.keyCode == 13){
+				e.preventDefault();
+				app.search.submitSearch();
+			}
+		});
 		this.searchinname.value = this.findinname;
+		this.updateSearchClear();
 		if(this.currentLoader){
 			delete this.currentLoader;
 		}
 		var bookListLoader = this.currentLoader = new BookListLoader("/io/searchtp/searchBooks?" + this.getQuery(), this.searchcontainer, this.viewtype);
+		bookListLoader.setCustomLoader(function(link, page){
+			return app.search.request(link);
+		});
 		bookListLoader.loader();
 		this.searchcontainer.style.height = (window.innerHeight - p.q(".titlebar").clientHeight) + "px";
 		p.q(".titlebar").style.position = "static";
+	}
+	// the search field keeps a clear button in sync with its content
+	app.search.updateSearchClear = function(){
+		var input = this.searchinname;
+		if(!input || !input.parentElement){
+			return;
+		}
+		var btn = input.parentElement.q(".sclear");
+		if(btn){
+			btn.classList.toggle("visible", !!input.value);
+		}
+	}
+	app.search.submitSearch = function(){
+		if(!this.searchinname){
+			return;
+		}
+		if(this.timer){
+			clearTimeout(this.timer);
+			this.timer = null;
+		}
+		this.findinname = this.searchinname.value;
+		this.doNewQuery();
+		this.searchinname.blur();
+	}
+	app.search.clearInput = function(){
+		if(!this.searchinname){
+			return;
+		}
+		this.searchinname.value = "";
+		this.updateSearchClear();
+		this.submitSearch();
+		this.searchinname.focus();
+	}
+	// the endpoint only reads the skipped keywords from the POST body, every
+	// other filter stays in the query string
+	app.search.request = function(link){
+		var ignores = (this.ignores || "").trim();
+		if(!ignores){
+			return app.net.get(link);
+		}
+		return app.net.post(link, "ignores=" + encodeURIComponent(ignores));
 	}
 	app.search.faceted = async function(p,host){
 		if(this.factedCache){
@@ -1437,6 +1860,7 @@ app.toast = function(msg){
 			t.innerHTML = "";
 			var face = this.factedCache[host];
 			if(!face){
+				this.updateTagToggle(p);
 				return;
 			}
 			for(var cat in face.category){
@@ -1451,7 +1875,7 @@ app.toast = function(msg){
 			for(var i=0;i<arr.length;i++){
 				var cat = arr[i].name;
 				var btn = document.createElement("div");
-				btn.className = "tag";
+				btn.className = "tag sfchip";
 				btn.setAttribute("v", slugVietnamese(cat));
 				btn.textContent = titleCase(cat)+"("+arr[i].value+")";
 				t.appendChild(btn);
@@ -1462,8 +1886,10 @@ app.toast = function(msg){
 				}
 			}
 			for(var i=0; i<this.tag.length; i++){
-				t.q(`.tag[v="${this.tag[i]}"]`).setAttribute("selected", "true");
+				var selected = t.q(`.tag[v="${this.tag[i]}"]`);
+				selected && selected.setAttribute("selected", "true");
 			}
+			this.updateTagToggle(p);
 		}else{
 			app.net.get("/searchfaceted.json").then(json=>{
 				app.search.factedCache = json;
@@ -1474,6 +1900,7 @@ app.toast = function(msg){
 	app.search.onHostChange = function(h){
 		app.search.faceted(app.topPage(), h);
 	}
+	app.search.loadIgnores();
 })(app);
 
 app.serialize = function(obj) {
@@ -1579,6 +2006,8 @@ app.serialize = function(obj) {
 		"DOWNLOADING": "ĐANG TẢI XUỐNG",
 		"DOWNLOADED": "ĐÃ TẢI XUỐNG",
 		"history": "Lịch sử",
+		"history_search_placeholder": "Tìm truyện đã đọc",
+		"history_search_empty": "Không tìm thấy truyện đã đọc phù hợp",
 		"follow": "Theo dõi",
 		"bookmark": "Đánh dấu",
 		"novel_owner": "Sở hữu",
@@ -1770,6 +2199,8 @@ app.serialize = function(obj) {
 		"DOWNLOADING": "DOWNLOADING",
 		"DOWNLOADED": "DOWNLOADED",
 		"history": "History",
+		"history_search_placeholder": "Search read novels",
+		"history_search_empty": "No matching read novel found",
 		"follow": "Follow",
 		"bookmark": "Bookmark",
 		"novel_owner": "My book",
@@ -2429,22 +2860,22 @@ app.serialize = function(obj) {
 			type: "select",
 			item: [
 				{text: "Lượt xem tuần",value:"viewweek",  onclick: function(){
-					app.refresh(g("bookrankingview"));
+					app.discover.applyRankType();
 				}},
 				{text: "Lượt xem ngày", value:"viewday", onclick: function(){
-					app.refresh(g("bookrankingview"));
+					app.discover.applyRankType();
 				}},
 				{text: "Lượt xem tổng", value:"view", onclick: function(){
-					app.refresh(g("bookrankingview"));
+					app.discover.applyRankType();
 				}},
 				{text: "Lượt thích", value:"like", onclick: function(){
-					app.refresh(g("bookrankingview"));
+					app.discover.applyRankType();
 				}},
 				{text: "Lượt theo dõi", value:"following", onclick: function(){
-					app.refresh(g("bookrankingview"));
+					app.discover.applyRankType();
 				}},
 				{text: "Lượt đánh dấu", value:"bookmarked", onclick: function(){
-					app.refresh(g("bookrankingview"));
+					app.discover.applyRankType();
 				}},
 			],
 			selection: "app.prop.viewranktype"
@@ -2663,11 +3094,12 @@ app.serialize = function(obj) {
 			type: "tap",
 			item: [
 				{text: app.text.w.delete, onclick: function(){
-					console.log(app.context.attach.data);
-					var host = app.context.attach.data.host;
-					var id = app.context.attach.data.id;
-					app.history.delete(host, id);
-					$(app.context.attach).fadeOut();
+					var b = app.context.attach && app.context.attach.data;
+					if(!b){
+						return;
+					}
+					// delete() also drops the row from the rendered page
+					app.history.delete(b.host, b.id);
 				}},
 				{text: "Đánh dấu", onclick: function(){
 					app.api.bookmark(app.context.attach.data);}},
@@ -3090,7 +3522,7 @@ app.serialize = function(obj) {
 							item: d.data.map(function(e){
 								return {text: e.name, value: e.id, onclick: function(){
 									app.prop.pushdir = e.id;
-									app.refresh(g("bookdirview"));
+									app.discover.applyPushDir();
 								}}
 							}),
 							selection: "app.prop.pushdir"
@@ -3175,45 +3607,550 @@ app.serialize = function(obj) {
 			}
 		},
 	}
+	app.history.searchQuery = "";
+	app.history.searchTimer = null;
+	app.history.searchDelay = 250;
+	app.history.normalizeSearch = function(t){
+		if(t === null || t === undefined){
+			return "";
+		}
+		t = ("" + t).toLowerCase();
+		try{
+			t = t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d");
+		}catch(e){}
+		return t.replace(/\s+/g, " ").trim();
+	};
+	app.history.isSearching = function(){
+		return this.normalizeSearch(this.searchQuery).length > 0;
+	};
+	// the grid shows the server's "tname" (translated name), history records store
+	// the original name in "title", so names have to be collected to search what
+	// the user actually sees on screen
+	app.history.searchableText = function(b){
+		var names = [b.title, b.tname, b.hname];
+		var out = [];
+		for(var i = 0; i < names.length; i++){
+			if(names[i]){
+				var n = app.history.normalizeSearch(names[i]);
+				if(n && out.indexOf(n) < 0){
+					out.push(n);
+				}
+			}
+		}
+		return out.join("\n");
+	};
+	// remember the names the server sent for a book we already have in history
+	app.history.applyNames = function(book){
+		if(!book || book.host === undefined || book.id === undefined){
+			return false;
+		}
+		var i = app.history.index[`${book.host}-${book.id}`];
+		if(i === undefined){
+			return false;
+		}
+		var b = app.history.readhistory[i];
+		if(!b){
+			return false;
+		}
+		var changed = false;
+		var fields = ["tname", "hname"];
+		for(var j = 0; j < fields.length; j++){
+			var f = fields[j];
+			if(book[f] && b[f] !== book[f]){
+				b[f] = book[f];
+				changed = true;
+			}
+		}
+		if(!b.namechecked){
+			b.namechecked = true;
+			changed = true;
+		}
+		return changed;
+	};
+	app.history.namesComplete = function(){
+		for(var i = 0; i < this.readhistory.length; i++){
+			var b = this.readhistory[i];
+			if(b && !b.namechecked){
+				return false;
+			}
+		}
+		return true;
+	};
+	// bookinfo is cached when reading, so most of the history can be filled in
+	// locally, without a single extra request
+	app.history.nameCacheLimit = 2000;
+	app.history.enrichNamesFromCache = async function(){
+		if(!app.storage.cache || typeof app.storage.cache.get != "function"){
+			return false;
+		}
+		var changed = false;
+		var limit = Math.min(this.readhistory.length, this.nameCacheLimit);
+		for(var i = 0; i < limit; i++){
+			var b = this.readhistory[i];
+			if(!b || b.namechecked){
+				continue;
+			}
+			try{
+				var raw = await app.storage.cache.get(`/mobile/bookinfo.php?hid=${b.id}&host=${b.host}`);
+				if(!raw){
+					continue;
+				}
+				var d = JSON.parse(raw);
+				if(d && d.book && this.applyNames(d.book)){
+					changed = true;
+				}
+			}catch(e){
+				// missing or invalid cache entry: the server pass will try it
+			}
+		}
+		return changed;
+	};
+	// fallback for books that are not in the cache: ask the server in batches
+	app.history.nameScanBatch = 200;
+	app.history.nameScanRequests = 8;
+	app.history.nameScanCooldown = 3000;
+	app.history.enrichNamesFromServer = async function(){
+		var pending = [];
+		for(var i = 0; i < this.readhistory.length; i++){
+			var b = this.readhistory[i];
+			if(b && !b.namechecked){
+				pending.push(b);
+			}
+		}
+		if(pending.length == 0){
+			return false;
+		}
+		// typing triggers this repeatedly; do not hammer the server
+		var now = new Date().getTime();
+		if(this.lastNameScan && now - this.lastNameScan < this.nameScanCooldown){
+			return false;
+		}
+		this.lastNameScan = now;
+		var changed = false;
+		var requests = 0;
+		for(var p = 0; p * this.nameScanBatch < pending.length && requests < this.nameScanRequests; p++){
+			var chunk = pending.slice(p * this.nameScanBatch, (p + 1) * this.nameScanBatch);
+			if(chunk.length == 0){
+				break;
+			}
+			requests++;
+			var pairs = chunk.map(function(b){
+				return b.host + "-" + b.id;
+			}).join("/");
+			var d;
+			try{
+				d = await app.net.post("/mobile/booklist.php?method=history", "data=" + pairs);
+			}catch(e){
+				// offline: keep the markers off so a later search retries
+				break;
+			}
+			if(!d || !d.list){
+				// unexpected answer, do not mark anything as resolved
+				break;
+			}
+			for(var j = 0; j < d.list.length; j++){
+				if(this.applyNames(d.list[j])){
+					changed = true;
+				}
+			}
+			// books the server no longer returns are marked too, so the scan
+			// makes progress instead of retrying the same batch forever
+			for(var j = 0; j < chunk.length; j++){
+				var rec = this.readhistory[this.index[`${chunk[j].host}-${chunk[j].id}`]];
+				if(rec && !rec.namechecked){
+					rec.namechecked = true;
+					changed = true;
+				}
+			}
+		}
+		return changed;
+	};
+	app.history.ensureNames = function(){
+		if(this.namesPromise){
+			return this.namesPromise;
+		}
+		var t = this;
+		this.namesPromise = (async function(){
+			var changed = await t.enrichNamesFromCache();
+			if(!t.namesComplete()){
+				changed = (await t.enrichNamesFromServer()) || changed;
+			}
+			return changed;
+		})().catch(function(e){
+			console.log(e);
+			return false;
+		}).then(function(changed){
+			t.namesPromise = null;
+			if(changed){
+				t.storage.save();
+				// the query is unchanged, so just re-run it with the new names
+				if(t.isSearching()){
+					t.refreshList();
+				}
+			}
+			return changed;
+		});
+		return this.namesPromise;
+	};
+	app.history.compareByReadTime = function(a, b){
+		return (Number(b && b.time) || 0) - (Number(a && a.time) || 0);
+	};
+	app.history.filterList = function(){
+		var list = (this.readhistory || []).slice();
+		// always newest read first, whatever order the stored array is in
+		list.sort(this.compareByReadTime);
+		var q = this.normalizeSearch(this.searchQuery);
+		if(!q){
+			return list;
+		}
+		var tokens = q.split(" ").filter(function(t){
+			return t.length > 0;
+		});
+		return list.filter(function(b){
+			if(!b){
+				return false;
+			}
+			var haystack = app.history.searchableText(b);
+			for(var i = 0; i < tokens.length; i++){
+				if(haystack.indexOf(tokens[i]) < 0){
+					return false;
+				}
+			}
+			return true;
+		});
+	};
+	// the server answers in FIELD(id, ...) order, so keep its rows in the order
+	// we asked for (read time) instead of trusting the response order
+	app.history.orderBooks = function(list, pairs){
+		var positions = {};
+		for(var i = 0; i < pairs.length; i++){
+			positions[pairs[i][0] + "-" + pairs[i][1]] = i;
+		}
+		return (list || []).slice().sort(function(a, b){
+			var ia = positions[a.host + "-" + a.id];
+			var ib = positions[b.host + "-" + b.id];
+			if(ia === undefined) ia = Number.MAX_SAFE_INTEGER;
+			if(ib === undefined) ib = Number.MAX_SAFE_INTEGER;
+			return ia - ib;
+		});
+	};
+	app.history.loadPage = function(list, p){
+		var pairs = [];
+		for(var i = p * this.fetchMaxEntry; i < (p + 1) * this.fetchMaxEntry; i++){
+			if(i >= list.length){
+				break;
+			}
+			var b = list[i];
+			pairs.push([b.host, b.id]);
+		}
+		if(pairs.length == 0){
+			return Promise.resolve({list: []});
+		}
+		var t = this;
+		return app.net.post("/mobile/booklist.php?method=history","data="+pairs.map(function(e){return e.join("-")}).join("/")).then(function(d){
+			if(d.code == 101){
+				return {list: []};
+			}
+			d.list = t.orderBooks(d.list, pairs);
+			return d;
+		}).catch(async function(e){
+			console.log("load offline");
+			await onDbLoad.waitForLoad();
+			var l = pairs.map(e=>app.storage.cache.get(`/mobile/bookinfo.php?hid=${e[1]}&host=${e[0]}`));
+			var d = await Promise.all(l);
+			d = d.filter(e=>e).map(e=>JSON.parse(e).book);
+			return {list: t.orderBooks(d, pairs)};
+		});
+	};
+	// The list is built once and only its content is redrawn. Reusing the same
+	// nodes matters: ui.pullToRefresh adds anonymous touch listeners that cannot
+	// be removed, and its "only at the top" check reads the scroller that was
+	// passed in, so replacing either node would leave a stale handler that fires
+	// on every downward drag no matter where the list is scrolled.
 	app.history.setContainer = function(){
 		var c = this.container;
+		// clip here as well as in css: the pull arrow is 50px above the list and
+		// must never be painted over the search bar
+		c.style.overflow = "hidden";
+		c.style.position = "relative";
 		var e = document.createElement("div");
+		e.className = "historylist";
 		e.style.height = "100%";
 		e.style.width = "100vw";
 		e.style.position = "relative";
-		var t = this;
-		var loader = async function(p){
-			var pairs = [];
-			for(var i = p * t.fetchMaxEntry; i < (p + 1) * t.fetchMaxEntry; i++){
-				if(i >= t.readhistory.length){
-					break;
-				}
-				var b = t.readhistory[i];
-				pairs.push([b.host, b.id]);
+		var s = document.createElement("div");
+		s.className = "flex2 g0 fleft f-3-col f-sm-4-col f-md-6-col";
+		s.style.height = "100%";
+		s.style.width = "100%";
+		s.style.overflow = "auto";
+		s.style.position = "absolute";
+		s.style.top = "0";
+		s.style.left = "0";
+		e.appendChild(s);
+		c.appendChild(e);
+		this.listContainer = e;
+		this.scrollerElement = s;
+		ui.pullToRefresh(e, s, app.text.pull2refresh);
+		// keep the indicator under the search bar whatever the stacking context
+		// of the list is (a transform on the list is added after the first pull)
+		var pull = e.querySelector(".pull2f");
+		if(pull){
+			pull.style.zIndex = "1";
+		}
+		e.onrefresh = function(trigger){
+			// keep the list on screen while the server answers: clearing it right
+			// away emptied the tab for as long as the request took
+			app.history.refreshList(true).then(function(){
+				trigger(true);
+			}).catch(function(){
+				trigger(false);
+			});
+		};
+		softObserver(s);
+		this.refreshList();
+	};
+	app.history.renderToken = 0;
+	app.history.currentList = [];
+	app.history.pendingClear = 0;
+	// keepOld: pull-to-refresh leaves the current entries in place and swaps
+	// them for the new page once it has arrived
+	app.history.refreshList = function(keepOld){
+		var s = this.scrollerElement;
+		if(!s){
+			return Promise.resolve();
+		}
+		this.renderToken++;
+		this.page = 0;
+		this.sentinel = null;
+		this.currentList = this.filterList();
+		if(this.isSearching() && this.currentList.length == 0){
+			s.innerHTML = "";
+			s.scrollTop = 0;
+			this.pendingClear = 0;
+			var nodata = app.createNodata(app.text.w.history_search_empty.toString());
+			// the scroller is a flex grid, keep the message full width
+			nodata.style.flex = "0 0 100%";
+			nodata.style.maxWidth = "100%";
+			s.appendChild(nodata);
+			return Promise.resolve();
+		}
+		if(keepOld && this.currentList.length > 0 && s.children.length > 0){
+			// appendPage clears the grid just before it writes the first page
+			this.pendingClear = this.renderToken;
+		}else{
+			this.pendingClear = 0;
+			s.innerHTML = "";
+			s.scrollTop = 0;
+		}
+		return this.appendPage(this.renderToken);
+	};
+	app.history.appendPage = async function(token){
+		var s = this.scrollerElement;
+		if(!s || token !== this.renderToken){
+			return;
+		}
+		var list = this.currentList || [];
+		var page = this.page || 0;
+		if(page * this.fetchMaxEntry >= list.length){
+			return;
+		}
+		var d;
+		try{
+			d = await this.loadPage(list, page);
+		}catch(err){
+			// keep the sentinel so the same page is retried when it scrolls back in
+			console.log(err);
+			return;
+		}
+		if(token !== this.renderToken){
+			return;
+		}
+		if(this.pendingClear === token){
+			this.pendingClear = 0;
+			// nothing came back: keep what the user already had instead of
+			// blanking the tab on a failed refresh
+			if(d.list.length > 0){
+				s.innerHTML = "";
+				s.scrollTop = 0;
+				this.sentinel = null;
 			}
-			if(pairs.length == 0){
-				return {list: []};
+		}
+		var named = false;
+		for(var i = 0; i < d.list.length; i++){
+			if(this.applyNames(d.list[i])){
+				named = true;
 			}
-			return app.net.post("/mobile/booklist.php?method=history","data="+pairs.map(function(e){return e.join("-")}).join("/")).then(function(d){
-				if(d.code == 101){
-					return {list: []};
-				}
-				return d;
-			}).catch(async function(e){
-				console.log("load offline");
-				await onDbLoad.waitForLoad();
-				var l = pairs.map(e=>app.storage.cache.get(`/mobile/bookinfo.php?hid=${e[1]}&host=${e[0]}`));
-				var d = await Promise.all(l);
-				d = d.filter(e=>e).map(e=>JSON.parse(e).book);
-				return {list: d};
+		}
+		if(named){
+			this.storage.save();
+		}
+		if(this.sentinel){
+			this.sentinel.remove();
+			this.sentinel = null;
+		}
+		var added = [];
+		for(let i = 0; i < d.list.length; i++){
+			// block scoped: every row's hold handler must keep its own element,
+			// otherwise they all report the last rendered book and "Xóa" deletes
+			// an entry the user never pressed
+			let el = app.render("booksquarefast", d.list[i]);
+			s.appendChild(el);
+			added.push(el);
+			el.addEventListener("click", function(){
+				app.platform.nativeClick();
+				app.fun.openBookWithData(this.data.lid, this.data);
+			});
+			ui.hold(el, function(){
+				app.context.current(1, el);
+			});
+			el.q("img").addEventListener("contextmenu", function(ev){
+				ev.preventDefault();
+				ev.stopPropagation();
+				return false;
 			});
 		}
-		app.celoader.infbookgrid(e, {
-			loader: loader,
-			perPage: this.fetchMaxEntry,
-			refresh: true
+		if(added.length > 0){
+			var h = added[0].scrollHeight;
+			for(var i = 0; i < added.length; i++){
+				added[i].style.height = h + "px";
+				added[i].setAttribute("offset", added[i].offsetTop);
+				app.applySleepWake(added[i], "none");
+			}
+		}
+		this.page = page + 1;
+		// page by how many entries are left, not by how many rows came back:
+		// a book that disappeared from the server must not stop the next page
+		if(this.page * this.fetchMaxEntry < list.length){
+			this.sentinel = app.createInf(function(){
+				app.history.appendPage(token);
+			}, true);
+			s.appendChild(this.sentinel);
+		}
+	};
+	app.history.triggerSearch = function(){
+		if(this.searchTimer){
+			clearTimeout(this.searchTimer);
+			this.searchTimer = null;
+		}
+		this.refreshList();
+	};
+	app.history.setSearchingClass = function(){
+		if(!this.searchBar){
+			return;
+		}
+		if(this.isSearching()){
+			this.searchBar.classList.add("searching");
+		}else{
+			this.searchBar.classList.remove("searching");
+		}
+	};
+	app.history.onSearchInput = function(value){
+		var t = this;
+		this.searchQuery = value || "";
+		this.setSearchingClass();
+		if(this.isSearching()){
+			// names come from the server / bookinfo cache; fill them in once so
+			// the search can match the translated titles shown in the grid
+			this.ensureNames();
+		}
+		if(this.searchTimer){
+			clearTimeout(this.searchTimer);
+		}
+		this.searchTimer = setTimeout(function(){
+			t.searchTimer = null;
+			t.refreshList();
+		}, this.searchDelay);
+	};
+	app.history.setupSearch = function(){
+		var bar = g("historysearchbar");
+		var input = g("historysearchinput");
+		if(!bar || !input){
+			return;
+		}
+		this.searchBar = bar;
+		this.searchInput = input;
+		input.placeholder = app.text.w.history_search_placeholder.toString();
+		input.value = this.searchQuery;
+		this.setSearchingClass();
+		input.addEventListener("input", function(){
+			app.history.onSearchInput(input.value);
 		});
-		c.appendChild(e);
+		input.addEventListener("keydown", function(ev){
+			if(ev.key == "Enter" || ev.keyCode == 13){
+				ev.preventDefault();
+				app.history.onSearchInput(input.value);
+				app.history.triggerSearch();
+				input.blur();
+			}
+		});
+		var clear = g("historysearchclear");
+		if(clear){
+			clear.addEventListener("click", function(){
+				input.value = "";
+				app.history.onSearchInput("");
+				app.history.triggerSearch();
+				input.focus();
+			});
+		}
+	};
+	// the bar is opt-in: the search button on the tab bar opens it (and closes it)
+	app.history.isSearchOpen = function(){
+		var view = this.searchBar ? this.searchBar.parentElement : null;
+		return !!view && view.classList.contains("searchopen");
+	};
+	app.history.toggleSearch = function(force){
+		var view = this.searchBar ? this.searchBar.parentElement : null;
+		if(!view){
+			return;
+		}
+		var open = typeof force == "boolean" ? force : !this.isSearchOpen();
+		if(open){
+			view.classList.add("searchopen");
+		}else{
+			view.classList.remove("searchopen");
+		}
+		this.updateSearchToggle();
+		if(open){
+			if(this.searchInput){
+				this.searchInput.focus();
+			}
+		}else if(this.searchInput){
+			this.searchInput.blur();
+			if(this.searchQuery){
+				this.searchInput.value = "";
+				this.onSearchInput("");
+				this.triggerSearch();
+			}
+		}
+	};
+	app.history.updateSearchToggle = function(){
+		var btn = this.searchToggle;
+		if(!btn){
+			return;
+		}
+		var tab = g("tabtusach");
+		var onHistory = !tab || !tab.current || tab.current() == 0;
+		btn.style.display = onHistory ? "" : "none";
+		btn.classList.toggle("searchopen", this.isSearchOpen());
+	};
+	app.history.setupSearchToggle = function(){
+		var btn = g("historysearchtoggle");
+		if(!btn){
+			return;
+		}
+		this.searchToggle = btn;
+		var tab = g("tabtusach");
+		if(tab){
+			var prev = tab.ontabchange;
+			var self = this;
+			tab.ontabchange = function(){
+				if(typeof prev == "function"){
+					prev.apply(this, arguments);
+				}
+				self.updateSearchToggle();
+			};
+		}
+		this.updateSearchToggle();
 	};
 	app.history.fetch = function(p){
 		var fl = [];
@@ -3294,6 +4231,11 @@ app.serialize = function(obj) {
 			id: b.id,
 			host: b.host,
 			title: b.name,
+			// the grid shows tname; keep it so this book is searchable by the
+			// name the user sees, without having to look it up again
+			tname: b.tname,
+			hname: b.hname,
+			namechecked: true,
 			time: new Date().getTime(),
 			chapter: c.id,
 			chaptertitle: c.title,
@@ -3337,9 +4279,14 @@ app.serialize = function(obj) {
 	}
 	
 	app.history.add = function(b){
-		if(!app.history.index[`${b.host}-${b.id}`]){
+		var i = app.history.index[`${b.host}-${b.id}`];
+		if(i === undefined){
 			app.history.readhistory.unshift(b);
 			app.history.buildIndex();
+			app.history.storage.save();
+		}else{
+			app.history.readhistory[i] = b;
+			app.history.sort();
 			app.history.storage.save();
 		}
 	}
@@ -3349,6 +4296,32 @@ app.serialize = function(obj) {
 			app.history.readhistory.splice(i,1);
 			app.history.buildIndex();
 			app.history.storage.save();
+		}
+		// the rendered page keeps its own copy of the list: drop the entry there
+		// too, or the next page render writes the deleted book back
+		if(app.history.currentList){
+			app.history.currentList = app.history.currentList.filter(function(b){
+				return !(b.host == host && b.id == id);
+			});
+		}
+		app.history.removeNode(host, id);
+	}
+	app.history.removeNode = function(host,id){
+		var s = this.scrollerElement;
+		if(!s){
+			return;
+		}
+		var nodes = s.querySelectorAll('[view="booksquarefast"]');
+		for(var i = 0; i < nodes.length; i++){
+			var b = nodes[i].data;
+			if(b && b.host == host && b.id == id){
+				nodes[i].style.transition = "opacity 0.2s";
+				nodes[i].style.opacity = "0";
+				setTimeout(function(n){
+					n.remove();
+				}.bind(null, nodes[i]), 200);
+				break;
+			}
 		}
 	}
 	app.history.deleteall = function(){
@@ -3400,13 +4373,24 @@ app.serialize = function(obj) {
 	}
 	
 	app.history.refresh = function(){
-		app.history.container.firstChild.onrefresh(function(){});
+		var e = this.listContainer || (this.container && this.container.firstChild);
+		if(!e){
+			return;
+		}
+		if(e.onrefresh){
+			e.onrefresh(function(){});
+		}else{
+			this.refreshList();
+		}
 	}
 	app.history.init = function(){
 		app.history.container = g("historyview");
 		app.history.scroller = app.history.container.parentElement;
+		app.history.setupSearch();
+		app.history.setupSearchToggle();
 		app.history.buildIndex();
 		app.history.removeDuplicate();
+		app.history.sort();
 		app.history.setContainer();
 		app.history.onload();
 	}
@@ -3940,7 +4924,10 @@ app.serialize = function(obj) {
 	}
 })(app);
 
-ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
+// the reader script carries fixes that ship with the site (the chapter frame
+// styles among them), so it must not sit in the app's HTTP cache for an hour:
+// app.v2.js is itself reloaded with a random query on every launch
+ui.scriptmanager.load("/asset/app.v2.read.js",function(){},true);
 
 
 
@@ -3966,11 +4953,11 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 			});
 	};
 	app.user.checklogin = async function(background = false, refresh = false){
-		try{
-			await app.net.networkManagerXHR.checkDomains();
-		}catch(e){
-			app.debug.reportRaw("network check failed: " + e.toString());
-		}
+		// try{
+		// 	await app.net.networkManagerXHR.checkDomains();
+		// }catch(e){
+		// 	app.debug.reportRaw("network check failed: " + e.toString());
+		// }
 		if(app.user.info){
 			if(!background){
 				app.debug.reportRaw("skip login check, user info already exists, userid: " + app.user.info.id);
@@ -4174,21 +5161,8 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 		}
 	}
 	app.platform.setStatusColor = function(color){
-		// if(isStatusOverlay){
-		// 	return;
-		// }
 		if(this.isIOS){
 			Capacitor.Plugins.StatusBar.setStyle({style: color});
-		}
-		if(this.isAndroid && false){
-			Capacitor.Plugins.StatusBar.setBackgroundColor({color: color});
-			if(color == "#ffffff"){
-				Capacitor.Plugins.StatusBar.setStyle({style: "LIGHT"});
-			}else if(color == "#333333"){
-				Capacitor.Plugins.StatusBar.setStyle({style: "DARK"});
-			}else{
-				Capacitor.Plugins.StatusBar.setStyle({style: "DEFAULT"});
-			}
 		}
 		if(this.isAndroid){
 			if(app.theme.isDarkBackground()){
@@ -4202,8 +5176,6 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 	}
 	app.platform.vibrate = function(time){
 		if(navigator.vibrate){
-		//	navigator.vibrate(time);
-		//	Capacitor.Plugins.Haptics.impact();
 			this.nativeClick();
 		}
 	}
@@ -4342,6 +5314,11 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 							window.onresize();
 						});
 					}, 100);
+					setTimeout(function(){
+						requestAnimationFrame(function(){
+							window.onresize();
+						});
+					}, 1000);
 				});
 			}else{
 				if(document.body.hasAttribute("ovlwv")){
@@ -4357,16 +5334,6 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 					g("metaviewport").setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover");
 				});
 			}
-			
-			
-			
-		}else{
-			// document.body.removeAttribute("ovlwv");
-			// g("mainview").style.marginTop = "0px";
-			// requestAnimationFrame(function(){
-			// 	Capacitor.Plugins.StatusBar.setOverlaysWebView({overlay: false});
-			// 	g("metaviewport").setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no");
-			// });
 		}
 		this.isOverlayWebview = enable;
 	}
@@ -4562,6 +5529,14 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 			var safariVer = getSafariVersion();
 			app.platform.isSafariWeb = true;
 			app.platform.safariVer = safariVer.major;
+			rootCss.update("html,body", {
+				"overscroll-behavior": "none",
+				"overscroll-behavior-y": "none"
+			});
+			rootCss.update("#overlay > div, .perf-div, #ptransit > div, tabview, .clistcontainer, .commentview, .bookinfo .body, .contentbox, #ctxoverlay, .popupedit_body, #chapterview .coption, .fpage .hostgrid:not(.collapsed)", {
+				"overscroll-behavior": "none",
+				"overscroll-behavior-y": "none"
+			});
 		}
 	}else{
 		app.platform.isWeb = true;
@@ -4878,7 +5853,7 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 	};
 	app.api.queryBookExtStatus =async function(bookinfo){
 		if(!app.user.isLogin){
-			return null;
+			return {};
 		}
 		var url = "/mobile/jsonify.php";
 		var params = app.serialize({
@@ -4892,7 +5867,7 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 			if(down.code == 100){
 				return down;
 			}else{
-				return null;
+				return {};
 			}
 		});
 	};
@@ -5861,30 +6836,374 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 		var popupTemplate = $.extend({},app.context.menu.namemanager.add);
 		app.context.showPopup(popupTemplate);
 	}
+	// The book page is both the download list and the upload entry point. The
+	// old titlebar button called app.namemanager.showUploadNameByBook, which was
+	// never defined anywhere, so tapping "Tải lên" did nothing at all.
+	app.namemanager.nameByBookPage = null;
+	app.namemanager.uploadUserKey = "stv_name_upload_user";
+	// /index.php?upload=true runs urldecode() on a value php already form-decoded
+	// once, so the payload has to be encoded twice to survive the round trip
+	app.namemanager.encodeTwice = function(s){
+		return encodeURIComponent(encodeURIComponent(String(s == null ? "" : s)));
+	};
+	app.namemanager.utf8Length = function(s){
+		s = String(s == null ? "" : s);
+		if(window.TextEncoder){
+			return new TextEncoder().encode(s).length;
+		}
+		return unescape(encodeURIComponent(s)).length;
+	};
+	app.namemanager.formatNumber = function(n){
+		return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+	};
+	app.namemanager.formatDate = function(v){
+		var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v == null ? "" : v));
+		if(m){
+			return m[3] + "/" + m[2] + "/" + m[1];
+		}
+		return v || "";
+	};
+	app.namemanager.packStats = function(content){
+		content = String(content == null ? "" : content);
+		var rows = content.split("\n");
+		var count = 0;
+		for(var i = 0; i < rows.length; i++){
+			if(rows[i].indexOf("=") > 0){
+				count++;
+			}
+		}
+		return {count: count, chars: content.length};
+	};
+	// a pack line is "<gốc>=<bản dịch>"; readers recognise the translated side,
+	// not the raw "$..." prefix, so the sample is built from the values
+	app.namemanager.packSample = function(content){
+		var rows = String(content == null ? "" : content).split("\n");
+		var out = [];
+		for(var i = 0; i < rows.length && out.length < 3; i++){
+			var line = rows[i].trim();
+			var eq = line.indexOf("=");
+			if(eq < 0){
+				continue;
+			}
+			var value = line.substring(eq + 1).trim();
+			if(value && out.indexOf(value) < 0){
+				out.push(value);
+			}
+		}
+		return out.join(" · ");
+	};
+	app.namemanager.bookNameKeys = function(book){
+		var name = String(book.name == null ? "" : book.name);
+		var author = String(book.author == null ? "" : book.author);
+		var keys = ["name_" + name + "_" + author];
+		// the comic reader stores the key with a trimmed name
+		if(name.trim() != name){
+			keys.push("name_" + name.trim() + "_" + author);
+		}
+		return keys;
+	};
+	app.namemanager.getBookNameData = async function(book){
+		var keys = this.bookNameKeys(book);
+		for(var i = 0; i < keys.length; i++){
+			var data = await this.get(keys[i]);
+			if(data && data.length){
+				return {key: keys[i], list: data};
+			}
+		}
+		// only trust the in-memory list when it belongs to this very book
+		if(this.namecontext == keys[0] && this.namedata.length){
+			return {key: keys[0], list: this.namedata.slice(0)};
+		}
+		return {key: keys[0], list: []};
+	};
+	app.namemanager.isNameByBookSupported = function(book){
+		if(!book){
+			return false;
+		}
+		// the packs live in a table keyed by the numeric book id and the host
+		return /^\d+$/.test(String(book.id == null ? "" : book.id)) &&
+			/^[a-z0-9]+$/.test(String(book.host == null ? "" : book.host));
+	};
 	app.namemanager.showNameByBook = function(){
 		var book = app.reader.bookinfo;
 		if(!book)return;
 		var p = app.pushPage("namebybook", book);
+		this.nameByBookPage = p;
+		this.fillNameByBookHeader(p, book);
+		this.renderNameByBookLocal(p, book);
+		this.loadNameByBook(p, book);
+	};
+	app.namemanager.fillNameByBookHeader = function(p, book){
+		var name = p.q(".nbbname");
+		if(name && !name.textContent.trim()){
+			name.textContent = book.tname || book.name || "";
+		}
+		var author = p.q(".nbbauthor");
+		if(author && !author.textContent.trim()){
+			author.textContent = book.hauthor || book.author || "";
+		}
+	};
+	app.namemanager.renderNameByBookLocal = async function(p, book){
+		var data = await this.getBookNameData(book);
+		var count = p.q(".localcount");
+		if(count){
+			count.textContent = this.formatNumber(data.list.length);
+		}
+		return data;
+	};
+	app.namemanager.showNameByBookSkeleton = function(list){
+		list.innerHTML = "";
+		for(var i = 0; i < 3; i++){
+			var sk = document.createElement("div");
+			sk.className = "nbbrow nbbskel";
+			sk.innerHTML = `<div class="nbbavatar"></div>
+				<div class="nbbmain">
+					<div class="nbbline" style="width: 45%"></div>
+					<div class="nbbline" style="width: 90%"></div>
+					<div class="nbbline" style="width: 60%"></div>
+				</div>`;
+			list.appendChild(sk);
+		}
+	};
+	app.namemanager.createNameByBookNotice = function(icon, msg, buttonText, onclick){
+		var e = document.createElement("div");
+		e.className = "nbbempty";
+		e.innerHTML = `<i class="fal fa-${icon}"></i>
+			<div class="nbbempty-msg"></div>
+			<button class="nbbempty-btn" type="button"></button>`;
+		e.q(".nbbempty-msg").textContent = msg;
+		var b = e.q(".nbbempty-btn");
+		if(buttonText){
+			b.textContent = buttonText;
+			b.addEventListener("click", onclick);
+		}else{
+			b.remove();
+		}
+		return e;
+	};
+	app.namemanager.loadNameByBook = function(p, book){
+		if(!p || !book){
+			return Promise.resolve();
+		}
 		var list = p.q(".list");
-		app.net.get("/mobile/namepack.php?m=book&book="+book.id+"&host="+book.host).then(async function(down){
-			down = down.data;
-			if(!down){
-				list.appendChild(app.createNodata("Có lỗi khi tải danh sách gói name cho truyện này."));
+		var sync = p.q(".nbbsync");
+		if(!list){
+			return Promise.resolve();
+		}
+		if(sync){
+			sync.classList.add("loading");
+		}
+		if(!list.q(".nbbrow")){
+			this.showNameByBookSkeleton(list);
+		}
+		var finish = function(){
+			if(sync){
+				sync.classList.remove("loading");
+			}
+		};
+		if(!this.isNameByBookSupported(book)){
+			list.innerHTML = "";
+			list.appendChild(this.createNameByBookNotice("ban", "Chưa hỗ trợ gói name cho truyện này."));
+			finish();
+			return Promise.resolve();
+		}
+		// t= keeps a cached answer from hiding a pack that was just uploaded
+		var url = "/mobile/namepack.php?m=book&book=" + encodeURIComponent(book.id) +
+			"&host=" + encodeURIComponent(book.host) + "&t=" + Date.now();
+		return app.net.get(url).then(function(down){
+			var packs = down && down.data ? down.data : [];
+			if(!Array.isArray(packs)){
+				// the endpoint answers with plain text on bad input
+				throw new Error("bad response");
+			}
+			list.innerHTML = "";
+			var packcount = p.q(".packcount");
+			if(packcount){
+				packcount.textContent = app.namemanager.formatNumber(packs.length);
+			}
+			if(packs.length == 0){
+				list.appendChild(app.namemanager.createNameByBookNotice("list-ul", "Chưa có ai đăng gói name cho truyện này.", "Tải lên gói name", function(){
+					app.namemanager.showUploadNameByBook();
+				}));
 				return;
 			}
-			if(down.length == 0){
-				list.appendChild(app.createNodata("Chưa có gói name cho truyện này."));
-				return;
+			for(var i = 0; i < packs.length; i++){
+				list.appendChild(app.namemanager.renderNamePackRow(p, book, packs[i]));
 			}
-			for(var i=0;i<down.length;i++){
-				let item = app.render("namepackbybookrow", down[i]);
-				item.q(".download").addEventListener("click",function(){
-					app.namemanager.appendPack(item.data.content);
-				});
-				list.appendChild(item);
+		}).catch(function(e){
+			console.log(e);
+			list.innerHTML = "";
+			list.appendChild(app.namemanager.createNameByBookNotice("exclamation-triangle", "Không tải được danh sách gói name.", "Thử lại", function(){
+				app.namemanager.loadNameByBook(p, book);
+			}));
+		}).then(finish);
+	};
+	// downloading a pack must land in this book's own key, not in whichever
+	// context the reader happened to leave loaded
+	app.namemanager.appendPackToBook = async function(book, content){
+		var data = await this.getBookNameData(book);
+		var key = data.key;
+		var list = data.list.slice(0);
+		var lines = String(content == null ? "" : content).split("\n");
+		var added = 0;
+		for(var i = 0; i < lines.length; i++){
+			var line = lines[i].trim();
+			if(line && line.indexOf("=") > 0 && list.indexOf(line) < 0){
+				list.push(line);
+				added++;
+			}
+		}
+		if(!added){
+			app.toast("Gói name này đã có trong danh sách của bạn.");
+			return 0;
+		}
+		await this.set(key, list);
+		// keep the open reader in sync when it is showing this very book
+		if(this.namecontext == key){
+			this.namedata = list.slice(0);
+			this.refreshCache();
+			app.reader.runNameForAll();
+		}
+		app.toast("Đã thêm " + this.formatNumber(added) + " name vào gói của bạn.");
+		return added;
+	};
+	app.namemanager.renderNamePackRow = function(p, book, pack){
+		var content = String(pack.content == null ? "" : pack.content);
+		var stats = this.packStats(content);
+		var author = String(pack.author == null ? "" : pack.author).trim() || "Ẩn danh";
+		var item = app.render("namepackbybookrow", {});
+		item.q(".author").textContent = author;
+		item.q(".nbbavatar").textContent = author.charAt(0);
+		item.q(".time").textContent = this.formatDate(pack.time);
+		item.q(".preview").textContent = this.packSample(content) || "Gói name";
+		item.q(".names").textContent = this.formatNumber(stats.count) + " name";
+		item.q(".length").textContent = this.formatNumber(stats.chars) + " ký tự";
+		item.q(".download").addEventListener("click", function(){
+			app.namemanager.appendPackToBook(book, content).then(function(){
+				app.namemanager.renderNameByBookLocal(p, book);
+				item.classList.add("added");
+			});
+		});
+		return item;
+	};
+	app.namemanager.refreshNameByBook = function(){
+		var p = this.nameByBookPage;
+		if(!p || !p.parentElement){
+			p = app.topPage();
+		}
+		var book = (p && p.data) || app.reader.bookinfo;
+		if(!p || !book){
+			return;
+		}
+		this.renderNameByBookLocal(p, book);
+		this.loadNameByBook(p, book);
+	};
+	app.namemanager.manageNameByBook = function(){
+		var p = this.nameByBookPage;
+		var book = (p && p.data) || app.reader.bookinfo;
+		if(!book){
+			return;
+		}
+		// showManager reads tname/name/author only, so hand it a safe copy
+		this.showManager({
+			name: book.name,
+			author: book.author,
+			tname: book.tname || book.name || "Name riêng"
+		});
+	};
+	app.namemanager.showUploadNameByBook = async function(){
+		var page = this.nameByBookPage;
+		var book = (page && page.data) || app.reader.bookinfo;
+		if(!book || !book.id){
+			app.toast("Không xác định được truyện để đăng name.");
+			return;
+		}
+		if(!this.isNameByBookSupported(book)){
+			app.toast("Chưa hỗ trợ đăng gói name cho truyện này.");
+			return;
+		}
+		var data = await this.getBookNameData(book);
+		var content = data.list.join("\n");
+		var stats = this.packStats(content);
+		if(!stats.count){
+			app.toast("Bạn chưa có name nào cho truyện này.");
+			return;
+		}
+		var savedUser = "";
+		try{
+			savedUser = (await app.storage.get(this.uploadUserKey)) || "";
+		}catch(e){}
+		var pop = app.context.showPopup({
+			title: "Đăng gói name",
+			body: `<div class="nbbup">
+					<div class="nbbupstats"><b class="nbbupnames"></b> name · <b class="nbbupchars"></b> ký tự</div>
+					<input class="nbbupuser browser-default" type="text" maxlength="40" autocomplete="off" placeholder="Tên của bạn (hiển thị công khai)">
+					<div class="nbbupnote">Gói name sẽ được đăng công khai cho mọi người cùng dùng cho truyện này.</div>
+					<div class="nbbuperr"></div>
+				</div>`,
+			button: `<button action=cancel>Hủy</button><button action=upload class="nbbupbtn">Đăng</button>`,
+			action: {
+				upload: function(p){
+					app.namemanager.doUploadNameByBook(p, book, content, stats);
+				},
+				cancel: function(p){
+					p.parentElement.hide();
+				}
 			}
 		});
-	}
+		pop.q(".nbbupnames").textContent = this.formatNumber(stats.count);
+		pop.q(".nbbupchars").textContent = this.formatNumber(stats.chars);
+		pop.q(".nbbupuser").value = savedUser;
+		if(this.utf8Length(content) < 200){
+			pop.q(".nbbupbtn").disabled = true;
+			pop.q(".nbbuperr").textContent = "Cần tối thiểu 200 ký tự để đăng, gói hiện có " + this.formatNumber(stats.chars) + ".";
+		}
+	};
+	app.namemanager.doUploadNameByBook = function(p, book, content, stats){
+		if(p.uploading){
+			return;
+		}
+		var user = String(p.q(".nbbupuser").value || "").trim();
+		var err = p.q(".nbbuperr");
+		var btn = p.q(".nbbupbtn");
+		if(!user){
+			err.textContent = "Nhập tên của bạn trước khi đăng.";
+			p.q(".nbbupuser").focus();
+			return;
+		}
+		if(this.utf8Length(content) < 200){
+			err.textContent = "Cần tối thiểu 200 ký tự để đăng, gói hiện có " + this.formatNumber(stats.chars) + ".";
+			return;
+		}
+		p.uploading = true;
+		btn.disabled = true;
+		err.textContent = "";
+		// same fields the web uploader posts; encodeTwice matches the server's
+		// extra urldecode() so newlines and Vietnamese survive intact
+		var body = "data=" + this.encodeTwice(content) +
+			"&username=" + this.encodeTwice(user) +
+			"&bookid=" + encodeURIComponent(book.id) +
+			"&host=" + encodeURIComponent(book.host);
+		app.net.post("/index.php?upload=true", body).then(function(text){
+			p.uploading = false;
+			btn.disabled = false;
+			if(!(typeof text == "string" && text.indexOf("success") >= 0)){
+				err.textContent = "Đăng không thành công. Vui lòng thử lại sau.";
+				return;
+			}
+			try{
+				app.storage.set(app.namemanager.uploadUserKey, user);
+			}catch(e){}
+			p.parentElement.hide();
+			app.toast("Đăng gói name thành công.");
+			app.namemanager.loadNameByBook(app.namemanager.nameByBookPage, book);
+		}).catch(function(e){
+			console.log(e);
+			p.uploading = false;
+			btn.disabled = false;
+			err.textContent = "Không kết nối được tới máy chủ.";
+		});
+	};
 	app.namemanager.showNamePack = function(){
 		var p = app.pushPage("namepackmanager", {});
 		var pub = p.q(".publiclist");
@@ -6874,6 +8193,10 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 	app.perf.initCss = `
 		html,body{
 			background-color: transparent !important;
+			/* the page lives in its own frame: without this the frame rubber-bands
+			   on iOS even though the page itself is the only scroller */
+			overscroll-behavior: none;
+			overscroll-behavior-y: none;
 		}
 	`;
 	app.perf.createFrame = function(){
@@ -6889,7 +8212,7 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 				head.push(`<style>${css.textContent}</style>`);
 			}
 		}
-		head.push(`<style>${app.perf.initCss}</style>`);
+		//head.push(`<style>${app.perf.initCss}</style>`);
 		frame.srcdoc = `<html><head>${head.join("")}</head><body></body></html>`;
 		frame.q = function(selector){
 			return frame.contentDocument.querySelector(selector);
@@ -6994,7 +8317,7 @@ ui.scriptmanager.load("/asset/app.v2.read.js",function(){},!isCachedFrontend);
 				head.push(`<style>${css.textContent}</style>`);
 			}
 		}
-		head.push(`<style>${app.perf.initCss}</style>`);
+		//head.push(`<style>${app.perf.initCss}</style>`);
 		var style = document.createElement("div");
 		style.innerHTML = head.join("");
 		style.className = "perf-style";
@@ -9027,3 +10350,194 @@ function parseQueryString(queryString) {
       return acc;
     }, {});
 }
+
+// ---- ranking / book push pages -------------------------------------------
+// Both pages keep their own chip bar pinned above the list: the ranking type
+// and the push channel used to be reachable only through the "..." menu.
+(function(app){
+	app.discover = app.discover || {};
+	app.discover.rankTypes = [
+		{id: "viewweek", text: "Tuần"},
+		{id: "viewday", text: "Ngày"},
+		{id: "view", text: "Tổng"},
+		{id: "like", text: "Thích"},
+		{id: "following", text: "Theo dõi"},
+		{id: "bookmarked", text: "Đánh dấu"}
+	];
+	app.discover.pushChannels = null;
+	app.discover.rankSource = function(id){
+		return "/io/searchtp/searchBooks?minc=50&sort=" + id + "&p=0";
+	}
+	app.discover.pushSource = function(id){
+		return "/mobile/booklist.php?method=bookpush&channel=" + encodeURIComponent(id || "");
+	}
+	// switch the source of an already rendered list, the chip bar stays alive
+	app.discover.reload = function(viewId, from){
+		var view = g(viewId);
+		if(!view){
+			return;
+		}
+		var list = view.q("bookdisplay");
+		if(list && list.listLoader){
+			list.listLoader.setBaseLink(from);
+			list.listLoader.reset();
+			list.scrollTop = 0;
+			return;
+		}
+		app.refresh(view);
+	}
+	// the tab view switches page on a horizontal drag; keep the touch on the bar
+	// so a long chip list can be scrolled instead of flipping the tab
+	app.discover.bindChips = function(bar){
+		if(!bar || bar.__discoverBound){
+			return;
+		}
+		bar.__discoverBound = true;
+		bar.addEventListener("touchstart", function(e){
+			e.stopPropagation();
+		}, {passive: true});
+	}
+	app.discover.renderChips = function(bar, items, activeId, onPick){
+		if(!bar){
+			return;
+		}
+		this.bindChips(bar);
+		bar.innerHTML = "";
+		for(var i = 0; i < items.length; i++){
+			(function(item){
+				var chip = document.createElement("div");
+				chip.className = "fchip" + (item.id == activeId ? " on" : "");
+				chip.textContent = item.text;
+				chip.addEventListener("click", function(){
+					app.platform.nativeClick();
+					onPick(item);
+				});
+				bar.appendChild(chip);
+			})(items[i]);
+		}
+		var active = bar.q(".fchip.on");
+		if(active){
+			bar.scrollLeft = Math.max(0, active.offsetLeft - (bar.clientWidth - active.offsetWidth) / 2);
+		}
+	}
+	app.discover.rankFilter = function(){
+		this.renderChips(g("rankfilterbar"), this.rankTypes, app.prop.viewranktype, function(item){
+			app.prop.viewranktype = item.id;
+			app.discover.applyRankType();
+		});
+	}
+	app.discover.applyRankType = function(){
+		this.reload("bookrankingview", this.rankSource(app.prop.viewranktype));
+		this.rankFilter();
+	}
+	app.discover.applyPushDir = function(){
+		this.reload("bookdirview", this.pushSource(app.prop.pushdir));
+		this.pushFilter();
+	}
+	app.discover.pushFilter = function(){
+		if(!g("pushdirbar")){
+			return;
+		}
+		this.loadPushChannels().then(function(list){
+			if(!list || !list.length || !g("pushdirbar")){
+				return;
+			}
+			var items = list.map(function(e){
+				return {id: e.id, text: e.name};
+			});
+			app.discover.renderChips(g("pushdirbar"), items, app.prop.pushdir, function(item){
+				app.prop.pushdir = item.id;
+				app.discover.applyPushDir();
+			});
+		}).catch(function(){});
+	}
+	app.discover.loadPushChannels = function(){
+		if(this.pushChannels){
+			return Promise.resolve(this.pushChannels);
+		}
+		try{
+			var cached = JSON.parse(localStorage.getItem("stv_push_channels") || "null");
+			if(cached && cached.length){
+				this.pushChannels = cached;
+				return Promise.resolve(cached);
+			}
+		}catch(e){}
+		return app.net.get("/mobile/bookmanage.php?act=listpushdir").then(function(d){
+			var list = (d && d.data) || [];
+			app.discover.pushChannels = list;
+			try{
+				localStorage.setItem("stv_push_channels", JSON.stringify(list));
+			}catch(e){}
+			return list;
+		});
+	}
+	app.discover.currentView = function(){
+		var tab = g("tabtimkiem");
+		if(!tab || !tab.currentTabNode){
+			return null;
+		}
+		var node = tab.currentTabNode();
+		return node ? node.getAttribute("view") : null;
+	}
+	app.discover.sync = function(){
+		var view = this.currentView();
+		if(view == "bookranking"){
+			this.rankFilter();
+		}else if(view == "bookpush"){
+			this.pushFilter();
+		}
+	}
+	app.discover.setup = function(){
+		var tab = g("tabtimkiem");
+		if(!this.setupDone){
+			this.setupDone = true;
+			if(tab){
+				var prev = tab.ontabchange;
+				tab.ontabchange = function(){
+					if(typeof prev == "function"){
+						prev.apply(this, arguments);
+					}
+					app.discover.sync();
+				};
+			}
+			this.loadPushChannels().catch(function(){});
+		}
+		this.sync();
+	}
+	// app.init() finishes the tab setup, hook after it
+	var init = app.init;
+	if(typeof init == "function"){
+		app.init = function(){
+			var ret = init.apply(this, arguments);
+			try{
+				app.discover.setup();
+			}catch(e){
+				console.error("discover setup", e);
+			}
+			return ret;
+		};
+	}else{
+		app.discover.setup();
+	}
+})(app);
+
+//app.license
+(function(app){
+	app.license = {
+		show: function(){
+			return app.pushPage("pagelicense", {});
+		},
+		open: function(url){
+			if(!url){
+				return;
+			}
+			// on native window.open is patched to Capacitor's Browser plugin;
+			// do not cache an instance here, every tap has to open a page
+			try{
+				window.open(url);
+			}catch(e){
+				console.error("license open", e);
+			}
+		}
+	};
+})(app);

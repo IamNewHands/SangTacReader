@@ -1,27 +1,27 @@
 {
   "host": "https://sangtacviet.com",
-  "generated": "2026-09-23T13:29:58.264Z",
+  "generated": "2026-11-17T15:24:45.525Z",
   "files": [
     {
       "name": "app.v2.js",
       "path": "/asset/app.v2.js",
-      "bytes": 252334,
-      "sha256": "90a93036110b81377ae6ed5362f43edc69f4389faf9d6a9d3c3abaae9d186aa1",
-      "lastModified": "Sun, 28 Jun 2026 19:08:22 GMT"
+      "bytes": 299207,
+      "sha256": "49757e2af23ad4ddea429f99c7735a17e0e8175ce223927a0e6c8d221c90c432",
+      "lastModified": "Fri, 13 Nov 2026 15:41:09 GMT"
     },
     {
       "name": "app.v2.css",
       "path": "/asset/app.v2.css",
-      "bytes": 50001,
-      "sha256": "7858c5dd8dbd1e59ce0388a2a66f81c21ed4312e46d4240e08bb3f44633cf47c",
-      "lastModified": "Fri, 09 May 2025 19:32:19 GMT"
+      "bytes": 71427,
+      "sha256": "d257645ed3c65801813cce5a45047cbca32a6853a8a47f848041aa336837524a",
+      "lastModified": "Fri, 13 Nov 2026 15:40:42 GMT"
     },
     {
       "name": "app.v2.bookdisplay.js",
       "path": "/asset/app.v2.bookdisplay.js",
-      "bytes": 26313,
-      "sha256": "88e8ee10285769b6e8cf66beffee8773ba133253260b64df4d0911a0826e03d1",
-      "lastModified": "Sat, 12 Jul 2025 04:14:24 GMT"
+      "bytes": 30476,
+      "sha256": "4c1e8e3bf0eaa7d20a6790a1c41ba785f33690c63d147b6167f7abfe1f747f0d",
+      "lastModified": "Mon, 09 Nov 2026 06:36:39 GMT"
     },
     {
       "name": "app.v2.config.js",
@@ -33,23 +33,23 @@
     {
       "name": "app.v2.read.js",
       "path": "/asset/app.v2.read.js",
-      "bytes": 140969,
-      "sha256": "9f945090b7fe1d96c95207f555ca473673a146146009d13736d4613f156eaa3a",
-      "lastModified": "Sat, 14 Feb 2026 14:37:08 GMT"
+      "bytes": 146062,
+      "sha256": "44c3afd30942f12bc1f895c864e0f39f71176f9a7fcbefb5d7804f802a1f608c",
+      "lastModified": "Wed, 11 Nov 2026 03:29:12 GMT"
     },
     {
       "name": "app.v2.chapterdisplay.js",
       "path": "/asset/app.v2.chapterdisplay.js",
-      "bytes": 153712,
-      "sha256": "e98555084647dfec2125b3d659e7237a02cc7af743026a57b5432c491a27c9ae",
-      "lastModified": "Sun, 15 Feb 2026 10:05:03 GMT"
+      "bytes": 156057,
+      "sha256": "ab38ade6fdf4be9ff0235df37250734b30a67f38c16ed34f3c23139701545a9a",
+      "lastModified": "Sun, 08 Nov 2026 17:12:19 GMT"
     },
     {
       "name": "stv.tts.js",
       "path": "/stv.tts.js",
-      "bytes": 45458,
-      "sha256": "a0ddd485817b4c08857bba2b0151d02fbca9617feb4c18989cb1b863d218bfe7",
-      "lastModified": "Fri, 19 Dec 2025 18:25:21 GMT"
+      "bytes": 46693,
+      "sha256": "721f4829fb3ae5338023ed8ad2faf045e5ec13fc0d4fe8f06a105469d7225d99",
+      "lastModified": "Wed, 11 Nov 2026 03:28:57 GMT"
     },
     {
       "name": "hanviet.js",

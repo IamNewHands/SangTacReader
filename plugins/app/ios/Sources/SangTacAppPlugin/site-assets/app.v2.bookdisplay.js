@@ -531,6 +531,109 @@ function _defineProperty(e, r, t) {
       });
     }
   }
+  // compact counter, keeps the stat line readable: 50385 -> "50.4k"
+  function formatCount(value) {
+    if (typeof value === "string") {
+      value = value.trim();
+      if (!value) {
+        return "0";
+      }
+      // some endpoints already hand back a compact value ("1.8k", "270k")
+      if (/[a-z]$/i.test(value)) {
+        return value;
+      }
+      value = parseFloat(value);
+    }
+    var n = value;
+    if (!isFinite(n) || n <= 0) {
+      return "0";
+    }
+    if (n < 1000) {
+      return String(Math.round(n * 10) / 10);
+    }
+    if (n < 1000000) {
+      var k = n / 1000;
+      return (k >= 100 ? Math.round(k) : Math.round(k * 10) / 10) + "k";
+    }
+    var m = n / 1000000;
+    return (m >= 100 ? Math.round(m) : Math.round(m * 10) / 10) + "m";
+  }
+  // row used by the ranking / book push pages: cover, name, author and a
+  // compact line of counters instead of the monospace glyph string
+  class BookRowStats extends BookRow {
+    constructor(...args) {
+      super(...args);
+      _defineProperty(this, "baseBookElement", app.render("book-row-stats", {}));
+    }
+    fillStats(ele) {
+      var data = ele.data;
+      var set = function (selector, value) {
+        var node = ele.q(selector);
+        if (node) {
+          node.textContent = formatCount(value);
+        }
+      };
+      // weekly views are the ranking metric but many books have none, fall back
+      // to the total count so the line never reads "0"
+      var week = typeof data.viewweek === "string" ? parseFloat(data.viewweek) : data.viewweek;
+      set(".st-view b", week > 0 ? data.viewweek : data.view);
+      set(".st-star b", data.star);
+      set(".st-like b", data.liked);
+      set(".st-sub b", data.subscribe);
+      set(".st-mark b", data.bookmark);
+      set(".st-chap b", data.chaptercount);
+    }
+    bindEvent(ele) {
+      var data = ele.data;
+      this.fillStats(ele);
+      ele.addEventListener("click", function () {
+        app.platform.nativeClick();
+        app.fun.openBookWithData(data.lid, data);
+      });
+      ui.hold(ele, function () {
+        app.context.current(1, ele);
+      });
+      ele.q("img").addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      });
+    }
+  }
+  // same row with the ordinal number of the book in the ranking list
+  class BookRowRanked extends BookRowStats {
+    constructor(...args) {
+      super(...args);
+    }
+    bindEvent(ele) {
+      super.bindEvent(ele);
+      var highlight = {
+        viewweek: ".st-view",
+        viewday: ".st-view",
+        view: ".st-view",
+        like: ".st-like",
+        following: ".st-sub",
+        bookmarked: ".st-mark"
+      }[app.prop.viewranktype];
+      var node = highlight ? ele.q(highlight) : null;
+      if (node) {
+        node.classList.add("hl");
+      }
+    }
+    placeNode(book, pos) {
+      var node = super.placeNode(book, pos);
+      if (node) {
+        var badge = node.q(".rankno");
+        if (badge) {
+          badge.textContent = pos + 1;
+          if (pos < 3) {
+            badge.classList.add("top" + (pos + 1));
+          }
+        }
+      }
+      return node;
+    }
+  }
   class BookSlider extends BookDisplay {
     constructor(...args) {
       super(...args);
@@ -675,6 +778,8 @@ function _defineProperty(e, r, t) {
         "row-1": BookRowNameAndAuthor,
         "row-2": BookRowNameAndAuthorAndStat,
         "row-3": BookRowExtended,
+        "row-stats": BookRowStats,
+        "row-rank": BookRowRanked,
         "grid-0": BookGridNameOnly,
         "grid-1": BookGridNameAndAuthor,
         "grid-2": BookGridNameAndAuthorAndStat,
@@ -807,8 +912,27 @@ function _defineProperty(e, r, t) {
               })
               .catch((err) => {
                 console.error("HTTP request failed", err);
+                var rootErr = err;
                 app.net.networkManager.checkDomains();
-                reject(err);
+                // Retry with raw fetch as a fallback if Capacitor HTTP fails
+                fetch(link, {
+                  method: "GET",
+                  headers: {
+                    "x-stv-transport": "app",
+                    "x-requested-with": "com.sangtacviet.mobilereader",
+                    "Accept": "application/json, text/plain, */*",
+                  }
+                }).then(response => {
+                  if (!response.ok) {
+                    throw new Error("HTTP error: " + response.status);
+                  }
+                  return response.json();
+                }).then(data => {
+                  resolve(data);
+                }).catch(fetchErr => {
+                  console.error("Fallback fetch failed", fetchErr);
+                  reject(new Error("Fallback fetch failed: " + fetchErr.message + " | Root error: " + rootErr.message));
+                });
               });
           });
         } else {
@@ -856,7 +980,7 @@ function _defineProperty(e, r, t) {
           if(isReset){
             self.clearAllContent();
           }
-          self.markLoadError(err.message || err);
+          self.markLoadError((err.message || err) + " " + (err.stack || ""));
           app.debug.report({stack: JSON.stringify(err) + self.baseLink + " f2 test"});
         });
       console.log("Booklist loader done", resultCode);

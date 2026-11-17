@@ -777,6 +777,48 @@ class AndroidTts extends TtsProvider {
         return await TTS.getEngines();
     }
 }
+class IosTts extends TtsProvider {
+    constructor(options) {
+        super(options);
+        this.options = options;
+        if(!options.voice){
+            this.options.voice = "default";
+        }
+        if(!options.rate){
+            this.options.rate = 1.5;
+        }
+        this.props = {
+            voice: {
+                type: 'select',
+                default: 'default',
+                description: 'Giọng đọc',
+            },
+            rate: {
+                type: 'float',
+                default: 1.5,
+                min: 0.5, max: 5,
+                description: 'Tốc độ đọc',
+            },
+        };
+    }
+
+    async speak(text, options) {
+        this.checkConfig();
+        if(options.rate){
+            this.options.rate = options.rate;
+        }
+        if(options.voice){
+            this.options.voice = options.voice;
+        }
+        var param = {
+            text: text,
+            voice: this.options.voice,
+            rate: this.options.rate,
+        };
+        var arrayBuffer = await TTS.speakToFile(param);
+        return new Blob([arrayBuffer], {type: 'audio/wav'});
+    }
+}
 class SangtacvietTts extends TtsProvider {
     constructor(options) {
         super(options);
@@ -913,6 +955,9 @@ var ttsEngine = {
         switch (name) {
             case "google":
                 this.provider = new AndroidTts(options);
+                break;
+            case "apple":
+                this.provider = new IosTts(options);
                 break;
             case "zalo":
                 this.provider = new ZaloTts(options);

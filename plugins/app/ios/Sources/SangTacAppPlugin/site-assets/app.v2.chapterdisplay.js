@@ -66,6 +66,45 @@ const preloaderAnimation = `
           padding: 8px;
           text-align: center;
       }`;
+// The chapter iframes load their helpers (g, q, applyNodeList, excuteApp) with
+// plain <script src> tags. Those URLs have to stay same-origin: same-origin is
+// the only form the WebView can still serve from its cache when the device is
+// offline. The mirror domains are unreachable offline, which leaves the iframe
+// without its helpers and makes every chapter render blank.
+function chapterFrameScriptUrl(name, fallback) {
+    try {
+        var scripts = document.querySelectorAll("script[src]");
+        for (var i = 0; i < scripts.length; i++) {
+            var src = scripts[i].getAttribute("src") || "";
+            if (src.indexOf(name) >= 0) {
+                return new URL(src, location.href).href;
+            }
+        }
+    } catch (e) {}
+    try {
+        return new URL(fallback, location.href).href;
+    } catch (e) {
+        return fallback;
+    }
+}
+// reading from the iframe document must not depend on the helper scripts being
+// loaded, otherwise a failed script blanks the chapter instead of degrading it
+function getFrameElement(frame, id) {
+    var cw = frame && frame.contentWindow;
+    var doc = (cw && cw.document) || (frame && frame.contentDocument);
+    if (!doc) {
+        return null;
+    }
+    var el = null;
+    try {
+        if (cw && typeof cw.g == "function") {
+            el = cw.g(id);
+        }
+    } catch (e) {
+        el = null;
+    }
+    return el || doc.getElementById(id);
+}
 class ChapterDisplay {
     constructor(root) {
         this.root = root;
@@ -90,7 +129,7 @@ class ChapterDisplay {
     unlockNameSelect() {} // unlock name select
     getCurrentWindow() {} // get the current window
     destroy() {
-        if (this.root) {
+        if (this.root && this.root.firstChild) {
             this.root.firstChild.remove();
         }
         for (var k in this) {
@@ -122,7 +161,7 @@ class SlideChapterDisplay extends ChapterDisplay {
             this,
             "baseSrcDoc",
             `<head>
-          <script src="${app.net.networkManagerXHR.bestDomain()}/stv.ui.js"></script>
+          <script src="${chapterFrameScriptUrl("stv.ui.js", "/stv.ui.js?v=1.360")}"></script>
           <style id="readerstyle"></style>
           <style id="localfont"></style>
           <link rel="stylesheet" href="{webfont}">
@@ -184,7 +223,7 @@ class SlideChapterDisplay extends ChapterDisplay {
                   min-height: 100%;
               }
           </style>
-          <script src="${app.net.networkManagerXHR.bestDomain()}/qtOnline.js?v=35"></script>
+          <script src="${chapterFrameScriptUrl("qtOnline.js", "/qtOnline.js?v=35")}"></script>
           <script type="id" id="hiddenid">0;0;0</script>
           </head><body>
               <div class="rctx" id="contextmenu"></div>
@@ -276,22 +315,26 @@ class SlideChapterDisplay extends ChapterDisplay {
                     var has = app.config.reader.prepend_chapter_name;
                     if (has) {
                         l.forEach((e) => {
-                            var cw = e.q(".content").contentWindow;
+                            var frame = e.q(".content");
+                            var body = frame.contentDocument && frame.contentDocument.body;
                             var name = e.q(".chaptername");
-                            var inner = cw.g("chaptername");
+                            if (!body || !name) {
+                                return;
+                            }
+                            var inner = getFrameElement(frame, "chaptername");
                             if (!inner) {
-                                inner = cw.document.createElement("div");
+                                inner = frame.contentDocument.createElement("div");
                                 inner.id = "chaptername";
                                 inner.textContent = name.textContent;
-                                cw.document.body.insertBefore(inner, cw.g("maincontent"));
+                                var maincontent = getFrameElement(frame, "maincontent");
+                                body.insertBefore(inner, maincontent);
                             } else if (inner.textContent != name.textContent) {
                                 inner.textContent = name.textContent;
                             }
                         });
                     } else {
                         l.forEach((e) => {
-                            var cw = e.q(".content").contentWindow;
-                            var inner = cw.g("chaptername");
+                            var inner = getFrameElement(e.q(".content"), "chaptername");
                             if (inner) {
                                 inner.remove();
                             }
@@ -686,10 +729,13 @@ class SlideChapterDisplay extends ChapterDisplay {
         container.q(".chaptername").textContent = chaptername;
         var frame = container.q(".content");
         var innerWindow = frame.contentWindow;
-        innerWindow.q("#maincontent").innerHTML = content;
+        var maincontent = getFrameElement(frame, "maincontent");
+        if (maincontent) {
+            maincontent.innerHTML = content;
+        }
         try {
-            innerWindow.applyNodeList();
-            innerWindow.excuteApp();
+            if (typeof innerWindow.applyNodeList == "function") innerWindow.applyNodeList();
+            if (typeof innerWindow.excuteApp == "function") innerWindow.excuteApp();
         } catch (e) {
             console.log(e);
         }
@@ -703,11 +749,15 @@ class SlideChapterDisplay extends ChapterDisplay {
     setContent2(text, cdata, view, isToTop) {
         view.cdata = cdata;
         view.q(".chaptername").textContent = cdata.chaptername;
-        var cw = view.q(".content").contentWindow;
-        cw.g("maincontent").innerHTML = text;
+        var frame = view.q(".content");
+        var cw = frame.contentWindow;
+        var maincontent = getFrameElement(frame, "maincontent");
+        if (maincontent) {
+            maincontent.innerHTML = text;
+        }
         try {
-            cw.applyNodeList();
-            cw.excuteApp();
+            if (typeof cw.applyNodeList == "function") cw.applyNodeList();
+            if (typeof cw.excuteApp == "function") cw.excuteApp();
         } catch (e) {}
         this.behaviour.prepend_chapter_name.apply();
         if (isToTop) {
@@ -871,7 +921,10 @@ class SlideChapterDisplay extends ChapterDisplay {
         }
     }
     showAlert(msg, view) {
-        var mct = view.q(".content").contentWindow.g("maincontent");
+        var mct = getFrameElement(view.q(".content"), "maincontent");
+        if (!mct) {
+            return;
+        }
         var preloader = view.q(".chapterpreloader");
         if (preloader) {
             preloader.remove();
@@ -1256,7 +1309,7 @@ class PageFlipChapterDisplay extends ChapterDisplay {
             this,
             "baseSrcDoc",
             `<head>
-          <script src="${app.net.networkManagerXHR.bestDomain()}/stv.ui.js"></script>
+          <script src="${chapterFrameScriptUrl("stv.ui.js", "/stv.ui.js?v=1.360")}"></script>
           <style id="readerstyle"></style>
           <style id="localfont"></style>
           <link rel="stylesheet" href="{webfont}">
@@ -1396,7 +1449,7 @@ class PageFlipChapterDisplay extends ChapterDisplay {
                 background: none !important;
               }
           </style>
-          <script src="${app.net.networkManagerXHR.bestDomain()}/qtOnline.js?v=35"></script>
+          <script src="${chapterFrameScriptUrl("qtOnline.js", "/qtOnline.js?v=35")}"></script>
           <script type="id" id="hiddenid">0;0;0</script>
           </head><body>
               <div class="rctx" id="contextmenu"></div>
@@ -1640,7 +1693,12 @@ class PageFlipChapterDisplay extends ChapterDisplay {
     }
     setContent(text, cdata, view) {
         view.cdata = cdata;
-        var hiddenRenderer = this.innerWindow.g("maincontent");
+        var hiddenRenderer = this.innerWindow && this.innerWindow.document
+            ? this.innerWindow.document.getElementById("maincontent")
+            : null;
+        if (!hiddenRenderer) {
+            return;
+        }
         view.baseHTML = text;
         view.reOrganizePages(hiddenRenderer, false, this.getDisplayHeight());
     }
@@ -3208,7 +3266,7 @@ class ContinuosChapterDisplay extends ChapterDisplay {
             this,
             "baseSrcDoc",
             `<head>
-          <script src="${app.net.networkManagerXHR.bestDomain()}/stv.ui.js"></script>
+          <script src="${chapterFrameScriptUrl("stv.ui.js", "/stv.ui.js?v=1.360")}"></script>
           <style id="readerstyle"></style>
           <style id="localfont"></style>
           <link rel="stylesheet" href="{webfont}">
@@ -3287,7 +3345,7 @@ class ContinuosChapterDisplay extends ChapterDisplay {
                   left: 0;
               }
           </style>
-          <script src="${app.net.networkManagerXHR.bestDomain()}/qtOnline.js?v=35"></script>
+          <script src="${chapterFrameScriptUrl("qtOnline.js", "/qtOnline.js?v=35")}"></script>
           <script type="id" id="hiddenid">0;0;0</script>
           </head><body>
               <div class="rctx" id="contextmenu"></div>

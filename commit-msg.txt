@@ -1,16 +1,31 @@
-修登录 403：登录地址要带 index.php，且 pin 被拒时要能退回站点原本的地址
+刷站点快照到 11 月 13 日那版：镜像不再喂 9 月的旧前端
 
-18:38 那份日志里每次登录都是：
-  [ERR] POST https://sangtacviet.app/?ajax=login -> 403 … <title>Just a moment...</title>
-两个错叠在一起：
+site-assets/ 停在 2026-09-23（7c6af2f），而站点在 11 月连推了几版前端：
+app.v2.js 9030 → 10544 行（+1631/−117），read.js 4504 → 4646，chapterdisplay.js
++80/−22，bookdisplay.js +126/−2，css +1028/−13，tts.js +45。镜像的正是这 8 个文件，
+所以过去七周里每个装了镜像的读者，拿到的都是 9 月的 bundle 配 11 月的 shell ——
+读者报的「历史分类顶部多了个搜索框就进不去了」正是这半边的错位：搜索框、排除关键词、
+线路面板都是 11 月 shell 与 bundle 一起加的功能，旧 bundle 里没有
+app.history.toggleSearch / app.search.editIgnores / app.search.submitSearch。
 
-1. 站点把登录发给 /?ajax=login，页面 origin 自己会把 / 映射到 index.php，而 .app 不映射，
-   裸根路径直接被 Cloudflare 拦。日志里两次成功的登录都是 /index.php?ajax=login
-   （17:12:53、17:57:01）。absoluteOn() 现在把 / 与 /?… 改写成 /index.php。
-2. pin 按设计忽略「域名」设置，所以四条路全撞同一堵墙 —— 读者说的「切换域名也不行」就是它。
-   现在 net.post 被 HTTP 层拒绝时回退一次到站点原本给的地址；只回退一次，因为 403 意味着
-   服务端什么都没执行，不可能把读者登录两遍。网络故障与 captcha 应答不回退。
+11 月这批还带了三处结构性改动，旧快照全缺：
+- app.v2.read.js:276 app.reader.closePreviousPages —— 翻页时把上一章的残留页摘掉，
+  站点自己在 :4760 调它；
+- app.v2.chapterdisplay.js:74 chapterFrameScriptUrl —— 章节 iframe 的脚本改走
+  same-origin 绝对地址，离线时 WebView 还能从缓存伺服；
+- app.chapterListTimeout（默认 12000）+ haveNetwork 判断 —— 离线可读已下载的书。
 
-守卫：check-ios-shim 30 块 / 676361 字节；test-site-patch 988 条断言 0 失败
-（新增 3 条：/?ajax=login 改写为 /index.php?ajax=login、403 时回退且面板写明被哪台拒、
-网络故障不换主机重放）。docs/capacitor-port.md 新增 §6.63.6。
+做法：node scripts/gen-site-assets.js 原样重下 8 个文件（iPhone UA，CRLF 归一后再算
+sha256，逐字节与线上核对过 app.v2.js / app.v2.css / bookdisplay / config 四件）。
+hanviet.js 与 app.v2.config.js 线上未变，因此不进本次 diff。
+
+守卫：check-ios-shim 32 块 / 702611 字节 / 141 markers；test-site-patch 1030 条断言
+0 失败（三处清单仍一致，8 个文件）；gen-site-i18n --check 461 labels / 76 fragments；
+gen-site-assets --check 8 文件 / 987431 字节同步。补丁锚点在快照里逐个 grep 过：
+.nametable 5、chaptertopinfo 14、.erroralert 3、settingitem 3、pageflip 11、
+app.pushPage 22、app.goback 5、app.user.checklogin 3、ui.smtab 4、bestDomain 6、
+app.tts.player 11。
+
+没进镜像的仍是 /asset/app.v2.comicprovider.js、app.v2.db.js、app.v2.surf.trans.js 与
+根路径的 stv.ui.js / stv.host.js：它们由 bundle 运行时或 HTML 解析器直接取，注入层
+碰不到，留给下一轮。

@@ -249,7 +249,6 @@ var events = {
 };
 // reader
 (function(app){
-    
     var events = {
         "view_contextmenu":{
             "click": function(e){e.stopPropagation();},
@@ -262,7 +261,6 @@ var events = {
             }
         }
     }
-	
 	app.reader = app.reader || {};
     app.reader.encryptedHosts = ["sangtac", "dich"];
 	app.reader.display = null;
@@ -271,9 +269,64 @@ var events = {
 	app.reader.ttssetting = null;
 	app.reader.drawer = null;
     app.reader.chapterDisplay = null;
-	app.reader.init = function(h,i,c){
+	// Only one reader page may exist at a time: init() looks the page up with
+	// g("chapterview"), which returns the first match in the document, so a
+	// leftover reader page from an earlier chapter silently takes over the whole
+	// reader - the new page stays blank and its drawer is never built.
+	app.reader.closePreviousPages = function(){
+		var roots = [g("overlay"), g("ptransit")];
+		var removed = 0;
+		for(var r = 0; r < roots.length; r++){
+			var root = roots[r];
+			if(!root){
+				continue;
+			}
+			// perf pages keep the page inside an iframe, the holder points at it
+			var holders = root.querySelectorAll(".perf-holder");
+			for(var i = 0; i < holders.length; i++){
+				var holder = holders[i];
+				if(!holder.self || holder.self.id != "chapterview"){
+					continue;
+				}
+				// the page may also be a sibling of the holder: then the loop
+				// below removes it and counts it once
+				var insideFrame = !(holder.self.closest && holder.self.closest("#overlay"));
+				holder.remove();
+				if(insideFrame){
+					removed++;
+				}
+			}
+			var pages = root.querySelectorAll("#chapterview");
+			for(var i = 0; i < pages.length; i++){
+				var page = pages[i];
+				try{
+					page.qq("[sleepwake]").forEach(function(e){
+						if(e.dispose){
+							e.dispose();
+						}
+					});
+				}catch(e){}
+				page.remove();
+				removed++;
+			}
+		}
+		if(removed > 0){
+			try{
+				clearInterval(window.readerWatchInterval);
+			}catch(e){}
+			var stack = app.platform && app.platform.stateStack;
+			if(stack && stack.length > 0){
+				stack.length = Math.max(0, stack.length - removed);
+			}
+		}
+		return removed;
+	}
+	app.reader.init = function(h,i,c, display){
 		this.clean();
-		this.display = g("chapterview");
+		this.display = display || g("chapterview");
+		if(!this.display){
+			return;
+		}
 		var p = this.display;
 		this.host = h;
 		this.id = i;
@@ -600,7 +653,9 @@ var events = {
 		}
 	}
 	app.reader.getContent = async function(h,i,c,rl){
-		if(this.offlineBook && !rl){
+		// a stored chapter is the only thing that can load without network, even
+		// when the reader asked for a reload
+		if(this.offlineBook && (!rl || navigator.onLine === false)){
 			var cdata = await this.offlineBook.getChapterOrNull(c);
 			if(cdata){
 				return JSON.parse(cdata);
@@ -1547,6 +1602,10 @@ var events = {
 		this.bottommenu = null;
 	}
 	app.reader.defaultRStyle = `i{text-decoration:none; font-style:normal;}body{margin:0;}
+		/* chapter text scrolls in its own frame; a rubber-band there pulls the
+		   last line up and reveals the reader background, so it is disabled on
+		   the frame root as well as the body */
+		html,body{overscroll-behavior:none;overscroll-behavior-y:none;}
 		#contextmenu{transform-origin:top left;position:absolute;z-index:1000;top: -100px;opacity:0;transition:opacity 0.2s;}
 		#contextmenu.active{opacity:1;}img{max-width:100%;}#contextmenu i{font-size: 1.5em;}`;
 	
@@ -1931,14 +1990,32 @@ var events = {
 		app.reader.autoscroller.start();
 	}
 	app.reader.loadDrawerChapter = async function(){
-		if(app.reader.drawer.q(".clistcontainer").children.length == 0)
-		return await getchapterlist(this.host,this.id, false, app.reader.drawer.q(".clistcontainer"), 90, false);
+		var clist = app.reader.drawer.q(".clistcontainer");
+		if(clist.children.length > 0 && clist.style.position != "absolute"){
+			// an unfinished build only left the first part behind
+			clist.innerHTML = "";
+			clist.scrollTop = 0;
+			clist.style.cssText = "";
+			clist.parentElement.style.height = "";
+		}
+		if(clist.children.length == 0)
+		return await getchapterlist(this.host,this.id, false, clist, 90, false);
 	}
 	app.reader.showDrawer = async function(){
 		app.reader.drawer.style.display = "block";
 		await waitFrame();
 		app.reader.drawer.classList.add("open");
-		if(app.reader.drawer.q(".clistcontainer").children.length == 0){
+		var clistContainer = app.reader.drawer.q(".clistcontainer");
+		// the container is set to absolute exactly when the build finishes: rows
+		// without it are leftovers of an aborted build (only the first part),
+		// rebuild them instead of showing a list that cannot scroll any further
+		if(clistContainer.children.length > 0 && clistContainer.style.position != "absolute"){
+			clistContainer.innerHTML = "";
+			clistContainer.scrollTop = 0;
+			clistContainer.style.cssText = "";
+			clistContainer.parentElement.style.height = "";
+		}
+		if(clistContainer.children.length == 0){
 			this.loadDrawerChapter();
 			app.reader.drawer.q(".chapterlist").addEventListener("click",async function(e){
 				var t = e.target;
@@ -2338,7 +2415,7 @@ var events = {
 	app.tts = {
 		voiceId: 0,
 	};
-	ui.scriptmanager.load("/stv.tts.js?v=7", function(){}, !isCachedFrontend);
+	ui.scriptmanager.load("/stv.tts.js?v=8", function(){}, !isCachedFrontend);
 
 	function Sentence(view, nodes, senid){
 		this.nodes = nodes;
@@ -2929,6 +3006,7 @@ var events = {
 		}
 		if(app.platform.isIOS){
 			return [
+				{ name: "Apple TextToSpeech", value: "apple" },
 				{ name: "Bing TTS", value: "bing" },
 				{ name: "Zalo AI", value: "zalo" },
 				{ name: "FPT AI", value: "fpt" },
@@ -3347,6 +3425,65 @@ var events = {
 			}
 			return list;
 		}
+		// Downloads made by an old version stored the content under the
+		// "undefined" prefix and lost the chapter list: every chapter looked
+		// missing (no marker, wrong rebuilt list). Rebuild the list from the
+		// files that are really on the device, once per book.
+		async repairDownloadedChapters(chapterList){
+			var book = this;
+			if(book.baseObject.repaired){
+				return await book.getChapterDownloaded();
+			}
+			if(book.repairing){
+				return book.repairing;
+			}
+			if(!chapterList || !chapterList.length){
+				return await book.getChapterDownloaded();
+			}
+			book.repairing = (async function(){
+				try{
+					var existing = await book.getChapterDownloaded();
+					var existSet = arrToObj(existing);
+					var found = [];
+					var pending = [];
+					for(var i = 0; i < chapterList.length; i++){
+						var cid = chapterList[i].cid;
+						if(!cid || existSet[cid]){
+							continue;
+						}
+						pending.push(cid);
+					}
+					// read in batches: one by one is far too slow for long books
+					var batchSize = 16;
+					for(var i = 0; i < pending.length; i += batchSize){
+						var batch = pending.slice(i, i + batchSize);
+						var results = await Promise.all(batch.map(function(id){
+							return app.storage.cache.getFile("undefined" + id);
+						}));
+						for(var j = 0; j < results.length; j++){
+							if(results[j]){
+								found.push(batch[j]);
+							}
+						}
+					}
+					book.baseObject.repaired = true;
+					if(found.length){
+						var all = existing.concat(found);
+						book.chapters = all;
+						await app.storage.cache.setFile(book.chapterStoreKey, JSON.stringify(all));
+						book.baseObject.totalDownloaded = all.length;
+						await app.offlineBook.store.save();
+					}
+					return book.chapters || existing;
+				}catch(e){
+					console.log(e);
+					return await book.getChapterDownloaded();
+				}finally{
+					book.repairing = null;
+				}
+			})();
+			return book.repairing;
+		}
 		async addDownloadedChapter(chapter){
 			var book = this;
 			var chapters = await book.getChapterDownloaded();
@@ -3376,22 +3513,27 @@ var events = {
 			var book = this;
 			var key = book.baseObject.chapterPreKey + chapter;
 			var data = await app.storage.cache.getFile(key);
+			if(!data){
+				// downloads made by an old version kept the content under the
+				// "undefined" prefix, it must still be readable
+				data = await app.storage.cache.getFile("undefined" + chapter);
+			}
 			return data;
 		}
 		async getChapterOrNull(chapter){
 			var book = this;
 			// check if exist
 			var chapters = await book.getChapterDownloaded();
-			if(chapters.indexOf(chapter) < 0){
-				if(parseInt(chapter) > 10000){
-					var oldBug = await app.storage.cache.getFile("undefined" + chapter);
-					if(oldBug){
-						return oldBug;
-					}
+			if(chapters.indexOf(chapter) >= 0){
+				var data = await book.getChapter(chapter);
+				if(data){
+					return data;
 				}
-				return null;
 			}
-			return await book.getChapter(chapter);
+			// the chapter list of old downloads can be missing while the content
+			// is still stored: load it instead of failing (any id, not only the
+			// long ids used by the old bug)
+			return await app.storage.cache.getFile("undefined" + chapter);
 		}
 		async downloadChapter(chapterid, content){
 			var book = this;
