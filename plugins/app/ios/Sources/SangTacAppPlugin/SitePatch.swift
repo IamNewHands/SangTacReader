@@ -11667,6 +11667,115 @@ enum SitePatch {
         }
         watch();
 
+        // Everything above measures the frame; this measures the reading, which is
+        // what a reader means by "loaded". The home tab fetches its list after
+        // app.init() and renders it into #historyview (app.v2.js:4155-4181), and
+        // the covers then arrive from a separate CDN host that the [ASSET]
+        // timeline cannot see -- it only counts same-origin requests. Those two
+        // steps are the gap between "the UI is up" and "there is something to
+        // read", and until now nothing in the log could tell them apart.
+        var contentSeen = false;
+
+        function contentNodes() {
+            var host = document.getElementById('historyview');
+            if (!host) { return 0; }
+            var kids = host.children || host.childNodes || [];
+            return kids.length;
+        }
+
+        function coverCount() {
+            var host = document.getElementById('historyview');
+            if (!host || typeof host.querySelectorAll !== 'function') { return '0/0'; }
+            var imgs = host.querySelectorAll('img');
+            if (!imgs || !imgs.length) { return '0/0'; }
+            var ready = 0;
+            for (var k = 0; k < imgs.length; k++) {
+                var img = imgs[k];
+                if (!img || !img.complete) { continue; }
+                if (typeof img.naturalWidth === 'number' && img.naturalWidth <= 0) { continue; }
+                ready++;
+            }
+            return ready + '/' + imgs.length;
+        }
+
+        function contentSummary() {
+            return contentNodes() + ' node(s) covers=' + coverCount();
+        }
+
+        function noteContent(reason) {
+            if (contentSeen) { return true; }
+            if (contentNodes() <= 0) { return false; }
+            contentSeen = true;
+            note('BOOT', 'first content at +' + (Date.now() - started) + 'ms ('
+                + reason + ', ' + contentSummary() + ')');
+            return true;
+        }
+
+        // The list is written by the site with createElement/appendChild, so a
+        // mutation is the moment it appears; the poll covers the case where it
+        // was already there before this block could observe anything.
+        if (typeof MutationObserver === 'function') {
+            try {
+                var contentObserver = new MutationObserver(function () {
+                    if (noteContent('mutation')) { contentObserver.disconnect(); }
+                });
+                contentObserver.observe(document.documentElement || document,
+                    { childList: true, subtree: true });
+            } catch (e) {}
+        }
+        var contentTimer = setInterval(function () {
+            if (noteContent('poll')) { clearInterval(contentTimer); }
+        }, 500);
+        setTimeout(function () { clearInterval(contentTimer); }, 30000);
+
+        // The shell is fetched from the site, so by the time this runs the launch
+        // is already about a second old. This is the one number that says how much
+        // of it was the network before any of our JavaScript existed.
+        note('BOOT', 'navigation: ' + (function () {
+            try {
+                var t = performance.timing;
+                if (t && t.navigationStart > 0 && t.responseStart > 0) {
+                    return 'html ' + (t.responseStart - t.navigationStart) + 'ms';
+                }
+            } catch (e) {}
+            return 'html unknown';
+        })());
+
+        // The stretch the page cannot see at all: process start, bridge setup, web
+        // view creation, and the network wait before this document existed. The
+        // plugin records its own load clock (SangTacAppPlugin.getInfo, uptimeMs /
+        // loadUptimeMs); subtracting this page's age leaves the time the launch
+        // spent before its first line of JavaScript ran. Without it "cold launch
+        // took 10s" cannot be split into "before the page" and "on the page".
+        (function () {
+            var tries = 0;
+            var timer = setInterval(function () {
+                tries++;
+                var bridge = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+                if (!bridge || typeof bridge.getInfo !== 'function') {
+                    if (tries > 200) { clearInterval(timer); }
+                    return;
+                }
+                clearInterval(timer);
+                try {
+                    var pending = bridge.getInfo();
+                    if (!pending || typeof pending.then !== 'function') { return; }
+                    pending.then(function (info) {
+                        if (!info || typeof info.uptimeMs !== 'number'
+                            || typeof info.loadUptimeMs !== 'number') { return; }
+                        var age = 0;
+                        try { age = Math.round(performance.now()); } catch (e) {}
+                        var before = info.uptimeMs - info.loadUptimeMs - age;
+                        note('BOOT', 'native: plugin loaded ' + (before >= 0
+                            ? before + 'ms before document start'
+                            : (-before) + 'ms after document start')
+                            + ' (page age ' + age + 'ms)');
+                    }, function () {});
+                } catch (e) {}
+            }, 25);
+            setTimeout(function () { clearInterval(timer); }, 10000);
+        })();
+
         var samples = [
             [0, 'document start'],
             [1000, 'stylesheet'],
@@ -11683,6 +11792,7 @@ enum SitePatch {
                         + ': app=' + (window.app ? 'yes' : 'no')
                         + ' config=' + ((window.app && window.app.config && window.app.config.reader)
                             ? 'yes' : 'no')
+                        + ' content=' + contentSummary()
                         + ' navbar=' + (function () {
                             var node = document.getElementById('mainnavbar');
                             if (!node) { return 'absent'; }
@@ -11930,23 +12040,24 @@ enum SitePatch {
      Opening the reader for the first time pulls four modules, each behind its
      own 300-800ms TTFB, and none of them is needed until then:
 
-         /asset/app.v2.read.js            32KB   app.v2.js:3943
-         /asset/app.v2.chapterdisplay.js  25KB   app.v2.read.js:237
-         /stv.tts.js?v=7                   9KB   app.v2.read.js:2341
-         /hanviet.js                      80KB   _page_vip.html:4546
+         /asset/app.v2.read.js            146KB   app.v2.js:4930
+         /asset/app.v2.chapterdisplay.js  156KB   app.v2.read.js:237
+         /stv.tts.js?v=8                   46KB   app.v2.read.js:2418
+         /hanviet.js                      233KB   _page_vip.html:4546
 
-     146KB in series, which is the "卡一下" the first chapter tap costs. Asking
-     for them once the home screen has painted moves that off the path the
-     reader waits on.
+     Half a megabyte in series, which is the "卡一下" the first chapter tap
+     costs. Asking for them once the home screen has painted moves that off the
+     path the reader waits on.
 
-     Safe without touching the site's logic because `scriptmanager.load`
-     de-duplicates by URL: in app mode `isCachedFrontend` is true
-     (app.v2.js:15), so `!isCachedFrontend` is false and the site requests all
-     four with a clean URL -- exactly the keys used here. The site's later call
-     therefore finds this entry in `stack` and just waits on it instead of
-     fetching again. Passing no `nocache` argument is deliberate: with it the
-     site would append `?nocache=<random>` and its own de-duplication (which
-     keys on the pre-append URL) would miss.
+     The URLs have to match the site's byte for byte, because `scriptmanager.load`
+     de-duplicates on the final URL: the same module under two keys is fetched
+     and evaluated twice, and a second `class TtsProvider` is a SyntaxError that
+     kills the whole file (that is exactly what "?v=7" here did against the
+     site's "?v=8" -- see stv-diagnostic-20261118-132042.log). The version suffix
+     below is therefore copied from app.v2.read.js:2418, not invented.
+
+     Passing no `nocache` argument is deliberate: with it the site appends
+     `?nocache=<random>`, which is a different key again and re-fetches.
      */
     static let readerPrefetch = """
     (function () {
@@ -11956,7 +12067,7 @@ enum SitePatch {
         var MODULES = [
             '/asset/app.v2.read.js',
             '/asset/app.v2.chapterdisplay.js',
-            '/stv.tts.js?v=7',
+            '/stv.tts.js?v=8',
             '/hanviet.js'
         ];
 

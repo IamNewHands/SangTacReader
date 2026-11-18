@@ -67,6 +67,14 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private var observers: [NSObjectProtocol] = []
 
+    /// System uptime when this plugin was loaded, i.e. during bridge setup at
+    /// launch. The page cannot see anything that happened before its own
+    /// document start -- the process start, the bridge, the web view -- and that
+    /// is where a cold launch spends its first second. Recording the clock here
+    /// lets the page subtract its own age and recover that stretch (see
+    /// `getInfo` and the bootShell block).
+    private static var loadUptime: TimeInterval = 0
+
     override public func load() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
@@ -85,6 +93,8 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
                                            object: nil, queue: OperationQueue.main) { [weak self] _ in
             self?.notifyListeners("resume", data: nil)
         })
+
+        SangTacAppPlugin.loadUptime = ProcessInfo.processInfo.systemUptime
 
         installDocumentStartScripts()
         showBootOverlay()
@@ -210,11 +220,17 @@ public class SangTacAppPlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject("Unable to get App Info")
             return
         }
+        // The two clocks below are for the boot timeline, not for display: the
+        // page subtracts its own age from "now minus plugin load" to find out how
+        // long the launch ran before its first line of JavaScript.
+        let now = ProcessInfo.processInfo.systemUptime
         call.resolve([
             "name": info["CFBundleDisplayName"] as? String ?? "",
             "id": info["CFBundleIdentifier"] as? String ?? "",
             "build": info["CFBundleVersion"] as? String ?? "",
-            "version": info["CFBundleShortVersionString"] as? String ?? ""
+            "version": info["CFBundleShortVersionString"] as? String ?? "",
+            "uptimeMs": Int((now * 1000).rounded()),
+            "loadUptimeMs": Int((SangTacAppPlugin.loadUptime * 1000).rounded())
         ])
     }
 

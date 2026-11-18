@@ -3249,6 +3249,20 @@ async function testBootShell() {
   console.log('first-paint shell');
   const sandbox = makeSandbox();
   installFakeApp(sandbox, { displayType: 'auto' });
+  // The two clocks the boot timeline needs from outside the page: how long the
+  // HTML took to arrive (performance.timing) and when the native plugin was
+  // loaded relative to process start (App.getInfo). Both are stubbed so the
+  // numbers in the log can be asserted instead of merely appearing.
+  sandbox.performance = {
+    now: () => 1200,
+    timing: { navigationStart: 1000, responseStart: 1520 },
+  };
+  sandbox.Capacitor.Plugins.App.getInfo = () => Promise.resolve({
+    name: 'SangTacViet', id: 'com.sangtacviet.mobilereader',
+    build: '1', version: '1.0',
+    uptimeMs: 5320,
+    loadUptimeMs: 2000,
+  });
   vm.runInContext(loadBlocks().join('\n'), sandbox);
 
   const root = sandbox.document.documentElement;
@@ -3278,6 +3292,38 @@ async function testBootShell() {
     JSON.stringify(sandbox.__stored.bootOverlayHide || []));
   check('the handover is in the durable log, not only in os_log',
     String(diag).indexOf('native boot overlay released') >= 0, String(diag).slice(-240));
+
+  // The launch is older than the page, and only these two numbers say by how
+  // much: the HTML round trip from performance.timing, and the native plugin's
+  // own clock less this page's age. Without them "cold launch took 10s" cannot
+  // be split into "before the page" and "on the page".
+  check('the HTML round trip is measured and logged',
+    String(diag).indexOf('navigation: html 520ms') >= 0, String(diag).slice(-400));
+  check('the native stretch before document start is derived from the plugin clock',
+    String(diag).indexOf('native: plugin loaded 2120ms before document start') >= 0,
+    String(diag).slice(-400));
+
+  // The frame can be up while the home tab is still empty, which is the state a
+  // reader calls "not loaded". The list arriving is the signal.
+  check('an empty home tab is reported as no content, not as a missing field',
+    String(diag).indexOf('content=0 node(s) covers=0/0') >= 0, String(diag).slice(-400));
+
+  const history = makeElement('div');
+  history.id = 'historyview';
+  sandbox.document.body.appendChild(history);
+  history.appendChild(makeElement('div'));
+  sandbox.__emitMutation({ type: 'childList', target: history, addedNodes: [] });
+  await tick(20);
+  // Re-read: the snapshot above was taken before the list existed.
+  const later = String(sandbox.window.__stvDiag.text());
+  check('the first content is timed, not just the frame',
+    later.indexOf('first content at +') >= 0
+      && later.indexOf('1 node(s) covers=0/0') >= 0,
+    later.slice(-400));
+  const firstContent = later.indexOf('first content at +');
+  const contentLogs = later.slice(firstContent).split('first content at +').length - 1;
+  check('the first content is logged once, not on every mutation',
+    contentLogs === 1, 'occurrences=' + String(contentLogs));
 
   // A build whose App plugin predates the method must still release the shell
   // (and must not throw on the way).
@@ -9239,8 +9285,13 @@ function testInjectionOrder() {
 
 /**
  * The reader's four modules are only requested once the reader opens, each
- * behind its own TTFB (app.v2.js:3943, app.v2.read.js:237/:2341,
+ * behind its own TTFB (app.v2.js:4930, app.v2.read.js:237/:2418,
  * _page_vip.html:4546). They are prefetched once the home screen has painted.
+ *
+ * The URLs are not ours to choose: `scriptmanager.load` de-duplicates on the
+ * final URL, so a prefetch under a different key re-fetches and re-evaluates the
+ * same file. "?v=7" against the site's "?v=8" did exactly that and produced a
+ * second `class TtsProvider`, a SyntaxError, and a dead TTS module on device.
  */
 async function testReaderPrefetch() {
   console.log('reader module prefetch');
@@ -9279,8 +9330,8 @@ async function testReaderPrefetch() {
     loaded.indexOf('/asset/app.v2.read.js') >= 0, JSON.stringify(loaded));
   check('chapterdisplay is prefetched with the same key the site uses',
     loaded.indexOf('/asset/app.v2.chapterdisplay.js') >= 0, JSON.stringify(loaded));
-  check('the tts module keeps its real version number',
-    loaded.indexOf('/stv.tts.js?v=7') >= 0, JSON.stringify(loaded));
+  check('the tts module keeps the exact key the site asks for',
+    loaded.indexOf('/stv.tts.js?v=8') >= 0, JSON.stringify(loaded));
   check('hanviet.js is prefetched',
     loaded.indexOf('/hanviet.js') >= 0, JSON.stringify(loaded));
   check('the prefetch is reported',
