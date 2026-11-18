@@ -11715,8 +11715,12 @@ enum SitePatch {
             return count;
         }
 
+        // A cover only counts once it has decoded. The log from 2026-11-18 19:48
+        // read `first content at +838ms (mutation, 0 item(s) 0/1 covers)`: the
+        // grid had not been rendered yet and the one image in the container was
+        // the tab icon, still loading. `total` was the wrong side of the count.
         function hasContent() {
-            return gridItems() > 0 || covers().total > 0;
+            return gridItems() > 0 || covers().ready > 0;
         }
 
         function contentSummary() {
@@ -12088,6 +12092,15 @@ enum SitePatch {
      is false the site randomises every one of these keys and no prefetch can
      ever match: the block then does nothing and says so, instead of causing a
      second evaluation to save a request the local copy answers anyway.
+
+     The key turned out not to be enough. The next device log (2026-11-18 19:48)
+     showed stv.tts.js evaluated at 19:48:09 and again at 19:48:13 by this block,
+     under the same `?v=8` key -- so the site had put that file on the page by a
+     path that never wrote to `stack`, and matching the key matched nothing. A
+     key is a guess about the loader's bookkeeping; the binding a file declares
+     is the fact. Each entry below therefore also carries a probe for its own
+     top-level `class`, and the block stands down when that probe already
+     resolves. The key check stays as a cheap second guard.
      */
     static let readerPrefetch = """
     (function () {
@@ -12097,9 +12110,23 @@ enum SitePatch {
         // Only the two the site loads with a clean, predictable key. read.js is
         // always asked for with `nocache = true`, and hanviet.js is not loaded by
         // anything in the mirrored set, so both would be a second evaluation.
+        //
+        // `present` names the top-level binding each file declares and asks
+        // whether it already resolves. A classic script's `class` lands in the
+        // global lexical scope: reachable as a bare identifier, invisible as a
+        // `window` property. `typeof` on the literal identifier is the only
+        // check that sees it, and it is also the only one that needs neither
+        // `eval` (blocked by a page CSP without unsafe-eval) nor the loader's
+        // bookkeeping.
         var MODULES = [
-            '/asset/app.v2.chapterdisplay.js',
-            '/stv.tts.js?v=8'
+            {
+                url: '/asset/app.v2.chapterdisplay.js',
+                present: function () { return typeof ChapterDisplay !== 'undefined'; }
+            },
+            {
+                url: '/stv.tts.js?v=8',
+                present: function () { return typeof TtsProvider !== 'undefined'; }
+            }
         ];
 
         function note(tag, message) {
@@ -12120,6 +12147,39 @@ enum SitePatch {
             } catch (e) { return null; }
         }
 
+        /**
+         Whether asking for this module now would evaluate it a second time.
+
+         Two independent guards, because the key is not the only way a module can
+         already be on the page:
+
+           - the global it declares. `class TtsProvider` at stv.tts.js:172 and
+             `class ChapterDisplay` at app.v2.chapterdisplay.js:108 are top-level
+             bindings in the global lexical scope, so a second evaluation is a
+             `SyntaxError: Can't create duplicate variable` that kills the whole
+             file. If the identifier already resolves, the file has run.
+           - the loader's own stack. `scriptmanager.load` keys on the final URL,
+             so a hit means the request is already in flight or done.
+
+         The identifier check is the one that matters: the device log from
+         2026-11-18 19:48 showed stv.tts.js being mirrored and evaluated at
+         19:48:09, then evaluated again at 19:48:13 by this block -- the site had
+         put it on the page by some path that never touched `stack`.
+         */
+        function standDown(manager, mod) {
+            try {
+                if (mod.present()) { return 'it is already on the page'; }
+            } catch (e) {
+                // `typeof` only throws on a binding in its temporal dead zone,
+                // which means the file is being evaluated right now. Stand down.
+                return 'it is being evaluated right now';
+            }
+            if (manager.stack && (mod.url in manager.stack)) {
+                return 'the site already asked for it';
+            }
+            return null;
+        }
+
         var requested = false;
 
         function prefetch(reason) {
@@ -12134,14 +12194,26 @@ enum SitePatch {
                 note('PREFETCH', 'skipped (' + reason + '): the site asks with nocache, so a second evaluation is all a prefetch could add');
                 return true;
             }
+            var asked = 0;
             for (var i = 0; i < MODULES.length; i++) {
+                var mod = MODULES[i];
+                var why = standDown(manager, mod);
+                if (why) {
+                    note('PREFETCH', mod.url + ' left alone (' + reason + '): ' + why);
+                    continue;
+                }
                 try {
-                    manager.load(MODULES[i], function () {});
+                    manager.load(mod.url, function () {});
+                    asked++;
                 } catch (e) {
-                    note('ERR', 'prefetch failed for ' + MODULES[i] + ': ' + e);
+                    note('ERR', 'prefetch failed for ' + mod.url + ': ' + e);
                 }
             }
-            note('PREFETCH', 'reader modules requested (' + reason + ')');
+            if (asked > 0) {
+                note('PREFETCH', asked + ' reader module(s) requested (' + reason + ')');
+            } else {
+                note('PREFETCH', 'nothing to request (' + reason + '): every module is already there');
+            }
             return true;
         }
 

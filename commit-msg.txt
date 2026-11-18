@@ -1,26 +1,22 @@
-预取只请求站点会用同一个键的模块，首屏内容不再把空壳当内容
+预取看模块是否已经在页面上，首屏内容只认已解码的封面
 
-真机日志（stv-diagnostic-20261118-182100.log，18:20 那次启动，构建 b12f3c8）证明上一版预取
-把 app.v2.read.js 和 hanviet.js 也算进去了，而这两个的键永远对不上：
+96e66e0 用「和站点同一个 URL 键」来决定要不要预取，19:48 的真机日志证明
+这条路不成立：站点自己求值 stv.tts.js 时根本没有写进 ui.scriptmanager.stack
+（同一段日志里 chapterdisplay 却去重成功了），于是四秒后又求值一次，报
+Can't create duplicate variable: 'TtsProvider'。键是猜的，绑定是事实。
 
-  app.v2.js:4930        read.js        nocache = true          -> ?nocache=<random>
-  _page_vip.html:4546   hanviet.js     不在镜像加载集里
+改成读模块自己声明的全局绑定：chapterdisplay 看 ChapterDisplay，tts 看
+TtsProvider。class 声明落在 global lexical scope 里，window 上看不见，所以
+只能用字面量 typeof；不用 eval，页面的 CSP 可能禁掉 unsafe-eval。typeof 在
+TDZ 里会抛，抛出就当作「正在求值」一并跳过。站点已经用同一个键请求过的也
+跳过，两条判据都不成立时才预取，并在日志里写明是哪一个让它停下的。
 
-scriptmanager.load 去重的是「加上 nocache 之后」的 URL（stv.ui.js:3241-3272），所以干净键
-预取 = 换一个键再求值一遍 read.js，而 read.js 内部第 2418 行又会加载 stv.tts.js?v=8，第二次
-求值撞上已存在的 class TtsProvider：
+首屏内容的第二处假阳性：19:48 的日志是 first content at +838ms (mutation,
+0 item(s) 0/1 covers)，书格没渲染、容器里那一张图也还没解码，是 tab 图标。
+按存在计数会把还没画出来的东西当成内容，改成按 complete 且 naturalWidth > 0
+的已解码封面计数。
 
-  18:20:38 [PREFETCH] reader modules requested (timer)
-  18:20:38 [ERR] onerror SyntaxError: Can't create duplicate variable: 'TtsProvider' @:0
-
-现在 MODULES 只留 chapterdisplay 与 tts.js?v=8（app.v2.read.js:237/:2418，两处 nocache 都是
-!isCachedFrontend），并在动手前读 app.v2.js:15 的 isCachedFrontend；站点若随机化键就整段
-stand down 并在日志里说明，而不是用一次重复求值换一个本地副本本来就能回答的请求。
-
-同一份日志还暴露首屏内容信号是假阳性：站点先 append 空 wrapper（app.v2.js:4178-4181）再渲染，
-旧判定「有子节点」于是在 +124ms 报 first content，而那一刻 covers=0/0。改为 gridItems() > 0
-（[view=bookgrid] 的子节点数）或 covers().total > 0（img 已 complete 且 naturalWidth>0），
-摘要从 "1 node(s) covers=0/0" 变成 "1 item(s) 0/0 covers"。
-
-门禁：check-ios-shim 32 blocks / 701437 bytes / 141 markers；gen-site-i18n --check 461 labels
-/ 76 fragments；test-site-patch 新增 10 条预取断言 + 3 条首屏断言全绿。
+测试补了这两条判据的两面：类已声明时不请求、未声明时仍请求、只停一个不会
+让整次预取沉默、两个都在页面上时说 nothing to request；封面未解码不算内容、
+解码后算、只记一次。书格那一项单独起一个页面来测，因为首屏只记一次，同一
+页里封面已经占了那个时刻。

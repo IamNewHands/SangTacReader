@@ -3322,23 +3322,66 @@ async function testBootShell() {
     String(sandbox.window.__stvDiag.text()).indexOf('first content at +') < 0,
     String(sandbox.window.__stvDiag.text()).slice(-300));
 
-  // A rendered grid item is: that is what the reader sees as a book row.
-  const grid = makeElement('div');
-  grid.setAttribute('view', 'bookgrid');
-  history.appendChild(grid);
-  grid.appendChild(makeElement('div'));
-  sandbox.__emitMutation({ type: 'childList', target: grid, addedNodes: [] });
+  // The second false positive, from the 19:48 device log:
+  // `first content at +838ms (mutation, 0 item(s) 0/1 covers)` -- the grid had
+  // not rendered and the one image in the container had not decoded. Counting
+  // covers by presence rather than by readiness is what let that through.
+  const cover = makeElement('img');
+  cover.complete = false;
+  cover.naturalWidth = 0;
+  history.appendChild(cover);
+  sandbox.__emitMutation({ type: 'childList', target: history, addedNodes: [] });
   await tick(20);
-  // Re-read: the snapshot above was taken before the grid existed.
-  const later = String(sandbox.window.__stvDiag.text());
-  check('the first content is timed, not just the frame',
-    later.indexOf('first content at +') >= 0
-      && later.indexOf('1 item(s) 0/0 covers') >= 0,
-    later.slice(-400));
-  const firstContent = later.indexOf('first content at +');
-  const contentLogs = later.slice(firstContent).split('first content at +').length - 1;
+  check('a cover that has not decoded is not content',
+    String(sandbox.window.__stvDiag.text()).indexOf('first content at +') < 0,
+    String(sandbox.window.__stvDiag.text()).slice(-300));
+
+  // A decoded cover is: that is what the reader actually sees.
+  cover.complete = true;
+  cover.naturalWidth = 300;
+  sandbox.__emitMutation({ type: 'childList', target: history, addedNodes: [] });
+  await tick(20);
+  const withCover = String(sandbox.window.__stvDiag.text());
+  check('a decoded cover is the first content',
+    withCover.indexOf('first content at +') >= 0
+      && withCover.indexOf('0 item(s) 1/1 covers') >= 0,
+    withCover.slice(-400));
+
+  // Only one line is ever written, so the grid has to be measured in a fresh
+  // page: in this one the cover already claimed the moment.
+  const contentLogs = String(sandbox.window.__stvDiag.text())
+    .split('first content at +').length - 1;
   check('the first content is logged once, not on every mutation',
     contentLogs === 1, 'occurrences=' + String(contentLogs));
+
+  // A rendered grid item counts on its own, with no decoded cover in sight.
+  const gridShell = makeSandbox();
+  installFakeApp(gridShell, { displayType: 'auto' });
+  gridShell.performance = {
+    now: () => 1200,
+    timing: { navigationStart: 1000, responseStart: 1520 },
+  };
+  gridShell.Capacitor.Plugins.App.getInfo = () => Promise.resolve({
+    name: 'SangTacViet', id: 'com.sangtacviet.mobilereader',
+    build: '1', version: '1.0',
+    uptimeMs: 5320,
+    loadUptimeMs: 2000,
+  });
+  vm.runInContext(loadBlocks().join('\n'), gridShell);
+  const gridHistory = makeElement('div');
+  gridHistory.id = 'historyview';
+  gridShell.document.body.appendChild(gridHistory);
+  const grid = makeElement('div');
+  grid.setAttribute('view', 'bookgrid');
+  gridHistory.appendChild(grid);
+  grid.appendChild(makeElement('div'));
+  gridShell.__emitMutation({ type: 'childList', target: grid, addedNodes: [] });
+  await tick(20);
+  const gridDiag = String(gridShell.window.__stvDiag.text());
+  check('a rendered grid item counts as content',
+    gridDiag.indexOf('1 item(s) 0/0 covers') >= 0, gridDiag.slice(-400));
+  check('the grid item is timed from document start',
+    gridDiag.indexOf('first content at +') >= 0, gridDiag.slice(-400));
 
   // A build whose App plugin predates the method must still release the shell
   // (and must not throw on the way).
@@ -9308,15 +9351,29 @@ function testInjectionOrder() {
  *
  * "?v=7" against the site's "?v=8" was that failure: a second evaluation, a
  * second `class TtsProvider`, a SyntaxError, and a dead TTS module on device.
- * The block now reads `isCachedFrontend` (app.v2.js:15) and stands down when the
- * site randomises its keys, which is the same condition the site uses.
+ *
+ * Matching the key turned out not to be sufficient. The 2026-11-18 19:48 device
+ * log showed stv.tts.js evaluated at 19:48:09 and again at 19:48:13, both under
+ * `?v=8`: the site had reached that file by a path that never wrote to `stack`,
+ * so the key matched and the de-duplication did not. The block now also probes
+ * the binding each file declares -- `class ChapterDisplay`
+ * (app.v2.chapterdisplay.js:108) and `class TtsProvider` (stv.tts.js:172) -- and
+ * stands down when it already resolves. Those are global *lexical* bindings, so
+ * they are invisible on `window` and visible to a bare `typeof`; the tests below
+ * create them the same way the real files do, with `class`, not by assigning a
+ * window property.
  */
 async function testReaderPrefetch() {
   console.log('reader module prefetch');
 
   // The site's own loader, with the real de-duplication rule: `stack` is keyed
   // on the URL as passed, BEFORE `nocache` is appended.
-  const makePrefetchSandbox = (cachedFrontend) => {
+  //
+  // `alreadyThere` models the case the 19:48 log exposed: a module the page
+  // evaluated without ever writing to `stack`. It is created as a top-level
+  // `class` in the sandbox, exactly like the real file declares it, so a probe
+  // that only looks at `window` cannot see it and a `typeof` probe can.
+  const makePrefetchSandbox = (cachedFrontend, alreadyThere) => {
     const sandbox = makeSandbox();
     installFakeApp(sandbox, { appLanguage: 'zh' });
     // app.v2.js:15 -- a top-level `const`, so it is a bare identifier to every
@@ -9338,7 +9395,10 @@ async function testReaderPrefetch() {
         },
       },
     };
-    vm.runInContext(loadBlocks().join('\n'), sandbox);
+    const prelude = (alreadyThere || [])
+      .map((name) => `class ${name} {}\n`)
+      .join('');
+    vm.runInContext(prelude + loadBlocks().join('\n'), sandbox);
     return { sandbox, loaded };
   };
 
@@ -9369,6 +9429,32 @@ async function testReaderPrefetch() {
   cached.sandbox.window.ui.scriptmanager.load('/asset/app.v2.chapterdisplay.js', function () {});
   check('the site\'s own later load is de-duplicated against the prefetch',
     cached.loaded.length === 2, JSON.stringify(cached.loaded));
+
+  // The 19:48 device log: stv.tts.js was on the page under ?v=8 and the prefetch
+  // asked for it again anyway, because the site had evaluated it without ever
+  // writing to `stack`. A probe for the file's own top-level class catches it.
+  const evaluated = makePrefetchSandbox(true, ['TtsProvider']);
+  evaluated.sandbox.__dispatch('load', {});
+  await tick(1600);
+  check('a module whose class is already declared is not requested again',
+    evaluated.loaded.indexOf('/stv.tts.js?v=8') < 0, JSON.stringify(evaluated.loaded));
+  check('the module that is not on the page is still prefetched',
+    evaluated.loaded.indexOf('/asset/app.v2.chapterdisplay.js') >= 0,
+    JSON.stringify(evaluated.loaded));
+  check('standing down for one module does not silence the prefetch',
+    String(evaluated.sandbox.window.__stvDiag.text()).indexOf('left alone') >= 0,
+    String(evaluated.sandbox.window.__stvDiag.text()).slice(-240));
+
+  // Both files already on the page: nothing to request, and the log has to say
+  // so -- a silent no-op is indistinguishable from a block that never ran.
+  const bothThere = makePrefetchSandbox(true, ['TtsProvider', 'ChapterDisplay']);
+  bothThere.sandbox.__dispatch('load', {});
+  await tick(1600);
+  check('nothing is requested when both modules are already on the page',
+    bothThere.loaded.length === 0, JSON.stringify(bothThere.loaded));
+  check('having nothing to request is reported, not silent',
+    String(bothThere.sandbox.window.__stvDiag.text()).indexOf('nothing to request') >= 0,
+    String(bothThere.sandbox.window.__stvDiag.text()).slice(-240));
 
   // The site appends `?nocache=<random>` whenever isCachedFrontend is false, so
   // no prefetch can match its key: the block has to stand down rather than pay
