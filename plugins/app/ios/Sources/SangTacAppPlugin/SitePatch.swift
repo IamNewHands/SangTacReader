@@ -11683,28 +11683,50 @@ enum SitePatch {
             return kids.length;
         }
 
-        function coverCount() {
+        function covers() {
+            var out = { ready: 0, total: 0 };
             var host = document.getElementById('historyview');
-            if (!host || typeof host.querySelectorAll !== 'function') { return '0/0'; }
-            var imgs = host.querySelectorAll('img');
-            if (!imgs || !imgs.length) { return '0/0'; }
-            var ready = 0;
+            if (!host || typeof host.querySelectorAll !== 'function') { return out; }
+            var imgs = host.querySelectorAll('img') || [];
+            out.total = imgs.length;
             for (var k = 0; k < imgs.length; k++) {
                 var img = imgs[k];
                 if (!img || !img.complete) { continue; }
                 if (typeof img.naturalWidth === 'number' && img.naturalWidth <= 0) { continue; }
-                ready++;
+                out.ready++;
             }
-            return ready + '/' + imgs.length;
+            return out;
+        }
+
+        // The site appends an empty wrapper first and only then renders the grid
+        // into it (app.v2.js:4178-4181), so "a child exists" is not content: the
+        // first log from this block read `1 node(s) covers=0/0` at +124ms and
+        // called an empty box the first content. A rendered grid item or a cover
+        // image is; nothing else is counted.
+        function gridItems() {
+            var host = document.getElementById('historyview');
+            if (!host || typeof host.querySelectorAll !== 'function') { return 0; }
+            var grids = host.querySelectorAll('[view=bookgrid]') || [];
+            var count = 0;
+            for (var k = 0; k < grids.length; k++) {
+                var kids = grids[k].children || grids[k].childNodes || [];
+                count += kids.length;
+            }
+            return count;
+        }
+
+        function hasContent() {
+            return gridItems() > 0 || covers().total > 0;
         }
 
         function contentSummary() {
-            return contentNodes() + ' node(s) covers=' + coverCount();
+            var c = covers();
+            return gridItems() + ' item(s) ' + c.ready + '/' + c.total + ' covers';
         }
 
         function noteContent(reason) {
             if (contentSeen) { return true; }
-            if (contentNodes() <= 0) { return false; }
+            if (contentNodes() <= 0 || !hasContent()) { return false; }
             contentSeen = true;
             note('BOOT', 'first content at +' + (Date.now() - started) + 'ms ('
                 + reason + ', ' + contentSummary() + ')');
@@ -12045,30 +12067,39 @@ enum SitePatch {
          /stv.tts.js?v=8                   46KB   app.v2.read.js:2418
          /hanviet.js                      233KB   _page_vip.html:4546
 
-     Half a megabyte in series, which is the "卡一下" the first chapter tap
-     costs. Asking for them once the home screen has painted moves that off the
-     path the reader waits on.
+     Asking for them once the home screen has painted moves that off the path
+     the reader waits on -- but only if the request lands on the *same* key the
+     site will use later. `scriptmanager.load` de-duplicates on the final URL
+     (stv.ui.js:3241-3272), and its third argument is a `nocache` flag that
+     appends `?nocache=<random>`: a module asked for under a key the site will
+     not repeat is fetched and evaluated a second time. For `stv.tts.js` that is
+     a `SyntaxError: Can't create duplicate variable: 'TtsProvider'` that kills
+     the whole file, which is what the device log showed on 2026-11-18.
 
-     The URLs have to match the site's byte for byte, because `scriptmanager.load`
-     de-duplicates on the final URL: the same module under two keys is fetched
-     and evaluated twice, and a second `class TtsProvider` is a SyntaxError that
-     kills the whole file (that is exactly what "?v=7" here did against the
-     site's "?v=8" -- see stv-diagnostic-20261118-132042.log). The version suffix
-     below is therefore copied from app.v2.read.js:2418, not invented.
+     So the key is not guessed here, it is derived from the site's own rule:
 
-     Passing no `nocache` argument is deliberate: with it the site appends
-     `?nocache=<random>`, which is a different key again and re-fetches.
+         app.v2.js:4930        read.js        nocache = true          -> random key, never prefetch
+         app.v2.read.js:237    chapterdisplay nocache = !isCachedFrontend
+         app.v2.read.js:2418   tts.js?v=8     nocache = !isCachedFrontend
+         _page_vip.html:4546   hanviet.js     loader not in the mirrored set -> not prefetched
+
+     `isCachedFrontend` is `window.hasOwnProperty('Capacitor')` (app.v2.js:15)
+     and it is a top-level `const`, so this block can read it directly. When it
+     is false the site randomises every one of these keys and no prefetch can
+     ever match: the block then does nothing and says so, instead of causing a
+     second evaluation to save a request the local copy answers anyway.
      */
     static let readerPrefetch = """
     (function () {
         if (window.__stvReaderPrefetchInstalled) { return; }
         window.__stvReaderPrefetchInstalled = true;
 
+        // Only the two the site loads with a clean, predictable key. read.js is
+        // always asked for with `nocache = true`, and hanviet.js is not loaded by
+        // anything in the mirrored set, so both would be a second evaluation.
         var MODULES = [
-            '/asset/app.v2.read.js',
             '/asset/app.v2.chapterdisplay.js',
-            '/stv.tts.js?v=8',
-            '/hanviet.js'
+            '/stv.tts.js?v=8'
         ];
 
         function note(tag, message) {
@@ -12081,6 +12112,14 @@ enum SitePatch {
                 ? ui.scriptmanager : null;
         }
 
+        /** The site's own nocache rule: app.v2.js:15, read as the page sees it. */
+        function cachedFrontend() {
+            try {
+                if (typeof isCachedFrontend === 'undefined') { return null; }
+                return !!isCachedFrontend;
+            } catch (e) { return null; }
+        }
+
         var requested = false;
 
         function prefetch(reason) {
@@ -12088,6 +12127,13 @@ enum SitePatch {
             var manager = scriptManager();
             if (!manager) { return false; }
             requested = true;
+            var clean = cachedFrontend();
+            if (clean !== true) {
+                // Either the flag is not readable yet or the site randomises every
+                // key: prefetching would evaluate these modules twice.
+                note('PREFETCH', 'skipped (' + reason + '): the site asks with nocache, so a second evaluation is all a prefetch could add');
+                return true;
+            }
             for (var i = 0; i < MODULES.length; i++) {
                 try {
                     manager.load(MODULES[i], function () {});

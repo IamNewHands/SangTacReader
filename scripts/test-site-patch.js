@@ -3306,19 +3306,34 @@ async function testBootShell() {
   // The frame can be up while the home tab is still empty, which is the state a
   // reader calls "not loaded". The list arriving is the signal.
   check('an empty home tab is reported as no content, not as a missing field',
-    String(diag).indexOf('content=0 node(s) covers=0/0') >= 0, String(diag).slice(-400));
+    String(diag).indexOf('content=0 item(s) 0/0 covers') >= 0, String(diag).slice(-400));
 
   const history = makeElement('div');
   history.id = 'historyview';
   sandbox.document.body.appendChild(history);
+  // The site appends an empty wrapper before it renders (app.v2.js:4178-4181),
+  // and the first device log from this block counted that wrapper as content:
+  // `first content at +124ms (mutation, 1 node(s) covers=0/0)` on an empty home.
+  // A wrapper is not content, so neither is it here.
   history.appendChild(makeElement('div'));
   sandbox.__emitMutation({ type: 'childList', target: history, addedNodes: [] });
   await tick(20);
-  // Re-read: the snapshot above was taken before the list existed.
+  check('an empty wrapper is not mistaken for the first content',
+    String(sandbox.window.__stvDiag.text()).indexOf('first content at +') < 0,
+    String(sandbox.window.__stvDiag.text()).slice(-300));
+
+  // A rendered grid item is: that is what the reader sees as a book row.
+  const grid = makeElement('div');
+  grid.setAttribute('view', 'bookgrid');
+  history.appendChild(grid);
+  grid.appendChild(makeElement('div'));
+  sandbox.__emitMutation({ type: 'childList', target: grid, addedNodes: [] });
+  await tick(20);
+  // Re-read: the snapshot above was taken before the grid existed.
   const later = String(sandbox.window.__stvDiag.text());
   check('the first content is timed, not just the frame',
     later.indexOf('first content at +') >= 0
-      && later.indexOf('1 node(s) covers=0/0') >= 0,
+      && later.indexOf('1 item(s) 0/0 covers') >= 0,
     later.slice(-400));
   const firstContent = later.indexOf('first content at +');
   const contentLogs = later.slice(firstContent).split('first content at +').length - 1;
@@ -9286,62 +9301,86 @@ function testInjectionOrder() {
 /**
  * The reader's four modules are only requested once the reader opens, each
  * behind its own TTFB (app.v2.js:4930, app.v2.read.js:237/:2418,
- * _page_vip.html:4546). They are prefetched once the home screen has painted.
+ * _page_vip.html:4546). Two of them can be prefetched once the home screen has
+ * painted -- but only under the exact key the site will repeat, because
+ * `scriptmanager.load` de-duplicates on the final URL and its `nocache` argument
+ * appends `?nocache=<random>`.
  *
- * The URLs are not ours to choose: `scriptmanager.load` de-duplicates on the
- * final URL, so a prefetch under a different key re-fetches and re-evaluates the
- * same file. "?v=7" against the site's "?v=8" did exactly that and produced a
+ * "?v=7" against the site's "?v=8" was that failure: a second evaluation, a
  * second `class TtsProvider`, a SyntaxError, and a dead TTS module on device.
+ * The block now reads `isCachedFrontend` (app.v2.js:15) and stands down when the
+ * site randomises its keys, which is the same condition the site uses.
  */
 async function testReaderPrefetch() {
   console.log('reader module prefetch');
 
-  const sandbox = makeSandbox();
-  installFakeApp(sandbox, { appLanguage: 'zh' });
   // The site's own loader, with the real de-duplication rule: `stack` is keyed
   // on the URL as passed, BEFORE `nocache` is appended.
-  const loaded = [];
-  sandbox.window.ui = {
-    scriptmanager: {
-      stack: {},
-      load(url, onload) {
-        if (url in this.stack) {
+  const makePrefetchSandbox = (cachedFrontend) => {
+    const sandbox = makeSandbox();
+    installFakeApp(sandbox, { appLanguage: 'zh' });
+    // app.v2.js:15 -- a top-level `const`, so it is a bare identifier to every
+    // later script in the same realm. `undefined` models a boot where the block
+    // runs before the site's own flag exists.
+    if (cachedFrontend !== undefined) { sandbox.isCachedFrontend = cachedFrontend; }
+    const loaded = [];
+    sandbox.window.ui = {
+      scriptmanager: {
+        stack: {},
+        load(url, onload) {
+          if (url in this.stack) {
+            if (onload) { onload(); }
+            return;
+          }
+          loaded.push(url);
+          this.stack[url] = Promise.resolve();
           if (onload) { onload(); }
-          return;
-        }
-        loaded.push(url);
-        this.stack[url] = Promise.resolve();
-        if (onload) { onload(); }
+        },
       },
-    },
+    };
+    vm.runInContext(loadBlocks().join('\n'), sandbox);
+    return { sandbox, loaded };
   };
-  vm.runInContext(loadBlocks().join('\n'), sandbox);
+
+  const cached = makePrefetchSandbox(true);
   await tick(60);
-
   check('nothing is prefetched before the page has loaded',
-    loaded.length === 0, JSON.stringify(loaded));
+    cached.loaded.length === 0, JSON.stringify(cached.loaded));
 
-  sandbox.__dispatch('load', {});
+  cached.sandbox.__dispatch('load', {});
   await tick(1600);
 
-  check('the reader modules are prefetched after load',
-    loaded.length === 4, JSON.stringify(loaded));
-  check('app.v2.read.js is prefetched',
-    loaded.indexOf('/asset/app.v2.read.js') >= 0, JSON.stringify(loaded));
+  check('the modules with a predictable key are prefetched after load',
+    cached.loaded.length === 2, JSON.stringify(cached.loaded));
   check('chapterdisplay is prefetched with the same key the site uses',
-    loaded.indexOf('/asset/app.v2.chapterdisplay.js') >= 0, JSON.stringify(loaded));
+    cached.loaded.indexOf('/asset/app.v2.chapterdisplay.js') >= 0,
+    JSON.stringify(cached.loaded));
   check('the tts module keeps the exact key the site asks for',
-    loaded.indexOf('/stv.tts.js?v=8') >= 0, JSON.stringify(loaded));
-  check('hanviet.js is prefetched',
-    loaded.indexOf('/hanviet.js') >= 0, JSON.stringify(loaded));
+    cached.loaded.indexOf('/stv.tts.js?v=8') >= 0, JSON.stringify(cached.loaded));
+  check('read.js is left alone, because the site asks for it with nocache',
+    cached.loaded.indexOf('/asset/app.v2.read.js') < 0, JSON.stringify(cached.loaded));
+  check('hanviet.js is left alone, because nothing in the mirror loads it',
+    cached.loaded.indexOf('/hanviet.js') < 0, JSON.stringify(cached.loaded));
   check('the prefetch is reported',
-    String(sandbox.window.__stvDiag.text()).indexOf('[PREFETCH]') >= 0,
-    String(sandbox.window.__stvDiag.text()).slice(-160));
+    String(cached.sandbox.window.__stvDiag.text()).indexOf('[PREFETCH]') >= 0,
+    String(cached.sandbox.window.__stvDiag.text()).slice(-160));
 
   // The site's own later request must be served from `stack`, not refetched.
-  sandbox.window.ui.scriptmanager.load('/asset/app.v2.read.js', function () {});
+  cached.sandbox.window.ui.scriptmanager.load('/asset/app.v2.chapterdisplay.js', function () {});
   check('the site\'s own later load is de-duplicated against the prefetch',
-    loaded.length === 4, JSON.stringify(loaded));
+    cached.loaded.length === 2, JSON.stringify(cached.loaded));
+
+  // The site appends `?nocache=<random>` whenever isCachedFrontend is false, so
+  // no prefetch can match its key: the block has to stand down rather than pay
+  // for a second evaluation of a file the local copy already answers.
+  const randomKeys = makePrefetchSandbox(false);
+  randomKeys.sandbox.__dispatch('load', {});
+  await tick(1600);
+  check('nothing is prefetched when the site randomises its keys',
+    randomKeys.loaded.length === 0, JSON.stringify(randomKeys.loaded));
+  check('standing down is reported, not silent',
+    String(randomKeys.sandbox.window.__stvDiag.text()).indexOf('skipped') >= 0,
+    String(randomKeys.sandbox.window.__stvDiag.text()).slice(-200));
 }
 
 /**

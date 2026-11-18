@@ -1,37 +1,26 @@
-给启动装上可读的钟：分清「页面之前」和「页面之上」各花了多久
+预取只请求站点会用同一个键的模块，首屏内容不再把空壳当内容
 
-真机冷启动 10s、热启动 5s 这件事一直没法查，因为日志里根本没有能回答它的数：
-BOOT 采样点只打 app/config/navbar 三件事（0/1/3/6/10/20s），全程都是
-app=yes config=yes navbar=85px，看不出内容什么时候到位；[ASSET] 时间线统计的是
-已经发出的请求，看不到「还没发出的等待」；而进程启动、bridge、webview 创建、
-HTML 往返这一段发生在 document start 之前，页面侧一个字都记不到。
+真机日志（stv-diagnostic-20261118-182100.log，18:20 那次启动，构建 b12f3c8）证明上一版预取
+把 app.v2.read.js 和 hanviet.js 也算进去了，而这两个的键永远对不上：
 
-三处补上：
+  app.v2.js:4930        read.js        nocache = true          -> ?nocache=<random>
+  _page_vip.html:4546   hanviet.js     不在镜像加载集里
 
-1) 首屏内容可见（bootShell 块）。#historyview 的列表由 app.init() 之后 fetch 并
-   渲染（app.v2.js:4155-4181），封面再从另一个 CDN 主机取 —— [ASSET] 只统计同源
-   请求，根本看不见封面。现在用 MutationObserver + 500ms 轮询盯住 historyview，
-   第一次出现子节点就打
-     [BOOT] first content at +Nms (mutation|poll, N node(s) covers=x/y)
-   并且每个采样点后面都带上 content=N node(s) covers=x/y。框架起来和「有东西可读」
-   从此是两个数，不是一个。
+scriptmanager.load 去重的是「加上 nocache 之后」的 URL（stv.ui.js:3241-3272），所以干净键
+预取 = 换一个键再求值一遍 read.js，而 read.js 内部第 2418 行又会加载 stv.tts.js?v=8，第二次
+求值撞上已存在的 class TtsProvider：
 
-2) HTML 往返（同一个块）。shell 来自远端 server.url，等这段 JS 跑起来时启动已经
-   过去一秒多了。用 performance.timing 打 navigation: html Nms，这是唯一能量化
-   「网络那一秒」的数。
+  18:20:38 [PREFETCH] reader modules requested (timer)
+  18:20:38 [ERR] onerror SyntaxError: Can't create duplicate variable: 'TtsProvider' @:0
 
-3) 原生那一段（SangTacAppPlugin）。插件在 load() 记下 systemUptime，getInfo 多回
-   uptimeMs / loadUptimeMs 两个字段（它没有任何 JS 消费者，加字段安全）；页面拿
-   自己的 performance.now() 去减，打出
-     [BOOT] native: plugin loaded Nms before document start (page age Nms)
-   冷启动里最贵的「页面还不存在」的那段第一次有了数字。
+现在 MODULES 只留 chapterdisplay 与 tts.js?v=8（app.v2.read.js:237/:2418，两处 nocache 都是
+!isCachedFrontend），并在动手前读 app.v2.js:15 的 isCachedFrontend；站点若随机化键就整段
+stand down 并在日志里说明，而不是用一次重复求值换一个本地副本本来就能回答的请求。
 
-顺带修一个真 bug：预取把 stv.tts.js 写成 ?v=7，站点 app.v2.read.js:2418 要的是
-?v=8。scriptmanager.load 按最终 URL 去重，两个 key 就是取两次、求值两次，第二个
-class TtsProvider 是 SyntaxError，整个文件失效 —— 诊断日志里那两条
-Can't create duplicate variable: 'TtsProvider' 就是它。预取的 URL 现在逐字节照抄
-站点的，注释里也写清为什么不能自己编版本号。
+同一份日志还暴露首屏内容信号是假阳性：站点先 append 空 wrapper（app.v2.js:4178-4181）再渲染，
+旧判定「有子节点」于是在 +124ms 报 first content，而那一刻 covers=0/0。改为 gridItems() > 0
+（[view=bookgrid] 的子节点数）或 covers().total > 0（img 已 complete 且 naturalWidth>0），
+摘要从 "1 node(s) covers=0/0" 变成 "1 item(s) 0/0 covers"。
 
-门禁：check-ios-shim（32 块 / 699523 字节 / 141 标记）、gen-site-i18n --check、
-test-site-patch 全绿；test-site-patch 新增 5 条断言，把两个钟的数（520ms、2120ms）、
-空首页报 0 node(s)、首屏内容只记一次都钉住了。
+门禁：check-ios-shim 32 blocks / 701437 bytes / 141 markers；gen-site-i18n --check 461 labels
+/ 76 fragments；test-site-patch 新增 10 条预取断言 + 3 条首屏断言全绿。
