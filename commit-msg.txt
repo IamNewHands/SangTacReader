@@ -1,31 +1,36 @@
-刷站点快照到 11 月 13 日那版：镜像不再喂 9 月的旧前端
+补掉站点样式引擎在 iOS 分支里的崩溃：设置页不再透明压层、点得动
 
-site-assets/ 停在 2026-09-23（7c6af2f），而站点在 11 月连推了几版前端：
-app.v2.js 9030 → 10544 行（+1631/−117），read.js 4504 → 4646，chapterdisplay.js
-+80/−22，bookdisplay.js +126/−2，css +1028/−13，tts.js +45。镜像的正是这 8 个文件，
-所以过去七周里每个装了镜像的读者，拿到的都是 9 月的 bundle 配 11 月的 shell ——
-读者报的「历史分类顶部多了个搜索框就进不去了」正是这半边的错位：搜索框、排除关键词、
-线路面板都是 11 月 shell 与 bundle 一起加的功能，旧 bundle 里没有
-app.history.toggleSearch / app.search.editIgnores / app.search.submitSearch。
+11 月那版前端在 app.v2.js 的 iOS 分支里调了两次 rootCss.update()，用的选择器
+（"html,body" 和 "#overlay > div, .perf-div, ... #ctxoverlay ..."）从来没被
+rootCss.set() 注册过。stv.ui.js 的 st.update() 直接取 this.collection[id] 再写
+.css，id 不存在就是 undefined，于是抛
+  TypeError: Cannot read properties of undefined (reading 'css')
+抛出点在 app.platform 那个 IIFE 里，一抛就中断了它后面所有 IIFE：
+app.theme / app.config / app.perf / app.images / app.fontmanager / app.namemanager
+全部停在 undefined。主题变量因此一次都没写进 :root，--background 与 --bg-tps
+是空串，而 #overlay 与 #overlay > div 的 background 是 var(--background) ——
+var 展开成空值时该声明 invalid at computed-value time，等同 unset，也就是透明。
+于是设置页下面那层用户 tab（头像、设置、登录）和 tabbar 直接透上来，看着像
+「页面重叠、设置项点不了」。
 
-11 月这批还带了三处结构性改动，旧快照全缺：
-- app.v2.read.js:276 app.reader.closePreviousPages —— 翻页时把上一章的残留页摘掉，
-  站点自己在 :4760 调它；
-- app.v2.chapterdisplay.js:74 chapterFrameScriptUrl —— 章节 iframe 的脚本改走
-  same-origin 绝对地址，离线时 WebView 还能从缓存伺服；
-- app.chapterListTimeout（默认 12000）+ haveNetwork 判断 —— 离线可读已下载的书。
+只在真机上炸：app.v2.js:5379 是 if(window.Capacitor){ ... if(!isAndroid && !isIOS)
+{ app.platform.isWeb = true; } }，有 Capacitor 且 platform 是 ios 才进这条分支，
+桌面浏览器 isWeb 为真，根本走不到那两行。
 
-做法：node scripts/gen-site-assets.js 原样重下 8 个文件（iPhone UA，CRLF 归一后再算
-sha256，逐字节与线上核对过 app.v2.js / app.v2.css / bookdisplay / config 四件）。
-hanviet.js 与 app.v2.config.js 线上未变，因此不进本次 diff。
+改法（compat 块，注入最早，stv.ui.js 一到位就生效）：
+- patchStyleEngine() 包一层 ui.style.create 返回的 sheet.update：collection 里
+  没有这个 id 就先按值注册（字符串走 set，对象先建空壳），再交给原 update 合并。
+  幂等标志 __stvStylePatched；ui.style 还没定义时每 10ms 重试，最多 2000 次。
+- 顺手补 patchTextLoader()：shell 的 app.celoader.text 用
+  eval("app.text." + ogText)，中文覆盖层把 ogText 改写成带空格或汉字之后这个 eval
+  会抛 SyntaxError（切一次语言三条），节点保持旧内容。改成直接查 app.text[key]，
+  查不到才回落到原实现。
 
-守卫：check-ios-shim 32 块 / 702611 字节 / 141 markers；test-site-patch 1030 条断言
-0 失败（三处清单仍一致，8 个文件）；gen-site-i18n --check 461 labels / 76 fragments；
-gen-site-assets --check 8 文件 / 987431 字节同步。补丁锚点在快照里逐个 grep 过：
-.nametable 5、chaptertopinfo 14、.erroralert 3、settingitem 3、pageflip 11、
-app.pushPage 22、app.goback 5、app.user.checklogin 3、ui.smtab 4、bestDomain 6、
-app.tts.player 11。
+验证（本地代理跑「线上 shell + 32 个注入块 + Capacitor 设备桩」）：
+- 修前：compat:false、theme/config/images 全 false、--background 空、stv.ui.js:3213
+  的 TypeError 照旧、设置页透明且点不到。
+- 修后：patched:true、theme/config/perf/images/fontmanager/namemanager 全 true、
+  --background=#ffffff、#overlay 子节点 rgb(255,255,255)，设置页 13 行里 11 行
+  elementFromPoint 命中自身（另两行是隐藏行与屏幕外），SyntaxError 归零。
 
-没进镜像的仍是 /asset/app.v2.comicprovider.js、app.v2.db.js、app.v2.surf.trans.js 与
-根路径的 stv.ui.js / stv.host.js：它们由 bundle 运行时或 HTML 解析器直接取，注入层
-碰不到，留给下一轮。
+门禁：check-ios-shim ✓（32 块）、gen-site-i18n --check ✓、test-site-patch ✓。

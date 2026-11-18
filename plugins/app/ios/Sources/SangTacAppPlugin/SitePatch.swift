@@ -68,6 +68,92 @@ enum SitePatch {
             return (typeof input === 'string') ? { text: input } : (input || {});
         }
 
+        /*
+         The site's style engine (stv.ui.js ui.style.create) keeps a selector
+         collection per <style> element, and its update() assumes the selector
+         was registered by set() first. The 2026-11 frontend calls
+         update("html,body", ...) and update("#overlay > div, ...", ...) inside
+         its iOS branch without ever registering either one, so update() throws
+         "Cannot read properties of undefined (reading 'css')" and the
+         app.platform IIFE aborts. Everything declared after that IIFE --
+         app.theme, app.config, app.perf, app.images, app.fontmanager -- then
+         stays undefined: --background/--color are never written, the overlay
+         computes to a transparent background, and the settings page shows the
+         tab underneath it with nothing clickable.
+         Register the selector on demand so update() merges into a fresh rule
+         instead of throwing.
+         */
+        function patchStyleEngine() {
+            var engine = window.ui && window.ui.style;
+            if (!engine || typeof engine.create !== 'function') { return false; }
+            if (engine.create.__stvStylePatched) { return true; }
+            var original = engine.create;
+            var wrapped = function (text) {
+                var sheet = original.apply(this, arguments);
+                if (sheet && typeof sheet.update === 'function' && !sheet.update.__stvStylePatched) {
+                    var update = sheet.update;
+                    var patched = function (id, value) {
+                        if (this.collection && !this.collection[id]) {
+                            if (typeof value === 'string') { this.set(id, value); return this; }
+                            this.collection[id] = { txt: '', css: {} };
+                        }
+                        return update.call(this, id, value);
+                    };
+                    patched.__stvStylePatched = true;
+                    sheet.update = patched;
+                }
+                return sheet;
+            };
+            wrapped.__stvStylePatched = true;
+            engine.create = wrapped;
+            return true;
+        }
+        if (!patchStyleEngine()) {
+            var styleTries = 0;
+            var styleTimer = setInterval(function () {
+                styleTries += 1;
+                if (patchStyleEngine() || styleTries > 2000) { clearInterval(styleTimer); }
+            }, 10);
+        }
+
+        /*
+         The shell renders every <text> node with eval("app.text." + ogText).
+         Once the Chinese overlay rewrites a node's text content, ogText can
+         hold spaces or CJK characters, so the eval throws a SyntaxError three
+         times per language switch and the node keeps stale content. Look the
+         key up directly instead, and fall back to the site's own renderer only
+         when the key is not a plain identifier.
+         */
+        function patchTextLoader() {
+            var loader = window.app && window.app.celoader;
+            if (!loader || typeof loader.text !== 'function') { return false; }
+            if (loader.text.__stvTextPatched) { return true; }
+            var original = loader.text;
+            var patched = function (ele) {
+                try {
+                    var ogText = ele.getAttribute('ogtext') || ele.textContent;
+                    var table = window.app && window.app.text;
+                    var value = table ? table[ogText] : null;
+                    var text = (typeof value === 'string' && value) ? value : ogText;
+                    ele.setAttribute('ogtext', ogText);
+                    ele.innerHTML = text || ogText;
+                    return ele;
+                } catch (error) {
+                    return original.apply(this, arguments);
+                }
+            };
+            patched.__stvTextPatched = true;
+            loader.text = patched;
+            return true;
+        }
+        if (!patchTextLoader()) {
+            var textTries = 0;
+            var textTimer = setInterval(function () {
+                textTries += 1;
+                if (patchTextLoader() || textTries > 2000) { clearInterval(textTimer); }
+            }, 10);
+        }
+
         var tts = window.TTS || {};
         tts.speak = function (input) { return callApp('speak', asOptions(input)); };
         tts.speakToFile = function (input) { return callApp('speakToFile', asOptions(input)); };
