@@ -6548,4 +6548,104 @@ JS 断言 1021 → **1030**（新增 9 条：没有会话不发请求、有会�
   那一刻页面里还没有 `app.user`，本块也没有答案可填；这条没有修，属于「App 还没起来」。
   若体感上仍然能看到，下一步是把原生遮罩多留到 `app.user` 就绪，代价是首屏晚约 0.3 秒。
 
+## §6.68 第 66 轮：主文档搬去 .app —— 同一份字节，换一条传输层
+
+### 6.68.1 二十秒的账挂在域名上，不在内容上
+
+23:40 那份日志里最刺眼的一行是 `[BOOT] navigation: html 20532ms`。同一份日志的其余部分
+都在说「内容早就到了」：`document start` 之后 29ms 就有原生插件回报，1152ms 外壳已经上屏，
+1627ms 首屏内容已经在。所以那二十秒全花在**取主文档**这一段，页面本身并不慢。
+
+把它拆开要回答的是「慢在整站、慢在服务端、还是慢在这一个域名」。实测（本机 node，iPhone UA）：
+
+| 目标 | 结果 |
+| --- | --- |
+| `sangtacviet.app/app.v2.php` | 6 次 total 1.43–2.83s |
+| `sangtacviet.com/app.v2.php` | 6 次 total 1.17 / 2.00 / 2.91 / 2.97 / 3.40 / 3.76s，另 2 次直接超时断开；更早一轮出现过 8.70 / 12.91s |
+| `warp.php`（小响应） | 两边都 0.5–1.5s |
+
+小响应两边都快，只有这份 190KB 的文档在 .com 上抖。再往下看传输层，差别是确定的：
+
+- `sangtacviet.app` 的 ALPN 协商到 **h2**，响应头 `server: cloudflare`、`cf-ray`、`cf-cache-status: DYNAMIC`；
+- `sangtacviet.com` 只协商 **http/1.1**，响应头 `server: nginx/1.18.0 (Ubuntu)`、`X-Powered-By: PHP/8.5.12`。
+
+6 路并发主文档各 30 次：`.app p50 537ms / p90 1243ms / max 1316ms`，`.com p50 849ms / p90 1302ms / max 1549ms`
+—— .com 更慢但**不失败**（早前 curl 里那 5 次 `code=000` 是本机 schannel 的单连接握手问题，不能算到服务端头上）。
+真机日志里还有一条更直接的：同一轮 `[DOMAIN] networkManager ranked 1.https://sangtacviet.com=alive/1188ms`，
+而 XHR 通道那一路是 `1.https://sangtacviet.com=timeout/-1ms` —— **.com 在真机上真的超时过一次**。
+
+### 6.68.2 换域之前先证明「换的是路，不是内容」
+
+这一步不做，换域就是在赌。两域逐字节比对（node，同一 UA）：
+
+- 主文档 `/app.v2.php`：两域均 200、**189993 字节、sha256 前 16 位 `64622b877bca1e06`，逐字节相同**；
+- 8 个镜像资源全部 SAME：`app.v2.js 309750`、`app.v2.css 75186`、`app.v2.bookdisplay.js 31474`、
+  `app.v2.config.js 4095`、`app.v2.read.js 150708`、`app.v2.chapterdisplay.js 160107`、
+  `stv.tts.js 48077`、`hanviet.js 233529`。
+
+主文档里 `sangtacviet.com` 出现 **0 次**，`location.href` 唯一命中是分析器的
+`trackView: function(url){ this.ele.contentWindow.postMessage({type:"trackView", url: url || location.href }, "*") }`，
+不是跳转。所以换成 .app 之后，页面里没有任何一处会把顶层导航带回 .com。
+
+### 6.68.3 为什么换了不会掉登录、掉设置
+
+三件事分别查到底：
+
+- **导航**：`WebViewDelegationHandler.swift:101-124` 先看 `shouldAllowNavigation(to: host)`，再看
+  `navURL.absoluteString.starts(with: bridge.config.serverURL.absoluteString)`；不是应用内导航且是顶层
+  才交给系统浏览器。allowNavigation 本来就含 `sangtacviet.app` 与 `*.sangtacviet.app`，改的只是
+  「哪条算应用内」。
+- **原生信任**：`SangTacAppPlugin.swift:536-540` 的 `trustedHosts` 是 allowNavigation 的**超集**
+  （`.com` / `.vip` / `.app` 三个），`:542-554` 用 `host == $0 || host.hasSuffix("." + $0)` 判定 ——
+  .app 一直在白名单里，settingsSave / settingsRestore / secretSave / secretLoad / diagnostic 照常放行。
+- **设置**：站点 `app.v2.js:648-677` 的 `app.storage` 在 `Capacitor.Plugins.Preferences` 存在时走
+  **Preferences 插件**（原生 UserDefaults），只有没有插件时才落 localStorage。所以 `config.reader` /
+  `config.ux` / `tts.setting` / `offlineBook` 这些键与页面域名无关。
+
+唯一真正与域绑定的是 cookie：`writeCookie(name, value)` 写的是 `name=value; path=/; max-age=31536000`，
+不写 domain，落到当前文档域。换到 .app 后 .app 域上没有旧 cookie —— 这正是 `restoreSession()` 的场景：
+它在页面读不到同名 cookie 时从 Keychain 写回。Keychain 里那份是 `stv.session` 单份、与域无关，
+所以换域之后会话靠这条路径重建，不是丢。
+
+### 6.68.4 改了哪几行
+
+| 文件 | 改动 |
+| --- | --- |
+| `capacitor.config.json:7-8` | `server.url` 与 `server.hostname` 由 `sangtacviet.com` 改为 `sangtacviet.app` |
+| `dist/index.html:10-11,15` | 注释里的 URL 与占位文案同步 |
+| `README.md:6`、`README.en.md:6` | 文档里的主文档地址同步 |
+
+没动的：allowNavigation 五项、`plugins.CapacitorHttp.enabled false`、`ios.contentInset never`、
+`limitsNavigationsToAppBoundDomains false`。CI 不校验也不改写 `server.url`（`build-ipa.yml` 里
+`capacitor.config.json` 只出现两处，一处是打印 packageClassList，一处是注释），`scripts/` 下 0 处引用，
+所以这条改动不会被门禁挡，也不会在 runner 上被覆盖。
+
+### 6.68.5 这一轮怎么验
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | **32 块** / 704630 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1046 条断言** / 0 失败 |
+| `gen-site-i18n.js --check` | 461 labels / 76 fragments in sync |
+| `gen-site-assets.js --check` | 8 文件 / 987431 字节 in sync |
+
+真机上要看的就三行：
+
+1. `[BOOT] navigation: html …ms` —— 期望回到 1–3 秒档，不再是 20 秒；
+2. `[DOMAIN] networkManagerXHR route: page=https://sangtacviet.app …` —— 页面 origin 应当已经是 .app；
+3. `[AUTH]` 与「用户」页 —— 首次启动可能看不到登录态，`restoreSession` 写回 cookie 后应当恢复；
+   若需要重登一次，那是换域的正常代价，不是回归。
+
+### 6.68.6 未证实与边界
+
+- **二十秒没能在真机复现到同一条链路上**：本机最快 1.17s、最慢 12.91s，真机那次 20.5s 属于移动网络叠加的
+  最坏档。换域能拿掉的是「HTTP/1.1 + 无 CDN 的长响应」这一层，拿不掉运营商那一段。
+- **.com 并不是不可用**：30 次并发 0 失败。换域是把「最坏档」压掉，不是修好 .com。
+- **Turnstile 未实测**：站点 `app.v2.js:10292` 用固定 sitekey `0x4AAAAAABbXTEjsj3isHkfm` 加载
+  `challenges.cloudflare.com/turnstile/v0/api.js`，唯一调用点是 `app.v2.read.js:805`（异常码 21）。
+  sitekey 若绑域名，.app 本来就是站点的官方域，理论上可用，但没有真的触发过一次。
+- **生成器仍指向 .com**：`scripts/gen-site-assets.js:40` 的默认 `HOST` 还是 `https://sangtacviet.com`，
+  `site-assets/manifest.json:2` 的 `host` 也是。两域资源逐字节相同，所以不影响运行；等下次真的需要
+  重新生成镜像时再一并改。
+
 
