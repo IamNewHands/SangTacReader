@@ -1817,7 +1817,23 @@ enum SitePatch {
                 });
             }
 
-            cache.getFile = function (key) {
+            // The name here is load-bearing, not decoration. The site decides
+            // where reading history lives by stringifying this very method:
+            //
+            //     if (app.storage.cache.getFile.toString().contain("getFile"))
+            //         storage = "sqlite";   // app.v2.js:3591
+            //
+            // Its localStorage branch writes `getFile: async function(key)`
+            // (app.v2.js:691), whose source text contains no "getFile"; only the
+            // SQLite branch (app.v2.js:713) is a *named* function and matches.
+            // An anonymous wrapper here therefore pins the site to localStorage
+            // silently -- and localStorage is per-origin, so the mirror moving
+            // from .com to .app left the reader's history behind and the home
+            // tab empty. Naming this function puts the site on its own
+            // Preferences-backed branch, which is not per-origin, and its
+            // built-in one-time migration (app.v2.js:3593-3599) lifts the old
+            // copy across on the next launch.
+            cache.getFile = function getFile(key) {
                 if (!blobKey(key)) { return storedGet.call(cache, key); }
                 return Promise.resolve().then(function () {
                     return plugin.blobRead({ key: key });

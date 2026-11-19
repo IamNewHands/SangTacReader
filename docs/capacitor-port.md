@@ -6648,4 +6648,78 @@ JS 断言 1021 → **1030**（新增 9 条：没有会话不发请求、有会�
   `site-assets/manifest.json:2` 的 `host` 也是。两域资源逐字节相同，所以不影响运行；等下次真的需要
   重新生成镜像时再一并改。
 
+## 6.69 换域后阅读历史为空：站点按 `toString()` 选存储分支
+
+**现象**：换到 `.app` 之后首页默认 tab（历史）是空的，设置、下载记录都在。
+
+### 6.69.1 根因
+
+§6.68.3 里那句「设置与域名无关」只对 `app.storage.get/set` 成立。历史走的是另一条路：
+
+| 位置 | 代码 | 实际后端 |
+| --- | --- | --- |
+| `app.v2.js:678-683` | `app.storage.getItem/setItem` → `localStorage.getItem/setItem` | **localStorage，恒与 origin 绑定** |
+| `app.v2.js:3587` | `readhistory = JSON.parse(await app.storage.getItem("readhistory") \|\| "[]")` | 读的永远是 localStorage |
+
+所以换域那一刻，`.app` 这个 origin 下没有 `readhistory`，站点读到 `"[]"`。
+
+站点本来有兜底：`:3591` 用 `app.storage.cache.getFile.toString().contain("getFile")` 探测存储分支，
+命中就走 SQLite 分支（Preferences 后端，与域无关），并把 localStorage 那份迁移过去（`:3593-3599`）。
+
+**这条探测被我们的补丁挡住了。** `SitePatch.swift` 的 `storageAccessor` 块包了 `cache.getFile`，
+当时写成匿名函数：
+
+```js
+cache.getFile = function (key) { ... };   // toString() = "function (key) { ... }"
+```
+
+站点自己那两个分支的源码文本恰好是：
+
+- localStorage 分支 `app.v2.js:691`：`getFile: async function(key){ return await app.storage.get(key); }` —— 源码里**没有** `getFile` 这个词；
+- SQLite 分支 `app.v2.js:713`：`getFile: async function(key){ return await getFile(key); }` —— 有。
+
+匿名包装后 `toString()` 里也没有 `getFile`，于是站点判定「这是 localStorage 分支」，
+**永远走 origin 绑定的那条路**，它自带的迁移一次都不会触发。设置没事，因为设置走 `app.storage.set`（Preferences）。
+
+### 6.69.2 修法
+
+把包装函数写成**具名函数**，`toString()` 里就带上 `getFile`：
+
+```js
+cache.getFile = function getFile(key) { ... };
+```
+
+这一行同时做两件事：站点切到 Preferences 后端（与域无关），并在下一次启动时用它自己的
+`app.v2.js:3593-3599` 把旧 origin 留下的那份 `readhistory` 读出来、比较长度、迁移过去。
+迁移是站点自己写的，我们只是不再挡路 —— 不新增迁移代码，也不改站点文件（镜像资源不能改）。
+
+`scripts/test-site-patch.js` 的 blob 用例里加了断言，锁的是**名字**而不是行为：
+
+```js
+const source = String(app.storage.cache.getFile);
+check('the getFile wrapper keeps a name the site can detect',
+  /function\s+getFile\b/.test(source), source.slice(0, 120));
+```
+
+### 6.69.3 这一轮怎么验
+
+| 守卫 | 结果 |
+| --- | --- |
+| `scripts/check-ios-shim.js` | **32 块** / 705718 字节 / 141 markers |
+| `scripts/test-site-patch.js` | **1047 条断言** / 0 失败 |
+
+真机上要看的：换域后新读的书，杀掉进程再启动仍在历史里（这条以前在换域时会丢，现在不会了）；
+诊断面板里应有一行 `[STORAGE] app.storage.get reads the Preferences result properly`。
+
+### 6.69.4 边界（重要）
+
+- **已经丢掉的那份不会自动回来。** 修复前 `readhistory` 一直写在 `.com` 这个 origin 的 localStorage 里；
+  换到 `.app` 之后页面读不到它，站点的迁移（`:3593-3599`）两边读到的都是空，所以它不会把旧数据搬过来。
+  这次修的是**今后**：历史改走 Preferences，与域无关，再换域也不会丢。
+- **旧数据仍在设备上**，只是从 `.app` 页面够不到：它在 WebKit 给 `.com` 存的那份 localStorage 里。
+  要捞回来需要一次性原生读取（WKWebsiteDataStore 的 LocalStorage sqlite，或临时用 `.com` origin 起一个隐藏
+  webview 读出来再写回），属于独立的一件事，本轮没做。
+- **重装同理**：数据容器已换，两边都是空，只能靠站点的 `loadhistory`（`:4459`，需登录）从服务端拉。
+- **`img.*` / `font_*` 不受影响**：那两类键仍走我们的 `blobKey` 分支写文件，只是包了一层具名函数。
+
 

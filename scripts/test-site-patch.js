@@ -9843,6 +9843,16 @@ async function testSiteBlobs() {
   check('the blob store reports itself installed',
     diag().indexOf('images and fonts now live in files') >= 0, diag().slice(-200));
 
+  // The site picks where reading history lives by stringifying this method:
+  // `app.storage.cache.getFile.toString().contain("getFile")` -> sqlite branch
+  // (app.v2.js:3591). Only a *named* function carries its own name in the
+  // source text, so an anonymous wrapper would pin the site to localStorage,
+  // which is per-origin -- and the mirror moving from .com to .app is exactly
+  // how a reader's history went missing. Guard the name, not the behaviour.
+  const source = String(app.storage.cache.getFile);
+  check('the getFile wrapper keeps a name the site can detect',
+    /function\s+getFile\b/.test(source), source.slice(0, 120));
+
   // A value written before the move is still what the site reads...
   const migrated = await app.storage.cache.getFile('img.legacy');
   check('a legacy image is still returned', migrated === 'BASE64-LEGACY', String(migrated));
