@@ -3,7 +3,7 @@
 # SangTacReader — sangtacviet 的非官方 iOS 客户端
 
 把 sangtacviet 的网页版装进一个 iOS 原生外壳：Capacitor 8 应用，远程加载
-`sangtacviet.com/app.v2.php`，并补齐站点前端依赖的原生能力，让站点走「app 模式」——
+`sangtacviet.app/app.v2.php`，并补齐站点前端依赖的原生能力，让站点走「app 模式」——
 这正是官方安卓版拿到完整阅读体验的原因。
 
 官方只发布安卓 APK，本项目自行封装，仅供个人学习使用。

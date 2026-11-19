@@ -1,22 +1,14 @@
-预取看模块是否已经在页面上，首屏内容只认已解码的封面
+主文档改从 sangtacviet.app 加载：绕开 .com 那条会拖到 20 秒的长响应
 
-96e66e0 用「和站点同一个 URL 键」来决定要不要预取，19:48 的真机日志证明
-这条路不成立：站点自己求值 stv.tts.js 时根本没有写进 ui.scriptmanager.stack
-（同一段日志里 chapterdisplay 却去重成功了），于是四秒后又求值一次，报
-Can't create duplicate variable: 'TtsProvider'。键是猜的，绑定是事实。
+同一个 /app.v2.php，两个域名返回的是同一份字节（189993 字节，sha256 前 16 位
+64622b877bca1e06），8 个镜像资源也逐字节相同；差别只在传输层：.app 走
+Cloudflare，协商 h2；.com 是 nginx/1.18.0 的 HTTP/1.1。真机日志里
+"navigation: html 20532ms" 就是从 .com 取这份文档的耗时，同一轮 .app 的
+warp.php 只用 1264ms。
 
-改成读模块自己声明的全局绑定：chapterdisplay 看 ChapterDisplay，tts 看
-TtsProvider。class 声明落在 global lexical scope 里，window 上看不见，所以
-只能用字面量 typeof；不用 eval，页面的 CSP 可能禁掉 unsafe-eval。typeof 在
-TDZ 里会抛，抛出就当作「正在求值」一并跳过。站点已经用同一个键请求过的也
-跳过，两条判据都不成立时才预取，并在日志里写明是哪一个让它停下的。
+改的是主文档入口，不是接口：站点自己的 STV_SERVER 与 bestDomain() 早就把
+业务请求放在 .app，页面只是还从 .com 加载。
 
-首屏内容的第二处假阳性：19:48 的日志是 first content at +838ms (mutation,
-0 item(s) 0/1 covers)，书格没渲染、容器里那一张图也还没解码，是 tab 图标。
-按存在计数会把还没画出来的东西当成内容，改成按 complete 且 naturalWidth > 0
-的已解码封面计数。
-
-测试补了这两条判据的两面：类已声明时不请求、未声明时仍请求、只停一个不会
-让整次预取沉默、两个都在页面上时说 nothing to request；封面未解码不算内容、
-解码后算、只记一次。书格那一项单独起一个页面来测，因为首屏只记一次，同一
-页里封面已经占了那个时刻。
+不动的东西：allowNavigation 五项本来就含 .app 与 *.sangtacviet.app；原生
+trustedHosts 是它的超集；设置走 Preferences 插件（UserDefaults），与页面域
+无关；Keychain 里的会话与域无关，换域后由 restoreSession 按需写回 cookie。

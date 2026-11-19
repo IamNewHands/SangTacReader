@@ -4,8 +4,8 @@
   "webDir": "dist",
   "bundledWebRuntime": false,
   "server": {
-    "url": "https://sangtacviet.com/app.v2.php",
-    "hostname": "sangtacviet.com",
+    "url": "https://sangtacviet.app/app.v2.php",
+    "hostname": "sangtacviet.app",
     "scheme": "https",
     "iosScheme": "https",
     "allowNavigation": [

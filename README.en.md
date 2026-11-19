@@ -3,7 +3,7 @@
 # SangTacReader — an unofficial iOS client for sangtacviet
 
 It wraps the sangtacviet website in a native iOS shell: a Capacitor 8 app that loads
-`sangtacviet.com/app.v2.php` remotely and supplies the native capabilities the site's
+`sangtacviet.app/app.v2.php` remotely and supplies the native capabilities the site's
 front end expects, so the site runs in **app mode** — the same reason the official Android
 build gets the full reading experience.
 
